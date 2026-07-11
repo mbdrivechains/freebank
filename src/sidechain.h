@@ -39,14 +39,17 @@
 /* Sidechain Identifiers */
 
 //! Sidechain number
-// PROVISIONAL (S-5/Tx-10): FreeBank slot candidate; locked at M1-package time
+// LOCKED (S-5/Tx-10, v0.1.0 M1 package, 2026-07-11): FreeBank = slot 130
 static const unsigned int THIS_SIDECHAIN = 130;
 
-//! Sidechain build commit hash
-static const std::string SIDECHAIN_BUILD_COMMIT_HASH = "a67a177c615cf2e228ab4027faa48a745e448c38";
+//! Sidechain build commit hash (M1 hash_id_2). Display-only; the authoritative
+//! per-release values live in the M1 proposal and the GitHub release notes
+//! (github.com/mbdrivechains/freebank/releases). A binary cannot embed the
+//! hash of the tarball that contains it, so these stay empty in-source.
+static const std::string SIDECHAIN_BUILD_COMMIT_HASH = "";
 
-//! Sidechain build tar hash
-static const std::string SIDECHAIN_BUILD_TAR_HASH = "15eda1257f8efcfded8a2ccbbdd756b29797f2c7f4174c9ef43d5667ac570374";
+//! Sidechain build tar hash (M1 hash_id_1). See SIDECHAIN_BUILD_COMMIT_HASH.
+static const std::string SIDECHAIN_BUILD_TAR_HASH = "";
 
 //! Required workscore for mainchain payout
 static const int MAINCHAIN_WITHDRAWAL_BUNDLE_MIN_WORKSCORE = 131;

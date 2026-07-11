@@ -32,7 +32,7 @@ const CBaseChainParams& BaseParams()
 
 std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain)
 {
-    // PROVISIONAL (S-5): locked at M1-package time
+    // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
     if (chain == CBaseChainParams::MAIN)
         return MakeUnique<CBaseChainParams>("", 8454);
     else if (chain == CBaseChainParams::REGTEST)

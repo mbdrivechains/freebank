@@ -106,13 +106,18 @@ public:
          * The characters are rarely used upper ASCII, not valid as UTF-8, and produce
          * a large 32-bit integer with any alignment.
          */
-        // PROVISIONAL (S-5): locked at M1-package time
+        // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0x18;
         pchMessageStart[3] = 0x45;
         nDefaultPort = 8455;
         nPruneAfterHeight = 100000;
+
+        // The main network pairs with a CUSF-enforcer mainchain (L2L Signet /
+        // eCash era): withdrawal bundles use the enforcer's BlindedM6 layout.
+        // LOCKED (S-5, v0.1.0)
+        fCUSFBundleFormat = true;
 
         genesis = CreateGenesisBlock(1668667160, 1, 0);
         consensus.hashGenesisBlock = genesis.GetHash();
@@ -122,22 +127,26 @@ public:
 
         vSeeds.clear();
 
-        // PROVISIONAL (S-5): locked at M1-package time
-        // PUBKEY_ADDRESS 75 / SCRIPT_ADDRESS 125 match the BTX mainchain for
-        // Phase 1 deposit testing (BASE_REBRAND.md 9.2); provisional for the eCash era.
+        // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11).
+        // Sidechain addresses: PUBKEY 75 / SCRIPT 125 (X... addresses).
+        // MAINCHAIN_PUBKEY_ADDRESS is 111 because the v0.1.0-era mainchain is
+        // L2L Signet, whose addresses carry the Bitcoin testnet prefix - a
+        // prefix-0 setting would reject every real signet withdrawal
+        // destination. Revisit only if the mainchain moves to a network with
+        // different address prefixes.
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,75);
-        base58Prefixes[MAINCHAIN_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
+        base58Prefixes[MAINCHAIN_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[MAINCHAIN_REGTEST_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,125);
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,128);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
 
-        // PROVISIONAL (S-5): locked at M1-package time
+        // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         bech32_hrp = "fbk";
 
         // TODO more seed nodes
-        vFixedSeeds.clear(); // PROVISIONAL (S-5): upstream pnSeed6_main pointed at LayerTwo Labs seed nodes (port 2599); FreeBank seeds set at M1-package time
+        vFixedSeeds.clear(); // v0.1.0 ships no fixed seeds (upstream pnSeed6_main pointed at LayerTwo Labs nodes); seed nodes added when a public network exists
 
         fDefaultConsistencyChecks = false;
         fRequireStandard = false;
@@ -193,7 +202,7 @@ public:
         // By default assume that the signatures in ancestors of this block are valid.
         consensus.defaultAssumeValid = uint256S("0x6fb2c5081b13ecf369b324db61406244c7df519b4676e28b536a4ef546e387eb");
 
-        // PROVISIONAL (S-5): locked at M1-package time
+        // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0x18;
@@ -226,7 +235,7 @@ public:
             0
         };
 
-        // PROVISIONAL (S-5): locked at M1-package time
+        // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         // PUBKEY_ADDRESS 75 / SCRIPT_ADDRESS 125 match the BTX mainchain for
         // Phase 1 deposit testing (BASE_REBRAND.md 9.2); provisional for the eCash era.
         base58Prefixes[MAINCHAIN_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
@@ -237,7 +246,7 @@ public:
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
 
-        // PROVISIONAL (S-5): locked at M1-package time
+        // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         bech32_hrp = "fbkrt";
     }
 };
