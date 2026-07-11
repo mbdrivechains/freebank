@@ -527,6 +527,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-enforceraddr=<addr:port>", _("CUSF enforcer gRPC address for -mainchaintransport=enforcer (default: 127.0.0.1:50051)"));
     strUsage += HelpMessageOpt("-grpcurlbin=<path>", _("grpcurl binary used by -mainchaintransport=enforcer (default: grpcurl)"));
     strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; empty = deposits fail closed"));
+    strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
 
     return strUsage;
 }
@@ -962,6 +963,13 @@ bool AppInitParameterInteraction()
                            "(the mainchain node's REST endpoint; the node needs bitcoind -rest -txindex). "
                            "Without it this node would reject deposit-bearing blocks and fork off the network."));
     LogPrintf("Using mainchain transport: %s\n", strMainchainTransport);
+
+    // The withdrawal-bundle wire format is per-network consensus; the override
+    // flag is a bench/test knob and must never appear on a public network.
+    if (gArgs.GetBoolArg("-cusfbundleformat", false) &&
+            chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-cusfbundleformat is a regtest-only test override; the bundle "
+                           "format on other networks is fixed by network consensus."));
 
     // ********************************************************* Step 3: parameter-to-internal-flags
     if (gArgs.IsArgSet("-debug")) {

@@ -11,7 +11,9 @@
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
 #include <streams.h>
+#include <txdb.h>
 #include <util.h>
+#include <validation.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -319,6 +321,12 @@ bool ParseEnforcerWithdrawalEvents(const UniValue& response, std::vector<L1Withd
         return true; // no peg data is a valid empty result
 
     for (size_t b = 0; b < blocks.size(); b++) {
+        // Block hash (ReverseHex == display order) - null if absent
+        uint256 hashBlock;
+        std::string strBlockHash;
+        if (GetHexField(find_value(find_value(blocks[b], "blockHeaderInfo"), "blockHash"), strBlockHash))
+            hashBlock = uint256S(strBlockHash);
+
         const UniValue& events = find_value(find_value(blocks[b], "blockInfo"), "events");
         if (!events.isArray())
             continue;
@@ -329,6 +337,7 @@ bool ParseEnforcerWithdrawalEvents(const UniValue& response, std::vector<L1Withd
                 continue;
 
             L1WithdrawalEvent ev;
+            ev.hashMainBlock = hashBlock;
             std::string strM6;
             // m6id is ConsensusHex (internal byte order), like bmm_commitment
             if (!GetHexField(find_value(wb, "m6id"), strM6))
@@ -750,8 +759,93 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         incoming.push_back(deposit);
     }
 
-    // Already oldest-first (seq ascending); the jsonrpc path reverses because
-    // the RPC returns newest-first - we do not need to.
+    // M6 payout treasury returns. When a withdrawal bundle succeeds, the M6
+    // spends the CTIP and pays the remaining treasury to vout[0]
+    // (bip300301_enforcer lib/types.rs into_m6). The legacy mainchain wallet
+    // reports that change back as a "D" pseudo-deposit and the chassis CTIP
+    // chain REQUIRES it - the miner refuses to build blocks over a gap - so
+    // synthesize the equivalent entry from Succeeded withdrawal events. Like
+    // the deposits above this re-emits every event each call; the miner's
+    // HaveDepositNonAmount dedup is the backstop. Fail the batch closed on
+    // any error.
+    std::vector<L1WithdrawalEvent> vEvent;
+    if (!ParseEnforcerWithdrawalEvents(result, vEvent)) {
+        LogPrintf("ERROR Enforcer client: failed to parse withdrawal events (batch failed closed)\n");
+        return std::vector<SidechainDeposit>();
+    }
+
+    // All deposit-event txids (not just new): used to exclude deposit txs
+    // when locating the M6 inside its block.
+    std::set<uint256> setDepositTxid;
+    for (const EnfDep& d : vDep)
+        setDepositTxid.insert(d.txid);
+
+    // An M6 pays the sidechain treasury script at vout[0]:
+    // OP_DRIVECHAIN(OP_NOP5) PUSH1(<sidechain#>) OP_TRUE
+    const CScript scriptTreasury = CScript() << OP_NOP5
+        << std::vector<unsigned char>{(unsigned char)THIS_SIDECHAIN} << OP_TRUE;
+
+    for (const L1WithdrawalEvent& ev : vEvent) {
+        if (ev.status != 'S')
+            continue;
+
+        if (ev.hashMainBlock.IsNull()) {
+            LogPrintf("ERROR Enforcer client: Succeeded withdrawal event without block hash (batch failed closed)\n");
+            return std::vector<SidechainDeposit>();
+        }
+
+        std::vector<uint256> vBlockTxid;
+        if (!RestGetBlockTxids(ev.hashMainBlock, vBlockTxid)) {
+            LogPrintf("ERROR Enforcer client: REST block fetch failed for %s (batch failed closed)\n", ev.hashMainBlock.ToString());
+            return std::vector<SidechainDeposit>();
+        }
+
+        // Locate the M6: the single non-coinbase, non-deposit tx in the event
+        // block paying the treasury script at vout[0]. Anything other than
+        // exactly one match fails closed.
+        int nFound = 0;
+        int nTxM6 = -1;
+        CMutableTransaction mtxM6;
+        for (size_t j = 1; j < vBlockTxid.size(); j++) {
+            if (setDepositTxid.count(vBlockTxid[j]))
+                continue;
+
+            CMutableTransaction mtx;
+            if (!RestGetRawTx(vBlockTxid[j], mtx)) {
+                LogPrintf("ERROR Enforcer client: REST raw-tx fetch failed for %s (batch failed closed)\n", vBlockTxid[j].ToString());
+                return std::vector<SidechainDeposit>();
+            }
+
+            if (mtx.vout.empty() || mtx.vout[0].scriptPubKey != scriptTreasury)
+                continue;
+
+            nFound++;
+            nTxM6 = (int)j;
+            mtxM6 = mtx;
+        }
+        if (nFound != 1) {
+            LogPrintf("ERROR Enforcer client: expected exactly 1 M6 in block %s, found %d (batch failed closed)\n", ev.hashMainBlock.ToString(), nFound);
+            return std::vector<SidechainDeposit>();
+        }
+
+        SidechainDeposit deposit;
+        deposit.nSidechain = THIS_SIDECHAIN;
+        deposit.strDest = SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST;
+        deposit.dtx = mtxM6;
+        deposit.nBurnIndex = 0; // into_m6 puts the treasury change at vout[0]
+        deposit.nTx = nTxM6;
+        deposit.hashMainchainBlock = ev.hashMainBlock;
+        // Cumulative treasury remaining after the payout; the miner's delta
+        // arithmetic clamps a "D" entry to 0 user payout itself (miner.cpp).
+        deposit.amtUserPayout = mtxM6.vout[0].nValue;
+
+        incoming.push_back(deposit);
+    }
+
+    // Deposits are oldest-first (seq ascending); the jsonrpc path reverses
+    // because the RPC returns newest-first - we do not need to. Synthesized
+    // "D" entries ride at the end: SortDeposits reconstructs true CTIP spend
+    // order from the vin chain before the miner uses the batch.
     return incoming;
 }
 
@@ -894,8 +988,9 @@ bool EnforcerL1Client::GetWorkScore(const uint256& hash, int& nWorkScore)
 bool EnforcerL1Client::ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle)
 {
     // Used by CreateWithdrawalBundleTx as a double-propose guard (don't create a
-    // new bundle if one is already tracked on L1). Return the m6ids of bundles
-    // the enforcer has seen submitted.
+    // new bundle if one is already tracked on L1) - the caller only tests for
+    // presence. NB the returned hashes are enforcer m6ids (blinded txids), not
+    // chassis bundle hashes; do not match them against chassis hashes.
     std::vector<L1WithdrawalEvent> vEvents;
     if (!FetchWithdrawalEvents(vEvents))
         return false;
@@ -970,20 +1065,42 @@ bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEv
     return ParseEnforcerWithdrawalEvents(result, vEvents);
 }
 
+// Map a chassis bundle hash (the bundle txid, dummy input included - the
+// value committed in sidechain blocks and passed to the status queries) to
+// the enforcer's m6id: the txid of the SAME bundle with its inputs stripped.
+// The enforcer's compute_m6id is compute_txid() of the zero-input BlindedM6
+// (bip300301_enforcer lib/types.rs), and a txid is the hash of the
+// no-witness serialization on both sides, so stripping vin is the whole map.
+static bool BlindedM6IdForBundle(const uint256& hashBundle, uint256& m6id)
+{
+    if (!psidechaintree)
+        return false;
+
+    SidechainWithdrawalBundle bundle;
+    if (!psidechaintree->GetWithdrawalBundle(hashBundle, bundle))
+        return false;
+
+    CMutableTransaction mtx(bundle.tx);
+    mtx.vin.clear();
+    m6id = CTransaction(mtx).GetHash();
+    return true;
+}
+
 bool EnforcerL1Client::HaveSpentWithdrawalBundle(const uint256& hash)
 {
-    // "Spent" == the bundle's M6 payout succeeded on the mainchain.
-    // NB: assumes the enforcer's m6id equals the chassis bundle hash (the value
-    // passed as `hash`). UNVERIFIED end-to-end - our local enforcer never emits a
-    // bundle event (its L1 broadcast is commented out upstream), so this could
-    // not be exercised on the bench; confirm the m6id<->bundle-hash mapping
-    // against a real bundle before relying on it for mainnet withdrawals.
+    // "Spent" == the bundle's M6 payout succeeded on the mainchain. Translate
+    // the chassis bundle hash to the enforcer m6id before matching events; an
+    // unknown bundle fails closed.
+    uint256 m6id;
+    if (!BlindedM6IdForBundle(hash, m6id))
+        return false;
+
     std::vector<L1WithdrawalEvent> vEvents;
     if (!FetchWithdrawalEvents(vEvents))
         return false;
 
     for (const L1WithdrawalEvent& e : vEvents) {
-        if (e.status == 'S' && e.m6id == hash)
+        if (e.status == 'S' && e.m6id == m6id)
             return true;
     }
     return false;
@@ -991,13 +1108,17 @@ bool EnforcerL1Client::HaveSpentWithdrawalBundle(const uint256& hash)
 
 bool EnforcerL1Client::HaveFailedWithdrawalBundle(const uint256& hash)
 {
-    // Same m6id<->bundle-hash caveat as HaveSpentWithdrawalBundle.
+    // Same chassis-hash -> m6id translation as HaveSpentWithdrawalBundle.
+    uint256 m6id;
+    if (!BlindedM6IdForBundle(hash, m6id))
+        return false;
+
     std::vector<L1WithdrawalEvent> vEvents;
     if (!FetchWithdrawalEvents(vEvents))
         return false;
 
     for (const L1WithdrawalEvent& e : vEvents) {
-        if (e.status == 'F' && e.m6id == hash)
+        if (e.status == 'F' && e.m6id == m6id)
             return true;
     }
     return false;

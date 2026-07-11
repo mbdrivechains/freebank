@@ -6292,12 +6292,22 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
 
     CMutableTransaction wjtx; // Withdrawal Bundle
 
-    // Add SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST OP_RETURN output
-    wjtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << ParseHex(HexStr(SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST))));
+    // Bundle wire format is a per-network consensus rule (see CUSFBundleFormat):
+    // - legacy: vout[0] = OP_RETURN "D" marker, vout[1] = fee (LE), payouts after
+    // - CUSF:   vout[0] = OP_RETURN PUSH8(fee BE), payouts after (BlindedM6)
+    const bool fCUSF = UseCUSFBundleFormat();
 
-    // Add a dummy output for mainchain fee encoding (updated later)
     CAmount amountMainchainFees = 0;
-    wjtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << CScriptNum(1LL << 40)));
+    if (fCUSF) {
+        // Fee output placeholder at vout[0] (final size already; updated later)
+        wjtx.vout.push_back(CTxOut(0, EncodeWithdrawalFeesCUSF(0)));
+    } else {
+        // Add SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST OP_RETURN output
+        wjtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << ParseHex(HexStr(SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST))));
+
+        // Add a dummy output for mainchain fee encoding (updated later)
+        wjtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << CScriptNum(1LL << 40)));
+    }
 
     wjtx.nVersion = 2;
     wjtx.vin.resize(1); // Dummy vin for serialization...
@@ -6329,7 +6339,10 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
     }
 
     // Update mainchain fee encoding output.
-    wjtx.vout[1].scriptPubKey = EncodeWithdrawalFees(amountMainchainFees);
+    if (fCUSF)
+        wjtx.vout[0].scriptPubKey = EncodeWithdrawalFeesCUSF(amountMainchainFees);
+    else
+        wjtx.vout[1].scriptPubKey = EncodeWithdrawalFees(amountMainchainFees);
 
     // Did anything make it into the Withdrawal Bundle?
     if (!wjtx.vout.size()) {
@@ -6423,16 +6436,21 @@ bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vecto
                 vWithdrawal.push_back(withdrawal);
             }
 
+            // Data outputs by network bundle format: legacy = return-dest
+            // marker + fee output; CUSF = fee output only (BlindedM6).
+            const bool fCUSF = UseCUSFBundleFormat();
+            const size_t nDataOutputs = fCUSF ? 1 : 2;
+
             // Check that there are actually enough outputs for this to be valid
-            if (withdrawalBundle->tx.vout.size() < 3) {
+            if (withdrawalBundle->tx.vout.size() < nDataOutputs + 1) {
                 strFail = "Invalid Withdrawal Bundle - too few outputs!\n";
                 return false;
             }
 
             // Check that the number of outputs equals the number of
-            // Withdrawal(s) listed in the Withdrawal Bundle + one encoded mainchain fee output + one
-            // encoded change return dest output
-            if (withdrawalBundle->tx.vout.size() != vWithdrawal.size() + 2) {
+            // Withdrawal(s) listed in the Withdrawal Bundle + the encoded data
+            // output(s) for this network's bundle format
+            if (withdrawalBundle->tx.vout.size() != vWithdrawal.size() + nDataOutputs) {
                 strFail = "Invalid Withdrawal Bundle - missing / extra outputs!\n";
                 return false;
             }
@@ -6440,7 +6458,9 @@ bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vecto
             // Check that the amount in the encoded mainchain fee output is
             // equal to the sum of fees from the withdrawals
             CAmount amountRead = 0;
-            if (!DecodeWithdrawalFees(withdrawalBundle->tx.vout[1].scriptPubKey, amountRead)) {
+            const CScript& scriptFee = withdrawalBundle->tx.vout[fCUSF ? 0 : 1].scriptPubKey;
+            if (!(fCUSF ? DecodeWithdrawalFeesCUSF(scriptFee, amountRead)
+                        : DecodeWithdrawalFees(scriptFee, amountRead))) {
                 strFail = "Invalid Withdrawal Bundle - failed to decode mainchain fee output!\n";
                 return false;
             }
@@ -6900,6 +6920,62 @@ bool DecodeWithdrawalFees(const CScript& script, CAmount& amount)
         return false;
     }
 
+    return true;
+}
+
+bool UseCUSFBundleFormat()
+{
+    if (Params().CUSFBundleFormat())
+        return true;
+
+    // Bench/test override: regtest only, so a stray flag can never fork a
+    // public network (init refuses it elsewhere).
+    return Params().NetworkIDString() == CBaseChainParams::REGTEST &&
+        gArgs.GetBoolArg("-cusfbundleformat", false);
+}
+
+CScript EncodeWithdrawalFeesCUSF(const CAmount& amount)
+{
+    // The enforcer's BlindedM6 requires vout[0] to be exactly
+    // OP_RETURN PUSH8(fee) with the fee in BIG-endian byte order
+    // (bip300301_enforcer lib/types.rs BlindedM6::try_from).
+    std::vector<unsigned char> vch(8, 0);
+    uint64_t n = (uint64_t)amount;
+    for (int i = 7; i >= 0; i--) {
+        vch[i] = n & 0xff;
+        n >>= 8;
+    }
+
+    CScript script;
+    script << OP_RETURN;
+    script << vch;
+    return script;
+}
+
+bool DecodeWithdrawalFeesCUSF(const CScript& script, CAmount& amount)
+{
+    // Expect exactly: OP_RETURN PUSH8 <8 bytes big-endian>
+    if (script.size() != 10 || script[0] != OP_RETURN)
+        return false;
+
+    CScript::const_iterator it = script.begin() + 1;
+    std::vector<unsigned char> vch;
+    opcodetype opcode;
+    if (!script.GetOp(it, opcode, vch))
+        return false;
+
+    if (vch.size() != 8)
+        return false;
+
+    uint64_t n = 0;
+    for (int i = 0; i < 8; i++)
+        n = (n << 8) | vch[i];
+
+    // A mainchain fee cannot exceed the money range
+    if (n > (uint64_t)MAX_MONEY)
+        return false;
+
+    amount = (CAmount)n;
     return true;
 }
 

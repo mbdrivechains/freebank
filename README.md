@@ -14,12 +14,18 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 ## What works today
 
 - **BIP 300/301 sidechain**: activates into a slot, advances by blind-merged-mining (BMM),
-  credits deposits (M5) and produces withdrawal bundles (M3).
+  credits deposits (M5), produces withdrawal bundles (M3) and completes the withdrawal
+  payout (M6) — the full peg-out cycle.
 - **Two mainchain transports**, selected at startup with `-mainchaintransport`:
   - `jsonrpc` — a drivechain-patched Bitcoin node's HTTP-RPC (the classic path).
   - `enforcer` — the CUSF `bip300301_enforcer` gRPC surface, invoked at runtime via
-    `grpcurl` (nothing of the enforcer is vendored or linked). BMM and deposit crediting
-    are verified end-to-end on this path.
+    `grpcurl` (nothing of the enforcer is vendored or linked). BMM, deposit crediting and
+    the **full withdrawal peg-out** (deposit → bundle → M6 payout → funds received on the
+    mainchain → follow-on deposits credit correctly) are verified end-to-end on this path.
+- **Per-network withdrawal-bundle format**: networks paired with the CUSF enforcer use its
+  `BlindedM6` wire layout; networks paired with a legacy drivechain mainchain keep the
+  classic layout. The format is fixed by network consensus (a regtest-only
+  `-cusfbundleformat` flag exists for bench testing).
 - **Bills of exchange** (the credit primitive): a unique, stateful instrument with
   `bill_id = sha256(encrypted_body)` as its identity (the node never decrypts the body),
   a face amount, a maturity + grace window, a consensus-enforced escrow bond posted by the
@@ -56,7 +62,8 @@ at one of the two transports:
 # against a drivechain-patched Bitcoin node (JSON-RPC)
 freebankd -mainchaintransport=jsonrpc
 
-# against the CUSF enforcer (gRPC via grpcurl); deposits also need the mainchain node's REST
+# against the CUSF enforcer (gRPC via grpcurl); deposits and withdrawal-status
+# also need the mainchain node's REST interface (bitcoind -rest -txindex)
 freebankd -mainchaintransport=enforcer \
           -enforceraddr=127.0.0.1:50051 \
           -mainchainrest=127.0.0.1:8332
@@ -70,7 +77,8 @@ MIT — see [`COPYING`](COPYING). Inherited from Bitcoin Core / the BitAssets ch
 
 ## Status
 
-Alpha. Consensus surfaces (bills, deposits, the transport layer) have unit + integration
-coverage and, for the bills and transport code, adversarial review; the withdrawal *payout*
-round-trip depends on the mainchain enforcer's bundle handling. Not yet audited; do not use
-with real value.
+Alpha. Consensus surfaces (bills, deposits, withdrawals, the transport layer) have unit +
+integration coverage and adversarial review; the full peg-out cycle is verified end-to-end
+against both a drivechain-patched mainchain and the CUSF enforcer (upstream ≥ `6fdb827`,
+which parses zero-input blinded bundles) on regtest. Not yet audited; do not use with
+real value.

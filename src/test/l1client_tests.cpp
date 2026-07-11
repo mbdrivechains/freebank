@@ -4,9 +4,12 @@
 
 #include <l1client.h>
 
+#include <primitives/transaction.h>
 #include <test/test_bitcoin.h>
 #include <uint256.h>
 #include <univalue.h>
+#include <utilstrencodings.h>
+#include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -205,7 +208,8 @@ BOOST_AUTO_TEST_CASE(l1client_parse_withdrawal_events)
     UniValue response(UniValue::VOBJ);
     BOOST_REQUIRE(response.read(
         "{\"blocks\": ["
-        "{\"blockInfo\": {\"events\": ["
+        "{\"blockHeaderInfo\": {\"blockHash\": {\"hex\": \"00000000000000000000000000000000000000000000000000000000000000aa\"}},"
+        "\"blockInfo\": {\"events\": ["
         "{\"withdrawalBundle\": {\"m6id\": {\"hex\": \"0100000000000000000000000000000000000000000000000000000000000000\"},"
         "\"event\": {\"succeeded\": {\"sequenceNumber\": \"3\", \"transaction\": {\"hex\": \"abcd\"}}}}},"
         "{\"deposit\": {\"sequenceNumber\": \"4\"}}"
@@ -224,6 +228,10 @@ BOOST_AUTO_TEST_CASE(l1client_parse_withdrawal_events)
 
     BOOST_CHECK(vEvents[0].m6id == uint256S("0000000000000000000000000000000000000000000000000000000000000001"));
     BOOST_CHECK_EQUAL(vEvents[0].status, 'S');
+    // Block hash is ReverseHex (display order) - no byte flip
+    BOOST_CHECK(vEvents[0].hashMainBlock == uint256S("00000000000000000000000000000000000000000000000000000000000000aa"));
+    // Second fixture block has no blockHeaderInfo: events still parse, hash null
+    BOOST_CHECK(vEvents[1].hashMainBlock.IsNull());
     BOOST_CHECK(vEvents[1].m6id == uint256S("0000000000000000000000000000000000000000000000000000000000000002"));
     BOOST_CHECK_EQUAL(vEvents[1].status, 'F');
     BOOST_CHECK(vEvents[2].m6id == uint256S("0000000000000000000000000000000000000000000000000000000000000003"));
@@ -234,6 +242,70 @@ BOOST_AUTO_TEST_CASE(l1client_parse_withdrawal_events)
     BOOST_REQUIRE(empty.read("{\"blocks\": []}"));
     BOOST_CHECK(ParseEnforcerWithdrawalEvents(empty, vEvents));
     BOOST_CHECK(vEvents.empty());
+}
+
+BOOST_AUTO_TEST_CASE(l1client_cusf_fee_codec)
+{
+    // The enforcer's BlindedM6 fee output is exactly OP_RETURN PUSH8(fee) in
+    // BIG-endian byte order (bip300301_enforcer lib/types.rs). 1,000,000 sats
+    // = 0x00000000000f4240 big-endian.
+    CScript script = EncodeWithdrawalFeesCUSF(1000000);
+    BOOST_CHECK_EQUAL(HexStr(script.begin(), script.end()), "6a0800000000000f4240");
+
+    CAmount amount = 0;
+    BOOST_REQUIRE(DecodeWithdrawalFeesCUSF(script, amount));
+    BOOST_CHECK_EQUAL(amount, 1000000);
+
+    // Round-trip assorted values incl. 0 and MAX_MONEY
+    for (const CAmount test : {CAmount(0), CAmount(1), CAmount(546), CAmount(MAX_MONEY)}) {
+        CAmount out = -1;
+        BOOST_REQUIRE(DecodeWithdrawalFeesCUSF(EncodeWithdrawalFeesCUSF(test), out));
+        BOOST_CHECK_EQUAL(out, test);
+    }
+
+    // The legacy (little-endian CDataStream) encoding of the same value must
+    // NOT decode as CUSF - byte order differs - and vice versa sizes match, so
+    // this guards against silently accepting the wrong endianness.
+    CScript scriptLegacy = EncodeWithdrawalFees(1000000);
+    CAmount cross = 0;
+    if (DecodeWithdrawalFeesCUSF(scriptLegacy, cross))
+        BOOST_CHECK(cross != 1000000);
+
+    // Over-MAX_MONEY big-endian value is rejected
+    CScript bad;
+    bad << OP_RETURN;
+    bad << std::vector<unsigned char>{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    BOOST_CHECK(!DecodeWithdrawalFeesCUSF(bad, cross));
+
+    // Wrong shapes rejected
+    BOOST_CHECK(!DecodeWithdrawalFeesCUSF(CScript(), cross));
+    BOOST_CHECK(!DecodeWithdrawalFeesCUSF(CScript() << OP_RETURN, cross));
+    BOOST_CHECK(!DecodeWithdrawalFeesCUSF(CScript() << OP_RETURN << std::vector<unsigned char>{0x01}, cross));
+}
+
+BOOST_AUTO_TEST_CASE(l1client_blinded_m6id)
+{
+    // The enforcer m6id is the txid of the bundle with inputs stripped. Verify
+    // the txid actually changes when the dummy input is removed and that the
+    // zero-input txid is stable (it is what BroadcastWithdrawalBundle sends).
+    CMutableTransaction mtx;
+    mtx.nVersion = 2;
+    mtx.vin.resize(1); // chassis dummy input (null prevout)
+    mtx.vin[0].scriptSig = CScript() << OP_0;
+    mtx.vout.push_back(CTxOut(0, EncodeWithdrawalFeesCUSF(1000000)));
+    mtx.vout.push_back(CTxOut(100000000, CScript() << OP_DUP << OP_HASH160
+        << std::vector<unsigned char>(20, 0x11) << OP_EQUALVERIFY << OP_CHECKSIG));
+
+    const uint256 hashBundle = CTransaction(mtx).GetHash();
+
+    CMutableTransaction mtxBlind(mtx);
+    mtxBlind.vin.clear();
+    const uint256 m6id = CTransaction(mtxBlind).GetHash();
+
+    BOOST_CHECK(hashBundle != m6id);
+    BOOST_CHECK(!m6id.IsNull());
+    // Deterministic: stripping again yields the same m6id
+    BOOST_CHECK(CTransaction(mtxBlind).GetHash() == m6id);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

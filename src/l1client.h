@@ -107,9 +107,11 @@ bool ParseEnforcerCtip(const UniValue& response, uint256& txid, uint32_t& n);
 
 /** One enforcer WithdrawalBundleEvent. status: 'S' succeeded (== spent / M6
  * paid on the mainchain), 'F' failed, 'U' submitted. m6id is decoded from the
- * event's ConsensusHex. */
+ * event's ConsensusHex. hashMainBlock is the mainchain block the event was
+ * recorded in (the block containing the M6 for 'S' events); null if absent. */
 struct L1WithdrawalEvent {
     uint256 m6id;
+    uint256 hashMainBlock;
     char status;
     L1WithdrawalEvent() : status(0) {}
 };

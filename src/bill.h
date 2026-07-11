@@ -18,7 +18,7 @@
 class CValidationState;
 
 //
-// Bills of exchange (Phase 3.3) - see docs-local/PHASE3_3_BILLS.md.
+// Bills of exchange (Phase 3.3).
 //
 // A bill is a unique, stateful credit instrument: identity is
 // bill_id = sha256(encrypted_body) (consensus never decrypts the body), the

@@ -598,6 +598,17 @@ CScript EncodeWithdrawalFees(const CAmount& amount);
 
 bool DecodeWithdrawalFees(const CScript& script, CAmount& amount);
 
+/** True if this network uses the CUSF enforcer BlindedM6 withdrawal-bundle
+ * layout (fee at vout[0] as an 8-byte big-endian push, payouts after, no
+ * return-dest marker). Params-driven; -cusfbundleformat may force it on
+ * regtest only (bench testing). */
+bool UseCUSFBundleFormat();
+
+/** CUSF BlindedM6 fee output: OP_RETURN PUSH8(fee as big-endian uint64). */
+CScript EncodeWithdrawalFeesCUSF(const CAmount& amount);
+
+bool DecodeWithdrawalFeesCUSF(const CScript& script, CAmount& amount);
+
 uint256 GetWithdrawalRefundMessageHash(const uint256& id);
 
 #endif // BITCOIN_VALIDATION_H

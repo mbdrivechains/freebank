@@ -65,6 +65,11 @@ public:
     uint64_t PruneAfterHeight() const { return nPruneAfterHeight; }
     /** Make miner stop after a block is found. In RPC, don't return until nGenProcLimit blocks are generated */
     bool MineBlocksOnDemand() const { return fMineBlocksOnDemand; }
+    /** Withdrawal-bundle wire format: CUSF enforcer BlindedM6 layout (fee at
+     * vout[0], big-endian, no return-dest marker) instead of the legacy
+     * drivechain layout. Per network - never per node - because the bundle is
+     * sidechain consensus (VerifyWithdrawalBundles replication check). */
+    bool CUSFBundleFormat() const { return fCUSFBundleFormat; }
     /** Return the BIP70 network string (main, test or regtest) */
     std::string NetworkIDString() const { return strNetworkID; }
     /** Return the list of hostnames to look up for DNS seeds */
@@ -91,6 +96,9 @@ protected:
     bool fDefaultConsistencyChecks;
     bool fRequireStandard;
     bool fMineBlocksOnDemand;
+    // Legacy layout everywhere today; flips to true in the eCash-signet /
+    // enforcer network params when those are locked (M1 package, S-5).
+    bool fCUSFBundleFormat = false;
     CCheckpointData checkpointData;
     ChainTxData chainTxData;
 };
