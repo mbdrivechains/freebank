@@ -8,6 +8,10 @@ drivechain-patched Bitcoin node as an alternative mainchain.
 
 > Be your own bank. Make your own credit.
 
+This is an exploration. It may or may not work out — but it illustrates just another
+possibility that drivechains open up: not only new execution environments or scaling, but
+new *monetary* arrangements settling against Bitcoin.
+
 FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT). It is **experimental,
 pre-audit software** — run it on regtest/testnet/signet with test coins only.
 
