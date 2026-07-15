@@ -57,6 +57,15 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 - **Metric denomination (display)**: RPCs report values in grams alongside base units at
   a fixed launch scale (`getgramrate`). Presentation-only — no consensus rule reads it.
 
+## Wallet (preview)
+
+A wallet GUI — desktop and browser (PWA) — is in development against a running
+`freebankd`: notes, houses, clearing pools and bills, with balances led in grams.
+
+![FreeBank wallet preview](doc/wallet-preview.png)
+
+Wallet code to follow.
+
 ## Build
 
 Native build (Ubuntu 24.04 shown; other platforms per standard Bitcoin Core build docs):
