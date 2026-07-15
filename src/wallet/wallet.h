@@ -1003,6 +1003,98 @@ public:
     bool RetireBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
     bool ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
 
+    // Discount houses (Phase 3.1). v1 is the single-wallet handshake (this
+    // wallet plays every partner) - the bills-issue precedent; multi-party
+    // coordination is a PSBT-era follow-up.
+    // Notes (Phase 3.2). Single-wallet v1: this wallet plays the house
+    // (partner keys) and the holders. MINT to a fresh holder key; TRANSFER /
+    // REDEEM spend a single holder's note coins.
+    bool MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    /** Transfer nUnits of a house's notes. scriptRecipient empty => self
+     * (fresh own key, the v1 default); otherwise pay the note to the supplied
+     * P2PKH script (a note is a plain P2PKH coin, so any standard address
+     * works as the payee — note-ness comes from the tx payload tagging). */
+    bool TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
+    bool RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    /** Option clause (3.5): lodge a demand while the house is suspended, which
+     * starts the holder's interest clock (5%/yr from the date of demand). */
+    bool DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    /** Insolvency waterfall (3.4): burn nUnits and take the pro-rata
+     * entitlement from the house's escrow pot. */
+    bool ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+
+    /** A wallet's note position in one house (drives listmynotes / the GUI hold view). */
+    struct WalletNoteHolding {
+        uint64_t units = 0;         // total note units this wallet holds for the house
+        uint64_t demandedUnits = 0; // subset stamped with a demand (3.5 option clause)
+        uint32_t coins = 0;         // number of note UTXOs
+    };
+    /** Aggregate this wallet's note holdings across every house (houses with units>0 only). */
+    void CollectNoteHoldings(std::map<uint32_t, WalletNoteHolding>& out);
+
+    /** A wallet's LP-share position in one pool (drives listmylp / the GUI hold view). */
+    struct WalletLpHolding {
+        uint64_t units = 0;         // total LP units this wallet holds for the pool
+        uint64_t coins = 0;         // number of LP-share UTXOs
+    };
+    /** Aggregate this wallet's LP holdings across every pool (pools with units>0 only). */
+    void CollectLpHoldings(std::map<uint32_t, WalletLpHolding>& out);
+
+    // Term deposits (Phase 3.8). Single-wallet v1: this wallet plays the house
+    // (partner keys) AND the savers/holders. ORIGINATE mints one receipt to a
+    // fresh holder key (house M-of-N); TRANSFER/WITHDRAW/CLAIM each spend ONE
+    // WHOLE receipt (atomic - no partial), selected by (house, principal).
+    /** House issues one term-deposit receipt: nPrincipal locked at nRateBps/yr
+     * until nMaturityHeight, to a fresh holder key. Cap N + D + principal <=
+     * lambda*E (capital only - deposits are outside rho). */
+    bool OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight, const CAmount& nFee);
+    /** Reassign a whole receipt (house, nPrincipal) to a fresh holder key. */
+    bool TransferDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
+    /** At/after maturity and while the house is Open, burn a matured receipt
+     * (house, nPrincipal) for principal + accrued interest (consensus floor). */
+    bool WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
+    /** At insolvency, burn a receipt (house, nPrincipal) for the subordinated
+     * pro-rata from the escrow pot (junior to notes). */
+    bool ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
+
+    // AMM pools (Phase 3.7). One pool per house (nPoolID == nHouseID); every
+    // op binds the pool's live priors, so a builder racing another pool op
+    // loses at ATMP and must simply be re-run (fresh priors, fresh sigs).
+    /** Charter the house's pool (M-of-N approved, effective-Open) and seed
+     * both sides from this wallet's undemanded notes + plain coins. */
+    bool CreatePool(std::string& strFail, uint256& txidOut, uint32_t nPoolID, uint32_t nFeeBps, uint64_t nInitNoteUnits, const CAmount& amountInitBtx, const CAmount& nFee);
+    /** Add liquidity (min-rule shares; unbalanced adds donate the excess). */
+    bool AddPoolLiquidity(std::string& strFail, uint256& txidOut, uint32_t nPoolID, uint64_t nAddNoteUnits, const CAmount& amountAddBtx, const CAmount& nFee);
+    /** Burn LP shares for the pro-rata of both sides. */
+    bool RemovePoolLiquidity(std::string& strFail, uint256& txidOut, uint32_t nPoolID, uint64_t nBurnLp, const CAmount& nFee);
+    /** Swap at x*y=k: fNoteToBtx ? notes in, sats out : sats in, notes out.
+     * nMinOut is the consensus slippage guard. */
+    bool SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID, bool fNoteToBtx, uint64_t nAmountIn, uint64_t nMinOut, const CAmount& nFee);
+    /** Terminal teardown of a floored pool (S == MIN_LIQUIDITY): burns the
+     * residual note-units from the house and force-pays the floor BTX to the
+     * house redemption key, deleting the record. Single-partner trigger at
+     * effective-Insolvent, else charter M-of-N. */
+    bool RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolID, const CAmount& nFee);
+
+    bool RegisterHouse(std::string& strFail, uint256& txidOut, uint8_t nTier, uint32_t nThresholdM, const std::string& strClassID, uint64_t nDenomMgGold, const std::vector<CAmount>& vPledge, const CAmount& nFee);
+    bool TopupHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nAmount, const CAmount& nFee);
+    bool AdmitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nPledge, const CAmount& nFee);
+    bool ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);
+    bool WinddownHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+    bool ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);
+    /** Publish a reserve attestation (Phase 3.4): proves the wallet's plain
+     * confirmed coins as the house's liquid till (up to MAX_ATTEST_PROOFS,
+     * largest first; fee funded from coins OUTSIDE the proof set). */
+    bool AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+    /** Option clause (Phase 3.5): invoke the deferral, and extend it once.
+     * Both share BuildDeferOrRenew (same M-of-N, no-escrow, one-change shape). */
+    bool DeferHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+    bool RenewDeferral(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+    bool BuildDeferOrRenew(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee, bool fRenew);
+    /** Take the locked till back out of consensus custody, once the clause has
+     * been lifted (3.5 D11). */
+    bool ReleaseReserves(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+
     void ListAccountCreditDebit(const std::string& strAccount, std::list<CAccountingEntry>& entries);
     bool AddAccountingEntry(const CAccountingEntry&);
     bool AddAccountingEntry(const CAccountingEntry&, CWalletDB *pwalletdb);

@@ -6,6 +6,10 @@
 #include <txmempool.h>
 
 #include <bill.h>
+#include <house.h>
+#include <note.h>
+#include <deposit.h>
+#include <pool.h>
 
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
@@ -935,6 +939,100 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
                 else if (ptx->nBillOp == BILL_OP_ENDORSE && outpoint.n == 0)
                     coin.SetBill(false, 0);
             }
+
+            // House pledge outputs stay tagged while unconfirmed for the same
+            // reason as bills above: only the consensus spend guard protects
+            // the anyone-can-spend escrow script. Unconfirmed pledges carry
+            // id 0, so RECLAIM cannot chain off them - fails closed.
+            if (ptx->nVersion == TRANSACTION_HOUSE_VERSION) {
+                if (ptx->nHouseOp == HOUSE_OP_REGISTER) {
+                    HouseRegister reg;
+                    if (DecodeHousePayload(ptx->vchHousePayload, reg) &&
+                            outpoint.n < reg.vPartnerPubKey.size())
+                        coin.SetHouseEscrow(0);
+                } else if ((ptx->nHouseOp == HOUSE_OP_TOPUP || ptx->nHouseOp == HOUSE_OP_ADMIT ||
+                        ptx->nHouseOp == HOUSE_OP_DEFER) && outpoint.n == 0) {
+                    // DEFER's vout[0] is the locked till (3.5) - escrow like any
+                    // pledge, and it must stay tagged while unconfirmed or a
+                    // plain tx could sweep it out of the mempool view.
+                    coin.SetHouseEscrow(0);
+                }
+            }
+
+            // Note outputs stay tagged while unconfirmed so a plain spend is
+            // rejected by the guard. Unlike bills/houses, a note references an
+            // EXISTING house (dense id in the payload) and carries its unit face
+            // in the payload, so the unconfirmed coin gets its REAL tag - note
+            // transfers can therefore chain in the mempool.
+            if (ptx->nVersion == TRANSACTION_NOTE_VERSION) {
+                if (ptx->nNoteOp == NOTE_OP_MINT) {
+                    NoteMint m;
+                    if (DecodeNotePayload(ptx->vchNotePayload, m) && outpoint.n < m.vUnits.size())
+                        coin.SetNote(m.nHouseID, m.vUnits[outpoint.n]);
+                } else if (ptx->nNoteOp == NOTE_OP_TRANSFER) {
+                    NoteTransfer x;
+                    if (DecodeNotePayload(ptx->vchNotePayload, x) && outpoint.n < x.vUnits.size())
+                        coin.SetNote(x.nHouseID, x.vUnits[outpoint.n], x.nDemandHeight);
+                } else if (ptx->nNoteOp == NOTE_OP_DEMAND) {
+                    // An unconfirmed demand has no block height yet, so the
+                    // demand stamp is not knowable here. Tag it as a note (so
+                    // the spend guard still protects it) with height 0; nothing
+                    // can chain off it - a TRANSFER of it would have to declare
+                    // a demand height that cannot match at connect. Fails closed.
+                    NoteDemand d;
+                    if (DecodeNotePayload(ptx->vchNotePayload, d) && outpoint.n < d.vUnits.size())
+                        coin.SetNote(d.nHouseID, d.vUnits[outpoint.n], 0);
+                } else if (ptx->nNoteOp == NOTE_OP_REDEEM && outpoint.n == 1) {
+                    // Unconfirmed brassage output: keep the escrow tag (id 0)
+                    // so the spend guard protects it; nothing can chain off it.
+                    NoteRedeem r;
+                    if (DecodeNotePayload(ptx->vchNotePayload, r) && r.fBrassage)
+                        coin.SetHouseEscrow(0);
+                } else if (ptx->nNoteOp == NOTE_OP_CLAIM && outpoint.n == 1) {
+                    // Unconfirmed insolvency-claim escrow change keeps its tag
+                    // so the spend guard protects the anyone-can-spend script;
+                    // like bills, the dense id 0 means nothing can chain off
+                    // it in the mempool - fails closed.
+                    NoteClaim c;
+                    if (DecodeNotePayload(ptx->vchNotePayload, c) && c.fEscrowChange)
+                        coin.SetHouseEscrow(0);
+                }
+            }
+
+            // Term-deposit receipts (Phase 3.8) stay tagged while unconfirmed so
+            // a plain spend is rejected by the guard. A TRANSFER's payload carries
+            // the FULL immutable terms (including origination), so an unconfirmed
+            // TRANSFER receipt gets its REAL tag and TRANSFERs chain in the
+            // mempool. An ORIGINATE receipt's origination = the connect height,
+            // which is NOT known here, so it is tagged with origination 0 - a
+            // TRANSFER off it would declare a height that cannot match at connect,
+            // so ORIGINATE->TRANSFER chaining fails closed (like note DEMAND).
+            if (ptx->nVersion == TRANSACTION_DEPOSIT_VERSION) {
+                if (ptx->nDepositOp == DEPOSIT_OP_ORIGINATE) {
+                    DepositOriginate o;
+                    if (DecodeDepositPayload(ptx->vchDepositPayload, o) && outpoint.n < o.vPrincipal.size())
+                        coin.SetDeposit(o.nHouseID, o.vPrincipal[outpoint.n], o.vRateBps[outpoint.n],
+                                        o.vMaturityHeight[outpoint.n], 0);
+                } else if (ptx->nDepositOp == DEPOSIT_OP_TRANSFER && outpoint.n == 0) {
+                    DepositTransfer x;
+                    if (DecodeDepositPayload(ptx->vchDepositPayload, x))
+                        coin.SetDeposit(x.nHouseID, x.nPrincipal, x.nRateBps,
+                                        x.nMaturityHeight, x.nOriginationHeight);
+                } else if (ptx->nDepositOp == DEPOSIT_OP_CLAIM && outpoint.n == 1) {
+                    DepositClaim c;
+                    if (DecodeDepositPayload(ptx->vchDepositPayload, c) && c.fEscrowChange)
+                        coin.SetHouseEscrow(0);
+                }
+            }
+
+            // Pool outputs (Phase 3.7) stay tagged while unconfirmed so a plain
+            // spend is rejected by the guard. Same shared payload-pure tagger as
+            // AddCoins, so the unconfirmed coin gets its REAL tags. Chaining a
+            // second pool op off it is separately blocked by the one-op-per-pool
+            // ATMP guard, so real tags cannot enable a premature chain.
+            if (ptx->nVersion == TRANSACTION_POOL_VERSION)
+                ApplyPoolCoinTags(*ptx, outpoint.n, coin);
+
             return true;
         } else {
             return false;

@@ -909,7 +909,7 @@ uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& 
     if (amount == CAmount(0))
         amount = DEFAULT_CRITICAL_DATA_AMOUNT;
 
-    // Divergences from the JSON-RPC twin (see PHASE2_L1CLIENT footguns):
+    // Divergences from the JSON-RPC twin:
     //  - value_sats is an integer of SATS, not a ValueFromAmount decimal string.
     //  - critical_hash is ConsensusHex (internal byte order) - h* is a merkle
     //    root, so encode with ConsensusHexFromUint256, NOT ToString().

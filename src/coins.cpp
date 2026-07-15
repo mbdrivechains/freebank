@@ -5,6 +5,10 @@
 #include <coins.h>
 
 #include <bill.h>
+#include <deposit.h>
+#include <house.h>
+#include <note.h>
+#include <pool.h>
 #include <consensus/consensus.h>
 #include <random.h>
 
@@ -85,7 +89,7 @@ void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possi
     cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
 }
 
-void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint32_t nAssetID, const CAmount amountAssetIn, int nControlN, uint32_t nNewAssetID, uint32_t nBillID, bool check) {
+void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint32_t nAssetID, const CAmount amountAssetIn, int nControlN, uint32_t nNewAssetID, uint32_t nBillID, uint32_t nHouseID, bool check) {
     bool fCoinbase = tx.IsCoinBase();
     const uint256& txid = tx.GetHash();
 
@@ -118,6 +122,104 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
         // take this branch.
         bool fBillTx = tx.nVersion == TRANSACTION_BILL_VERSION && nBillID != 0;
 
+        // House transactions tag pledge escrow outputs: REGISTER posts one per
+        // partner at vout[0..N-1] (N from the payload), TOPUP / ADMIT at
+        // vout[0]. House txs cannot spend asset-colored inputs
+        // (bad-house-colored-input), so they always take this branch.
+        bool fHouseTx = tx.nVersion == TRANSACTION_HOUSE_VERSION && nHouseID != 0;
+        size_t nHousePledges = 0;
+        if (fHouseTx && tx.nHouseOp == HOUSE_OP_REGISTER) {
+            HouseRegister reg;
+            if (DecodeHousePayload(tx.vchHousePayload, reg))
+                nHousePledges = reg.vPartnerPubKey.size();
+        }
+
+        // Note transactions tag their new note outputs (fNote + nHouseID +
+        // per-output nNoteUnits). Unlike houses, a note carries its house and
+        // unit split in the PAYLOAD, so AddCoins is self-contained and tags
+        // identically on ConnectBlock and RollforwardBlock with no threaded id
+        // (sidestepping the positional-arg / stale-id regression class). MINT
+        // and TRANSFER create note outputs at vout[0..vUnits-1]; REDEEM does not.
+        bool fNoteTx = tx.nVersion == TRANSACTION_NOTE_VERSION;
+        uint32_t nNoteHouse = 0;
+        std::vector<uint64_t> vNoteUnits;
+        // Demand height carried onto the new note outputs (3.5). DEMAND stamps
+        // THIS block's height; TRANSFER carries the payload's value forward
+        // (tx_verify has already forced it to equal the spent notes' height),
+        // so a demanded note keeps its interest clock when it changes hands.
+        uint32_t nNoteDemandHeight = 0;
+        bool fClaimEscrowChange = false;
+        uint32_t nClaimHouse = 0;
+        if (fNoteTx) {
+            if (tx.nNoteOp == NOTE_OP_MINT) {
+                NoteMint m;
+                if (DecodeNotePayload(tx.vchNotePayload, m)) { nNoteHouse = m.nHouseID; vNoteUnits = m.vUnits; }
+            } else if (tx.nNoteOp == NOTE_OP_TRANSFER) {
+                NoteTransfer x;
+                if (DecodeNotePayload(tx.vchNotePayload, x)) { nNoteHouse = x.nHouseID; vNoteUnits = x.vUnits; nNoteDemandHeight = x.nDemandHeight; }
+            } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
+                NoteDemand d;
+                if (DecodeNotePayload(tx.vchNotePayload, d)) { nNoteHouse = d.nHouseID; vNoteUnits = d.vUnits; nNoteDemandHeight = (uint32_t)nHeight; }
+            } else if (tx.nNoteOp == NOTE_OP_REDEEM) {
+                // The dynamic-brassage spread (3.5) is an escrow output at
+                // vout[1] - payload-driven like every other note tag, so
+                // connect == rollforward.
+                NoteRedeem r;
+                if (DecodeNotePayload(tx.vchNotePayload, r) && r.fBrassage) {
+                    fClaimEscrowChange = true;
+                    nClaimHouse = r.nHouseID;
+                }
+            } else if (tx.nNoteOp == NOTE_OP_CLAIM) {
+                // An insolvency claim may return escrow change at vout[1]; the
+                // payload is self-contained (connect == rollforward), and the
+                // contextual check pinned vout[1]'s script to the canonical
+                // escrow script before this coin can exist.
+                NoteClaim c;
+                if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange) {
+                    fClaimEscrowChange = true;
+                    nClaimHouse = c.nHouseID;
+                }
+            }
+        }
+
+        // Term-deposit receipts (Phase 3.8) self-tag from the payload, exactly
+        // like notes - no threaded dense id, so connect == rollforward. ORIGINATE
+        // stamps origination = THIS block's height across the whole batch;
+        // TRANSFER carries the payload's origination (== the spent receipt's,
+        // enforced by tx_verify) so the receipt keeps its birth height and clock.
+        bool fDepositTx = tx.nVersion == TRANSACTION_DEPOSIT_VERSION;
+        uint32_t nDepHouse = 0;
+        std::vector<uint64_t> vDepPrincipal;
+        std::vector<uint32_t> vDepRate, vDepMaturity;
+        uint32_t nDepOrigination = 0;
+        bool fDepEscrowChange = false;
+        uint32_t nDepEscrowHouse = 0;
+        if (fDepositTx) {
+            if (tx.nDepositOp == DEPOSIT_OP_ORIGINATE) {
+                DepositOriginate o;
+                if (DecodeDepositPayload(tx.vchDepositPayload, o)) {
+                    nDepHouse = o.nHouseID; vDepPrincipal = o.vPrincipal;
+                    vDepRate = o.vRateBps; vDepMaturity = o.vMaturityHeight;
+                    nDepOrigination = (uint32_t)nHeight;
+                }
+            } else if (tx.nDepositOp == DEPOSIT_OP_TRANSFER) {
+                DepositTransfer x;
+                if (DecodeDepositPayload(tx.vchDepositPayload, x)) {
+                    nDepHouse = x.nHouseID;
+                    vDepPrincipal.push_back(x.nPrincipal);
+                    vDepRate.push_back(x.nRateBps);
+                    vDepMaturity.push_back(x.nMaturityHeight);
+                    nDepOrigination = x.nOriginationHeight;
+                }
+            } else if (tx.nDepositOp == DEPOSIT_OP_CLAIM) {
+                DepositClaim c;
+                if (DecodeDepositPayload(tx.vchDepositPayload, c) && c.fEscrowChange) {
+                    fDepEscrowChange = true;
+                    nDepEscrowHouse = c.nHouseID;
+                }
+            }
+        }
+
         for (size_t i = 0; i < tx.vout.size(); ++i) {
             bool fAsset = fNewAsset && i < 2;
             bool fControl = fNewAsset && i == 0;
@@ -131,6 +233,32 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
                 else if (tx.nBillOp == BILL_OP_ENDORSE && i == 0)
                     coin.SetBill(false, nBillID);
             }
+
+            if (fHouseTx) {
+                if (tx.nHouseOp == HOUSE_OP_REGISTER && i < nHousePledges)
+                    coin.SetHouseEscrow(nHouseID);
+                else if ((tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT) && i == 0)
+                    coin.SetHouseEscrow(nHouseID);
+                // The till locked at DEFER (3.5 D11) is escrow custody too.
+                else if (tx.nHouseOp == HOUSE_OP_DEFER && i == 0)
+                    coin.SetHouseEscrow(nHouseID);
+            }
+
+            if (fNoteTx && nNoteHouse != 0 && i < vNoteUnits.size())
+                coin.SetNote(nNoteHouse, vNoteUnits[i], nNoteDemandHeight);
+
+            if (fNoteTx && fClaimEscrowChange && i == 1)
+                coin.SetHouseEscrow(nClaimHouse);
+
+            if (fDepositTx && nDepHouse != 0 && i < vDepPrincipal.size())
+                coin.SetDeposit(nDepHouse, vDepPrincipal[i], vDepRate[i], vDepMaturity[i], nDepOrigination);
+
+            if (fDepositTx && fDepEscrowChange && i == 1)
+                coin.SetHouseEscrow(nDepEscrowHouse);
+
+            // Pool outputs (Phase 3.7) self-tag from the payload via the single
+            // shared tagger - connect == rollforward == mempool by construction.
+            ApplyPoolCoinTags(tx, i, coin);
 
             cache.AddCoin(COutPoint(txid, i), std::move(coin), overwrite);
         }

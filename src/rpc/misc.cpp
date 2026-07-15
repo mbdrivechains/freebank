@@ -5,6 +5,10 @@
 
 #include <base58.h>
 #include <bill.h>
+#include <gramscale.h>
+#include <house.h>
+#include <pool.h>
+#include <note.h>
 #include <bmmcache.h>
 #include <chain.h>
 #include <clientversion.h>
@@ -844,7 +848,9 @@ static UniValue BillToJSON(const CBill& bill, bool fIncludeBody)
     obj.pushKV("id", (uint64_t)bill.nBillID);
     obj.pushKV("bill_id", bill.billID.ToString());
     obj.pushKV("amount", ValueFromAmount(bill.amount));
+    obj.pushKV("amount_grams", GramsUV((int64_t)bill.amount));
     obj.pushKV("escrow", ValueFromAmount(bill.amountEscrow));
+    obj.pushKV("escrow_grams", GramsUV((int64_t)bill.amountEscrow));
     obj.pushKV("status", std::string(1, bill.status));
     obj.pushKV("issued_height", (uint64_t)bill.nIssuedHeight);
     obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
@@ -917,6 +923,262 @@ UniValue getbill(const JSONRPCRequest& request)
     return BillToJSON(bill, true /* fIncludeBody */);
 }
 
+
+static UniValue HouseToJSON(const CHouse& house)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("id", (uint64_t)house.nHouseID);
+    obj.pushKV("househash", house.houseID.ToString());
+    obj.pushKV("tier", house.nTier);
+    obj.pushKV("threshold", (uint64_t)house.nThresholdM);
+    obj.pushKV("classid", house.strClassID);
+    obj.pushKV("denominationmggold", house.nDenomMgGold);
+    obj.pushKV("lambdax10", (uint64_t)HOUSE_LAMBDA_X10[house.nTier <= MAX_HOUSE_TIER ? house.nTier : 0]);
+    obj.pushKV("activeescrow", ValueFromAmount(house.ActiveEscrow()));
+    obj.pushKV("activeescrow_grams", GramsUV((int64_t)house.ActiveEscrow()));
+    obj.pushKV("mintedunits", house.nMintedUnits);
+    obj.pushKV("mintedunits_grams", GramsUV((int64_t)house.nMintedUnits));
+    // Term-deposit accounting (Phase 3.8): the D in the shared cap N + D <=
+    // lambda*E, and the weighted-average REMAINING term (blocks) of the deposit
+    // book - the market's view of the maturity profile (a full bucketed ladder
+    // lands with the wallet in T-i10). match_funding is the attestation-checked
+    // long-vs-short rule (vacuously true in v1 - no loan book yet).
+    obj.pushKV("depositunits", house.nDepositUnits);
+    obj.pushKV("depositwam", (uint64_t)HouseDepositWAM(house, chainActive.Height() + 1));
+    obj.pushKV("matchfundingok", HouseMatchFundingOK(house, chainActive.Height() + 1));
+    // Raw weighted-maturity accumulator (Sigma principal*maturity), the two u64
+    // words of the 128-bit value. Height-independent house state - the reorg gate
+    // folds these into its canonical signature so a DisconnectBlock undo of a
+    // deposit op is checked byte-exact, not just via the depositunits counter.
+    obj.pushKV("depositwtmathi", house.nDepositWtMatHi);
+    obj.pushKV("depositwtmatlo", house.nDepositWtMatLo);
+    obj.pushKV("insolventdepositprincipal", house.nInsolventDepositPrincipal);
+    // The BINDING cap is the min of the two (3.5 D2): capital (lambda*escrow)
+    // and reserve (attested till / rho). Publish all three - the market prices
+    // which constraint is binding.
+    obj.pushKV("mintcapunits", HouseMintCapUnits(house));
+    obj.pushKV("mintcapunits_grams", GramsUV((int64_t)HouseMintCapUnits(house)));
+    obj.pushKV("capitalcapunits", HouseCapitalCapUnits(house));
+    obj.pushKV("reservecapunits", HouseReserveCapUnits(house));
+    // The attested ratio and the redemption spread it implies (3.5). Published
+    // so a holder can see the cost of the exit BEFORE they take it - the whole
+    // deterrent depends on the fee being known ex ante.
+    obj.pushKV("attestedratiobps", (uint64_t)HouseAttestedRatioBps(house));
+    obj.pushKV("brassagebps", (uint64_t)HouseBrassageBps(house));
+
+    static const auto StatusName = [](char s) -> std::string {
+        if (s == HOUSE_STATUS_OPEN) return "open";
+        if (s == HOUSE_STATUS_STRESSED) return "stressed";
+        if (s == HOUSE_STATUS_DEFERRED) return "deferred";
+        if (s == HOUSE_STATUS_INSOLVENT) return "insolvent";
+        if (s == HOUSE_STATUS_WOUNDDOWN) return "wounddown";
+        return "unknown";
+    };
+    obj.pushKV("status", StatusName(house.status));
+    // The consensus-operative status at the current tip (3.4): stressed /
+    // insolvent are usually DERIVED (missed cadence, window expiry), not
+    // stored - display must not go stale between transitions and txs.
+    {
+        const int nTipHeight = chainActive.Height();
+        obj.pushKV("effective_status", StatusName(HouseEffectiveStatus(house, nTipHeight)));
+        uint32_t nStress = house.nStressSinceHeight;
+        const uint32_t nDeadline = house.nLastAttestHeight + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE;
+        if ((uint32_t)nTipHeight > nDeadline && (nStress == 0 || nDeadline + 1 < nStress))
+            nStress = nDeadline + 1;
+        if (nStress != 0)
+            obj.pushKV("stress_since", (uint64_t)nStress);
+        obj.pushKV("attest_deadline", (uint64_t)nDeadline);
+        obj.pushKV("lastattestheight", (uint64_t)house.nLastAttestHeight);
+        obj.pushKV("lastattestreserves", ValueFromAmount(house.amountLastAttestReserves));
+        obj.pushKV("lastattestreserves_grams", GramsUV((int64_t)house.amountLastAttestReserves));
+        if (house.nInsolventHeight != 0) {
+            obj.pushKV("insolventheight", (uint64_t)house.nInsolventHeight);
+            obj.pushKV("insolventunits", house.nInsolventUnits);
+            obj.pushKV("insolventpot", ValueFromAmount(house.amountInsolventPot));
+        }
+        obj.pushKV("escrowchangeoutputs", (uint64_t)house.vOutEscrowChange.size());
+        obj.pushKV("reservelockoutputs", (uint64_t)house.vOutReserveLock.size());
+        // Option-clause state (3.5). The confidence-death counters are
+        // published deliberately: CD is a guard, not a kill switch, so the
+        // MARKET is what prices a house that keeps reaching for the clause.
+        if (house.nDeferInvokedHeight != 0) {
+            obj.pushKV("defer_invoked_height", (uint64_t)house.nDeferInvokedHeight);
+            obj.pushKV("defer_end_height", (uint64_t)house.DeferEndHeight());
+        }
+        obj.pushKV("defer_renewals", (uint64_t)house.nDeferRenewals);
+        obj.pushKV("defer_activations", (uint64_t)house.nDeferActivations);
+        // DR-2: the height the most recent episode ended (recovery), 0 if none.
+        // Interest on a demanded note accrues demand -> this height, not to the
+        // eventual redemption.
+        obj.pushKV("defer_ended_height", (uint64_t)house.nDeferEndedHeight);
+        obj.pushKV("defer_suspended_blocks", (uint64_t)house.DeferSuspendedBlocks(nTipHeight));
+        obj.pushKV("confidence_dead", HouseConfidenceDead(house, nTipHeight));
+    }
+    obj.pushKV("registeredheight", (uint64_t)house.nRegisteredHeight);
+    obj.pushKV("txidregister", house.txidRegister.ToString());
+
+    UniValue partners(UniValue::VARR);
+    for (size_t i = 0; i < house.vPartner.size(); i++) {
+        const HousePartner& p = house.vPartner[i];
+        UniValue po(UniValue::VOBJ);
+        po.pushKV("index", (uint64_t)i);
+        po.pushKV("pubkey", HexStr(p.vchPubKey));
+        po.pushKV("pledge", ValueFromAmount(p.amountPledge));
+        po.pushKV("status", p.status == HOUSE_PARTNER_ACTIVE ? "active"
+                          : p.status == HOUSE_PARTNER_SETTLED ? "settled" : "tail");
+        if (p.status == HOUSE_PARTNER_TAIL)
+            po.pushKV("tailunlockheight", (uint64_t)p.nTailUnlockHeight);
+        po.pushKV("pledgeoutputs", (uint64_t)p.vOutPledge.size());
+        partners.push_back(po);
+    }
+    obj.pushKV("partners", partners);
+    return obj;
+}
+
+UniValue listhouses(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "listhouses\n"
+            "List all discount houses tracked by the node\n"
+            "\nResult (array of house objects)\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listhouses", "")
+            + HelpExampleRpc("listhouses", "")
+        );
+
+    LOCK(cs_main);
+
+    UniValue ret(UniValue::VARR);
+    for (const CHouse& house : phousetree->GetHouses())
+        ret.push_back(HouseToJSON(house));
+
+    return ret;
+}
+
+UniValue gethouse(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "gethouse\n"
+            "\nArguments:\n"
+            "1. id            (numeric, required) the house ID number\n"
+            "\nGet one discount house (full record incl. partner set)\n"
+            "\nExamples:\n"
+            + HelpExampleCli("gethouse", "1")
+            + HelpExampleRpc("gethouse", "1")
+        );
+
+    const uint32_t nHouseID = request.params[0].get_int();
+
+    LOCK(cs_main);
+
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house))
+        throw JSONRPCError(RPC_MISC_ERROR, "Unknown house!");
+
+    return HouseToJSON(house);
+}
+
+static UniValue PoolToJSON(const CPool& pool)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("pool_id", (uint64_t)pool.nPoolID);
+    obj.pushKV("house_id", (uint64_t)pool.nPoolID);   // v1 invariant: one pool per house
+    obj.pushKV("fee_bps", (uint64_t)pool.nFeeBps);
+    obj.pushKV("note_reserve", pool.nNoteReserve);
+    obj.pushKV("note_reserve_grams", GramsUV((int64_t)pool.nNoteReserve));
+    obj.pushKV("btx_reserve", pool.amountBtxReserve);
+    obj.pushKV("btx_reserve_grams", GramsUV((int64_t)pool.amountBtxReserve));
+    obj.pushKV("lp_supply", pool.nLpSupply);
+    obj.pushKV("locked_lp", POOL_MIN_LIQUIDITY);
+    // Spot price of one note unit in sats, scaled by 1e8 for precision
+    // (informational; the executable price includes the fee + impact).
+    if (pool.nNoteReserve > 0) {
+        const unsigned __int128 px = (unsigned __int128)(uint64_t)pool.amountBtxReserve
+                                   * (unsigned __int128)100000000 / (unsigned __int128)pool.nNoteReserve;
+        obj.pushKV("spot_price_sats_x1e8", (uint64_t)px);
+    }
+    obj.pushKV("note_escrow_txid", pool.outNote.hash.ToString());
+    obj.pushKV("note_escrow_vout", (uint64_t)pool.outNote.n);
+    obj.pushKV("btx_escrow_txid", pool.outBtx.hash.ToString());
+    obj.pushKV("btx_escrow_vout", (uint64_t)pool.outBtx.n);
+    obj.pushKV("createheight", (uint64_t)pool.nCreateHeight);
+    return obj;
+}
+
+UniValue listpools(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "listpools\n"
+            "List all note<->BTX AMM pools tracked by the node\n"
+            "\nResult (array of pool objects)\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listpools", "")
+            + HelpExampleRpc("listpools", "")
+        );
+
+    LOCK(cs_main);
+
+    UniValue ret(UniValue::VARR);
+    for (const CPool& pool : ppooltree->GetPools())
+        ret.push_back(PoolToJSON(pool));
+
+    return ret;
+}
+
+UniValue getpool(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "getpool\n"
+            "\nArguments:\n"
+            "1. id            (numeric, required) the pool ID (== the house ID)\n"
+            "\nGet one AMM pool (reserves, LP supply, fee, custody outpoints)\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getpool", "1")
+            + HelpExampleRpc("getpool", "1")
+        );
+
+    const uint32_t nPoolID = request.params[0].get_int();
+
+    LOCK(cs_main);
+
+    CPool pool;
+    if (!ppooltree->GetPool(nPoolID, pool))
+        throw JSONRPCError(RPC_MISC_ERROR, "Unknown pool!");
+
+    return PoolToJSON(pool);
+}
+
+UniValue getgramrate(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "getgramrate\n"
+            "Report the launch presentation scale (satoshis per gram of gold).\n"
+            "PRESENTATION ONLY: redemption is fixed at par in ECX and this scale\n"
+            "is NOT consensus-enforced.\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"sats_per_gram\": n,   (numeric) satoshis representing one gram of gold\n"
+            "  \"grams_per_ecx\": n,   (numeric) grams of gold per 1 ECX (1e8 / sats_per_gram)\n"
+            "  \"disclaimer\": \"x\"     (string) presentation-scale caveat\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getgramrate", "")
+            + HelpExampleRpc("getgramrate", "")
+        );
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("sats_per_gram", g_launchSatsPerGram);
+    ret.pushKV("grams_per_ecx", GramsFromSats(COIN));
+    ret.pushKV("disclaimer",
+               "launch presentation scale; redemption is fixed ECX; NOT consensus-enforced");
+    return ret;
+}
+
 static const CRPCCommand commands[] =
 { //  category              name                        actor (function)           argNames
   //  --------------------- ------------------------    -----------------------    ----------
@@ -948,6 +1210,14 @@ static const CRPCCommand commands[] =
 
     { "bills",              "listbills",                    &listbills,                     {}},
     { "bills",              "getbill",                      &getbill,                       {"id"}},
+
+    { "houses",             "listhouses",                   &listhouses,                    {}},
+    { "houses",             "gethouse",                     &gethouse,                      {"id"}},
+
+    { "pools",              "listpools",                    &listpools,                     {}},
+    { "pools",              "getpool",                      &getpool,                       {"id"}},
+
+    { "freebank",           "getgramrate",                  &getgramrate,                   {}},
 
     /* BitAssets */
     { "BitAssets",          "listassets",                   &listassets,                    {}},

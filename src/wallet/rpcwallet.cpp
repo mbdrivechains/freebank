@@ -4,8 +4,12 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <amount.h>
+#include <gramscale.h>
 #include <base58.h>
 #include <bill.h>
+#include <house.h>
+#include <pool.h>
+#include <note.h>
 #include <bmmcache.h>
 #include <chain.h>
 #include <consensus/validation.h>
@@ -3859,6 +3863,1224 @@ UniValue endorsebill(const JSONRPCRequest& request)
     return response;
 }
 
+
+
+UniValue mintnote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "mintnote\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"units\"  (numeric, required) note units to mint (base-native, 1 unit redeems 1 sat)\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nMint house notes to a fresh holder key. House M-of-N authorized;\n"
+            "capped by the escrow (N + minted <= lambda * active escrow).\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("mintnote", "1 100000")
+            + HelpExampleRpc("mintnote", "1 100000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->MintNote(strFail, txid, nHouseID, nUnits, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue transfernote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+        throw std::runtime_error(
+            "transfernote\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the house ID number\n"
+            "2. \"units\"     (numeric, required) note units to transfer\n"
+            "3. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "4. \"toaddress\" (string, optional) a FreeBank P2PKH address to pay the notes to;\n"
+            "               omit or pass \"\" to transfer to a fresh key in this wallet (self)\n"
+            "\nTransfer notes of a house held by this wallet (single sender). A note is a\n"
+            "plain P2PKH coin, so any standard address can receive it; the payee's wallet\n"
+            "recognizes the incoming note automatically.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("transfernote", "1 25000 0.001 \"Xrecipientaddress...\"")
+            + HelpExampleRpc("transfernote", "1, 25000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    // Optional external recipient (arg 4). A note is a plain P2PKH coin, so any
+    // valid FreeBank P2PKH address can receive it; empty/omitted => self-transfer.
+    CScript scriptRecipient;
+    if (request.params.size() >= 4 && !request.params[3].isNull()) {
+        const std::string strAddr = request.params[3].get_str();
+        if (!strAddr.empty()) {
+            CTxDestination dest = DecodeDestination(strAddr);
+            if (!IsValidDestination(dest))
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid FreeBank address");
+            if (!boost::get<CKeyID>(&dest))
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Note recipient must be a legacy (P2PKH) address");
+            scriptRecipient = GetScriptForDestination(dest);
+        }
+    }
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->TransferNote(strFail, txid, nHouseID, nUnits, nFee, scriptRecipient)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue redeemnote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "redeemnote\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"units\"  (numeric, required) note units to redeem (a holder's coins must sum exactly to this)\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nBurn notes and receive base-coin 1:1 from the house reserves.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("redeemnote", "1 25000")
+            + HelpExampleRpc("redeemnote", "1 25000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->RedeemNote(strFail, txid, nHouseID, nUnits, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue demandnote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "demandnote\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"units\"  (numeric, required) note units to demand (an undemanded holder's coins must sum exactly to this)\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nLodge a demand against a SUSPENDED house (option clause). The notes\n"
+            "are not surrendered - they are re-issued to you stamped with the demand\n"
+            "height, and interest accrues at 5%/yr from that date. Demanded notes\n"
+            "stay transferable, so you can sell at a market discount instead of\n"
+            "waiting out the window.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("demandnote", "1 25000")
+            + HelpExampleRpc("demandnote", "1 25000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->DemandNote(strFail, txid, nHouseID, nUnits, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue claimnote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "claimnote\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"units\"  (numeric, required) note units to claim (a holder's coins must sum exactly to this)\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nInsolvency waterfall: burn notes of an INSOLVENT house and take\n"
+            "the pro-rata entitlement min(U, U*pot/units) from its escrow pot.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("claimnote", "1 25000")
+            + HelpExampleRpc("claimnote", "1 25000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->ClaimNote(strFail, txid, nHouseID, nUnits, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue listmynotes(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size())
+        throw std::runtime_error(
+            "listmynotes\n"
+            "\nList this wallet's note holdings, one row per house, with the house's\n"
+            "current (effective) status and whether par redemption / demand is open.\n"
+            "Units are base-native (1 unit redeems 1 sat).\n"
+            "\nResult:\n"
+            "[\n"
+            "  {\n"
+            "    \"house_id\": n,             (numeric) the house ID\n"
+            "    \"units\": n,                (numeric) total note units held\n"
+            "    \"grams\": n,                (numeric) presentation-only gram-of-gold view (units / launch scale)\n"
+            "    \"demanded_units\": n,       (numeric) units stamped with a demand (option clause)\n"
+            "    \"coins\": n,                (numeric) number of note UTXOs\n"
+            "    \"house_status\": \"x\",       (string) effective status: o/s/d/i/w\n"
+            "    \"redeemable\": true|false,  (bool) par redemption currently open\n"
+            "    \"demandable\": true|false   (bool) a demand can be lodged now (house suspended)\n"
+            "  }, ...\n"
+            "]\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("listmynotes", "")
+            + HelpExampleRpc("listmynotes", "")
+        );
+
+    ObserveSafeMode();
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::map<uint32_t, CWallet::WalletNoteHolding> holdings;
+    pwallet->CollectNoteHoldings(holdings);
+
+    const int nHeight = chainActive.Height();
+    UniValue ret(UniValue::VARR);
+    for (const auto& kv : holdings) {
+        CHouse house;
+        const bool haveHouse = phousetree && phousetree->GetHouse(kv.first, house);
+        const char eff = haveHouse ? HouseEffectiveStatus(house, nHeight) : '?';
+
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("house_id", (uint64_t)kv.first);
+        obj.pushKV("units", kv.second.units);
+        // Presentation-only gram view of the holding (units are base-native sats).
+        obj.pushKV("grams", GramsUV((int64_t)kv.second.units));
+        obj.pushKV("demanded_units", kv.second.demandedUnits);
+        obj.pushKV("coins", (uint64_t)kv.second.coins);
+        obj.pushKV("house_status", std::string(1, eff));
+        // Par redemption is open through Stressed, blocked once Deferred/Insolvent.
+        obj.pushKV("redeemable", eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED);
+        // Option clause: a demand can only be lodged against a suspended (Deferred) house.
+        obj.pushKV("demandable", eff == HOUSE_STATUS_DEFERRED);
+        if (haveHouse) {
+            obj.pushKV("house_tier", (uint64_t)house.nTier);
+            obj.pushKV("house_minted_units", house.nMintedUnits);
+        }
+        ret.push_back(obj);
+    }
+    return ret;
+}
+
+UniValue listmylp(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size())
+        throw std::runtime_error(
+            "listmylp\n"
+            "\nList this wallet's LP-share holdings, one row per pool, with the pool's\n"
+            "current reserves and this wallet's pro-rata claim on them.\n"
+            "\nResult:\n"
+            "[\n"
+            "  {\n"
+            "    \"pool_id\": n,             (numeric) the pool ID (== house ID)\n"
+            "    \"lp_units\": n,            (numeric) LP units held by this wallet\n"
+            "    \"lp_supply\": n,           (numeric) total LP units outstanding\n"
+            "    \"share_bps\": n,           (numeric) this wallet's share in basis points\n"
+            "    \"my_note_units\": n,       (numeric) pro-rata note-unit claim\n"
+            "    \"my_btx_sats\": n,         (numeric) pro-rata base-sat claim\n"
+            "    \"note_reserve\": n,        (numeric) pool note-unit reserve\n"
+            "    \"btx_reserve\": n,         (numeric) pool base-sat reserve\n"
+            "    \"fee_bps\": n              (numeric) pool swap fee in basis points\n"
+            "  }, ...\n"
+            "]\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("listmylp", "")
+            + HelpExampleRpc("listmylp", "")
+        );
+
+    ObserveSafeMode();
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::map<uint32_t, CWallet::WalletLpHolding> holdings;
+    pwallet->CollectLpHoldings(holdings);
+
+    UniValue ret(UniValue::VARR);
+    for (const auto& kv : holdings) {
+        CPool pool;
+        if (!ppooltree || !ppooltree->GetPool(kv.first, pool))
+            continue;
+        if (pool.nLpSupply == 0)
+            continue;
+
+        const uint64_t units = kv.second.units;
+        uint64_t myNote  = (uint64_t)((unsigned __int128)units * pool.nNoteReserve / pool.nLpSupply);
+        CAmount  myBtx   = (CAmount)((unsigned __int128)units * (uint64_t)pool.amountBtxReserve / pool.nLpSupply);
+        uint64_t shareBps = (uint64_t)((unsigned __int128)units * 10000 / pool.nLpSupply);
+        // Clamp to a valid upper bound. The wallet's LP collector counts our own
+        // still-unconfirmed coins, but reserves/supply come from connected chain
+        // state, so a pending self addliquidity would momentarily report a share
+        // over 100% (more than the pool holds). You can never own more than the
+        // whole pool - cap the display; it self-corrects when the add confirms.
+        // Display value only; no consensus or spend path here.
+        if (shareBps > 10000) shareBps = 10000;
+        if (myNote > pool.nNoteReserve) myNote = pool.nNoteReserve;
+        if (myBtx > pool.amountBtxReserve) myBtx = pool.amountBtxReserve;
+
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("pool_id", (uint64_t)kv.first);
+        obj.pushKV("lp_units", units);
+        obj.pushKV("lp_supply", pool.nLpSupply);
+        obj.pushKV("share_bps", shareBps);
+        obj.pushKV("my_note_units", myNote);
+        obj.pushKV("my_note_units_grams", GramsUV((int64_t)myNote));
+        obj.pushKV("my_btx_sats", myBtx);
+        obj.pushKV("my_btx_sats_grams", GramsUV((int64_t)myBtx));
+        obj.pushKV("note_reserve", pool.nNoteReserve);
+        obj.pushKV("note_reserve_grams", GramsUV((int64_t)pool.nNoteReserve));
+        obj.pushKV("btx_reserve", (int64_t)pool.amountBtxReserve);
+        obj.pushKV("btx_reserve_grams", GramsUV((int64_t)pool.amountBtxReserve));
+        obj.pushKV("fee_bps", (uint64_t)pool.nFeeBps);
+        ret.push_back(obj);
+    }
+    return ret;
+}
+
+UniValue originatedeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 4 || request.params.size() > 5)
+        throw std::runtime_error(
+            "originatedeposit\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the house ID number\n"
+            "2. \"principal\" (numeric, required) deposit principal in sats (base-native 1:1)\n"
+            "3. \"ratebps\"   (numeric, required) annual rate in basis points (house-set)\n"
+            "4. \"maturity\"  (numeric, required) absolute sidechain height the term ends at\n"
+            "5. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nHouse issues a term-deposit receipt to a fresh holder key. House M-of-N\n"
+            "authorized; capped by capital (N + D + principal <= lambda * active escrow).\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("originatedeposit", "1 1000000 500 5000")
+            + HelpExampleRpc("originatedeposit", "1 1000000 500 5000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nPrincipal = request.params[1].get_int64();
+    const uint32_t nRateBps = request.params[2].get_int();
+    const uint32_t nMaturityHeight = request.params[3].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 5) nFee = AmountFromValue(request.params[4]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->OriginateDeposit(strFail, txid, nHouseID, nPrincipal, nRateBps, nMaturityHeight, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue transferdeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "transferdeposit\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the house ID number\n"
+            "2. \"principal\" (numeric, required) principal of the whole receipt to reassign\n"
+            "3. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nReassign a whole term-deposit receipt (house, principal) held by this\n"
+            "wallet to a fresh recipient key. Immutable terms carry over exactly.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("transferdeposit", "1 1000000")
+            + HelpExampleRpc("transferdeposit", "1 1000000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nPrincipal = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->TransferDeposit(strFail, txid, nHouseID, nPrincipal, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue withdrawdeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "withdrawdeposit\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the house ID number\n"
+            "2. \"principal\" (numeric, required) principal of the matured receipt to withdraw\n"
+            "3. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nAt/after maturity and while the house is open, burn a matured receipt\n"
+            "and receive principal + accrued interest (consensus floor) from the house.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("withdrawdeposit", "1 1000000")
+            + HelpExampleRpc("withdrawdeposit", "1 1000000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nPrincipal = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->WithdrawDeposit(strFail, txid, nHouseID, nPrincipal, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue claimdeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "claimdeposit\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the house ID number\n"
+            "2. \"principal\" (numeric, required) principal of the receipt to claim\n"
+            "3. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nInsolvency waterfall: burn a receipt of an INSOLVENT house and take the\n"
+            "SUBORDINATED pro-rata from the escrow pot (junior to notes; capped at principal).\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("claimdeposit", "1 1000000")
+            + HelpExampleRpc("claimdeposit", "1 1000000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nPrincipal = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->ClaimDeposit(strFail, txid, nHouseID, nPrincipal, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue createpool(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 5)
+        throw std::runtime_error(
+            "createpool\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the house ID (== the pool ID; one pool per house)\n"
+            "2. \"noteunits\" (numeric, required) note units seeding the note side\n"
+            "3. \"btxsats\"   (numeric, required) sats seeding the BTX side\n"
+            "4. \"feebps\"    (numeric, optional) swap fee in basis points, default 30 (bounds 1..100)\n"
+            "5. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nCharter the house's note<->BTX AMM pool (house M-of-N approved, effective-Open)\n"
+            "and seed both sides. sqrt(noteunits*btxsats) must exceed the locked liquidity\n"
+            "floor; the creator receives the LP shares above the lock.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("createpool", "1 100000 100000")
+            + HelpExampleRpc("createpool", "1 100000 100000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nPoolID = request.params[0].get_int();
+    const uint64_t nNoteUnits = request.params[1].get_int64();
+    const CAmount amountBtx = request.params[2].get_int64();
+    uint32_t nFeeBps = POOL_FEE_BPS_DEFAULT;
+    if (request.params.size() >= 4) nFeeBps = request.params[3].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 5) nFee = AmountFromValue(request.params[4]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->CreatePool(strFail, txid, nPoolID, nFeeBps, nNoteUnits, amountBtx, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue addpoolliquidity(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
+        throw std::runtime_error(
+            "addpoolliquidity\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the pool ID (== the house ID)\n"
+            "2. \"noteunits\" (numeric, required) note units to add\n"
+            "3. \"btxsats\"   (numeric, required) sats to add\n"
+            "4. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nAdd liquidity to the pool. LP shares minted by the min-rule\n"
+            "min(noteunits*S/X, btxsats*S/Y); an unbalanced add donates the excess.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("addpoolliquidity", "1 10000 10000")
+            + HelpExampleRpc("addpoolliquidity", "1 10000 10000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nPoolID = request.params[0].get_int();
+    const uint64_t nNoteUnits = request.params[1].get_int64();
+    const CAmount amountBtx = request.params[2].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 4) nFee = AmountFromValue(request.params[3]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->AddPoolLiquidity(strFail, txid, nPoolID, nNoteUnits, amountBtx, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue removepoolliquidity(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "removepoolliquidity\n"
+            "\nArguments:\n"
+            "1. \"id\"       (numeric, required) the pool ID (== the house ID)\n"
+            "2. \"lpunits\"  (numeric, required) LP units to burn\n"
+            "3. \"fee\"      (numeric or string, optional) default 0.001\n"
+            "\nBurn LP shares for the pro-rata of both sides (notes + sats). The locked\n"
+            "liquidity floor is never redeemable.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("removepoolliquidity", "1 5000")
+            + HelpExampleRpc("removepoolliquidity", "1 5000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nPoolID = request.params[0].get_int();
+    const uint64_t nBurnLp = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->RemovePoolLiquidity(strFail, txid, nPoolID, nBurnLp, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue retirepool(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "retirepool\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the pool ID (== the house ID)\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "\nTerminally close a pool sitting at the locked liquidity floor (all\n"
+            "issued LP removed): burns the residual note-units from the house, force-\n"
+            "pays the floor BTX to the house redemption key, and deletes the record -\n"
+            "letting a house that ever chartered a pool reach winddown / final settle.\n"
+            "Charter M-of-N approves at any status; a single non-settled partner may\n"
+            "trigger once the house is effectively insolvent.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("retirepool", "1")
+            + HelpExampleRpc("retirepool", "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nPoolID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->RetirePool(strFail, txid, nPoolID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue swapnote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 4 || request.params.size() > 5)
+        throw std::runtime_error(
+            "swapnote\n"
+            "\nArguments:\n"
+            "1. \"id\"        (numeric, required) the pool ID (== the house ID)\n"
+            "2. \"direction\" (string, required) \"noteforbtx\" (notes in, sats out) or \"btxfornote\"\n"
+            "3. \"amountin\"  (numeric, required) note units (noteforbtx) or sats (btxfornote) to swap in\n"
+            "4. \"minout\"    (numeric, required) minimum acceptable out-amount (consensus slippage guard)\n"
+            "5. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nSwap at x*y=k against the pool (fee accrues to the reserves). One pool op\n"
+            "per pool per block: on a race, re-run for fresh priors.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("swapnote", "1 \"noteforbtx\" 1000 980")
+            + HelpExampleRpc("swapnote", "1 \"noteforbtx\" 1000 980")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nPoolID = request.params[0].get_int();
+    const std::string strDir = request.params[1].get_str();
+    bool fNoteToBtx;
+    if (strDir == "noteforbtx") fNoteToBtx = true;
+    else if (strDir == "btxfornote") fNoteToBtx = false;
+    else throw JSONRPCError(RPC_INVALID_PARAMETER, "direction must be \"noteforbtx\" or \"btxfornote\"");
+    const uint64_t nAmountIn = request.params[2].get_int64();
+    const uint64_t nMinOut = request.params[3].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 5) nFee = AmountFromValue(request.params[4]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->SwapNote(strFail, txid, nPoolID, fNoteToBtx, nAmountIn, nMinOut, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue registerhouse(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 5 || request.params.size() > 6)
+        throw std::runtime_error(
+            "registerhouse\n"
+            "\nArguments:\n"
+            "1. \"tier\"      (numeric, required) liability tier 0-3\n"
+            "2. \"threshold\" (numeric, required) approvals M for threshold ops (1 for solo)\n"
+            "3. \"classid\"   (string, required) note-class id, [a-z0-9]{1,16}, globally unique\n"
+            "4. \"denommg\"   (numeric, required) note denomination unit in mg of gold\n"
+            "5. \"pledges\"   (array, required) pledge amount per partner (1 entry = solo)\n"
+            "6. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "\nRegister a discount house. This wallet holds every partner key\n"
+            "(single-wallet handshake, v1).\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("registerhouse", "0 1 \"clyde\" 1000 \"[1.0]\"")
+            + HelpExampleRpc("registerhouse", "3 2 \"ayr\" 1000 \"[1.0,1.0,1.0]\"")
+        );
+
+    ObserveSafeMode();
+
+    const uint8_t nTier = request.params[0].get_int();
+    const uint32_t nThresholdM = request.params[1].get_int();
+    const std::string strClassID = request.params[2].get_str();
+    const uint64_t nDenomMgGold = request.params[3].get_int64();
+
+    std::vector<CAmount> vPledge;
+    UniValue arr = request.params[4].get_array();
+    for (size_t i = 0; i < arr.size(); i++)
+        vPledge.push_back(AmountFromValue(arr[i]));
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 6)
+        nFee = AmountFromValue(request.params[5]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->RegisterHouse(strFail, txid, nTier, nThresholdM, strClassID, nDenomMgGold, vPledge, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue topuphouse(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
+        throw std::runtime_error(
+            "topuphouse\n"
+            "\nArguments:\n"
+            "1. \"id\"      (numeric, required) the house ID number\n"
+            "2. \"partner\" (numeric, required) partner index growing their pledge\n"
+            "3. \"amount\"  (numeric or string, required) amount to add\n"
+            "4. \"fee\"     (numeric or string, optional) default 0.001\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("topuphouse", "1 0 2.5")
+            + HelpExampleRpc("topuphouse", "1 0 2.5")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint32_t nPartnerIndex = request.params[1].get_int();
+    const CAmount nAmount = AmountFromValue(request.params[2]);
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 4)
+        nFee = AmountFromValue(request.params[3]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->TopupHouse(strFail, txid, nHouseID, nPartnerIndex, nAmount, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue admitpartner(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "admitpartner\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number (tier 3 only)\n"
+            "2. \"pledge\" (numeric or string, required) the new partner's pledge\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nAdmit a new partner (fresh key from this wallet) with M-of-N\n"
+            "approval from the active partner keys this wallet holds.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("admitpartner", "1 1.0")
+            + HelpExampleRpc("admitpartner", "1 1.0")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nHouseID = request.params[0].get_int();
+    const CAmount nPledge = AmountFromValue(request.params[1]);
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3)
+        nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->AdmitPartner(strFail, txid, nHouseID, nPledge, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue exitpartner(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "exitpartner\n"
+            "\nArguments:\n"
+            "1. \"id\"      (numeric, required) the house ID number (tier 3 only)\n"
+            "2. \"partner\" (numeric, required) partner index leaving the house\n"
+            "3. \"fee\"     (numeric or string, optional) default 0.001\n"
+            "\nVoluntary partner exit. The pledge enters the tail-liability\n"
+            "lock and is reclaimable after it expires.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("exitpartner", "1 2")
+            + HelpExampleRpc("exitpartner", "1 2")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint32_t nPartnerIndex = request.params[1].get_int();
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3)
+        nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->ExitPartner(strFail, txid, nHouseID, nPartnerIndex, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue winddownhouse(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "winddownhouse\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the house ID number\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "\nVoluntarily close a house (M-of-N approval). Multi-partner\n"
+            "pledges enter the tail lock; solo pledges unlock immediately.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("winddownhouse", "1")
+            + HelpExampleRpc("winddownhouse", "1")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nHouseID = request.params[0].get_int();
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2)
+        nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->WinddownHouse(strFail, txid, nHouseID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue attesthouse(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "attesthouse\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the house ID number\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "\nPublish a reserve attestation: proves this wallet's plain\n"
+            "confirmed coins as the house's liquid till. Below the\n"
+            "10% floor the house turns Stressed; recovery needs 15%.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("attesthouse", "1")
+            + HelpExampleRpc("attesthouse", "1")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nHouseID = request.params[0].get_int();
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2)
+        nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->AttestHouse(strFail, txid, nHouseID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+// DEFER / RENEW: identical RPC shape, so one implementation with a flag.
+static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    const char* name = fRenew ? "renewdeferral" : "deferhouse";
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            std::string(name) + "\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the house ID number\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            + (fRenew
+                ? "\nExtend the running option-clause deferral by one further window\n"
+                  "(one renewal permitted per episode).\n"
+                : "\nInvoke the option clause (ARCH s7 Option (c)): a STRESSED house\n"
+                  "suspends par redemption for the deferral window. Holders queue and\n"
+                  "accrue interest from the date of demand. Recovery (an attestation at\n"
+                  "floor+buffer) lifts it; expiry without recovery goes to Insolvent.\n"
+                  "Refused at Open (nothing to defer) and at Insolvent (resolution,\n"
+                  "never suspension), and once confidence-dead.\n")
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli(name, "1")
+            + HelpExampleRpc(name, "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2)
+        nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    const bool ok = fRenew ? pwallet->RenewDeferral(strFail, txid, nHouseID, nFee)
+                           : pwallet->DeferHouse(strFail, txid, nHouseID, nFee);
+    if (!ok) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue releasereserves(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "releasereserves\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the house ID number\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "\nTake the house's locked till back out of consensus custody. Invoking\n"
+            "the option clause LOCKS the attested reserves into the pot the holders\n"
+            "can claim from; they come back only once the clause has been lifted\n"
+            "(the house is effectively Open again), so it can pay its queue.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("releasereserves", "1")
+            + HelpExampleRpc("releasereserves", "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->ReleaseReserves(strFail, txid, nHouseID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue deferhouse(const JSONRPCRequest& request)   { return DeferOrRenewRPC(request, false); }
+UniValue renewdeferral(const JSONRPCRequest& request) { return DeferOrRenewRPC(request, true); }
+
+UniValue reclaimpledge(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "reclaimpledge\n"
+            "\nArguments:\n"
+            "1. \"id\"      (numeric, required) the house ID number\n"
+            "2. \"partner\" (numeric, required) partner index reclaiming\n"
+            "3. \"fee\"     (numeric or string, optional) default 0.001\n"
+            "\nReclaim a tail-expired pledge (or a solo pledge after wind-down).\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("reclaimpledge", "1 0")
+            + HelpExampleRpc("reclaimpledge", "1 0")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint32_t nPartnerIndex = request.params[1].get_int();
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3)
+        nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->ReclaimPledge(strFail, txid, nHouseID, nPartnerIndex, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
 UniValue retirebill(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -4020,7 +5242,9 @@ UniValue listmybills(const JSONRPCRequest& request)
         obj.pushKV("id", (uint64_t)bill.nBillID);
         obj.pushKV("bill_id", bill.billID.ToString());
         obj.pushKV("amount", ValueFromAmount(bill.amount));
+        obj.pushKV("amount_grams", GramsUV((int64_t)bill.amount));
         obj.pushKV("escrow", ValueFromAmount(bill.amountEscrow));
+        obj.pushKV("escrow_grams", GramsUV((int64_t)bill.amountEscrow));
         obj.pushKV("status", std::string(1, bill.status));
         obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
         obj.pushKV("grace_blocks", (uint64_t)bill.nGraceBlocks);
@@ -4696,6 +5920,33 @@ static const CRPCCommand commands[] =
     { "bills",              "claimbillescrow",                  &claimbillescrow,               {"id", "fee"} },
     { "bills",              "listmybills",                      &listmybills,                   {} },
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
+    { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee"} },
+    { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress"} },
+    { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
+    { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
+    { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee"} },
+    { "notes",              "listmynotes",                      &listmynotes,                   {} },
+    { "deposits",           "originatedeposit",                 &originatedeposit,              {"id", "principal", "ratebps", "maturity", "fee"} },
+    { "deposits",           "transferdeposit",                  &transferdeposit,               {"id", "principal", "fee"} },
+    { "deposits",           "withdrawdeposit",                  &withdrawdeposit,               {"id", "principal", "fee"} },
+    { "deposits",           "claimdeposit",                     &claimdeposit,                  {"id", "principal", "fee"} },
+
+    { "pools",              "createpool",                       &createpool,                    {"id", "noteunits", "btxsats", "feebps", "fee"} },
+    { "pools",              "addpoolliquidity",                 &addpoolliquidity,              {"id", "noteunits", "btxsats", "fee"} },
+    { "pools",              "removepoolliquidity",              &removepoolliquidity,           {"id", "lpunits", "fee"} },
+    { "pools",              "retirepool",                       &retirepool,                    {"id", "fee"} },
+    { "pools",              "swapnote",                         &swapnote,                      {"id", "direction", "amountin", "minout", "fee"} },
+    { "pools",              "listmylp",                         &listmylp,                      {} },
+    { "houses",             "registerhouse",                    &registerhouse,                 {"tier", "threshold", "classid", "denommg", "pledges", "fee"} },
+    { "houses",             "topuphouse",                       &topuphouse,                    {"id", "partner", "amount", "fee"} },
+    { "houses",             "admitpartner",                     &admitpartner,                  {"id", "pledge", "fee"} },
+    { "houses",             "exitpartner",                      &exitpartner,                   {"id", "partner", "fee"} },
+    { "houses",             "winddownhouse",                    &winddownhouse,                 {"id", "fee"} },
+    { "houses",             "attesthouse",                      &attesthouse,                   {"id", "fee"} },
+    { "houses",             "deferhouse",                       &deferhouse,                    {"id", "fee"} },
+    { "houses",             "renewdeferral",                    &renewdeferral,                 {"id", "fee"} },
+    { "houses",             "releasereserves",                  &releasereserves,               {"id", "fee"} },
+    { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee"} },
 };
 
 void RegisterWalletRPCCommands(CRPCTable &t)

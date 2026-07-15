@@ -15,6 +15,10 @@
 static const int SERIALIZE_TRANSACTION_NO_WITNESS = 0x40000000;
 static const int TRANSACTION_BITASSET_CREATE_VERSION = 10;
 static const int TRANSACTION_BILL_VERSION = 11;
+static const int TRANSACTION_HOUSE_VERSION = 12;
+static const int TRANSACTION_NOTE_VERSION = 13;
+static const int TRANSACTION_DEPOSIT_VERSION = 14;   // Phase 3.8 term deposits
+static const int TRANSACTION_POOL_VERSION = 15;      // Phase 3.7 AMM pools
 
 /** An outpoint - a combination of a transaction hash and an index n into its vout */
 class COutPoint
@@ -256,6 +260,26 @@ inline void UnserializeTransaction(TxType& tx, Stream& s) {
         s >> tx.nBillOp;
         s >> tx.vchBillPayload;
     }
+
+    if (tx.nVersion == TRANSACTION_HOUSE_VERSION) {
+        s >> tx.nHouseOp;
+        s >> tx.vchHousePayload;
+    }
+
+    if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
+        s >> tx.nNoteOp;
+        s >> tx.vchNotePayload;
+    }
+
+    if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION) {
+        s >> tx.nDepositOp;
+        s >> tx.vchDepositPayload;
+    }
+
+    if (tx.nVersion == TRANSACTION_POOL_VERSION) {
+        s >> tx.nPoolOp;
+        s >> tx.vchPoolPayload;
+    }
 }
 
 template<typename Stream, typename TxType>
@@ -298,6 +322,26 @@ inline void SerializeTransaction(const TxType& tx, Stream& s) {
         s << tx.nBillOp;
         s << tx.vchBillPayload;
     }
+
+    if (tx.nVersion == TRANSACTION_HOUSE_VERSION) {
+        s << tx.nHouseOp;
+        s << tx.vchHousePayload;
+    }
+
+    if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
+        s << tx.nNoteOp;
+        s << tx.vchNotePayload;
+    }
+
+    if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION) {
+        s << tx.nDepositOp;
+        s << tx.vchDepositPayload;
+    }
+
+    if (tx.nVersion == TRANSACTION_POOL_VERSION) {
+        s << tx.nPoolOp;
+        s << tx.vchPoolPayload;
+    }
 }
 
 
@@ -314,7 +358,7 @@ public:
     // adapting relay policy by bumping MAX_STANDARD_VERSION, and then later date
     // bumping the default CURRENT_VERSION at which point both CURRENT_VERSION and
     // MAX_STANDARD_VERSION will be equal.
-    static const int32_t MAX_STANDARD_VERSION=11;
+    static const int32_t MAX_STANDARD_VERSION=15;
 
     // The local variables are made const to prevent unintended modification
     // without updating the cached hash value. However, CTransaction is not
@@ -334,6 +378,18 @@ public:
 
     const uint8_t nBillOp;
     const std::vector<unsigned char> vchBillPayload;
+
+    const uint8_t nHouseOp;
+    const std::vector<unsigned char> vchHousePayload;
+
+    const uint8_t nNoteOp;
+    const std::vector<unsigned char> vchNotePayload;
+
+    const uint8_t nDepositOp;
+    const std::vector<unsigned char> vchDepositPayload;
+
+    const uint8_t nPoolOp;
+    const std::vector<unsigned char> vchPoolPayload;
 
 private:
     /** Memory only. */
@@ -425,6 +481,18 @@ struct CMutableTransaction
 
     uint8_t nBillOp = 0;
     std::vector<unsigned char> vchBillPayload;
+
+    uint8_t nHouseOp = 0;
+    std::vector<unsigned char> vchHousePayload;
+
+    uint8_t nNoteOp = 0;
+    std::vector<unsigned char> vchNotePayload;
+
+    uint8_t nDepositOp = 0;
+    std::vector<unsigned char> vchDepositPayload;
+
+    uint8_t nPoolOp = 0;
+    std::vector<unsigned char> vchPoolPayload;
 
     CMutableTransaction();
     CMutableTransaction(const CTransaction& tx);

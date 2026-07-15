@@ -6,6 +6,8 @@
 #include <txdb.h>
 
 #include <bill.h>
+#include <house.h>
+#include <pool.h>
 #include <chainparams.h>
 #include <consensus/params.h>
 #include <hash.h>
@@ -41,6 +43,16 @@ static const char DB_ASSET_LAST_ID = 'I';
 static const char DB_BILL = 'B';
 static const char DB_BILL_HASH = 'H';
 static const char DB_BILL_LAST_ID = 'J';
+static const char DB_POOL = 'P';
+static const char DB_HOUSE = 'D';
+static const char DB_HOUSE_HASH = 'E';
+static const char DB_HOUSE_CLASS = 'G';
+static const char DB_HOUSE_LAST_ID = 'K';
+// Best-block marker for the side DBs (HouseDB + BillDB are separate LevelDB
+// instances, so one char serves both): the last block whose effects are in
+// the DB, written ATOMICALLY with those effects (Phase 3.4 review - ties the
+// side DBs to the chainstate lifecycle; see HouseDB::WriteBlockEffects).
+static const char DB_SIDE_BEST_BLOCK = 'Z';
 
 namespace {
 
@@ -650,6 +662,115 @@ bool BitAssetDB::GetAsset(const uint32_t nID, BitAsset& asset)
     return Read(std::make_pair(DB_ASSET, nID), asset);
 }
 
+
+HouseDB::HouseDB(size_t nCacheSize, bool fMemory, bool fWipe)
+    : CDBWrapper(GetDataDir() / "blocks" / "Houses", nCacheSize, fMemory, fWipe) { }
+
+bool HouseDB::WriteHouse(const CHouse& house)
+{
+    CDBBatch batch(*this);
+    batch.Write(std::make_pair(DB_HOUSE, house.nHouseID), house);
+    batch.Write(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
+    batch.Write(std::make_pair(DB_HOUSE_CLASS, house.strClassID), house.nHouseID);
+    return WriteBatch(batch, true);
+}
+
+bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock)
+{
+    CDBBatch batch(*this);
+    for (const CHouse& house : vHouse) {
+        batch.Write(std::make_pair(DB_HOUSE, house.nHouseID), house);
+        batch.Write(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
+        batch.Write(std::make_pair(DB_HOUSE_CLASS, house.strClassID), house.nHouseID);
+    }
+    if (pnLastID)
+        batch.Write(DB_HOUSE_LAST_ID, *pnLastID);
+    batch.Write(DB_SIDE_BEST_BLOCK, hashBestBlock);
+    return WriteBatch(batch, true);
+}
+
+bool HouseDB::GetBestBlock(uint256& hashBlock)
+{
+    return Read(DB_SIDE_BEST_BLOCK, hashBlock);
+}
+
+bool HouseDB::WriteBestBlock(const uint256& hashBlock)
+{
+    return Write(DB_SIDE_BEST_BLOCK, hashBlock, true);
+}
+
+std::vector<CHouse> HouseDB::GetHouses()
+{
+    std::ostringstream ss;
+    ::Serialize(ss, std::make_pair(DB_HOUSE, 0));
+
+    std::vector<CHouse> vHouse;
+
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(ss.str());
+    while (pcursor->Valid()) {
+        boost::this_thread::interruption_point();
+
+        std::pair<char, uint32_t> key;
+        CHouse house;
+        if (pcursor->GetKey(key) && key.first == DB_HOUSE) {
+            if (pcursor->GetValue(house))
+                vHouse.push_back(house);
+        }
+
+        pcursor->Next();
+    }
+    return vHouse;
+}
+
+bool HouseDB::GetLastHouseID(uint32_t& nID)
+{
+    return Read(DB_HOUSE_LAST_ID, nID);
+}
+
+bool HouseDB::WriteLastHouseID(const uint32_t nID)
+{
+    return Write(DB_HOUSE_LAST_ID, nID);
+}
+
+bool HouseDB::GetHouse(const uint32_t nID, CHouse& house)
+{
+    return Read(std::make_pair(DB_HOUSE, nID), house);
+}
+
+bool HouseDB::GetHouseIDByHash(const uint256& houseID, uint32_t& nID)
+{
+    return Read(std::make_pair(DB_HOUSE_HASH, houseID), nID);
+}
+
+bool HouseDB::HaveHouseHash(const uint256& houseID)
+{
+    return Exists(std::make_pair(DB_HOUSE_HASH, houseID));
+}
+
+bool HouseDB::HaveClassID(const std::string& strClassID)
+{
+    return Exists(std::make_pair(DB_HOUSE_CLASS, strClassID));
+}
+
+bool HouseDB::GetHouseIDByClassID(const std::string& strClassID, uint32_t& nID)
+{
+    return Read(std::make_pair(DB_HOUSE_CLASS, strClassID), nID);
+}
+
+bool HouseDB::RemoveHouse(const uint32_t nID)
+{
+    CHouse house;
+    if (!GetHouse(nID, house))
+        return false;
+
+    CDBBatch batch(*this);
+    batch.Erase(std::make_pair(DB_HOUSE, nID));
+    batch.Erase(std::make_pair(DB_HOUSE_HASH, house.houseID));
+    batch.Erase(std::make_pair(DB_HOUSE_CLASS, house.strClassID));
+    return WriteBatch(batch, true);
+}
+
 BillDB::BillDB(size_t nCacheSize, bool fMemory, bool fWipe)
     : CDBWrapper(GetDataDir() / "blocks" / "Bills", nCacheSize, fMemory, fWipe) { }
 
@@ -661,6 +782,29 @@ bool BillDB::WriteBills(const std::vector<CBill>& vBill)
         batch.Write(std::make_pair(DB_BILL_HASH, bill.billID), bill.nBillID);
     }
     return WriteBatch(batch, true);
+}
+
+bool BillDB::WriteBlockEffects(const std::vector<CBill>& vBill, const uint32_t* pnLastID, const uint256& hashBestBlock)
+{
+    CDBBatch batch(*this);
+    for (const CBill& bill : vBill) {
+        batch.Write(std::make_pair(DB_BILL, bill.nBillID), bill);
+        batch.Write(std::make_pair(DB_BILL_HASH, bill.billID), bill.nBillID);
+    }
+    if (pnLastID)
+        batch.Write(DB_BILL_LAST_ID, *pnLastID);
+    batch.Write(DB_SIDE_BEST_BLOCK, hashBestBlock);
+    return WriteBatch(batch, true);
+}
+
+bool BillDB::GetBestBlock(uint256& hashBlock)
+{
+    return Read(DB_SIDE_BEST_BLOCK, hashBlock);
+}
+
+bool BillDB::WriteBestBlock(const uint256& hashBlock)
+{
+    return Write(DB_SIDE_BEST_BLOCK, hashBlock, true);
 }
 
 bool BillDB::WriteBill(const CBill& bill)
@@ -733,6 +877,74 @@ bool BillDB::RemoveBill(const uint32_t nID)
     batch.Erase(std::make_pair(DB_BILL, nID));
     batch.Erase(std::make_pair(DB_BILL_HASH, bill.billID));
     return WriteBatch(batch, true);
+}
+
+PoolDB::PoolDB(size_t nCacheSize, bool fMemory, bool fWipe)
+    : CDBWrapper(GetDataDir() / "blocks" / "Pools", nCacheSize, fMemory, fWipe) { }
+
+bool PoolDB::WritePool(const CPool& pool)
+{
+    return Write(std::make_pair(DB_POOL, pool.nPoolID), pool, true);
+}
+
+bool PoolDB::WriteBlockEffects(const std::vector<CPool>& vPool, const std::vector<uint32_t>& vRemove, const uint256& hashBestBlock)
+{
+    CDBBatch batch(*this);
+    for (const CPool& pool : vPool)
+        batch.Write(std::make_pair(DB_POOL, pool.nPoolID), pool);
+    for (const uint32_t nID : vRemove)
+        batch.Erase(std::make_pair(DB_POOL, nID));
+    batch.Write(DB_SIDE_BEST_BLOCK, hashBestBlock);
+    return WriteBatch(batch, true);
+}
+
+bool PoolDB::GetBestBlock(uint256& hashBlock)
+{
+    return Read(DB_SIDE_BEST_BLOCK, hashBlock);
+}
+
+bool PoolDB::WriteBestBlock(const uint256& hashBlock)
+{
+    return Write(DB_SIDE_BEST_BLOCK, hashBlock, true);
+}
+
+std::vector<CPool> PoolDB::GetPools()
+{
+    std::ostringstream ss;
+    ::Serialize(ss, std::make_pair(DB_POOL, 0));
+
+    std::vector<CPool> vPool;
+
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(ss.str());
+    while (pcursor->Valid()) {
+        boost::this_thread::interruption_point();
+
+        std::pair<char, uint32_t> key;
+        CPool pool;
+        if (pcursor->GetKey(key) && key.first == DB_POOL) {
+            if (pcursor->GetValue(pool))
+                vPool.push_back(pool);
+        }
+
+        pcursor->Next();
+    }
+    return vPool;
+}
+
+bool PoolDB::GetPool(const uint32_t nID, CPool& pool)
+{
+    return Read(std::make_pair(DB_POOL, nID), pool);
+}
+
+bool PoolDB::HavePool(const uint32_t nID)
+{
+    return Exists(std::make_pair(DB_POOL, nID));
+}
+
+bool PoolDB::RemovePool(const uint32_t nID)
+{
+    return Erase(std::make_pair(DB_POOL, nID), true);
 }
 
 namespace {

@@ -8,6 +8,7 @@
 #include <policy/policy.h>
 
 #include <bill.h>
+#include <house.h>
 
 #include <consensus/validation.h>
 #include <validation.h>
@@ -128,6 +129,14 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
                 o == 1 && IsBillEscrowScript(txout.scriptPubKey))
             continue;
 
+        // House pledge escrow outputs (same script family) - REGISTER posts
+        // one per partner at vout[0..N-1]; TOPUP / ADMIT post one at vout[0]
+        if (tx.nVersion == TRANSACTION_HOUSE_VERSION &&
+                IsHouseEscrowScript(txout.scriptPubKey) &&
+                (tx.nHouseOp == HOUSE_OP_REGISTER ||
+                 (o == 0 && (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT))))
+            continue;
+
         if (!::IsStandard(txout.scriptPubKey, whichType, witnessEnabled)) {
             reason = "scriptpubkey";
             return false;
@@ -175,6 +184,10 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
         // Bill title / escrow prevouts are governed by the bill consensus
         // rules; the escrow script has no standard type
         if (tx.nVersion == TRANSACTION_BILL_VERSION && (coin.fBill || coin.fBillEscrow))
+            continue;
+
+        // House pledge prevouts likewise (RECLAIM spends them)
+        if (tx.nVersion == TRANSACTION_HOUSE_VERSION && coin.fHouseEscrow)
             continue;
 
         const CTxOut& prev = coin.out;

@@ -55,7 +55,7 @@ std::string CTxOut::ToString() const
 }
 
 CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::CURRENT_VERSION), nLockTime(0) {}
-CMutableTransaction::CMutableTransaction(const CTransaction& tx) : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion), nLockTime(tx.nLockTime), ticker(tx.ticker), headline(tx.headline), payload(tx.payload), nBillOp(tx.nBillOp), vchBillPayload(tx.vchBillPayload) {}
+CMutableTransaction::CMutableTransaction(const CTransaction& tx) : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion), nLockTime(tx.nLockTime), ticker(tx.ticker), headline(tx.headline), payload(tx.payload), nBillOp(tx.nBillOp), vchBillPayload(tx.vchBillPayload), nHouseOp(tx.nHouseOp), vchHousePayload(tx.vchHousePayload), nNoteOp(tx.nNoteOp), vchNotePayload(tx.vchNotePayload), nDepositOp(tx.nDepositOp), vchDepositPayload(tx.vchDepositPayload), nPoolOp(tx.nPoolOp), vchPoolPayload(tx.vchPoolPayload) {}
 
 uint256 CMutableTransaction::GetHash() const
 {
@@ -76,9 +76,9 @@ uint256 CTransaction::GetWitnessHash() const
 }
 
 /* For backward compatibility, the hash is initialized to 0. TODO: remove the need for this default constructor entirely. */
-CTransaction::CTransaction() : vin(), vout(), nVersion(CTransaction::CURRENT_VERSION), nLockTime(0), ticker(""), headline(""), payload(), nBillOp(0), vchBillPayload(), hash() {}
-CTransaction::CTransaction(const CMutableTransaction &tx) : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion), nLockTime(tx.nLockTime), ticker(tx.ticker), headline(tx.headline), payload(tx.payload), nBillOp(tx.nBillOp), vchBillPayload(tx.vchBillPayload), hash(ComputeHash()) {}
-CTransaction::CTransaction(CMutableTransaction &&tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion), nLockTime(tx.nLockTime), ticker(tx.ticker), headline(tx.headline), payload(tx.payload), nBillOp(tx.nBillOp), vchBillPayload(std::move(tx.vchBillPayload)), hash(ComputeHash()) {}
+CTransaction::CTransaction() : vin(), vout(), nVersion(CTransaction::CURRENT_VERSION), nLockTime(0), ticker(""), headline(""), payload(), nBillOp(0), vchBillPayload(), nHouseOp(0), vchHousePayload(), nNoteOp(0), vchNotePayload(), nDepositOp(0), vchDepositPayload(), nPoolOp(0), vchPoolPayload(), hash() {}
+CTransaction::CTransaction(const CMutableTransaction &tx) : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion), nLockTime(tx.nLockTime), ticker(tx.ticker), headline(tx.headline), payload(tx.payload), nBillOp(tx.nBillOp), vchBillPayload(tx.vchBillPayload), nHouseOp(tx.nHouseOp), vchHousePayload(tx.vchHousePayload), nNoteOp(tx.nNoteOp), vchNotePayload(tx.vchNotePayload), nDepositOp(tx.nDepositOp), vchDepositPayload(tx.vchDepositPayload), nPoolOp(tx.nPoolOp), vchPoolPayload(tx.vchPoolPayload), hash(ComputeHash()) {}
+CTransaction::CTransaction(CMutableTransaction &&tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion), nLockTime(tx.nLockTime), ticker(tx.ticker), headline(tx.headline), payload(tx.payload), nBillOp(tx.nBillOp), vchBillPayload(std::move(tx.vchBillPayload)), nHouseOp(tx.nHouseOp), vchHousePayload(std::move(tx.vchHousePayload)), nNoteOp(tx.nNoteOp), vchNotePayload(std::move(tx.vchNotePayload)), nDepositOp(tx.nDepositOp), vchDepositPayload(std::move(tx.vchDepositPayload)), nPoolOp(tx.nPoolOp), vchPoolPayload(std::move(tx.vchPoolPayload)), hash(ComputeHash()) {}
 
 CAmount CTransaction::GetValueOut() const
 {

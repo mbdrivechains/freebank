@@ -9,18 +9,11 @@
 #include <config/bitcoin-config.h>
 #endif //HAVE_CONFIG_H
 
-// FreeBank version identity: force 0.1.0.0 (CLIENT_VERSION = 10000),
-// overriding any configure-provided values (configure.ac still carries the
-// inherited 4.01.00.0). Keep in sync with wallet FEATURE_* constants, which
-// must not exceed CLIENT_VERSION.
-#undef CLIENT_VERSION_MAJOR
-#define CLIENT_VERSION_MAJOR 0
-#undef CLIENT_VERSION_MINOR
-#define CLIENT_VERSION_MINOR 1
-#undef CLIENT_VERSION_REVISION
-#define CLIENT_VERSION_REVISION 0
-#undef CLIENT_VERSION_BUILD
-#define CLIENT_VERSION_BUILD 0
+// FreeBank version identity comes from configure.ac (via bitcoin-config.h)
+// since v0.2.0. (A Phase-0 hard override to 0.1.0.0 lived here while
+// configure.ac still carried the inherited BitAssets version; configure.ac
+// has been authoritative since the S-5 lock.) Wallet FEATURE_* constants are
+// pinned at 10000 (= v0.1.0.0) and must never exceed CLIENT_VERSION.
 
 // Check that required client information is defined
 #if !defined(CLIENT_VERSION_MAJOR) || !defined(CLIENT_VERSION_MINOR) || !defined(CLIENT_VERSION_REVISION) || !defined(CLIENT_VERSION_BUILD) || !defined(CLIENT_VERSION_IS_RELEASE) || !defined(COPYRIGHT_YEAR)

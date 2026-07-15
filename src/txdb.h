@@ -18,6 +18,8 @@
 class BitAssetObj;
 class BitAsset;
 struct CBill;
+struct CHouse;
+class CPool;
 class CBlockIndex;
 class CCoinsViewDBCursor;
 class SidechainObj;
@@ -175,6 +177,60 @@ public:
     bool RemoveAsset(const uint32_t nID);
 };
 
+/** Access to the house database (blocks/Houses/) */
+class HouseDB : public CDBWrapper
+{
+public:
+    HouseDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+
+    bool WriteHouse(const CHouse& house);
+
+    /** One block's house effects + the best-block marker in a SINGLE atomic
+     * batch (Phase 3.4 review): the marker ties this DB to the chainstate
+     * lifecycle. ConnectBlock skips already-applied blocks after a crash and
+     * aborts on divergence instead of double-applying (which the ATTEST
+     * priors check would turn into a permanent canonical-chain rejection). */
+    bool WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock);
+    bool GetBestBlock(uint256& hashBlock);
+    bool WriteBestBlock(const uint256& hashBlock);
+
+    std::vector<CHouse> GetHouses();
+
+    bool GetLastHouseID(uint32_t& nID);
+    bool WriteLastHouseID(const uint32_t nID);
+    bool GetHouse(const uint32_t nID, CHouse& house);
+    bool GetHouseIDByHash(const uint256& houseID, uint32_t& nID);
+    bool HaveHouseHash(const uint256& houseID);
+    bool HaveClassID(const std::string& strClassID);
+    bool GetHouseIDByClassID(const std::string& strClassID, uint32_t& nID);
+
+    bool RemoveHouse(const uint32_t nID);
+};
+
+/** Access to the pool database (blocks/Pools/). nPoolID == nHouseID (one pool
+ * per house), so there is NO dense-id assignment and no hash index. */
+class PoolDB : public CDBWrapper
+{
+public:
+    PoolDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+
+    bool WritePool(const CPool& pool);
+
+    /** See HouseDB::WriteBlockEffects - same atomic per-block discipline.
+     * vRemove deletes pools whose CREATE was disconnected in this block's
+     * undo, in the same atomic batch as the marker. */
+    bool WriteBlockEffects(const std::vector<CPool>& vPool, const std::vector<uint32_t>& vRemove, const uint256& hashBestBlock);
+    bool GetBestBlock(uint256& hashBlock);
+    bool WriteBestBlock(const uint256& hashBlock);
+
+    std::vector<CPool> GetPools();
+
+    bool GetPool(const uint32_t nID, CPool& pool);
+    bool HavePool(const uint32_t nID);
+
+    bool RemovePool(const uint32_t nID);
+};
+
 /** Access to the bill database (blocks/Bills/) */
 class BillDB : public CDBWrapper
 {
@@ -183,6 +239,11 @@ public:
 
     bool WriteBills(const std::vector<CBill>& vBill);
     bool WriteBill(const CBill& bill);
+
+    /** See HouseDB::WriteBlockEffects - same atomic per-block discipline. */
+    bool WriteBlockEffects(const std::vector<CBill>& vBill, const uint32_t* pnLastID, const uint256& hashBestBlock);
+    bool GetBestBlock(uint256& hashBlock);
+    bool WriteBestBlock(const uint256& hashBlock);
 
     std::vector<CBill> GetBills();
 

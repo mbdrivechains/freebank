@@ -35,6 +35,8 @@
 class BMMCache;
 class BitAssetDB;
 class BillDB;
+class HouseDB;
+class PoolDB;
 class ConnectTrace;
 class CBlockIndex;
 class CBlockTreeDB;
@@ -348,7 +350,7 @@ int VersionBitsTipStateSinceHeight(const Consensus::Params& params, Consensus::D
 
 
 /** Apply the effects of this transaction on the UTXO set represented by view */
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& undo, int nHeight, CAmount& amountAssetInOut, int& nControlNOut, uint32_t& nAssetIDOut, const uint32_t nNewAssetIDIn = 0, const uint32_t nNewBillIDIn = 0);
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& undo, int nHeight, CAmount& amountAssetInOut, int& nControlNOut, uint32_t& nAssetIDOut, const uint32_t nNewAssetIDIn = 0, const uint32_t nNewBillIDIn = 0, const uint32_t nNewHouseIDIn = 0);
 
 /** Transaction validation functions */
 
@@ -509,6 +511,8 @@ extern std::unique_ptr<BitAssetDB> passettree;
 
 /** Global variable that points to the active bill tree (protected by cs_main) */
 extern std::unique_ptr<BillDB> pbilltree;
+extern std::unique_ptr<HouseDB> phousetree;
+extern std::unique_ptr<PoolDB> ppooltree;
 
 /**
  * Return the spend height, which is one more than the inputs.GetBestBlock().

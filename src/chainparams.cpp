@@ -237,7 +237,7 @@ public:
 
         // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         // PUBKEY_ADDRESS 75 / SCRIPT_ADDRESS 125 match the BTX mainchain for
-        // Phase 1 deposit testing (BASE_REBRAND.md 9.2); provisional for the eCash era.
+        // Phase 1 deposit testing; provisional for the eCash era.
         base58Prefixes[MAINCHAIN_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
         base58Prefixes[MAINCHAIN_REGTEST_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,75);

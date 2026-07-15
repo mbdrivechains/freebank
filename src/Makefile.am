@@ -143,6 +143,11 @@ BITCOIN_CORE_H = \
   script/sign.h \
   script/standard.h \
   bill.h \
+  gramscale.h \
+  house.h \
+  note.h \
+  deposit.h \
+  pool.h \
   l1client.h \
   sidechain.h \
   sidechainclient.h \
@@ -224,7 +229,6 @@ libbitcoin_server_a_SOURCES = \
   rpc/safemode.cpp \
   rpc/server.cpp \
   script/sigcache.cpp \
-  bill.cpp \
   l1client.cpp \
   sidechain.cpp \
   sidechainclient.cpp \
@@ -332,6 +336,12 @@ libbitcoin_common_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libbitcoin_common_a_SOURCES = \
   base58.cpp \
   bech32.cpp \
+  bill.cpp \
+  gramscale.cpp \
+  house.cpp \
+  note.cpp \
+  deposit.cpp \
+  pool.cpp \
   chainparams.cpp \
   coins.cpp \
   compressor.cpp \

@@ -40,6 +40,23 @@ public:
         ::Serialize(s, txout->fBill);
         ::Serialize(s, txout->fBillEscrow);
         ::Serialize(s, txout->nBillID);
+        ::Serialize(s, txout->fHouseEscrow);
+        ::Serialize(s, txout->nHouseID);
+        ::Serialize(s, txout->fNote);
+        ::Serialize(s, txout->nNoteUnits);
+        ::Serialize(s, txout->nDemandHeight);
+        // Deposit receipt terms (Phase 3.8) must survive a disconnect too, or a
+        // reorg-restored receipt loses its principal/rate/maturity.
+        ::Serialize(s, txout->fDeposit);
+        ::Serialize(s, txout->nDepositPrincipal);
+        ::Serialize(s, txout->nDepositRateBps);
+        ::Serialize(s, txout->nDepositMaturityHeight);
+        ::Serialize(s, txout->nDepositOriginationHeight);
+        // Pool custody / LP tags (Phase 3.7) must survive a disconnect, or a
+        // reorg-restored escrow coin re-enters the UTXO set anyone-can-spend.
+        ::Serialize(s, txout->fPoolEscrow);
+        ::Serialize(s, txout->fLpShare);
+        ::Serialize(s, txout->nLpUnits);
     }
 
     explicit TxInUndoSerializer(const Coin* coin) : txout(coin) {}
@@ -70,6 +87,19 @@ public:
         ::Unserialize(s, txout->fBill);
         ::Unserialize(s, txout->fBillEscrow);
         ::Unserialize(s, txout->nBillID);
+        ::Unserialize(s, txout->fHouseEscrow);
+        ::Unserialize(s, txout->nHouseID);
+        ::Unserialize(s, txout->fNote);
+        ::Unserialize(s, txout->nNoteUnits);
+        ::Unserialize(s, txout->nDemandHeight);
+        ::Unserialize(s, txout->fDeposit);
+        ::Unserialize(s, txout->nDepositPrincipal);
+        ::Unserialize(s, txout->nDepositRateBps);
+        ::Unserialize(s, txout->nDepositMaturityHeight);
+        ::Unserialize(s, txout->nDepositOriginationHeight);
+        ::Unserialize(s, txout->fPoolEscrow);
+        ::Unserialize(s, txout->fLpShare);
+        ::Unserialize(s, txout->nLpUnits);
     }
 
     explicit TxInUndoDeserializer(Coin* coin) : txout(coin) {}

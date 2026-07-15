@@ -17,6 +17,8 @@
 #include <compat/sanity.h>
 #include <consensus/validation.h>
 #include <fs.h>
+#include <gramscale.h>
+#include <house.h>
 #include <httpserver.h>
 #include <httprpc.h>
 #include <key.h>
@@ -261,6 +263,8 @@ void Shutdown()
         psidechaintree.reset();
         passettree.reset();
         pbilltree.reset();
+        phousetree.reset();
+        ppooltree.reset();
     }
 #ifdef ENABLE_WALLET
     StopWallets();
@@ -528,6 +532,10 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-grpcurlbin=<path>", _("grpcurl binary used by -mainchaintransport=enforcer (default: grpcurl)"));
     strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; empty = deposits fail closed"));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
+    strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
+    strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
+    strUsage += HelpMessageOpt("-deferwindow=<n>", _("Regtest only: override the option-clause deferral window in blocks (default: 12960 = 90 days; integration-gate knob)"));
+    strUsage += HelpMessageOpt("-launchsatspergram=<n>", _("Regtest only: override the launch presentation scale in satoshis per gram of gold (default: 4822613; presentation only, NOT consensus)"));
 
     return strUsage;
 }
@@ -970,6 +978,45 @@ bool AppInitParameterInteraction()
             chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-cusfbundleformat is a regtest-only test override; the bundle "
                            "format on other networks is fixed by network consensus."));
+
+    // The attestation cadence and stress window are consensus parameters; the
+    // overrides exist so integration gates need not mine a week of blocks.
+    if ((gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow") ||
+            gArgs.IsArgSet("-deferwindow")) &&
+            chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-attestcadence / -stressedwindow / -deferwindow are regtest-only test "
+                           "overrides; on other networks these are fixed by network consensus."));
+    if (chainparams.NetworkIDString() == CBaseChainParams::REGTEST) {
+        const int64_t nCadence = gArgs.GetArg("-attestcadence", (int64_t)HOUSE_ATTEST_CADENCE);
+        const int64_t nWindow = gArgs.GetArg("-stressedwindow", (int64_t)HOUSE_STRESSED_WINDOW);
+        const int64_t nDefer = gArgs.GetArg("-deferwindow", (int64_t)HOUSE_DEFER_WINDOW);
+        if (nCadence < 1 || nCadence > 100000 || nWindow < 1 || nWindow > 1000000 ||
+                nDefer < 1 || nDefer > 1000000)
+            return InitError(_("-attestcadence / -stressedwindow / -deferwindow out of range."));
+        HOUSE_ATTEST_CADENCE = (uint32_t)nCadence;
+        HOUSE_STRESSED_WINDOW = (uint32_t)nWindow;
+        HOUSE_DEFER_WINDOW = (uint32_t)nDefer;
+        if (gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow") ||
+                gArgs.IsArgSet("-deferwindow"))
+            LogPrintf("REGTEST override: attest cadence %u, stressed window %u, defer window %u\n",
+                      HOUSE_ATTEST_CADENCE, HOUSE_STRESSED_WINDOW, HOUSE_DEFER_WINDOW);
+    }
+
+    // Launch presentation scale (sats per gram of gold). Presentation only;
+    // NOT consensus. The override exists so regtest can exercise the gram
+    // display without pinning to the frozen launch ratio.
+    if (gArgs.IsArgSet("-launchsatspergram") &&
+            chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-launchsatspergram is a regtest-only test override; on other "
+                           "networks the launch presentation scale is fixed."));
+    if (chainparams.NetworkIDString() == CBaseChainParams::REGTEST &&
+            gArgs.IsArgSet("-launchsatspergram")) {
+        const int64_t nScale = gArgs.GetArg("-launchsatspergram", DEFAULT_LAUNCH_SATS_PER_GRAM);
+        if (nScale < 1 || nScale > MAX_MONEY)
+            return InitError(_("-launchsatspergram out of range."));
+        g_launchSatsPerGram = nScale;
+        LogPrintf("REGTEST override: launch scale %d sats/gram\n", g_launchSatsPerGram);
+    }
 
     // ********************************************************* Step 3: parameter-to-internal-flags
     if (gArgs.IsArgSet("-debug")) {
@@ -1480,6 +1527,8 @@ bool AppInitMain()
                 psidechaintree.reset(new CSidechainTreeDB(nSidechainTreeDBCache, false, fReset));
                 passettree.reset(new BitAssetDB(nBitAssetDBCache, false, fReset));
                 pbilltree.reset(new BillDB(nBillDBCache, false, fReset));
+                phousetree.reset(new HouseDB(nBillDBCache, false, fReset));
+                ppooltree.reset(new PoolDB(nBillDBCache, false, fReset));
 
                 if (fReset) {
                     pblocktree->WriteReindexing(true);
@@ -1556,6 +1605,37 @@ bool AppInitMain()
                         break;
                     }
                     assert(chainActive.Tip() != nullptr);
+
+                    // Side-DB lifecycle (3.4 review): the House/Bill DBs carry
+                    // a best-block marker written atomically with each block's
+                    // effects. At the tip (normal) or ahead of it on the same
+                    // chain (chainstate flush lagged; reconnects will skip) is
+                    // healthy. Behind, or on another branch, means house/bill
+                    // state silently diverged (crash) - unhealable without a
+                    // replay, so demand -reindex instead of forking off.
+                    const auto CheckSideDBMarker = [](const uint256& hashSideBest) {
+                        if (hashSideBest.IsNull())
+                            return true;   // bootstrap: marker starts with the first flush
+                        BlockMap::iterator it = mapBlockIndex.find(hashSideBest);
+                        if (it == mapBlockIndex.end())
+                            return false;
+                        const CBlockIndex* pMarker = it->second;
+                        const CBlockIndex* pTip = chainActive.Tip();
+                        if (pMarker == pTip)
+                            return true;
+                        return pMarker->nHeight > pTip->nHeight &&
+                               pMarker->GetAncestor(pTip->nHeight) == pTip;
+                    };
+                    uint256 hashHouseBest;
+                    phousetree->GetBestBlock(hashHouseBest);
+                    uint256 hashBillBest;
+                    pbilltree->GetBestBlock(hashBillBest);
+                    uint256 hashPoolBest;
+                    ppooltree->GetBestBlock(hashPoolBest);
+                    if (!CheckSideDBMarker(hashHouseBest) || !CheckSideDBMarker(hashBillBest) || !CheckSideDBMarker(hashPoolBest)) {
+                        strLoadError = _("House/Bill/Pool database is out of sync with the chain state - restart with -reindex");
+                        break;
+                    }
                 }
 
                 if (!fReset) {
