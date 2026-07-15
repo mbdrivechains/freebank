@@ -64,7 +64,7 @@ A wallet GUI — desktop and browser (PWA) — is in development against a runni
 
 ![FreeBank wallet preview](doc/wallet-preview.png)
 
-Wallet code to follow.
+Wallet code: [mbdrivechains/freebank-gui](https://github.com/mbdrivechains/freebank-gui).
 
 ## Build
 
