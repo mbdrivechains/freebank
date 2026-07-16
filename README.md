@@ -99,6 +99,8 @@ freebankd -mainchaintransport=enforcer \
 
 Advance the chain with `freebank-cli refreshbmm`, once the slot is active on the mainchain.
 
+Full signet bring-up (topology, requirements, verification order): [`doc/signet.md`](doc/signet.md).
+
 ## License
 
 MIT — see [`COPYING`](COPYING). Inherited from Bitcoin Core / the BitAssets chassis.
