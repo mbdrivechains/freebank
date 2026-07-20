@@ -73,6 +73,9 @@ public:
 
     bool GetBlockHash(int nHeight, uint256& hashBlock);
 
+    /* Batched backward walk for cold header-cache sync (see L1Client). */
+    bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash);
+
     bool HaveSpentWithdrawalBundle(const uint256& hash);
 
     bool HaveFailedWithdrawalBundle(const uint256& hash);

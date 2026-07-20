@@ -215,6 +215,11 @@ bool SidechainClient::GetBlockHash(int nHeight, uint256& hashBlock)
     return GetL1Client().GetBlockHash(nHeight, hashBlock);
 }
 
+bool SidechainClient::GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash)
+{
+    return GetL1Client().GetAncestorHashes(hashBlock, nHeight, nMax, vHash);
+}
+
 bool SidechainClient::HaveSpentWithdrawalBundle(const uint256& hash)
 {
     return GetL1Client().HaveSpentWithdrawalBundle(hash);

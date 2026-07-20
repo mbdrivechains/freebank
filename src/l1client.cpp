@@ -4,6 +4,8 @@
 
 #include <l1client.h>
 
+#include <chainparams.h>
+#include <chainparamsbase.h>
 #include <core_io.h>
 #include <sidechain.h>
 #include <uint256.h>
@@ -50,6 +52,7 @@ public:
     bool GetWorkScore(const uint256& hash, int& nWorkScore) override;
     bool ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle) override;
     bool GetBlockHash(int nHeight, uint256& hashBlock) override;
+    bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override;
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
 
@@ -82,8 +85,12 @@ public:
     bool GetWorkScore(const uint256& hash, int& nWorkScore) override;
     bool ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle) override;
     bool GetBlockHash(int nHeight, uint256& hashBlock) override;
+    bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override;
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
+
+    /* The init-time REST reachability probe borrows the private RestGet. */
+    friend bool ::ProbeMainchainRest(std::string& strError);
 
 private:
     /*
@@ -504,7 +511,7 @@ bool EnforcerL1Client::BroadcastWithdrawalBundle(const std::string& hex)
 
 bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
 {
-    std::string strHostPort = gArgs.GetArg("-mainchainrest", "");
+    std::string strHostPort = gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST);
     if (strHostPort.empty())
         return false;
 
@@ -568,6 +575,17 @@ bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
         LogPrintf("ERROR Enforcer REST GET %s: %s\n", strPath, e.what());
         return false;
     }
+}
+
+bool ProbeMainchainRest(std::string& strError)
+{
+    EnforcerL1Client client;
+    std::string strBody;
+    if (client.RestGet("/rest/chaininfo.json", strBody) && !strBody.empty())
+        return true;
+    strError = strprintf("mainchain REST endpoint %s did not answer /rest/chaininfo.json",
+                         gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST));
+    return false;
 }
 
 bool EnforcerL1Client::RestGetRawTx(const uint256& txid, CMutableTransaction& tx)
@@ -679,7 +697,7 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
 {
     std::vector<SidechainDeposit> incoming;
 
-    if (gArgs.GetArg("-mainchainrest", "").empty()) {
+    if (gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST).empty()) {
         LogUnimplemented("UpdateDeposits", "set -mainchainrest=<host:port> to enable enforcer deposit crediting");
         return incoming;
     }
@@ -854,7 +872,7 @@ bool EnforcerL1Client::VerifyDeposit(const uint256& hashMainBlock, const uint256
     // Byte-identical to the jsonrpc verifydeposit: confirm the deposit tx sits
     // at index nTx of the named mainchain block (block.vtx[nTx].GetHash()==txid).
     // Fail closed if REST is unavailable or the index is out of range.
-    if (gArgs.GetArg("-mainchainrest", "").empty()) {
+    if (gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST).empty()) {
         LogUnimplemented("VerifyDeposit", "set -mainchainrest=<host:port>");
         return false;
     }
@@ -1049,6 +1067,29 @@ bool EnforcerL1Client::GetBlockHash(int nHeight, uint256& hashBlock)
     return false;
 }
 
+bool EnforcerL1Client::GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash)
+{
+    // The enforcer indexes by hash, so a batch of ancestors is a single call:
+    // ask for the cursor block plus its (nMax - 1) ancestors.
+    vHash.clear();
+    if (nMax == 0)
+        return true;
+
+    std::vector<L1BlockHeader> vHeader;
+    if (!GetHeaderInfos(hashBlock, nMax - 1, vHeader))
+        return false;
+
+    // Newest-first, [0] == hashBlock. Stop at genesis rather than trusting the
+    // caller's count.
+    for (const L1BlockHeader& header : vHeader) {
+        vHash.push_back(header.hashBlock);
+        if (header.nHeight == 0)
+            break;
+    }
+
+    return !vHash.empty();
+}
+
 bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents)
 {
     L1BlockHeader tip;
@@ -1133,10 +1174,17 @@ bool IsValidL1Transport(const std::string& strTransport)
     return strTransport == "jsonrpc" || strTransport == "enforcer";
 }
 
+const std::string& DefaultMainchainTransport()
+{
+    static const std::string jsonrpc = "jsonrpc";
+    static const std::string enforcer = "enforcer";
+    return Params().NetworkIDString() == CBaseChainParams::REGTEST ? jsonrpc : enforcer;
+}
+
 L1Transport GetL1Transport()
 {
     static const L1Transport transport =
-        gArgs.GetArg("-mainchaintransport", "jsonrpc") == "enforcer" ?
+        gArgs.GetArg("-mainchaintransport", DefaultMainchainTransport()) == "enforcer" ?
             L1Transport::ENFORCER : L1Transport::JSONRPC;
     return transport;
 }
@@ -1624,6 +1672,33 @@ bool JsonRpcL1Client::GetBlockHash(int nHeight, uint256& hashBlock)
     hashBlock = uint256S(strHash);
 
     return (!hashBlock.IsNull());
+}
+
+bool JsonRpcL1Client::GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash)
+{
+    // The JSON-RPC mainchain indexes by height, so each hash is a direct
+    // lookup: walk heights down from the cursor. Unchanged from the historical
+    // per-block behaviour (getblockhash is O(1) on this transport).
+    vHash.clear();
+    if (nMax == 0)
+        return true;
+
+    // The cursor block's own hash is already known - do not re-request it.
+    vHash.push_back(hashBlock);
+
+    for (uint32_t i = 1; i < nMax; i++) {
+        const int nWant = nHeight - (int)i;
+        if (nWant < 0)
+            break;
+
+        uint256 hash;
+        if (!GetBlockHash(nWant, hash))
+            return false;
+
+        vHash.push_back(hash);
+    }
+
+    return true;
 }
 
 bool JsonRpcL1Client::HaveSpentWithdrawalBundle(const uint256& hash)

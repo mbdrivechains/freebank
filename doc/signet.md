@@ -66,6 +66,14 @@ freebankd -mainchaintransport=enforcer \
   -rpcuser=user -rpcpassword=pass
 ```
 
+As of v0.2.1 the values above are the **defaults** — a bare `freebankd` does exactly
+this (`enforcer` transport, gRPC on `127.0.0.1:50051`, REST on `127.0.0.1:38332`),
+matching an orchestrated BitWindow-style stack. The flags remain for overriding; on
+regtest the transport default stays `jsonrpc` for the local-pair test harness.
+Startup now also probes the REST endpoint (with ~60s of retries for orchestrated
+starts) and fails loud if it never answers, rather than letting a REST-less node
+reject its first deposit-bearing block later.
+
 Advance the chain with `freebank-cli refreshbmm 0.001` (typically in a loop) once the
 slot is active.
 
@@ -82,6 +90,27 @@ slot is active.
    marks Spent. Note the withdrawal ACK **threshold is a property of the enforcer's
    network config** — regtest uses short thresholds (5/10) but a real signet may run
    mainnet-scale numbers; confirm the actual threshold before promising a timeline.
+
+## Signet resets
+
+Test signets get wiped and restarted — on the LayerTwo Labs signet this has happened
+repeatedly, and the `signetchallenge` (and therefore the network magic) rotates when it
+does. Plan for the wipe:
+
+- **Sidechain activation does not persist across a reset.** The slot-130 M1 must be
+  re-proposed on the fresh chain; if you depend on the sidechain staying active, ask the
+  signet operator to include it in whatever seeding batch they replay after a restart.
+- **Reset drill** (run whenever the tip height drops sharply, the magic mismatches, or
+  peers vanish):
+  1. Re-check <https://drivechain.info/dev.txt> for the current challenge and seeds;
+     update `bitcoind`'s options and delete `peers.dat` before resyncing.
+  2. Start the enforcer with a **fresh datadir** — enforcer state carried across a chain
+     reset can disagree with the freshly-synced bitcoind.
+  3. Give freebankd a **fresh datadir** too: the old sidechain state is anchored (BMM
+     commitments, deposits) to a mainchain that no longer exists.
+- **Expect deep reorgs even without a full reset** — test signets are used for fork and
+  reorg testing. A deep mainchain reorg is signet turbulence, not necessarily a FreeBank
+  bug; check the signet operator's channels before filing one.
 
 ## Known limitations (v0.2.0)
 

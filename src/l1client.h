@@ -21,6 +21,21 @@ enum class L1Transport {
     ENFORCER, // CUSF bip300301_enforcer gRPC via grpcurl (eCash-v2 / Cygnet)
 };
 
+/** Mainchain-connection defaults. Orchestrated installs (BitWindow) launch the
+ *  sidechain binary with no arguments, so the argless defaults must describe
+ *  the standard CUSF stack: enforcer gRPC on 50051, bitcoind REST on the
+ *  signet RPC port. Regtest keeps the legacy jsonrpc default — the integration
+ *  gates run a local drivechain-patched pair on 18443, not an enforcer stack.
+ *  Every value remains overridable on the command line. */
+const std::string& DefaultMainchainTransport();
+static const std::string DEFAULT_MAINCHAIN_REST = "127.0.0.1:38332";
+
+/** Startup reachability probe for the -mainchainrest endpoint (one HTTP GET of
+ *  /rest/chaininfo.json). Returns false with strError set if it does not
+ *  answer; init fails loud on that rather than letting a node without REST
+ *  reject the first deposit-bearing block and fork off the network. */
+bool ProbeMainchainRest(std::string& strError);
+
 /**
  * L1Client - the mainchain I/O behind SidechainClient.
  *
@@ -47,6 +62,20 @@ public:
     virtual bool GetWorkScore(const uint256& hash, int& nWorkScore) = 0;
     virtual bool ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle) = 0;
     virtual bool GetBlockHash(int nHeight, uint256& hashBlock) = 0;
+
+    /**
+     * Batched backward walk for cold header-cache sync: up to nMax hashes
+     * newest-first, starting AT (hashBlock, nHeight) and descending toward
+     * genesis. The caller supplies both the cursor hash and its height so each
+     * transport can use its cheap primitive: the enforcer indexes by hash and
+     * answers a whole batch in one ancestor call, while the JSON-RPC mainchain
+     * indexes by height and looks each one up directly.
+     *
+     * Walking per-block through GetBlockHash() instead is quadratic on the
+     * enforcer transport (every call re-walks from the tip), which made a cold
+     * sync of a few thousand blocks take the better part of an hour.
+     */
+    virtual bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) = 0;
     virtual bool HaveSpentWithdrawalBundle(const uint256& hash) = 0;
     virtual bool HaveFailedWithdrawalBundle(const uint256& hash) = 0;
 };

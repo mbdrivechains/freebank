@@ -10126,6 +10126,11 @@ void SetNetworkActive(bool fActive, const std::string& strReason)
     }
 }
 
+//! Mainchain hashes requested per ancestor batch during a header-cache walk.
+//! The enforcer answers a batch in a single call, so this is the difference
+//! between one request per block and one per thousand.
+static const uint32_t MAIN_BLOCK_CACHE_BATCH = 1000;
+
 bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
 {
     std::lock_guard<std::mutex> lock(mainBlockCacheMutex);
@@ -10161,17 +10166,38 @@ bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
     }
 
     // Otherwise;
-    // From the new mainchain tip, start looping back through mainchain blocks
+    // From the new mainchain tip, start walking back through mainchain blocks
     // while keeping track of them in order until we find one that connects to
     // one of our cached blocks by prevblock.
+    //
+    // The walk is BATCHED (see L1Client::GetAncestorHashes): asking each
+    // transport for a run of ancestors at a time, rather than one hash per
+    // call. On the enforcer transport a per-block walk is quadratic - every
+    // GetBlockHash() re-walks from the tip - which made a cold sync of a few
+    // thousand blocks take the better part of an hour.
     uint256 hashPrevBlock;
     std::deque<uint256> deqHashNew;
+    std::vector<uint256> vBatch;
+    size_t nBatchPos = 0;
+    uint256 hashCursor = hashMainTip;
+    int nCursor = nMainBlocks;
     for (int i = nMainBlocks; i > 0; i--) {
-        // Get the prevblockhash
-        if (!client.GetBlockHash(i - 1, hashPrevBlock)) {
-            LogPrintf("%s: Failed to get to mainchain block: %u\n", __func__, i - 1);
-            return false;
+        // Refill the batch when exhausted. The batch starts AT the cursor
+        // block, so skip its first entry (already consumed as the cursor).
+        if (nBatchPos >= vBatch.size()) {
+            if (!client.GetAncestorHashes(hashCursor, nCursor, MAIN_BLOCK_CACHE_BATCH, vBatch) || vBatch.size() < 2) {
+                LogPrintf("%s: Failed to get to mainchain block: %u\n", __func__, i - 1);
+                return false;
+            }
+            nBatchPos = 1;
         }
+
+        hashPrevBlock = vBatch[nBatchPos++];
+
+        // Advance the cursor to the oldest hash consumed so the next refill
+        // continues from there.
+        hashCursor = hashPrevBlock;
+        nCursor = i - 1;
 
         // Check if the prevblock is in our cache. Once we find a prevblock in
         // our cache we can update our cache from that block up to the new

@@ -527,10 +527,10 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-server", _("Accept command line and JSON-RPC commands"));
 
     strUsage += HelpMessageGroup(_("Sidechain options:"));
-    strUsage += HelpMessageOpt("-mainchaintransport=<mode>", _("How to reach the mainchain: jsonrpc (drivechain-patched node HTTP-RPC, default) or enforcer (CUSF bip300301_enforcer gRPC via grpcurl)"));
+    strUsage += HelpMessageOpt("-mainchaintransport=<mode>", _("How to reach the mainchain: enforcer (CUSF bip300301_enforcer gRPC via grpcurl; default) or jsonrpc (drivechain-patched node HTTP-RPC; default on regtest)"));
     strUsage += HelpMessageOpt("-enforceraddr=<addr:port>", _("CUSF enforcer gRPC address for -mainchaintransport=enforcer (default: 127.0.0.1:50051)"));
     strUsage += HelpMessageOpt("-grpcurlbin=<path>", _("grpcurl binary used by -mainchaintransport=enforcer (default: grpcurl)"));
-    strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; empty = deposits fail closed"));
+    strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; probed at startup (default: 127.0.0.1:38332)"));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
     strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
     strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
@@ -958,18 +958,35 @@ bool AppInitParameterInteraction()
         InitWarning(strprintf(_("Reducing -maxconnections from %d to %d, because of system limitations."), nUserMaxConnections, nMaxConnections));
 
     // Sidechain: validate the mainchain transport selection
-    const std::string strMainchainTransport = gArgs.GetArg("-mainchaintransport", "jsonrpc");
+    const std::string strMainchainTransport = gArgs.GetArg("-mainchaintransport", DefaultMainchainTransport());
     if (!IsValidL1Transport(strMainchainTransport))
         return InitError(strprintf(_("Unknown -mainchaintransport value '%s' (expected: jsonrpc or enforcer)"), strMainchainTransport));
     // The enforcer transport verifies deposits over the mainchain REST endpoint,
-    // separately from the enforcer gRPC connection. Require -mainchainrest at
-    // startup: a node with the gRPC connection but no REST follows empty blocks
-    // fine, then REJECTS the first deposit-bearing block (VerifyDeposit fails
-    // closed) and silently forks off the network. Fail loud here instead.
-    if (strMainchainTransport == "enforcer" && gArgs.GetArg("-mainchainrest", "").empty())
-        return InitError(_("-mainchaintransport=enforcer requires -mainchainrest=<host:port> "
-                           "(the mainchain node's REST endpoint; the node needs bitcoind -rest -txindex). "
-                           "Without it this node would reject deposit-bearing blocks and fork off the network."));
+    // separately from the enforcer gRPC connection. A node with the gRPC
+    // connection but no working REST follows empty blocks fine, then REJECTS
+    // the first deposit-bearing block (VerifyDeposit fails closed) and silently
+    // forks off the network. Fail loud at startup instead: require the endpoint
+    // to be set AND answering. Probe with retries — orchestrated installs
+    // (BitWindow) start the mainchain node moments before this one, so tolerate
+    // its RPC/REST warm-up.
+    if (strMainchainTransport == "enforcer") {
+        const std::string strMainchainRest = gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST);
+        if (strMainchainRest.empty())
+            return InitError(_("-mainchaintransport=enforcer requires -mainchainrest=<host:port> "
+                               "(the mainchain node's REST endpoint; the node needs bitcoind -rest -txindex). "
+                               "Without it this node would reject deposit-bearing blocks and fork off the network."));
+        std::string strProbeError;
+        bool fRestUp = false;
+        for (int i = 0; i < 12 && !fRestUp; i++) {
+            if (i > 0) MilliSleep(5000);
+            fRestUp = ProbeMainchainRest(strProbeError);
+        }
+        if (!fRestUp)
+            return InitError(strprintf(_("%s (after 60s of retries). The mainchain node must run with "
+                                         "-rest -txindex, reachable at -mainchainrest=<host:port>. Without "
+                                         "it this node would reject deposit-bearing blocks and fork off the "
+                                         "network."), strProbeError));
+    }
     LogPrintf("Using mainchain transport: %s\n", strMainchainTransport);
 
     // The withdrawal-bundle wire format is per-network consensus; the override
