@@ -19,6 +19,7 @@
 #endif
 
 #include <boost/thread.hpp>
+#include <boost/version.hpp>
 
 namespace {
 //! Make sure database has a unique fileid within the environment. If it
@@ -714,7 +715,11 @@ bool CWalletDBWrapper::Backup(const std::string& strDest)
                         return false;
                     }
 
+#if BOOST_VERSION >= 107400
                     fs::copy_file(pathSrc, pathDest, fs::copy_options::overwrite_existing);
+#else
+                    fs::copy_file(pathSrc, pathDest, fs::copy_option::overwrite_if_exists);
+#endif
                     LogPrintf("copied %s to %s\n", strFile, pathDest.string());
                     return true;
                 } catch (const fs::filesystem_error& e) {
