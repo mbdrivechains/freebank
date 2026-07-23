@@ -101,7 +101,17 @@ Advance the chain with `freebank-cli refreshbmm`, once the slot is active on the
 
 Full signet bring-up (topology, requirements, verification order): [`doc/signet.md`](doc/signet.md).
 
+## Feedback
+
+- **Problems / bugs** — open an [issue](https://github.com/mbdrivechains/freebank/issues)
+  (the template asks for version, platform, and steps).
+- **Ideas, questions, discussion** — use
+  [Discussions](https://github.com/mbdrivechains/freebank/discussions).
+- **Security vulnerabilities** — please email privately first: see
+  [`SECURITY.md`](SECURITY.md).
+
 ## License
+
 
 MIT — see [`COPYING`](COPYING). Inherited from Bitcoin Core / the BitAssets chassis.
 
