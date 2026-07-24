@@ -3236,7 +3236,7 @@ bool CWallet::CreateAsset(CTransactionRef& tx, std::string& strFail, const std::
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     // Select coins to cover fee
     std::vector<COutput> vCoins;
@@ -3250,7 +3250,7 @@ bool CWallet::CreateAsset(CTransactionRef& tx, std::string& strFail, const std::
 
     // Handle change if there is any
     const CAmount nChange = nAmountRet - nFee;
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     if (nChange > 0) {
         CScript scriptChange;
 
@@ -3362,7 +3362,7 @@ bool CWallet::IssueBill(CTransactionRef& tx, std::string& strFail, const std::ve
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     if (nMaturityHeight <= (uint32_t)chainActive.Height()) {
         strFail = "Maturity height must be in the future!";
@@ -3424,7 +3424,7 @@ bool CWallet::IssueBill(CTransactionRef& tx, std::string& strFail, const std::ve
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -3486,7 +3486,7 @@ bool CWallet::EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CBill bill;
     if (!pbilltree->GetBill(nBillID, bill)) {
@@ -3541,7 +3541,7 @@ bool CWallet::EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nFee;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -3606,7 +3606,7 @@ bool CWallet::RetireBill(std::string& strFail, uint256& txidOut, const uint32_t 
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CBill bill;
     if (!pbilltree->GetBill(nBillID, bill)) {
@@ -3647,7 +3647,7 @@ bool CWallet::RetireBill(std::string& strFail, uint256& txidOut, const uint32_t 
     // vout[0] = face payment to the current holder; change back to us
     mtx.vout.push_back(CTxOut(bill.amount, BillScriptForPubKey(bill.vchHolderPubKey)));
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = bill.amountEscrow + nAmountRet - bill.amount - nFee;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -3722,7 +3722,7 @@ bool CWallet::ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CBill bill;
     if (!pbilltree->GetBill(nBillID, bill)) {
@@ -3783,7 +3783,7 @@ bool CWallet::ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint
     walletTx.BindWallet(this);
     walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     CValidationState state;
     if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
         strFail = "Failed to commit escrow claim transaction! Reject reason: " + FormatStateMessage(state);
@@ -3959,7 +3959,7 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     if (nUnits == 0 || nUnits > (uint64_t)MAX_MONEY) { strFail = "Invalid note units!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
@@ -4101,7 +4101,7 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -4159,7 +4159,7 @@ bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHou
     if (nUnits == 0) { strFail = "Invalid note units!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     // Pick a single holder whose note coins sum to >= nUnits (single-sender v1).
     std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
@@ -4224,7 +4224,7 @@ bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHou
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the transfer dust + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -4309,7 +4309,7 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     if (nUnits == 0) { strFail = "Invalid note units!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     {
         CHouse house;
@@ -4360,7 +4360,7 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     CAmount nAmountRet = 0;
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "Could not fund the demand fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = (nBurnedDust + nAmountRet) - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -4420,7 +4420,7 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     if (nUnits == 0) { strFail = "Invalid note units!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     // Fail-fast mirror of the 3.4 consensus gate: redemption is open through
     // Stressed, blocked at effective Insolvent (the waterfall replaces it).
@@ -4513,7 +4513,7 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     CAmount nAmountRet = 0;
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "House could not fund the redemption payout + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = (nBurnedDust + nAmountRet) - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -4577,7 +4577,7 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     if (nUnits == 0) { strFail = "Invalid note units!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
@@ -4670,7 +4670,7 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     CAmount nAmountRet = 0;
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "Could not fund the claim fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = (nBurnedDust + nAmountRet) - nFee;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -4807,7 +4807,7 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
     if (nPrincipal == 0 || nPrincipal > (uint64_t)MAX_MONEY) { strFail = "Invalid deposit principal!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     const int nNextHeight = chainActive.Height() + 1;
     CHouse house;
@@ -4848,7 +4848,7 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the receipt dust + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -4922,7 +4922,7 @@ bool CWallet::TransferDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     WalletDepositCoin dc;
     if (!SelectDepositReceipt(this, nHouseID, nPrincipal, false, chainActive.Height() + 1, dc)) {
@@ -4949,7 +4949,7 @@ bool CWallet::TransferDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the transfer dust + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5013,7 +5013,7 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     const int nNextHeight = chainActive.Height() + 1;
     CHouse house;
@@ -5058,7 +5058,7 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     CAmount nAmountRet = 0;
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "Could not fund the maturity payout + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = (DEPOSIT_DUST_VALUE + nAmountRet) - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5116,7 +5116,7 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     const int nNextHeight = chainActive.Height() + 1;
     CHouse house;
@@ -5198,7 +5198,7 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     CAmount nAmountRet = 0;
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "Could not fund the claim fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = (DEPOSIT_DUST_VALUE + nAmountRet) - nFee;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5434,7 +5434,7 @@ bool CWallet::CreatePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     if (nFeeBps < POOL_FEE_BPS_MIN || nFeeBps > POOL_FEE_BPS_MAX) { strFail = "Pool fee out of bounds (1..100 bps)!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     // Fail-fast mirrors of the consensus gates (CommitTransaction does not
     // surface an ATMP rejection to the caller).
@@ -5485,7 +5485,7 @@ bool CWallet::CreatePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the pool seed + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5548,7 +5548,7 @@ bool CWallet::AddPoolLiquidity(std::string& strFail, uint256& txidOut, uint32_t 
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CPool pool;
     if (!ppooltree->GetPool(nPoolID, pool)) { strFail = "Unknown pool!"; return false; }
@@ -5596,7 +5596,7 @@ bool CWallet::AddPoolLiquidity(std::string& strFail, uint256& txidOut, uint32_t 
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the liquidity add + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5661,7 +5661,7 @@ bool CWallet::RemovePoolLiquidity(std::string& strFail, uint256& txidOut, uint32
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CPool pool;
     if (!ppooltree->GetPool(nPoolID, pool)) { strFail = "Unknown pool!"; return false; }
@@ -5741,7 +5741,7 @@ bool CWallet::RemovePoolLiquidity(std::string& strFail, uint256& txidOut, uint32
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the remove + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5803,7 +5803,7 @@ bool CWallet::RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     // Fail-fast mirrors of the consensus gates.
     CPool pool;
@@ -5843,7 +5843,7 @@ bool CWallet::RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     CAmount nAmountRet = 0;
     if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the retire fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -5917,7 +5917,7 @@ bool CWallet::SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID,
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CPool pool;
     if (!ppooltree->GetPool(nPoolID, pool)) { strFail = "Unknown pool!"; return false; }
@@ -5977,7 +5977,7 @@ bool CWallet::SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID,
     CAmount nAmountRet = 0;
     if (nTarget > 0 && !SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the swap + fee!"; return false; }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -6058,7 +6058,7 @@ bool CWallet::RegisterHouse(std::string& strFail, uint256& txidOut, uint8_t nTie
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     if (phousetree->HaveClassID(strClassID)) {
         strFail = "Class id already registered!";
@@ -6133,7 +6133,7 @@ bool CWallet::RegisterHouse(std::string& strFail, uint256& txidOut, uint8_t nTie
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -6192,7 +6192,7 @@ bool CWallet::TopupHouse(std::string& strFail, uint256& txidOut, const uint32_t 
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) {
@@ -6233,7 +6233,7 @@ bool CWallet::TopupHouse(std::string& strFail, uint256& txidOut, const uint32_t 
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -6305,7 +6305,7 @@ bool CWallet::AdmitPartner(std::string& strFail, uint256& txidOut, const uint32_
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) {
@@ -6360,7 +6360,7 @@ bool CWallet::AdmitPartner(std::string& strFail, uint256& txidOut, const uint32_
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     if (nChange > 0) {
         CPubKey vchPubKey;
@@ -6415,7 +6415,7 @@ bool CWallet::ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) {
@@ -6457,7 +6457,7 @@ bool CWallet::ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     CPubKey vchPubKey;
     if (!reserveKey.GetReservedKey(vchPubKey)) {
@@ -6521,7 +6521,7 @@ bool CWallet::WinddownHouse(std::string& strFail, uint256& txidOut, const uint32
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) {
@@ -6563,7 +6563,7 @@ bool CWallet::WinddownHouse(std::string& strFail, uint256& txidOut, const uint32
         return false;
     }
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nTarget;
     CPubKey vchPubKey;
     if (!reserveKey.GetReservedKey(vchPubKey)) {
@@ -6624,7 +6624,7 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     pwallet->BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
@@ -6680,7 +6680,7 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
                            "lower) if the till has shrunk since the last attestation.";
         return false;
     }
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - amountLock - nFee;
     CPubKey vchPubKey;
     if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
@@ -6760,7 +6760,7 @@ bool CWallet::ReleaseReserves(std::string& strFail, uint256& txidOut, const uint
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
@@ -6795,7 +6795,7 @@ bool CWallet::ReleaseReserves(std::string& strFail, uint256& txidOut, const uint
     for (const COutPoint& out : vSpend)
         mtx.vin.push_back(CTxIn(out, CScript()));
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     CPubKey vchPubKey;
     if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
     mtx.vout.push_back(CTxOut(amountLocked - nFee, GetScriptForDestination(vchPubKey.GetID())));
@@ -6835,7 +6835,7 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) {
@@ -6958,7 +6958,7 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
     mtx.nVersion = TRANSACTION_HOUSE_VERSION;
     mtx.nHouseOp = HOUSE_OP_ATTEST;
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     const CAmount nChange = nAmountRet - nFee;
     CPubKey vchPubKey;
     if (!reserveKey.GetReservedKey(vchPubKey)) {
@@ -7049,7 +7049,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
 
     BlockUntilSyncedToCurrentChain();
 
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) {
@@ -7176,7 +7176,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
             strFail = "Could not fund the settle fee!";
             return false;
         }
-        CReserveKey reserveKeySettle(vpwallets[0]);
+        CReserveKey reserveKeySettle(this);
         const CAmount nChange = nAmountRet - nFee;
         if (nChange > 0) {
             CPubKey vchPubKey;
@@ -7290,7 +7290,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
     walletTx.BindWallet(this);
     walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
 
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     CValidationState state;
     if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
         strFail = "Failed to commit reclaim! Reject reason: " + FormatStateMessage(state);
@@ -7321,7 +7321,7 @@ bool CWallet::TransferAsset(std::string& strFail, uint256& txidOut, const uint25
     }
 
     BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, vpwallets[0]->cs_wallet);
+    LOCK2(cs_main, cs_wallet);
 
     // Get our asset outputs from txid
     std::vector<COutput> vOut;
@@ -7355,7 +7355,7 @@ bool CWallet::TransferAsset(std::string& strFail, uint256& txidOut, const uint25
 
     // Handle asset change
     const CAmount nAssetChange = nAmountAsset - nAmount;
-    CReserveKey reserveKeyAsset(vpwallets[0]);
+    CReserveKey reserveKeyAsset(this);
     if (nAssetChange > 0) {
         CScript scriptAssetChange;
 
@@ -7387,7 +7387,7 @@ bool CWallet::TransferAsset(std::string& strFail, uint256& txidOut, const uint25
 
     // Handle fee input change if there is any
     const CAmount nChange = nAmountCoins - nFee;
-    CReserveKey reserveKey(vpwallets[0]);
+    CReserveKey reserveKey(this);
     if (nChange > 0) {
         CScript scriptChange;
 
