@@ -181,9 +181,12 @@ static const uint32_t BLOCKS_PER_YEAR = 52560;
 // a payoff geometry we do not have (its failed banks repaid ~100c of face; ours
 // repay 1/lambda). In the sim's OWN base-native control brassage is a measured
 // no-op - its only ignition source is a gold-basis shock that 1:1 removes. The
-// MECHANISM ships; these DIALS await a v1-shaped sim run. PROVISIONAL (R-1).
+// MECHANISM ships. DIALS now VALIDATED by OQ-SIM-V1 (2026-07-26, gateway/sim/run_v1_full.py):
+// theta=rho/4, defer-window 90d, defer-interest 5% confirmed insensitive under the CM-5b race;
+// brassage-max raised 300->400. Noteholder loss = 0 across the whole sweep (failures are solvent
+// social-deaths, recovery 1.0). See FREEBANK_OPEN_QUESTIONS.md OQ-SIM-V1 (RESOLVED).
 static const uint32_t HOUSE_THETA_BPS = 250;          // rho/4
-static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 300;   // 3% at/below theta
+static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-SIM-V1 2026-07-26: 3% sat exactly at the run-survival threshold; 4% holds an 8%/day run — ~2x margin — at zero calm-market cost since the fee is prox-gated)
 // beta_base = 0 (D8a): exact PAR while Open. Since an Open house always has
 // rr >= rho (a below-floor attestation is precisely what makes it Stressed),
 // the spread can only ever bite once the house is publicly impaired - which
