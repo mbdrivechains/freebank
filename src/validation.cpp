@@ -38,6 +38,7 @@
 #include <note.h>
 #include <deposit.h>
 #include <pool.h>
+#include <settle.h>
 #include <sidechainclient.h>
 
 #include <functional>
@@ -395,6 +396,9 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, CPool&)>& fnGetPool,
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                         CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired);
+bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                          CHouse& houseAOut, CHouse& houseBOut);
 
 /** Verify a reserve proof set (declared outpoints + per-coin recency signatures)
  * against the live UTXO state, summing the proven liquid value into amountOut.
@@ -746,6 +750,50 @@ static bool IsCurrentForFeeEstimation()
  * failure. Node policy only - consensus is untouched. Cost is bounded: only
  * v12/v13 txs do work, and the one-op-per-house guard caps them at one per
  * house. */
+/** SLOT-KEYED house-slot extraction: returns true
+ * iff mtx takes a one-op-per-house-per-block slot, with the touched house
+ * id(s) - nB is nonzero only for the dual-slot v16 exchange. Guards MUST key
+ * on this property, never on per-op enumerated lists in callers - the DR-2
+ * permanent template-brick re-opens through any single omitted op type
+ * (the sister-design review proved one omission - WINDDOWN - recreates it).
+ * Status-dependent but state-NEUTRAL ops (pool CREATE, note DEMAND) take no
+ * slot and cannot interact with a settle either way: a settle changes no
+ * status and they change no house record. */
+static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
+{
+    nA = 0;
+    nB = 0;
+    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+            mtx.vchHousePayload.size() >= 4) {
+        memcpy(&nA, mtx.vchHousePayload.data(), 4);
+        return nA != 0;
+    }
+    if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
+            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM) &&
+            mtx.vchNotePayload.size() >= 4) {
+        memcpy(&nA, mtx.vchNotePayload.data(), 4);
+        return nA != 0;
+    }
+    if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
+            (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
+             mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+        memcpy(&nA, mtx.vchDepositPayload.data(), 4);
+        return nA != 0;
+    }
+    if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.nPoolOp == POOL_OP_RETIRE &&
+            mtx.vchPoolPayload.size() >= 4) {
+        memcpy(&nA, mtx.vchPoolPayload.data(), 4);   // nPoolID == nHouseID
+        return nA != 0;
+    }
+    if (mtx.nVersion == TRANSACTION_SETTLE_VERSION && mtx.nSettleOp == SETTLE_OP_EXCHANGE &&
+            mtx.vchSettlePayload.size() >= 8) {
+        memcpy(&nA, mtx.vchSettlePayload.data(), 4);
+        memcpy(&nB, mtx.vchSettlePayload.data() + 4, 4);
+        return nA != 0 && nB != 0;
+    }
+    return false;
+}
+
 static void EvictStaleHouseNoteOps()
 {
     AssertLockHeld(cs_main);
@@ -788,7 +836,8 @@ static void EvictStaleHouseNoteOps()
             const bool fNoteTx = (mtx.nVersion == TRANSACTION_NOTE_VERSION);
             const bool fDepositTx = (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION);
             const bool fPoolTx = (mtx.nVersion == TRANSACTION_POOL_VERSION);
-            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx)
+            const bool fSettleTx = (mtx.nVersion == TRANSACTION_SETTLE_VERSION);
+            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx)
                 continue;
 
             CValidationState stateStale;
@@ -816,6 +865,15 @@ static void EvictStaleHouseNoteOps()
                 bool fHouseChanged = false;
                 if (!CheckDepositOperation(mtx, stateStale, nNextHeight, fnGetHouse, fnGetCoin, houseResult, fHouseChanged))
                     fStale = true;
+            } else if (fSettleTx) {
+                // A settle's validity hangs on TWO non-input house records:
+                // any landed house op, another settle, a lazy eligibility flip
+                // (status / ratio / attest-recency) or plain expiry stales it.
+                // Per the codebase's own lesson: never enumerate staleness
+                // causes - re-run the REAL contextual check at height+1.
+                CHouse houseA, houseB;
+                if (!CheckSettleOperation(mtx, stateStale, nNextHeight, fnGetHouse, houseA, houseB))
+                    fStale = true;
             } else { // fPoolTx: a connected pool op moved the priors every
                      // pooled loser bound; a governance op can close the house
                      // a pending CREATE needs Open. Re-run the real check.
@@ -837,7 +895,12 @@ static void EvictStaleHouseNoteOps()
         // distinguishes an expected staleness from a consensus bug.
         LogPrintf("%s: evicting now-invalid house/note op %s from mempool (%s)\n",
                   __func__, e.first->GetHash().ToString(), e.second);
-        mempool.removeRecursive(*e.first, MemPoolRemovalReason::CONFLICT);
+        // EXPIRY, not CONFLICT: same wallet-notification rationale as the
+        // ATTEST-displacement eviction - a CONFLICT-reason removal outside a
+        // block never reaches TransactionRemovedFromMempool, leaving the
+        // owning wallet's fInMempool stale (settles_roundtrip finding; the
+        // staleness applied to house/note evictions here too).
+        mempool.removeRecursive(*e.first, MemPoolRemovalReason::EXPIRY);
     }
 }
 
@@ -1117,6 +1180,29 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             CBill billResult;
             if (!CheckBillOperation(tx, state, GetSpendHeight(view), nFees, fnGetBill, fnHaveBillHash, billResult))
                 return error("%s: CheckBillOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+        }
+
+        // Settle ops (v16): contextual admission + the dual-slot guard.
+        // The exchange takes BOTH houses' one-op-per-block slots, so it cannot
+        // co-reside with ANY pooled house-slot-taking op touching either house
+        // (ordered first in a template, either one bricks the other inside
+        // TestBlockValidity - the DR-2 class). Slot-KEYED via GetHouseSlotIDs,
+        // never enumerated. The mirror direction (incoming slot-taker vs
+        // pooled settle, incl. ATTEST-displaces) is guarded after the family
+        // blocks below; cross-block staleness heals via the eviction sweep.
+        if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+            auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
+            CHouse houseA, houseB;
+            if (!CheckSettleOperation(tx, state, GetSpendHeight(view), fnGetHouse, houseA, houseB))
+                return error("%s: CheckSettleOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                uint32_t nTheirA = 0, nTheirB = 0;
+                if (!GetHouseSlotIDs(mi->GetTx(), nTheirA, nTheirB))
+                    continue;
+                if (nTheirA == houseA.nHouseID || nTheirA == houseB.nHouseID ||
+                        (nTheirB != 0 && (nTheirB == houseA.nHouseID || nTheirB == houseB.nHouseID)))
+                    return state.DoS(0, false, REJECT_DUPLICATE, "settle-house-op-in-mempool");
+            }
         }
 
         // Contextual house checks. Consensus allows ONE house op per house per
@@ -1451,6 +1537,54 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     }
                     if (fTheirsHouseChanging && nTheirs == nPoolTouched)
                         return state.DoS(0, false, REJECT_DUPLICATE, "pool-op-in-mempool");
+                }
+            }
+        }
+
+        // Mirror settle guard, slot-keyed: the INCOMING tx takes a
+        // house slot and the mempool holds a v16 settle touching that house -
+        // the two cannot ride one block. Default: reject the incomer. The ONE
+        // exception (J2): an otherwise-valid ATTEST *displaces* the pooled
+        // settle instead - the settle is evicted and the ATTEST accepted.
+        // Rationale: settles are re-signable; attestation deadlines are not
+        // deferrable, and without displacement a hostile BMM sequencer could
+        // park a co-signed settle in the mempool, never include it, and let
+        // this very guard block the house's routine ATTEST until it derives a
+        // PUBLIC Stressed episode at zero attacker cost. Runs after the family
+        // guard blocks, so the incomer has already passed its own contextual
+        // checks ("otherwise-valid"). Placement note: eviction happens even if
+        // the ATTEST later fails fee policy - acceptable, the settle re-signs.
+        {
+            uint32_t nInA = 0, nInB = 0;
+            if (tx.nVersion != TRANSACTION_SETTLE_VERSION && GetHouseSlotIDs(tx, nInA, nInB)) {
+                const bool fAttest = tx.nVersion == TRANSACTION_HOUSE_VERSION &&
+                                     tx.nHouseOp == HOUSE_OP_ATTEST;
+                std::vector<CTransactionRef> vDisplace;
+                for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                    const CTransaction& mtx = mi->GetTx();
+                    if (mtx.nVersion != TRANSACTION_SETTLE_VERSION)
+                        continue;
+                    uint32_t nTheirA = 0, nTheirB = 0;
+                    if (!GetHouseSlotIDs(mtx, nTheirA, nTheirB))
+                        continue;
+                    if (nTheirA == nInA || nTheirB == nInA) {
+                        if (fAttest)
+                            vDisplace.push_back(mi->GetSharedTx());
+                        else
+                            return state.DoS(0, false, REJECT_DUPLICATE, "house-op-settle-in-mempool");
+                    }
+                }
+                for (const CTransactionRef& ref : vDisplace) {
+                    LogPrintf("%s: ATTEST on house %u displaces pooled settle %s\n",
+                              __func__, nInA, ref->GetHash().ToString());
+                    // EXPIRY, not CONFLICT: CMainSignals::MempoolEntryRemoved
+                    // deliberately drops BLOCK/CONFLICT removals (those reach
+                    // wallets via block-connect paths) - but this eviction
+                    // happens OUTSIDE any block, and with CONFLICT the owning
+                    // wallet's fInMempool flag would stay stale forever,
+                    // wedging AbandonTransaction and stranding the presented
+                    // bundle coins (found by the settles_roundtrip gate).
+                    pool.removeRecursive(*ref, MemPoolRemovalReason::EXPIRY);
                 }
             }
         }
@@ -3913,6 +4047,108 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
     return true;
 }
 
+/** Contextual checks for a v16 SETTLE_OP_EXCHANGE (settlement spec s4
+ * checks 8-13; check 14 - the dual house slots - is enforced at the
+ * ConnectBlock/ATMP staging layer). Side-effect-free and fJustCheck-symmetric:
+ * reads houses through the caller's closure, writes nothing. On success,
+ * houseAOut/houseBOut carry the two mutated records (nMintedUnits -= units,
+ * nLastSettleHeight = nHeight) for the caller to stage.
+ *
+ * Validity depends on NO non-input coin - no reserve proofs are carried
+ * (deliberate: they would re-enter the R-i7 template-brick class; the
+ * attest-recency conjunct in HouseParEligible is the substitute) - so the only
+ * non-input dependency is the two CHouse records, covered by the dual slots +
+ * the ATMP guard matrix. */
+bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                          CHouse& houseAOut, CHouse& houseBOut)
+{
+    if (tx.nSettleOp != SETTLE_OP_EXCHANGE)
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-op");
+    SettleExchange x;
+    if (!DecodeSettlePayload(tx.vchSettlePayload, x))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-payload");
+
+    // (8) Both houses exist and are par-eligible: effective-Open, attested
+    // ratio at/above the floor, attestation RECENT (within one cadence - the
+    // J6 conjunct). Stressed/Deferred/Insolvent/Wounddown paper cannot
+    // par-exchange; it clears through the status-ungated AMM at market.
+    CHouse houseA, houseB;
+    if (!fnGetHouse(x.nHouseA, houseA) || !fnGetHouse(x.nHouseB, houseB))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-unknown-house");
+    if (!HouseParEligible(houseA, nHeight) || !HouseParEligible(houseB, nHeight))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-house-ineligible");
+
+    // (9) Per-house cadence: an eligibility comparison, never a sweep. Also
+    // the undo-idempotence invariant (s6.1): connect requires prior==0 or
+    // height-prior >= cadence, so a stored stamp can never equal the connect
+    // height of a later settle - "already undone" and "to-undo" cannot collide.
+    auto fnCadenceOK = [nHeight](const CHouse& h) {
+        if (h.nLastSettleHeight == 0) return true;
+        if (nHeight < 0 || (uint32_t)nHeight < h.nLastSettleHeight) return false;
+        return (uint32_t)nHeight - h.nLastSettleHeight >= SETTLE_CADENCE_BLOCKS;
+    };
+    if (!fnCadenceOK(houseA) || !fnCadenceOK(houseB))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-cadence");
+
+    // (10) Priors byte-exact, BOTH houses (ATTEST pattern): DisconnectBlock
+    // restores from the payload alone, and any replay is structurally invalid.
+    if (x.nPrevMintedUnitsA != houseA.nMintedUnits ||
+            x.nPrevMintedUnitsB != houseB.nMintedUnits ||
+            x.nPrevLastSettleHeightA != houseA.nLastSettleHeight ||
+            x.nPrevLastSettleHeightB != houseB.nLastSettleHeight)
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-priors-mismatch");
+    // Defensive: the burn cannot exceed outstanding liabilities (the input
+    // layer's Sum(coins)==counter invariant makes this unreachable; belt-and-
+    // braces so the counter can never wrap).
+    if (x.nUnitsANotes > houseA.nMintedUnits || x.nUnitsBNotes > houseB.nMintedUnits)
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-exceed-minted");
+
+    // (11) Mode-1 creditor direction: dU > 0 means more of A's paper came home,
+    // A is net debtor, the residual lands on B's consensus-declared redemption
+    // key (mirror for dU < 0). Shape already pinned vout[0] as P2PKH with
+    // nValue == amountResidual; here the EXACT destination is pinned.
+    if (x.nMode == 1) {
+        const CHouse& creditor = x.nUnitsANotes > x.nUnitsBNotes ? houseB : houseA;
+        if (tx.vout.empty() ||
+                tx.vout[0].scriptPubKey != NoteScriptForPubKey(creditor.vchRedemptionDestPK))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-residual-dest");
+    }
+
+    // (12) Expiry bounds a dangling co-signed authorization (wallet default
+    // tip+72 - under HOUSE_ATTEST_STALENESS, so a floating settle can never
+    // straddle an attestation deadline).
+    if (x.nExpiryHeight != 0 && (nHeight < 0 || (uint32_t)nHeight > x.nExpiryHeight))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-expired");
+
+    // (13) Four signatures over ONE shared digest - atomic mutual consent:
+    // both houses' M-of-N approver quorums (corporate consent) and both
+    // presentment-key holders (coin authority; their P2PKH scriptSigs bind the
+    // spend, this sig binds the op semantics - the standard double-binding).
+    const uint256 hashPrevouts = SettleHashPrevouts(tx);
+    const uint256 hashOutputs = BillHashOutputs(tx);
+    const uint256 sighash = SettleExchangeSigHash(x, hashPrevouts, hashOutputs);
+    if (!VerifyHouseApprovers(houseA, x.vApproverIndexA, x.vApproverSigA,
+            sighash, houseA.nThresholdM, state, "bad-settle-approver"))
+        return false;
+    if (!VerifyHouseApprovers(houseB, x.vApproverIndexB, x.vApproverSigB,
+            sighash, houseB.nThresholdM, state, "bad-settle-approver"))
+        return false;
+    if (!CPubKey(x.vchPresentKeyOfANotes).Verify(sighash, x.vchPresentSigOfANotes) ||
+            !CPubKey(x.vchPresentKeyOfBNotes).Verify(sighash, x.vchPresentSigOfBNotes))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
+
+    // Mutations for the caller to stage: REDEEM semantics, twice, atomically -
+    // the counters only ever move against real burned coins (input layer).
+    houseAOut = houseA;
+    houseAOut.nMintedUnits -= x.nUnitsANotes;
+    houseAOut.nLastSettleHeight = (uint32_t)nHeight;
+    houseBOut = houseB;
+    houseBOut.nMintedUnits -= x.nUnitsBNotes;
+    houseBOut.nLastSettleHeight = (uint32_t)nHeight;
+    return true;
+}
+
 bool CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
@@ -4927,6 +5163,53 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write note claim undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+        }
+
+        // Settle undo (Phase 3.7 pt2, v16; s6.1 of the settlement design): the
+        // first crash-IDEMPOTENT delta undo in the file - recorded as the
+        // pattern for future dual-record ops. Two WriteHouse calls per settle
+        // means a crash can land between them; the skip branch makes the undo
+        // per-house resumable instead of demanding -reindex. Provably
+        // unambiguous: connect required nHeight - prior >= SETTLE_CADENCE_BLOCKS
+        // (or prior == 0), so a stored stamp equal to the payload prior can
+        // only mean "already undone", never "still connected". Restoration is
+        // byte-exact from the payload alone: connect required both counters
+        // and both stamps to equal the priors (the ATTEST argument). Note
+        // coins are restored by the generic CTxUndo machinery; nothing
+        // pool/bill/deposit-side is touched by any v16 path.
+        if (fHouseUndo && tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+            SettleExchange sx;
+            if (!DecodeSettlePayload(tx.vchSettlePayload, sx)) {
+                error("DisconnectBlock(): Failed to decode settle payload!");
+                return DISCONNECT_FAILED;
+            }
+            const struct { uint32_t nID; uint64_t nUnits; uint32_t nPrior; } sides[2] = {
+                { sx.nHouseA, sx.nUnitsANotes, sx.nPrevLastSettleHeightA },
+                { sx.nHouseB, sx.nUnitsBNotes, sx.nPrevLastSettleHeightB },
+            };
+            for (const auto& side : sides) {
+                CHouse house;
+                if (!phousetree->GetHouse(side.nID, house)) {
+                    error("DisconnectBlock(): Failed to read settle house %u!", side.nID);
+                    return DISCONNECT_FAILED;
+                }
+                if (house.nLastSettleHeight == side.nPrior)
+                    continue;   // already undone (crash-resume) - skip this house
+                if (house.nLastSettleHeight != (uint32_t)pindex->nHeight) {
+                    error("DisconnectBlock(): Settle undo stamp mismatch house %u!", side.nID);
+                    return DISCONNECT_FAILED;
+                }
+                if (house.nMintedUnits > (uint64_t)MAX_MONEY - side.nUnits) {
+                    error("DisconnectBlock(): Settle undo unit overflow house %u!", side.nID);
+                    return DISCONNECT_FAILED;
+                }
+                house.nMintedUnits += side.nUnits;      // exact per-op delta (never net)
+                house.nLastSettleHeight = side.nPrior;  // byte-exact from the bound prior
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write settle undo house %u!", side.nID);
                     return DISCONNECT_FAILED;
                 }
             }
@@ -6057,6 +6340,51 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 } else {
                     mapPoolUpdate[poolResult.nPoolID] = poolResult;
                 }
+            }
+        }
+
+        // Settle ops (Phase 3.7 pt2, v16): the FIRST dual-house-slot op - the
+        // exchange mutates BOTH houses' records (nMintedUnits, the cadence
+        // stamp), so it takes BOTH one-op-per-house-per-block slots; any
+        // earlier same-block house-state change on either house rejects, which
+        // keeps every per-house undo a deterministic per-op inverse (never
+        // net-delta). Under fHouseDBReplay the section is skipped ENTIRELY -
+        // v16 tags no outputs and assigns no ids (the notes precedent), and
+        // with no consensus pool reads the mixed HouseDB-ahead/PoolDB-behind
+        // crash window cannot touch v16 by construction.
+        if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+            if (!fHouseDBReplay) {
+                auto fnGetHouse = [&](uint32_t nID, CHouse& house) {
+                    std::map<uint32_t, CHouse>::const_iterator it = mapHouseUpdate.find(nID);
+                    if (it != mapHouseUpdate.end()) { house = it->second; return true; }
+                    for (const CHouse& h : vHouseNew)
+                        if (h.nHouseID == nID) { house = h; return true; }
+                    return phousetree->GetHouse(nID, house);
+                };
+                CHouse houseA, houseB;
+                if (!CheckSettleOperation(tx, state, pindex->nHeight, fnGetHouse, houseA, houseB))
+                    return error("ConnectBlock(): CheckSettleOperation on %s failed with %s",
+                        tx.GetHash().ToString(), FormatStateMessage(state));
+
+                // Both slots, checked against BOTH staging structures. A house
+                // registered this block cannot settle (its record is in
+                // vHouseNew, not the DB the payload priors were signed
+                // against); a house already changed this block cannot settle
+                // again. Note the fnGetHouse closure reads staged-first, but
+                // the slot check right here rejects any staged entry before
+                // the closure's answer could matter - staged == parent state
+                // for both houses whenever the op connects.
+                for (const uint32_t nID : {houseA.nHouseID, houseB.nHouseID}) {
+                    for (const CHouse& h : vHouseNew)
+                        if (h.nHouseID == nID)
+                            return state.DoS(100, error("ConnectBlock(): settle on house %u registered this block",
+                                nID), REJECT_INVALID, "bad-house-multiple-ops");
+                    if (mapHouseUpdate.count(nID))
+                        return state.DoS(100, error("ConnectBlock(): second house-state change for house %u this block",
+                            nID), REJECT_INVALID, "bad-house-multiple-ops");
+                }
+                mapHouseUpdate[houseA.nHouseID] = houseA;
+                mapHouseUpdate[houseB.nHouseID] = houseB;
             }
         }
 

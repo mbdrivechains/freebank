@@ -9,6 +9,7 @@
 #include <bill.h>
 #include <house.h>
 #include <pool.h>
+#include <settle.h>
 #include <note.h>
 #include <bmmcache.h>
 #include <chain.h>
@@ -4642,6 +4643,215 @@ UniValue swapnote(const JSONRPCRequest& request)
     return response;
 }
 
+UniValue proposesettle(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 5)
+        throw std::runtime_error(
+            "proposesettle\n"
+            "\nArguments:\n"
+            "1. \"ownid\"        (numeric, required) this wallet's house ID (the CREDITOR side of a residual settle)\n"
+            "2. \"counterparty\" (numeric, required) the house to settle with (its wallet runs signsettle)\n"
+            "3. \"maxunits\"     (numeric, optional, default 0 = all) cap the presented units (fires an exact-split consolidation if needed)\n"
+            "4. \"expiryblocks\" (numeric, optional, default 72) proposal + settle expiry, blocks from now\n"
+            "5. \"fee\"          (numeric or string, optional) default 0.001 - used only by a consolidation step\n"
+            "\nRound 1 of the settle ceremony: presents this wallet's counterparty-issued\n"
+            "notes (largest single-key holding). May return a consolidation txid instead -\n"
+            "re-run once it confirms. The DEBTOR must be the responder: initiate from the\n"
+            "creditor's wallet (a pure equal swap may initiate from either).\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("proposesettle", "1 2")
+            + HelpExampleRpc("proposesettle", "1 2")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nOwn = request.params[0].get_int();
+    const uint32_t nCtpy = request.params[1].get_int();
+    uint64_t nMaxUnits = 0;
+    if (request.params.size() >= 3) nMaxUnits = request.params[2].get_int64();
+    uint32_t nExpiryBlocks = 72;
+    if (request.params.size() >= 4) nExpiryBlocks = request.params[3].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 5) nFee = AmountFromValue(request.params[4]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::string strHex, strFail;
+    uint256 txidConsolidate;
+    if (!pwallet->ProposeSettle(strFail, strHex, txidConsolidate, nOwn, nCtpy, nMaxUnits, nExpiryBlocks, nFee)) {
+        if (!txidConsolidate.IsNull()) {
+            UniValue response(UniValue::VOBJ);
+            response.pushKV("status", "consolidating");
+            response.pushKV("txid", txidConsolidate.ToString());
+            response.pushKV("hint", strFail);
+            return response;
+        }
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", "proposed");
+    response.pushKV("proposal", strHex);
+    return response;
+}
+
+UniValue signsettle(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "signsettle\n"
+            "\nArguments:\n"
+            "1. \"proposal\" (string, required) the hex blob from the counterparty's proposesettle\n"
+            "2. \"fee\"      (numeric or string, optional) default 0.001\n"
+            "\nRound 2: the responder (who must be the DEBTOR, or a pure swap) presents its\n"
+            "own paper, assembles + funds the final transaction (residual at exact par to\n"
+            "the creditor's redemption key), signs its quorum + presenter + inputs, and\n"
+            "returns the part-signed tx for the initiator's completesettle.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("signsettle", "\"<proposalhex>\"")
+            + HelpExampleRpc("signsettle", "\"<proposalhex>\"")
+        );
+
+    ObserveSafeMode();
+    const std::string strProposal = request.params[0].get_str();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::string strHexTx, strFail;
+    if (!pwallet->SignSettle(strFail, strHexTx, strProposal, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("hex", strHexTx);
+    return response;
+}
+
+UniValue completesettle(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "completesettle\n"
+            "\nArguments:\n"
+            "1. \"hex\" (string, required) the part-signed tx from the counterparty's signsettle\n"
+            "\nRound 3 (final): the initiator verifies the terms (a residual must pay THIS\n"
+            "house's redemption key), counter-signs its quorum + presenter + inputs, and\n"
+            "broadcasts. Returns the settle txid.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("completesettle", "\"<txhex>\"")
+            + HelpExampleRpc("completesettle", "\"<txhex>\"")
+        );
+
+    ObserveSafeMode();
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->CompleteSettle(strFail, txid, request.params[0].get_str())) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue listpresentable(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "listpresentable\n"
+            "\nArguments:\n"
+            "1. \"id\" (numeric, required) the issuing house whose paper to inventory\n"
+            "\nThis wallet's presentable (undemanded) notes of that issue, grouped by\n"
+            "holder key, largest first - a settle bundle must ride ONE key.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listpresentable", "2")
+            + HelpExampleRpc("listpresentable", "2")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<CWallet::PresentableGroup> vGroups;
+    pwallet->ListPresentableNotes(nHouseID, vGroups);
+    UniValue response(UniValue::VARR);
+    for (const CWallet::PresentableGroup& g : vGroups) {
+        UniValue o(UniValue::VOBJ);
+        o.pushKV("holder_pubkey", HexStr(g.vchHolderPubKey));
+        o.pushKV("units", g.nUnits);
+        o.pushKV("coins", (uint64_t)g.nCoins);
+        response.push_back(o);
+    }
+    return response;
+}
+
+UniValue listsettlements(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "listsettlements\n"
+            "\nEvery v16 settle this wallet has seen (either side), decoded - txid-keyed\n"
+            "so board/panel numbers stay chain-addressable.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listsettlements", "")
+            + HelpExampleRpc("listsettlements", "")
+        );
+
+    ObserveSafeMode();
+    LOCK2(cs_main, pwallet->cs_wallet);
+    UniValue response(UniValue::VARR);
+    for (const auto& entry : pwallet->mapWallet) {
+        const CWalletTx* pcoin = &entry.second;
+        if (pcoin->tx->nVersion != TRANSACTION_SETTLE_VERSION)
+            continue;
+        SettleExchange x;
+        if (!DecodeSettlePayload(pcoin->tx->vchSettlePayload, x))
+            continue;
+        UniValue o(UniValue::VOBJ);
+        o.pushKV("txid", entry.first.ToString());
+        o.pushKV("house_a", (uint64_t)x.nHouseA);
+        o.pushKV("house_b", (uint64_t)x.nHouseB);
+        o.pushKV("units_a_retired", x.nUnitsANotes);
+        o.pushKV("units_b_retired", x.nUnitsBNotes);
+        o.pushKV("mode", x.nMode == 1 ? "residual" : "swap");
+        o.pushKV("residual_sats", x.amountResidual);
+        const int nDepth = pcoin->GetDepthInMainChain();
+        o.pushKV("confirmations", nDepth);
+        response.push_back(o);
+    }
+    return response;
+}
+
 UniValue registerhouse(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -5937,6 +6147,11 @@ static const CRPCCommand commands[] =
     { "pools",              "retirepool",                       &retirepool,                    {"id", "fee"} },
     { "pools",              "swapnote",                         &swapnote,                      {"id", "direction", "amountin", "minout", "fee"} },
     { "pools",              "listmylp",                         &listmylp,                      {} },
+    { "settle",             "proposesettle",                    &proposesettle,                 {"ownid", "counterparty", "maxunits", "expiryblocks", "fee"} },
+    { "settle",             "signsettle",                       &signsettle,                    {"proposal", "fee"} },
+    { "settle",             "completesettle",                   &completesettle,                {"hex"} },
+    { "settle",             "listpresentable",                  &listpresentable,               {"id"} },
+    { "settle",             "listsettlements",                  &listsettlements,               {} },
     { "houses",             "registerhouse",                    &registerhouse,                 {"tier", "threshold", "classid", "denommg", "pledges", "fee"} },
     { "houses",             "topuphouse",                       &topuphouse,                    {"id", "partner", "amount", "fee"} },
     { "houses",             "admitpartner",                     &admitpartner,                  {"id", "pledge", "fee"} },

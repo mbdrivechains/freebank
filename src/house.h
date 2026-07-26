@@ -204,7 +204,12 @@ static const uint32_t HOUSE_CD_MAX_SUSPENDED    = 38880;   // ~9 months
 // CHouse on-disk serialization version (D10). v4 = 3.5 layout (option-clause
 // state). Any record with a different version byte is rejected at read - each
 // layout change bumps this and adds a guarded migration.
-static const uint8_t HOUSE_SER_VERSION = 6;
+// v7 (settlement Phase A): nLastSettleHeight - the per-house settle cadence
+// stamp. Migration is CODE-ENFORCED read-by-stored-version: a v6 record reads
+// at its old layout and the field defaults to 0 (never settled) - an
+// un-upgraded record can never silently misread, and reindexed vs
+// non-reindexed nodes hold identical bytes.
+static const uint8_t HOUSE_SER_VERSION = 7;
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -305,6 +310,11 @@ struct CHouse {
     uint64_t nDepositWtMatHi;
     uint64_t nDepositWtMatLo;
     uint64_t nInsolventDepositPrincipal;
+    // Settlement Phase A (v7): height of this house's last SETTLE_OP_EXCHANGE
+    // (0 = never). Cadence is an eligibility comparison against this stamp -
+    // never a sweep. Mutated only by the settle connect/undo (payload-prior
+    // bound, ATTEST pattern).
+    uint32_t nLastSettleHeight;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -313,7 +323,7 @@ struct CHouse {
                nDeferInvokedHeight(0), nDeferRenewals(0), nDeferCumBlocks(0),
                nDeferActivations(0), nDeferLastActivation(0), nDeferEndedHeight(0),
                nDepositUnits(0), nDepositWtMatHi(0), nDepositWtMatLo(0),
-               nInsolventDepositPrincipal(0) {}
+               nInsolventDepositPrincipal(0), nLastSettleHeight(0) {}
 
     /** The 128-bit weighted-maturity accumulator Sigma(principal_i * maturity_i). */
     unsigned __int128 DepositWtMaturity() const
@@ -400,6 +410,11 @@ struct CHouse {
         // a record keeps the (old) uncapped accrual until the next recovery.
         if (nSerVersion >= 6) {
             READWRITE(nDeferEndedHeight);
+        }
+        // v7 (settlement Phase A): the per-house settle cadence stamp. A v6
+        // record defaults to 0 = never settled (immediately cadence-eligible).
+        if (nSerVersion >= 7) {
+            READWRITE(nLastSettleHeight);
         }
     }
 
@@ -823,6 +838,17 @@ uint32_t HouseBrassageBps(const CHouse& house);
 
 /** The spread owed on redeeming nUnits at nBps. Floor division; 128-bit. */
 CAmount HouseBrassageAmount(uint64_t nUnits, uint32_t nBps);
+
+/** Par-eligibility for the settlement layer (Phase A) - pure derivation, no
+ * state: effective-Open AND attested ratio at/above the floor AND the
+ * attestation RECENT (within one cadence - stricter than Open's tolerance of
+ * up to HOUSE_ATTEST_MISS_N windows; halves the attest-flash window and
+ * aligns settle with MINT's recency demand, though deliberately WITHOUT
+ * MINT's live reserve proofs - carrying proofs would re-enter the R-i7
+ * non-input-coin template-brick class). The first two conjuncts are exactly
+ * the condition under which HouseBrassageBps returns 0: par at settlement
+ * coincides with par at the redemption window, on the same attested facts. */
+bool HouseParEligible(const CHouse& house, int nHeight);
 
 /** Weighted-average REMAINING term (blocks) of the house's outstanding term
  * deposits at height nHeight: (Sigma(principal*maturity) / Sigma(principal)) -

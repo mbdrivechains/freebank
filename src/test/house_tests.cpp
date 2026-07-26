@@ -522,11 +522,12 @@ BOOST_AUTO_TEST_CASE(house_v4_to_v5_migration)
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << house;
     std::vector<char> bytes(ss.begin(), ss.end());
-    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)6);
+    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)7);
     bytes[0] = (char)4;                 // stamp as v4
-    // Drop the v5 addendum (four zeroed u64 deposit fields, 32B) AND the v6
-    // addendum (zeroed u32 nDeferEndedHeight, 4B) - both post-date v4.
-    bytes.resize(bytes.size() - 36);
+    // Drop the v5 addendum (four zeroed u64 deposit fields, 32B), the v6
+    // addendum (zeroed u32 nDeferEndedHeight, 4B) AND the v7 addendum (zeroed
+    // u32 nLastSettleHeight, 4B) - all post-date v4.
+    bytes.resize(bytes.size() - 40);
 
     CDataStream ssV4(bytes, SER_NETWORK, PROTOCOL_VERSION);
     CHouse h2;
@@ -562,9 +563,10 @@ BOOST_AUTO_TEST_CASE(house_v5_to_v6_migration)
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << house;
     std::vector<char> bytes(ss.begin(), ss.end());
-    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)6);
+    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)7);
     bytes[0] = (char)5;                 // stamp as v5
-    bytes.resize(bytes.size() - 4);     // drop the zeroed u32 nDeferEndedHeight
+    // Drop the zeroed u32 nDeferEndedHeight (v6) + zeroed u32 nLastSettleHeight (v7).
+    bytes.resize(bytes.size() - 8);
 
     CDataStream ssV5(bytes, SER_NETWORK, PROTOCOL_VERSION);
     CHouse h2;

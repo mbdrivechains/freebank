@@ -991,6 +991,10 @@ static UniValue HouseToJSON(const CHouse& house)
         obj.pushKV("lastattestheight", (uint64_t)house.nLastAttestHeight);
         obj.pushKV("lastattestreserves", ValueFromAmount(house.amountLastAttestReserves));
         obj.pushKV("lastattestreserves_grams", GramsUV((int64_t)house.amountLastAttestReserves));
+        // Settlement (Phase 3.7 pt2): the per-house cadence stamp + the derived
+        // par-eligibility the clearing board keys its "par lamp" on.
+        obj.pushKV("lastsettleheight", (uint64_t)house.nLastSettleHeight);
+        obj.pushKV("pareligible", HouseParEligible(house, chainActive.Height()));
         if (house.nInsolventHeight != 0) {
             obj.pushKV("insolventheight", (uint64_t)house.nInsolventHeight);
             obj.pushKV("insolventunits", house.nInsolventUnits);

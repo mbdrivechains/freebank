@@ -19,6 +19,7 @@ static const int TRANSACTION_HOUSE_VERSION = 12;
 static const int TRANSACTION_NOTE_VERSION = 13;
 static const int TRANSACTION_DEPOSIT_VERSION = 14;   // Phase 3.8 term deposits
 static const int TRANSACTION_POOL_VERSION = 15;      // Phase 3.7 AMM pools
+static const int TRANSACTION_SETTLE_VERSION = 16;    // Phase 3.7 pt2 settlement (SETTLE_EXCHANGE)
 
 /** An outpoint - a combination of a transaction hash and an index n into its vout */
 class COutPoint
@@ -280,6 +281,11 @@ inline void UnserializeTransaction(TxType& tx, Stream& s) {
         s >> tx.nPoolOp;
         s >> tx.vchPoolPayload;
     }
+
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+        s >> tx.nSettleOp;
+        s >> tx.vchSettlePayload;
+    }
 }
 
 template<typename Stream, typename TxType>
@@ -342,6 +348,11 @@ inline void SerializeTransaction(const TxType& tx, Stream& s) {
         s << tx.nPoolOp;
         s << tx.vchPoolPayload;
     }
+
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+        s << tx.nSettleOp;
+        s << tx.vchSettlePayload;
+    }
 }
 
 
@@ -358,7 +369,7 @@ public:
     // adapting relay policy by bumping MAX_STANDARD_VERSION, and then later date
     // bumping the default CURRENT_VERSION at which point both CURRENT_VERSION and
     // MAX_STANDARD_VERSION will be equal.
-    static const int32_t MAX_STANDARD_VERSION=15;
+    static const int32_t MAX_STANDARD_VERSION=16;
 
     // The local variables are made const to prevent unintended modification
     // without updating the cached hash value. However, CTransaction is not
@@ -390,6 +401,9 @@ public:
 
     const uint8_t nPoolOp;
     const std::vector<unsigned char> vchPoolPayload;
+
+    const uint8_t nSettleOp;
+    const std::vector<unsigned char> vchSettlePayload;
 
 private:
     /** Memory only. */
@@ -493,6 +507,9 @@ struct CMutableTransaction
 
     uint8_t nPoolOp = 0;
     std::vector<unsigned char> vchPoolPayload;
+
+    uint8_t nSettleOp = 0;
+    std::vector<unsigned char> vchSettlePayload;
 
     CMutableTransaction();
     CMutableTransaction(const CTransaction& tx);

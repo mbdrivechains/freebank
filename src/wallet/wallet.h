@@ -1070,6 +1070,26 @@ public:
     /** Swap at x*y=k: fNoteToBtx ? notes in, sats out : sats in, notes out.
      * nMinOut is the consensus slippage guard. */
     bool SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID, bool fNoteToBtx, uint64_t nAmountIn, uint64_t nMinOut, const CAmount& nFee);
+
+    /** Settlement ceremony (Phase 3.7 pt2). ProposeSettle: export the
+     * round-1 blob presenting this wallet's counterparty-issued paper (largest
+     * single-key holding; if fragmented, fires ONE consolidating TransferNote
+     * toward the largest key and reports it via txidConsolidate - re-run once
+     * confirmed; iterated calls converge). SignSettle: the responder (must be
+     * the debtor, or a pure swap) assembles + part-signs the full tx.
+     * CompleteSettle: the initiator counter-signs and broadcasts. */
+    bool ProposeSettle(std::string& strFail, std::string& strHexOut, uint256& txidConsolidate,
+                       uint32_t nOwnHouseID, uint32_t nCounterpartyHouseID,
+                       uint64_t nMaxUnits, uint32_t nExpiryBlocks, const CAmount& nFee);
+    bool SignSettle(std::string& strFail, std::string& strHexTxOut,
+                    const std::string& strHexProposal, const CAmount& nFee);
+    bool CompleteSettle(std::string& strFail, uint256& txidOut, const std::string& strHexTx);
+    struct PresentableGroup {
+        std::vector<unsigned char> vchHolderPubKey;
+        uint64_t nUnits;
+        size_t nCoins;
+    };
+    void ListPresentableNotes(uint32_t nIssuerHouseID, std::vector<PresentableGroup>& vOut);
     /** Terminal teardown of a floored pool (S == MIN_LIQUIDITY): burns the
      * residual note-units from the house and force-pays the floor BTX to the
      * house redemption key, deleting the record. Single-partner trigger at

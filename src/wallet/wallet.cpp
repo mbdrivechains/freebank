@@ -8,12 +8,14 @@
 #include <bill.h>
 #include <deposit.h>
 #include <pool.h>
+#include <settle.h>
 #include <house.h>
 #include <note.h>
 #include <txdb.h>
 
 #include <base58.h>
 #include <checkpoints.h>
+#include <core_io.h>
 #include <chain.h>
 #include <wallet/coincontrol.h>
 #include <consensus/consensus.h>
@@ -1958,6 +1960,18 @@ bool CWalletTx::IsTrusted() const
         // Transactions not sent by us: not trusted
         const CWalletTx* parent = pwallet->GetWalletTx(txin.prevout.hash);
         if (parent == nullptr)
+            return false;
+        // Bounds-check the parent output before indexing it. Upstream 0.16
+        // indexes blind, which turns any wallet entry whose input references a
+        // missing/short parent vout into an out-of-bounds READ - the CScript
+        // handed to Solver() is then garbage and IsPayToScriptHash() faults.
+        // Observed on the droplet 2026-07-26 as a deterministic freebankd
+        // SIGSEGV inside getbalance -> IsTrusted -> IsMine -> Solver ->
+        // IsPayToScriptHash (backtrace from the core dump), which crashloops
+        // the node because the wallet is polled constantly. An unresolvable
+        // parent output cannot be proven ours, so the honest answer is "not
+        // trusted" - never a crash.
+        if (!parent->tx || txin.prevout.n >= parent->tx->vout.size())
             return false;
         const CTxOut& parentOut = parent->tx->vout[txin.prevout.n];
         if (pwallet->IsMine(parentOut) != ISMINE_SPENDABLE)
@@ -3952,10 +3966,20 @@ static void CollectWalletNoteCoins(CWallet* pwallet, uint32_t nHouseID,
     }
 }
 
+static bool HouseStateChangePending(uint32_t nHouseID);   // defined below (settle-aware)
+
 bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee)
 {
     strFail = "Unknown error!";
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    // Fail fast if the mempool already holds a house-state-changing op for this
+    // house - incl. a v16 SETTLE, which takes BOTH its houses' slots. Without
+    // this the ATMP guard still rejects, but CommitTransaction does not surface
+    // that to the RPC caller (the house-review precedent).
+    if (HouseStateChangePending(nHouseID)) {
+        strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
+        return false;
+    }
     if (nUnits == 0 || nUnits > (uint64_t)MAX_MONEY) { strFail = "Invalid note units!"; return false; }
 
     BlockUntilSyncedToCurrentChain();
@@ -5385,6 +5409,14 @@ static bool HouseStateChangePending(uint32_t nHouseID)
         } else if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.nPoolOp == POOL_OP_RETIRE &&
                 mtx.vchPoolPayload.size() >= 4) {
             memcpy(&nTheirs, mtx.vchPoolPayload.data(), 4); fMatch = true;
+        } else if (mtx.nVersion == TRANSACTION_SETTLE_VERSION &&
+                mtx.vchSettlePayload.size() >= 8) {
+            // Dual-slot: a pooled settle takes BOTH houses' slots.
+            uint32_t nTheirA = 0, nTheirB = 0;
+            memcpy(&nTheirA, mtx.vchSettlePayload.data(), 4);
+            memcpy(&nTheirB, mtx.vchSettlePayload.data() + 4, 4);
+            if (nTheirA == nHouseID || nTheirB == nHouseID)
+                return true;
         }
         if (fMatch && nTheirs == nHouseID)
             return true;
@@ -6028,6 +6060,492 @@ bool CWallet::SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID,
     CValidationState state;
     if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
         strFail = "Failed to commit swap! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Settlement ceremony (Phase 3.7 pt2). Wallet protocol, not consensus.
+
+/** Sign the shared digest with this wallet's ACTIVE approver keys for `house`,
+ * ascending indices, stopping at exactly thresholdM (VerifyHouseApprovers
+ * demands exactly M). */
+static bool SignSettleApprovers(CWallet* pwallet, const CHouse& house, const uint256& sighash,
+                                std::vector<uint32_t>& vIdx,
+                                std::vector<std::vector<unsigned char>>& vSig, std::string& strFail)
+{
+    for (size_t i = 0; i < house.vPartner.size() && vIdx.size() < house.nThresholdM; i++) {
+        const HousePartner& p = house.vPartner[i];
+        if (p.status != HOUSE_PARTNER_ACTIVE)
+            continue;
+        CKey key;
+        if (!pwallet->GetKey(CPubKey(p.vchPubKey).GetID(), key))
+            continue;
+        std::vector<unsigned char> sig;
+        if (!key.Sign(sighash, sig))
+            continue;
+        vIdx.push_back((uint32_t)i);
+        vSig.push_back(sig);
+    }
+    if (vIdx.size() < house.nThresholdM) {
+        strFail = strprintf("This wallet holds only %u of the %u approver keys house %u requires!",
+                            (unsigned)vIdx.size(), house.nThresholdM, house.nHouseID);
+        return false;
+    }
+    return true;
+}
+
+/** Advisory pre-flight shared by the ceremony steps: both houses exist,
+ * par-eligible, cadence-clear, and no pooled house-slot op touches either
+ * (the connect-time checks are the real gate; failing fast here beats an
+ * opaque CommitTransaction reject). */
+static bool SettlePreflight(uint32_t nA, uint32_t nB, CHouse& houseA, CHouse& houseB, std::string& strFail)
+{
+    if (!phousetree->GetHouse(nA, houseA) || !phousetree->GetHouse(nB, houseB)) {
+        strFail = "Unknown house!"; return false;
+    }
+    const int nHeight = chainActive.Height();
+    if (!HouseParEligible(houseA, nHeight) || !HouseParEligible(houseB, nHeight)) {
+        strFail = "A house is not par-eligible (must be Open, at/above the reserve floor, and attested within one cadence)!";
+        return false;
+    }
+    for (const CHouse* h : {&houseA, &houseB}) {
+        if (h->nLastSettleHeight != 0 && (uint32_t)nHeight < h->nLastSettleHeight + SETTLE_CADENCE_BLOCKS) {
+            strFail = strprintf("House %u settled at height %u - cadence window (%u blocks) not yet open!",
+                                h->nHouseID, h->nLastSettleHeight, SETTLE_CADENCE_BLOCKS);
+            return false;
+        }
+    }
+    if (HouseStateChangePending(nA) || HouseStateChangePending(nB)) {
+        strFail = "A house-state-changing op for one of these houses is already pending - retry next block!";
+        return false;
+    }
+    return true;
+}
+
+/** A displaced/evicted settle (ATTEST-displaces at ATMP, the staleness sweep)
+ * is re-signable by design - but the completer's wallet still holds the
+ * unbroadcast copy, which encumbers the presented bundle coins until it is
+ * abandoned. Free them: abandon any of OUR unconfirmed v16 txs touching either
+ * house that is no longer in the mempool. (The responder never commits its
+ * half, so only the completer's wallet needs this.) */
+static void AbandonDisplacedSettles(CWallet* pwallet, uint32_t nHouseA, uint32_t nHouseB)
+{
+    std::vector<uint256> vAbandon;
+    for (auto& entry : pwallet->mapWallet) {
+        CWalletTx& wtx = entry.second;
+        if (wtx.tx->nVersion != TRANSACTION_SETTLE_VERSION)
+            continue;
+        // Resync the cached mempool flag from the POOL ITSELF before trusting
+        // it: removal notifications are scheduler-async (and CONFLICT/BLOCK
+        // reasons never arrive at all), so a displaced settle can carry a
+        // stale fInMempool == true - which would also wedge the
+        // AbandonTransaction below via its own InMempool() guard.
+        {
+            LOCK(mempool.cs);
+            wtx.fInMempool = mempool.exists(entry.first);
+        }
+        if (wtx.GetDepthInMainChain() != 0 || wtx.InMempool() || wtx.isAbandoned())
+            continue;
+        uint32_t nA = 0, nB = 0;
+        if (wtx.tx->vchSettlePayload.size() >= 8) {
+            memcpy(&nA, wtx.tx->vchSettlePayload.data(), 4);
+            memcpy(&nB, wtx.tx->vchSettlePayload.data() + 4, 4);
+        }
+        if (nA == nHouseA || nA == nHouseB || nB == nHouseA || nB == nHouseB)
+            vAbandon.push_back(entry.first);
+    }
+    for (const uint256& txid : vAbandon) {
+        LogPrintf("%s: abandoning displaced settle %s\n", __func__, txid.ToString());
+        pwallet->AbandonTransaction(txid);
+    }
+}
+
+bool CWallet::ProposeSettle(std::string& strFail, std::string& strHexOut, uint256& txidConsolidate,
+                            uint32_t nOwnHouseID, uint32_t nCounterpartyHouseID,
+                            uint64_t nMaxUnits, uint32_t nExpiryBlocks, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    strHexOut.clear();
+    txidConsolidate.SetNull();
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    if (nOwnHouseID == nCounterpartyHouseID) { strFail = "A house cannot settle with itself!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    CHouse houseOwn, houseCtpy;
+    if (!SettlePreflight(nOwnHouseID, nCounterpartyHouseID, houseOwn, houseCtpy, strFail))
+        return false;
+    AbandonDisplacedSettles(this, nOwnHouseID, nCounterpartyHouseID);
+
+    // What we present: COUNTERPARTY-issued paper this wallet holds, on ONE key
+    // (the v16 input rule). Prefer an exact-match key when a cap is given;
+    // split/merge via TransferNote otherwise and report the consolidation.
+    std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
+    CollectWalletNoteCoins(this, nCounterpartyHouseID, mapByHolder);
+    const std::vector<WalletNoteCoin>* pBest = nullptr;
+    uint64_t nBestUnits = 0;
+    const std::vector<WalletNoteCoin>* pExact = nullptr;
+    for (const auto& kv : mapByHolder) {
+        if (kv.first.second != 0)
+            continue;   // demanded notes cannot be presented
+        uint64_t nTotal = 0;
+        for (const WalletNoteCoin& c : kv.second)
+            nTotal += c.units;
+        if (nTotal == 0)
+            continue;
+        if (nMaxUnits > 0 && nTotal == nMaxUnits)
+            pExact = &kv.second;
+        if (nTotal > nBestUnits) { nBestUnits = nTotal; pBest = &kv.second; }
+    }
+    if (!pBest) { strFail = strprintf("No presentable (undemanded) notes of house %u held!", nCounterpartyHouseID); return false; }
+
+    const std::vector<WalletNoteCoin>* pUse = pBest;
+    uint64_t nUseUnits = nBestUnits;
+    if (nMaxUnits > 0) {
+        if (pExact) {
+            pUse = pExact;
+            nUseUnits = nMaxUnits;
+        } else if (nBestUnits > nMaxUnits) {
+            // Exact split: TransferNote sends EXACTLY nMaxUnits to a fresh key
+            // (change returns to the source holder). Re-run once confirmed.
+            CPubKey pubFresh;
+            if (!GetKeyFromPool(pubFresh)) { strFail = "Keypool ran out!"; return false; }
+            if (!TransferNote(strFail, txidConsolidate, nCounterpartyHouseID, nMaxUnits, nFee,
+                              GetScriptForDestination(pubFresh.GetID())))
+                return false;
+            strFail = "Consolidating an exact-sum bundle - re-run proposesettle once the split confirms.";
+            return false;
+        }   // else: best-effort under the cap - present the largest key as-is
+    }
+    if (pUse->size() > SETTLE_MAX_BUNDLE_INPUTS) {
+        // Merge the key's fragments into one coin (self-transfer of the full
+        // holding re-issues it as a single note coin). Re-run once confirmed.
+        if (!TransferNote(strFail, txidConsolidate, nCounterpartyHouseID, nUseUnits, nFee,
+                          (*pUse)[0].script))
+            return false;
+        strFail = "Merging a fragmented bundle - re-run proposesettle once the merge confirms.";
+        return false;
+    }
+
+    SettleProposalV1 prop;
+    prop.nHouseInitiator = nOwnHouseID;
+    prop.nHouseCounterparty = nCounterpartyHouseID;
+    prop.nUnitsPresented = nUseUnits;
+    prop.vchPresentKey = (*pUse)[0].vchHolderPubKey;
+    for (const WalletNoteCoin& c : *pUse)
+        prop.vBundle.push_back(c.outpoint);
+    prop.nExpiryHeight = (uint32_t)chainActive.Height() + (nExpiryBlocks ? nExpiryBlocks : 72);
+
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << prop;
+    strHexOut = HexStr(ss.begin(), ss.end());
+    return true;
+}
+
+bool CWallet::SignSettle(std::string& strFail, std::string& strHexTxOut,
+                         const std::string& strHexProposal, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    strHexTxOut.clear();
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+
+    SettleProposalV1 prop;
+    if (!IsHex(strHexProposal)) { strFail = "Proposal is not hex!"; return false; }
+    try {
+        std::vector<unsigned char> vch = ParseHex(strHexProposal);
+        CDataStream ss(vch, SER_NETWORK, PROTOCOL_VERSION);
+        ss >> prop;
+        if (!ss.empty()) { strFail = "Trailing bytes in proposal!"; return false; }
+    } catch (const std::exception&) { strFail = "Undecodable proposal!"; return false; }
+    if (prop.nVersion != 1) { strFail = "Unknown proposal version!"; return false; }
+    if (prop.vBundle.empty() || prop.vBundle.size() > SETTLE_MAX_BUNDLE_INPUTS ||
+            prop.nUnitsPresented == 0) { strFail = "Malformed proposal!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    // We are the responder: prop.nHouseCounterparty is OUR house; the paper the
+    // initiator presents is OUR issue, held on the initiator's presentment key.
+    const uint32_t nOwn = prop.nHouseCounterparty;
+    const uint32_t nCtpy = prop.nHouseInitiator;
+    CHouse houseOwn, houseCtpy;
+    if (!SettlePreflight(nOwn, nCtpy, houseOwn, houseCtpy, strFail))
+        return false;
+    AbandonDisplacedSettles(this, nOwn, nCtpy);
+    if (prop.nExpiryHeight != 0 && (uint32_t)chainActive.Height() >= prop.nExpiryHeight) {
+        strFail = "Proposal expired!"; return false;
+    }
+
+    // Verify the initiator's bundle against confirmed state: our issue, pure
+    // fNote, undemanded, on the declared key, exact sum.
+    const CScript scriptTheirs = NoteScriptForPubKey(prop.vchPresentKey);
+    uint64_t nUnitsTheirs = 0;
+    for (const COutPoint& out : prop.vBundle) {
+        Coin coin;
+        if (!pcoinsTip->GetCoin(out, coin) || coin.IsSpent()) { strFail = "A proposed bundle coin is missing/spent!"; return false; }
+        if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
+                coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID ||
+                coin.nHouseID != nOwn || coin.nDemandHeight != 0 ||
+                coin.out.scriptPubKey != scriptTheirs) {
+            strFail = "A proposed bundle coin is not a clean presentable note of our issue!"; return false;
+        }
+        nUnitsTheirs += coin.nNoteUnits;
+    }
+    if (nUnitsTheirs != prop.nUnitsPresented) { strFail = "Proposed bundle sum mismatch!"; return false; }
+
+    // Our side: the largest single-key holding of the INITIATOR's issue.
+    std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
+    CollectWalletNoteCoins(this, nCtpy, mapByHolder);
+    const std::vector<WalletNoteCoin>* pMine = nullptr;
+    uint64_t nUnitsMine = 0;
+    for (const auto& kv : mapByHolder) {
+        if (kv.first.second != 0)
+            continue;
+        uint64_t nTotal = 0;
+        for (const WalletNoteCoin& c : kv.second)
+            nTotal += c.units;
+        if (nTotal > nUnitsMine && kv.second.size() <= SETTLE_MAX_BUNDLE_INPUTS) {
+            nUnitsMine = nTotal; pMine = &kv.second;
+        }
+    }
+    if (!pMine) { strFail = strprintf("No presentable notes of house %u held - nothing to exchange!", nCtpy); return false; }
+
+    // Canonical A/B by dense id; each bundle is keyed by its ISSUER, presented
+    // by the OTHER side. Direction: dU = unitsA - unitsB; dU > 0 -> A debtor.
+    const bool fOwnIsA = nOwn < nCtpy;
+    const uint64_t nUnitsA = fOwnIsA ? nUnitsTheirs : nUnitsMine;   // A-issued
+    const uint64_t nUnitsB = fOwnIsA ? nUnitsMine : nUnitsTheirs;   // B-issued
+    const uint64_t dU = nUnitsA >= nUnitsB ? nUnitsA - nUnitsB : nUnitsB - nUnitsA;
+    const uint8_t nMode = dU != 0 ? 1 : 0;
+    if (nMode == 1) {
+        const uint32_t nDebtor = nUnitsA > nUnitsB ? (fOwnIsA ? nOwn : nCtpy)
+                                                   : (fOwnIsA ? nCtpy : nOwn);
+        if (nDebtor != nOwn) {
+            strFail = "This side would be the CREDITOR - the debtor must respond (initiate the settle from the creditor's wallet)!";
+            return false;
+        }
+        if ((CAmount)dU < SETTLE_MIN_RESIDUAL) {
+            strFail = strprintf("Residual %u sats is below the %d floor - adjust presented units toward a pure swap!",
+                                (unsigned)dU, (int)SETTLE_MIN_RESIDUAL);
+            return false;
+        }
+    }
+    const CHouse& houseA = fOwnIsA ? houseOwn : houseCtpy;
+    const CHouse& houseB = fOwnIsA ? houseCtpy : houseOwn;
+
+    SettleExchange x;
+    x.nHouseA = houseA.nHouseID;
+    x.nHouseB = houseB.nHouseID;
+    x.nMode = nMode;
+    x.nUnitsANotes = nUnitsA;
+    x.nUnitsBNotes = nUnitsB;
+    x.nCountANotes = (uint16_t)(fOwnIsA ? prop.vBundle.size() : pMine->size());
+    x.nCountBNotes = (uint16_t)(fOwnIsA ? pMine->size() : prop.vBundle.size());
+    x.vchPresentKeyOfANotes = fOwnIsA ? prop.vchPresentKey : (*pMine)[0].vchHolderPubKey;
+    x.vchPresentKeyOfBNotes = fOwnIsA ? (*pMine)[0].vchHolderPubKey : prop.vchPresentKey;
+    x.amountResidual = nMode == 1 ? (CAmount)dU : 0;   // exact par
+    x.nPrevMintedUnitsA = houseA.nMintedUnits;
+    x.nPrevMintedUnitsB = houseB.nMintedUnits;
+    x.nPrevLastSettleHeightA = houseA.nLastSettleHeight;
+    x.nPrevLastSettleHeightB = houseB.nLastSettleHeight;
+    x.nExpiryHeight = prop.nExpiryHeight;
+
+    // Skeleton: A-bundle, B-bundle, then OUR funding (we are debtor-or-swap:
+    // residual + fee). vout[0] = residual to the CREDITOR's declared key.
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_SETTLE_VERSION;
+    mtx.nSettleOp = SETTLE_OP_EXCHANGE;
+    const std::vector<COutPoint>* pFirst;   // the A-issued bundle's outpoints
+    std::vector<COutPoint> vMineOut;
+    for (const WalletNoteCoin& c : *pMine)
+        vMineOut.push_back(c.outpoint);
+    pFirst = fOwnIsA ? &prop.vBundle : &vMineOut;
+    const std::vector<COutPoint>* pSecond = fOwnIsA ? &vMineOut : &prop.vBundle;
+    for (const COutPoint& out : *pFirst)
+        mtx.vin.push_back(CTxIn(out, CScript()));
+    for (const COutPoint& out : *pSecond)
+        mtx.vin.push_back(CTxIn(out, CScript()));
+
+    if (nMode == 1) {
+        const CHouse& creditor = nUnitsA > nUnitsB ? houseB : houseA;
+        mtx.vout.push_back(CTxOut(x.amountResidual, NoteScriptForPubKey(creditor.vchRedemptionDestPK)));
+    }
+
+    const CAmount nTarget = (nMode == 1 ? x.amountResidual : 0) + nFee;
+    std::vector<COutput> vCoins;
+    AvailableCoins(vCoins, true);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the residual + fee!"; return false; }
+    CReserveKey reserveKey(this);
+    const CAmount nChange = nAmountRet - nTarget;
+    if (nChange > 0) {
+        CPubKey pubChange;
+        if (!reserveKey.GetReservedKey(pubChange)) { strFail = "Keypool ran out!"; return false; }
+        CTxOut out(nChange, GetScriptForDestination(pubChange.GetID()));
+        if (!IsDust(out, ::dustRelayFee)) mtx.vout.push_back(out);
+    }
+    reserveKey.KeepKey();
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
+    // Payload signatures: OUR quorum + OUR presenter over the shared digest
+    // (the skeleton is final; the initiator's signatures land later - the
+    // digest excludes sig fields and P2PKH sighash excludes the trailer).
+    const CTransaction ctxDigest(mtx);
+    const uint256 sighash = SettleExchangeSigHash(x, SettleHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
+    {
+        std::vector<uint32_t>& vIdx = fOwnIsA ? x.vApproverIndexA : x.vApproverIndexB;
+        std::vector<std::vector<unsigned char>>& vSig = fOwnIsA ? x.vApproverSigA : x.vApproverSigB;
+        if (!SignSettleApprovers(this, houseOwn, sighash, vIdx, vSig, strFail))
+            return false;
+    }
+    {
+        CKey keyPresent;
+        if (!GetKey(CPubKey((*pMine)[0].vchHolderPubKey).GetID(), keyPresent)) { strFail = "Presenter key missing!"; return false; }
+        std::vector<unsigned char>& vchSig = fOwnIsA ? x.vchPresentSigOfBNotes : x.vchPresentSigOfANotes;
+        if (!keyPresent.Sign(sighash, vchSig)) { strFail = "Failed to sign as presenter!"; return false; }
+        // Placeholder for the initiator's slots so the payload decodes with a
+        // well-formed shape downstream (completesettle replaces them).
+    }
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << x;
+    mtx.vchSettlePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+
+    // scriptSig-sign OUR bundle inputs + funding inputs on the final skeleton.
+    const CTransaction txToSign(mtx);
+    const size_t nMineStart = fOwnIsA ? prop.vBundle.size() : 0;
+    size_t nIn = nMineStart;
+    for (const WalletNoteCoin& c : *pMine) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, NOTE_DUST_VALUE, SIGHASH_ALL), c.script, sigdata)) {
+            strFail = "Signing our bundle inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+    nIn = prop.vBundle.size() + pMine->size();
+    for (const auto& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL), coin.txout.scriptPubKey, sigdata)) {
+            strFail = "Signing funding inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+
+    strHexTxOut = EncodeHexTx(CTransaction(mtx));
+    return true;
+}
+
+void CWallet::ListPresentableNotes(uint32_t nIssuerHouseID, std::vector<PresentableGroup>& vOut)
+{
+    LOCK2(cs_main, cs_wallet);
+    std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
+    CollectWalletNoteCoins(this, nIssuerHouseID, mapByHolder);
+    for (const auto& kv : mapByHolder) {
+        if (kv.first.second != 0)
+            continue;   // demanded notes are not presentable
+        PresentableGroup g;
+        g.vchHolderPubKey = kv.second[0].vchHolderPubKey;
+        g.nCoins = kv.second.size();
+        g.nUnits = 0;
+        for (const WalletNoteCoin& c : kv.second)
+            g.nUnits += c.units;
+        if (g.nUnits > 0)
+            vOut.push_back(g);
+    }
+    std::sort(vOut.begin(), vOut.end(),
+              [](const PresentableGroup& a, const PresentableGroup& b) { return a.nUnits > b.nUnits; });
+}
+
+bool CWallet::CompleteSettle(std::string& strFail, uint256& txidOut, const std::string& strHexTx)
+{
+    strFail = "Unknown error!";
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+
+    CMutableTransaction mtx;
+    if (!DecodeHexTx(mtx, strHexTx, true)) { strFail = "Undecodable transaction!"; return false; }
+    if (mtx.nVersion != TRANSACTION_SETTLE_VERSION || mtx.nSettleOp != SETTLE_OP_EXCHANGE) {
+        strFail = "Not a settle transaction!"; return false;
+    }
+    SettleExchange x;
+    if (!DecodeSettlePayload(mtx.vchSettlePayload, x)) { strFail = "Undecodable settle payload!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    // Our side = the one whose approver slots are still empty.
+    const bool fSignA = x.vApproverSigA.empty();
+    if (!fSignA && !x.vApproverSigB.empty()) { strFail = "Both sides already signed!"; return false; }
+    const uint32_t nOwn = fSignA ? x.nHouseA : x.nHouseB;
+    CHouse houseOwn, houseCtpy;
+    if (!SettlePreflight(nOwn, fSignA ? x.nHouseB : x.nHouseA, houseOwn, houseCtpy, strFail))
+        return false;
+
+    // The initiator must be the CREDITOR in a residual settle (the debtor
+    // responded and funded); verify the residual lands on OUR declared key.
+    if (x.nMode == 1) {
+        const bool fAIsCreditor = x.nUnitsBNotes > x.nUnitsANotes;
+        if (fAIsCreditor != fSignA) { strFail = "This side is the debtor - the responder should have finalized!"; return false; }
+        if (mtx.vout.empty() ||
+                mtx.vout[0].scriptPubKey != NoteScriptForPubKey(houseOwn.vchRedemptionDestPK)) {
+            strFail = "The residual does not pay this house's redemption key!"; return false;
+        }
+    }
+
+    // Counter-sign: our quorum + our presenter (we present the OTHER house's
+    // issue, so our presenter slot is the ctpy-issued side's key).
+    const CTransaction ctxDigest(mtx);
+    const uint256 sighash = SettleExchangeSigHash(x, SettleHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
+    {
+        std::vector<uint32_t>& vIdx = fSignA ? x.vApproverIndexA : x.vApproverIndexB;
+        std::vector<std::vector<unsigned char>>& vSig = fSignA ? x.vApproverSigA : x.vApproverSigB;
+        vIdx.clear(); vSig.clear();
+        if (!SignSettleApprovers(this, houseOwn, sighash, vIdx, vSig, strFail))
+            return false;
+    }
+    const std::vector<unsigned char>& vchPresentKey = fSignA ? x.vchPresentKeyOfBNotes : x.vchPresentKeyOfANotes;
+    std::vector<unsigned char>& vchPresentSig = fSignA ? x.vchPresentSigOfBNotes : x.vchPresentSigOfANotes;
+    {
+        CKey keyPresent;
+        if (!GetKey(CPubKey(vchPresentKey).GetID(), keyPresent)) { strFail = "Presenter key missing from this wallet!"; return false; }
+        if (!keyPresent.Sign(sighash, vchPresentSig)) { strFail = "Failed to sign as presenter!"; return false; }
+    }
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << x;
+    mtx.vchSettlePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+
+    // scriptSig-sign OUR bundle region (the ctpy-issued side): positions are
+    // [0, countA) for the A-issued bundle, [countA, countA+countB) for B's.
+    const CTransaction txToSign(mtx);
+    const size_t nStart = fSignA ? x.nCountANotes : 0;
+    const size_t nCount = fSignA ? x.nCountBNotes : x.nCountANotes;
+    const CScript scriptMine = NoteScriptForPubKey(vchPresentKey);
+    for (size_t k = 0; k < nCount; k++) {
+        const size_t nIn = nStart + k;
+        if (nIn >= mtx.vin.size()) { strFail = "Truncated bundle region!"; return false; }
+        if (!mtx.vin[nIn].scriptSig.empty())
+            continue;
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, (unsigned int)nIn, NOTE_DUST_VALUE, SIGHASH_ALL), scriptMine, sigdata)) {
+            strFail = "Signing our bundle inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, (unsigned int)nIn, sigdata);
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CReserveKey reserveKey(this);
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit settle! Reject reason: " + FormatStateMessage(state); return false;
     }
     txidOut = walletTx.tx->GetHash();
     return true;

@@ -44,8 +44,8 @@ const std::string CLIENT_NAME("FreeBank");
 //! git will put "#define GIT_ARCHIVE 1" on the next line inside archives. 
 #define GIT_ARCHIVE 1
 #ifdef GIT_ARCHIVE
-#define GIT_COMMIT_ID "4f34b90471525411ae028a39e27b2e8136d239d5"
-#define GIT_COMMIT_DATE "Sun, 26 Jul 2026 17:04:16 +1000"
+#define GIT_COMMIT_ID "54c8a3983319f9511b8a0a762524525be0f66695"
+#define GIT_COMMIT_DATE "Mon, 27 Jul 2026 09:38:42 +1000"
 #endif
 
 #define BUILD_DESC_WITH_SUFFIX(maj, min, rev, build, suffix) \

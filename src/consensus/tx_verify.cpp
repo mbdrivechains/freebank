@@ -9,6 +9,7 @@
 #include <note.h>
 #include <deposit.h>
 #include <pool.h>
+#include <settle.h>
 #include <consensus/consensus.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -209,6 +210,12 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
             return false;
     }
 
+    // Settle transactions (Phase 3.7 pt2): context-free shape checks
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+        if (!CheckSettleTransactionShape(tx, state))
+            return false;
+    }
+
     // Check for negative or overflow output values
     CAmount nValueOut = 0;
     std::vector<CTxOut>::const_iterator it;
@@ -318,6 +325,24 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         }
     }
 
+    // For a settle EXCHANGE (v16), the two presented bundles sit at FIXED vin
+    // positions (vin[0..countA) = A-issued notes, the next countB = B-issued)
+    // and every bundle coin must be P2PKH to its declared presentment key.
+    // Decode once up front; the payload already passed shape. If the decode
+    // fails here the note guard below rejects any note spend fail-closed.
+    SettleExchange settle;
+    bool fHaveSettle = false;
+    CScript expectedSettleScriptA, expectedSettleScriptB;
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION && tx.nSettleOp == SETTLE_OP_EXCHANGE) {
+        if (DecodeSettlePayload(tx.vchSettlePayload, settle)) {
+            expectedSettleScriptA = NoteScriptForPubKey(settle.vchPresentKeyOfANotes);
+            expectedSettleScriptB = NoteScriptForPubKey(settle.vchPresentKeyOfBNotes);
+            fHaveSettle = true;
+        }
+    }
+    uint64_t nSettleUnitsAIn = 0;
+    uint64_t nSettleUnitsBIn = 0;
+
     uint32_t nAssetIDFound = 0;
     CAmount nValueIn = 0;
     unsigned int nBillTitleIn = 0;
@@ -354,6 +379,39 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         nValueIn += coin.out.nValue;
         if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn)) {
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-inputvalues-outofrange");
+        }
+
+        // Settle bundles (Phase 3.7 pt2, v16): positional discipline. Bundle
+        // slots must be EXACTLY fNote-with-matching-issuer and no other tag
+        // bit - never a script-shape test. The named catastrophic vector: the
+        // pool's note-side custody coin is dual-tagged fNote+fPoolEscrow;
+        // accepting it here would burn the pool's X while PoolDB still records
+        // custody -> outNote spent -> every later pool op fails vin-pinning ->
+        // LPs permanently locked out of Y. Everything past the bundles must be
+        // PLAIN funding (v16 conservation is burn-only: units in, none out).
+        if (fHaveSettle) {
+            const unsigned int nBundleEnd = (unsigned int)settle.nCountANotes +
+                                            (unsigned int)settle.nCountBNotes;
+            if (i < nBundleEnd) {
+                const bool fSideA = i < settle.nCountANotes;
+                if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
+                if (coin.nHouseID != (fSideA ? settle.nHouseA : settle.nHouseB))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-issuer");
+                if (coin.nDemandHeight != 0)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-demanded-note");
+                if (coin.out.scriptPubKey != (fSideA ? expectedSettleScriptA : expectedSettleScriptB))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-input-not-presenter");
+                uint64_t& nUnits = fSideA ? nSettleUnitsAIn : nSettleUnitsBIn;
+                if (coin.nNoteUnits > SETTLE_MAX_UNITS || nUnits > SETTLE_MAX_UNITS - coin.nNoteUnits)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-overflow");
+                nUnits += coin.nNoteUnits;
+            } else {
+                if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
+            }
         }
 
         if (coin.nAssetID && nAssetIDFound && coin.nAssetID != nAssetIDFound)
@@ -457,7 +515,14 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // rejected. All note inputs must share one house; note txs cannot
         // spend asset/bill coins, and only CLAIM may spend house escrow
         // (checked above).
-        if (coin.fNote && !coin.fPoolEscrow) {
+        if (coin.fNote && !coin.fPoolEscrow && !fHaveSettle) {
+            // (fHaveSettle: a decoded v16 EXCHANGE is the third sanctioned
+            // spender class of fNote coins; its bundles are fully validated by
+            // the positional block above - issuer, tag purity, presenter
+            // script, per-side sums - and the single-house/single-holder
+            // accumulators here do not apply to a dual-issuer exchange. A v16
+            // whose payload did NOT decode has fHaveSettle false and lands
+            // here: neither fNoteOpOK nor fPoolOpOK -> rejected, fail-closed.)
             const bool fNoteOpOK = tx.nVersion == TRANSACTION_NOTE_VERSION &&
                     (tx.nNoteOp == NOTE_OP_TRANSFER || tx.nNoteOp == NOTE_OP_REDEEM ||
                      tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_DEMAND);
@@ -838,6 +903,19 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nNoteIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-pool-retire-note-inputs");
         }
+    }
+
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION && fHaveSettle) {
+        // Exact-sum bundles, all-or-nothing (no partial fills at consensus -
+        // partiality happens BEFORE the op via TransferNote denomination
+        // surgery). The positional block above already forced every bundle
+        // slot to be a pure fNote coin of the right issuer on the right
+        // presenter key; the sums close the loop: each side's spent units
+        // must equal the declared (and quorum-signed) figure exactly. Burn-only
+        // conservation is structural - v16 has no coin tagger, so no output
+        // can re-issue a unit.
+        if (nSettleUnitsAIn != settle.nUnitsANotes || nSettleUnitsBIn != settle.nUnitsBNotes)
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-sum");
     }
 
     const CAmount value_out = tx.GetValueOut();

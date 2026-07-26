@@ -318,6 +318,23 @@ CAmount HouseBrassageAmount(uint64_t nUnits, uint32_t nBps)
     return amt > (unsigned __int128)MAX_MONEY ? (CAmount)MAX_MONEY : (CAmount)amt;
 }
 
+bool HouseParEligible(const CHouse& house, int nHeight)
+{
+    if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
+        return false;
+    if (HouseAttestedRatioBps(house) < HOUSE_RESERVE_FLOOR_PCT * 100)
+        return false;
+    // Recency conjunct: a never-attested house (nLastAttestHeight == 0 with no
+    // reserves) fails the ratio check above unless it has zero liabilities; the
+    // recency test additionally bars any house coasting inside Open's
+    // missed-cadence tolerance from par-clearing on stale numbers.
+    if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight)
+        return false;
+    if ((uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
+        return false;
+    return true;
+}
+
 uint32_t HouseDepositWAM(const CHouse& house, int nHeight)
 {
     if (house.nDepositUnits == 0)
