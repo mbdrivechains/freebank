@@ -7,6 +7,7 @@
 
 #include <bill.h>
 #include <deposit.h>
+#include <oracle.h>
 #include <pool.h>
 #include <settle.h>
 #include <house.h>
@@ -3966,7 +3967,7 @@ static void CollectWalletNoteCoins(CWallet* pwallet, uint32_t nHouseID,
     }
 }
 
-static bool HouseStateChangePending(uint32_t nHouseID);   // defined below (settle-aware)
+static bool HouseStateChangePending(uint32_t nHouseID);   // defined below (T-s6: settle-aware)
 
 bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee)
 {
@@ -6066,7 +6067,7 @@ bool CWallet::SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID,
 }
 
 // ---------------------------------------------------------------------------
-// Settlement ceremony (Phase 3.7 pt2). Wallet protocol, not consensus.
+// Settlement ceremony (Phase 3.7 pt2, T-s6). Wallet protocol, not consensus.
 
 /** Sign the shared digest with this wallet's ACTIVE approver keys for `house`,
  * ascending indices, stopping at exactly thresholdM (VerifyHouseApprovers
@@ -6110,10 +6111,11 @@ static bool SettlePreflight(uint32_t nA, uint32_t nB, CHouse& houseA, CHouse& ho
         strFail = "A house is not par-eligible (must be Open, at/above the reserve floor, and attested within one cadence)!";
         return false;
     }
+    const uint32_t nSettleCadence = Params().GetConsensus().nSettleCadence;
     for (const CHouse* h : {&houseA, &houseB}) {
-        if (h->nLastSettleHeight != 0 && (uint32_t)nHeight < h->nLastSettleHeight + SETTLE_CADENCE_BLOCKS) {
+        if (h->nLastSettleHeight != 0 && (uint32_t)nHeight < h->nLastSettleHeight + nSettleCadence) {
             strFail = strprintf("House %u settled at height %u - cadence window (%u blocks) not yet open!",
-                                h->nHouseID, h->nLastSettleHeight, SETTLE_CADENCE_BLOCKS);
+                                h->nHouseID, h->nLastSettleHeight, nSettleCadence);
             return false;
         }
     }
@@ -7336,6 +7338,390 @@ bool CWallet::ReleaseReserves(std::string& strFail, uint256& txidOut, const uint
     CValidationState state;
     if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
         strFail = "Failed to commit the release! Reject reason: " + FormatStateMessage(state);
+        return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Gold oracle (Phase G-1, T-o4). Consensus-INERT: these build and broadcast
+// v17 ops that maintain the fix and the submitter records; nothing reads them.
+// ---------------------------------------------------------------------------
+
+/** True if the mempool holds an oracle op for nSubmitterID that the incoming op
+ * cannot displace. Mirrors the ATMP slot guards exactly (validation.cpp): one
+ * oracle op per submitter per block, EXCEPT that a newer SUBMIT displaces a
+ * pooled SUBMIT for the same submitter - so for an incoming SUBMIT only a
+ * pooled BOND blocks. Failing fast here beats an opaque CommitTransaction
+ * reject (the house-review precedent). */
+static bool OracleOpPending(uint32_t nSubmitterID, bool fIncomingSubmit)
+{
+    LOCK(mempool.cs);
+    for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
+        const CTransaction& mtx = mi->GetTx();
+        if (mtx.nVersion != TRANSACTION_ORACLE_VERSION || mtx.vchOraclePayload.size() < 4)
+            continue;
+        uint32_t nTheirs = 0;
+        memcpy(&nTheirs, mtx.vchOraclePayload.data(), 4);   // nSubmitterID leads both payloads
+        if (nTheirs != nSubmitterID || nTheirs == 0)
+            continue;
+        if (fIncomingSubmit && mtx.nOracleOp == ORACLE_OP_SUBMIT)
+            continue;                                       // displaceable, not blocking
+        return true;
+    }
+    return false;
+}
+
+/** True if the mempool already holds a FRESH registration (id 0). Consensus
+ * allows one per block, so a second would brick our own template. */
+static bool OracleFreshBondPending()
+{
+    LOCK(mempool.cs);
+    for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
+        const CTransaction& mtx = mi->GetTx();
+        if (mtx.nVersion != TRANSACTION_ORACLE_VERSION || mtx.nOracleOp != ORACLE_OP_BOND ||
+                mtx.vchOraclePayload.size() < 4)
+            continue;
+        uint32_t nTheirs = 0;
+        memcpy(&nTheirs, mtx.vchOraclePayload.data(), 4);
+        if (nTheirs == 0)
+            return true;
+    }
+    return false;
+}
+
+/** A v17 op survives up to nOracleOpWindow heights, so - unlike under the old
+ * one-block rule - it is NOT stranded by the next tip change and its inputs
+ * stay encumbered across several blocks. It leaves the pool when the window
+ * exhausts, its branch moves, its priors are overtaken, or a re-sign displaces
+ * it at ATMP. Any of those leaves this wallet holding an unconfirmed copy whose
+ * inputs are still reserved - the AbandonDisplacedSettles wedge, which bites
+ * harder here because a submitter re-signs every block. Free them: abandon any
+ * of OUR unconfirmed v17 txs no longer in the mempool.
+ *
+ * Note this does NOT abandon a still-pooled predecessor, which is deliberate:
+ * it may yet confirm inside its window. That is precisely why
+ * CollectPlainOracleFunding must refuse to fund the next re-sign from its
+ * change - chaining onto a tx that displacement is about to evict is the
+ * node-abort path (see the ATMP displacement guard). */
+static void AbandonStaleOracleOps(CWallet* pwallet)
+{
+    std::vector<uint256> vAbandon;
+    for (std::map<uint256, CWalletTx>::iterator it = pwallet->mapWallet.begin();
+            it != pwallet->mapWallet.end(); ++it) {
+        CWalletTx& wtx = it->second;
+        if (wtx.tx->nVersion != TRANSACTION_ORACLE_VERSION)
+            continue;
+        // Resync the cached flag from the POOL itself first: removal
+        // notifications are scheduler-async, so a displaced op can carry a
+        // stale fInMempool == true, which would also wedge AbandonTransaction
+        // via its own InMempool() guard.
+        {
+            LOCK(mempool.cs);
+            wtx.fInMempool = mempool.exists(it->first);
+        }
+        if (wtx.GetDepthInMainChain() != 0 || wtx.InMempool() || wtx.isAbandoned())
+            continue;
+        vAbandon.push_back(it->first);
+    }
+    for (const uint256& txid : vAbandon) {
+        LogPrintf("%s: abandoning stale oracle op %s\n", __func__, txid.ToString());
+        pwallet->AbandonTransaction(txid);
+    }
+}
+
+/** Fund nTarget from PLAIN coins only. Oracle txs may not spend any tagged coin
+ * (consensus: "bad-oracle-colored-input"), and the bond escrow itself is
+ * anyone-can-spend so it never appears in AvailableCoins at all - it is reached
+ * only through the submitter record's tracked outpoint. */
+static void CollectPlainOracleFunding(CWallet* pwallet, std::vector<COutput>& vPlainOut)
+{
+    std::vector<COutput> vCoins;
+    pwallet->AvailableCoins(vCoins, true);
+    for (const COutput& out : vCoins) {
+        if (!out.fSpendable)
+            continue;
+        // Tags live in the UTXO set, so they can only be READ for a CONFIRMED
+        // coin. Do not require the lookup to succeed: an unconfirmed coin is
+        // absent from pcoinsTip by definition, and dropping those starved every
+        // oracle op in a wallet whose spare coins were still in the mempool -
+        // which is the normal state on a chain making blocks every few seconds.
+        // Unconfirmed coins are safe to accept here because AvailableCoins has
+        // already skipped the tagged output classes that are IsMine (notes,
+        // deposit receipts, pool/LP), and the bond escrow is anyone-can-spend so
+        // it never appears in this list at all.
+        // Never fund an oracle op from an UNCONFIRMED oracle op's change. Under
+        // the validity window a predecessor survives in the mempool for up to k
+        // blocks, and its own inputs are already spent-in-wallet, so this change
+        // output is exactly what AvailableCoins would offer a re-sign. Chaining
+        // onto it makes the re-sign a descendant of the tx the ATMP guard is
+        // about to displace - which consensus now refuses outright, and which
+        // used to abort the node. Keep the two ops independent so displacement
+        // stays a clean swap.
+        if (out.tx->tx->nVersion == TRANSACTION_ORACLE_VERSION &&
+                out.tx->GetDepthInMainChain() == 0)
+            continue;
+
+        Coin coin;
+        const COutPoint outpoint(out.tx->GetHash(), out.i);
+        if (pcoinsTip->GetCoin(outpoint, coin) && !coin.IsSpent() &&
+                (coin.fBitAsset || coin.fBitAssetControl || coin.fBill || coin.fBillEscrow ||
+                 coin.fHouseEscrow || coin.fNote || coin.fDeposit || coin.fPoolEscrow ||
+                 coin.fLpShare || coin.fOracleBond))
+            continue;
+        vPlainOut.push_back(out);
+    }
+}
+
+static const char* ORACLE_FUNDING_FAIL =
+    "Could not fund the oracle op from plain coins - the wallet needs a spare "
+    "untagged coin (oracle txs cannot spend notes, escrow, receipts or bonds)!";
+
+bool CWallet::BondOracleSubmitter(std::string& strFail, uint256& txidOut, uint32_t& nAssignedIDOut,
+                                  uint32_t nSubmitterID, const CAmount& amountBond, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    nAssignedIDOut = 0;
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    if (amountBond <= 0) { strFail = "Bond amount must be positive!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    AbandonStaleOracleOps(this);
+
+    const int nHeight = chainActive.Height() + 1;
+    const bool fFresh = (nSubmitterID == 0);
+    if (fFresh && OracleFreshBondPending()) {
+        strFail = "A fresh oracle registration is already in the mempool (one per block) - retry next block!";
+        return false;
+    }
+    if (!fFresh && OracleOpPending(nSubmitterID, false /* fIncomingSubmit */)) {
+        strFail = "An oracle op for this submitter is already in the mempool (one per submitter per block) - retry next block!";
+        return false;
+    }
+
+    // Resolve the submitter key and the priors this op will bind.
+    CKey key;
+    std::vector<unsigned char> vchPubKey;
+    COracleSubmitter sub;                 // zero-valued for a fresh registration
+    CAmount amountCarried = 0;
+    COutPoint outBondPrev;
+    if (fFresh) {
+        CPubKey pub;
+        if (!GetKeyFromPool(pub)) { strFail = "Keypool ran out, please call keypoolrefill first!"; return false; }
+        vchPubKey.assign(pub.begin(), pub.end());
+        if (!GetKey(pub.GetID(), key)) { strFail = "Lost the fresh submitter key!"; return false; }
+    } else {
+        if (!phousetree->GetOracleSubmitter(nSubmitterID, sub)) { strFail = "Unknown oracle submitter!"; return false; }
+        vchPubKey = sub.vchPubKey;
+        if (!GetKey(CPubKey(vchPubKey).GetID(), key)) {
+            strFail = "This wallet does not hold the submitter's key!"; return false;
+        }
+        // Consolidate the existing bond: only a same-key BOND may spend that
+        // coin, and the record repoints to THIS tx's vout[0], so leaving it
+        // behind would orphan the value from the record that tracks it.
+        Coin coinBond;
+        if (pcoinsTip->GetCoin(sub.bondOutpoint, coinBond) && !coinBond.IsSpent()) {
+            if (!coinBond.fOracleBond) { strFail = "Recorded bond outpoint is not a bond coin!"; return false; }
+            if (coinBond.out.scriptPubKey != OracleBondScript(vchPubKey)) {
+                strFail = "Recorded bond coin does not carry this submitter's key!"; return false;
+            }
+            amountCarried = coinBond.out.nValue;
+            outBondPrev = sub.bondOutpoint;
+        }
+    }
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_ORACLE_VERSION;
+    mtx.nOracleOp = ORACLE_OP_BOND;
+    // vout[0] = the bond escrow, pinned by consensus. Built before the payload
+    // signature, which binds hashOutputs.
+    mtx.vout.push_back(CTxOut(amountCarried + amountBond, OracleBondScript(vchPubKey)));
+
+    std::vector<COutput> vPlain;
+    CollectPlainOracleFunding(this, vPlain);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vPlain, amountBond + nFee, setCoins, nAmountRet)) {
+        strFail = ORACLE_FUNDING_FAIL; return false;
+    }
+
+    CReserveKey reserveKey(this);
+    const CAmount nChange = nAmountRet - amountBond - nFee;
+    if (nChange > 0) {
+        CPubKey pubChange;
+        if (!reserveKey.GetReservedKey(pubChange)) { strFail = "Keypool ran out!"; return false; }
+        CTxOut outChange(nChange, GetScriptForDestination(pubChange.GetID()));
+        if (!IsDust(outChange, ::dustRelayFee)) mtx.vout.push_back(outChange);
+    }
+    // Inputs before the payload signature - it binds hashPrevouts (R-i6). The
+    // consolidated bond rides first; its script is anyone-can-spend, so it
+    // takes an empty scriptSig and is skipped by the signing loop below.
+    if (!outBondPrev.IsNull())
+        mtx.vin.push_back(CTxIn(outBondPrev));
+    for (const CInputCoin& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
+    OracleBond payload;
+    payload.nSubmitterID = nSubmitterID;
+    payload.nTargetHeight = (uint32_t)nHeight;
+    payload.vchSubmitterPubKey = vchPubKey;
+    payload.nPrevBondHeight = sub.nBondHeight;
+    payload.nPrevLastSubmitHeight = sub.nLastSubmitHeight;
+    payload.nPrevUnbondRequestHeight = sub.nUnbondRequestHeight;
+    payload.outPrevBond = sub.bondOutpoint;   // null for a fresh registration
+    {
+        const CTransaction txForSig(mtx);
+        if (!key.Sign(OracleBondSigHash(payload, OracleHashPrevouts(txForSig), BillHashOutputs(txForSig)),
+                      payload.vchSig)) {
+            strFail = "Failed to sign the oracle bond!"; return false;
+        }
+    }
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << payload;
+    mtx.vchOraclePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+
+    const CTransaction txToSign(mtx);
+    unsigned int nIn = outBondPrev.IsNull() ? 0 : 1;   // skip the anyone-can-spend bond input
+    for (const CInputCoin& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL),
+                              coin.txout.scriptPubKey, sigdata)) {
+            strFail = "Signing oracle bond inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit the oracle bond! Reject reason: " + FormatStateMessage(state);
+        return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    // A fresh id is assigned by CONSENSUS at connect (last id + 1). Report the
+    // value this op will take if it connects next - callers must re-read it
+    // from listoraclesubmitters once confirmed rather than trust it blindly,
+    // since another fresh bond could land first on a competing branch.
+    if (fFresh) {
+        uint32_t nLast = 0;
+        phousetree->GetLastOracleSubmitterID(nLast);
+        nAssignedIDOut = nLast + 1;
+    } else {
+        nAssignedIDOut = nSubmitterID;
+    }
+    return true;
+}
+
+bool CWallet::SubmitOraclePrice(std::string& strFail, uint256& txidOut,
+                                uint32_t nSubmitterID, uint64_t nPriceMilligrams, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    if (nSubmitterID == 0) { strFail = "Invalid submitter id!"; return false; }
+    if (nPriceMilligrams < ORACLE_PRICE_MIN || nPriceMilligrams > ORACLE_PRICE_MAX) {
+        strFail = "Price out of range (milligrams of gold per 1000 ECX)!"; return false;
+    }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    // Every prior submission is stale the moment the tip moved, and a re-sign
+    // for THIS height displaces our own pooled one - free their inputs first or
+    // the wallet starves itself of funding within a few blocks.
+    AbandonStaleOracleOps(this);
+
+    if (OracleOpPending(nSubmitterID, true /* fIncomingSubmit */)) {
+        strFail = "A bond for this submitter is already in the mempool - retry next block!";
+        return false;
+    }
+
+    const int nHeight = chainActive.Height() + 1;
+    if (!chainActive.Tip()) { strFail = "No chain tip!"; return false; }
+    const uint256 hashPrevBlock = chainActive.Tip()->GetBlockHash();
+
+    COracleSubmitter sub;
+    if (!phousetree->GetOracleSubmitter(nSubmitterID, sub)) { strFail = "Unknown oracle submitter!"; return false; }
+    if (sub.nBondHeight == 0 || sub.nBondHeight >= (uint32_t)nHeight) {
+        strFail = "Submitter bonded in this very block - a submission must reference a bond from a PRIOR block; retry next block!";
+        return false;
+    }
+    CKey key;
+    if (!GetKey(CPubKey(sub.vchPubKey).GetID(), key)) {
+        strFail = "This wallet does not hold the submitter's key!"; return false;
+    }
+
+    CGoldFix fixPrev;
+    phousetree->GetGoldFix(fixPrev);      // stays null before the first fix
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_ORACLE_VERSION;
+    mtx.nOracleOp = ORACLE_OP_SUBMIT;
+
+    // A submission moves no value: it needs only a fee and one output to exist
+    // (CheckTransaction rejects an empty vout). Fund fee + a dust-clearing
+    // change output back to ourselves.
+    const CAmount nChangeFloor = NOTE_DUST_VALUE;
+    std::vector<COutput> vPlain;
+    CollectPlainOracleFunding(this, vPlain);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vPlain, nFee + nChangeFloor, setCoins, nAmountRet)) {
+        strFail = ORACLE_FUNDING_FAIL; return false;
+    }
+
+    CReserveKey reserveKey(this);
+    CPubKey pubChange;
+    if (!reserveKey.GetReservedKey(pubChange)) { strFail = "Keypool ran out!"; return false; }
+    mtx.vout.push_back(CTxOut(nAmountRet - nFee, GetScriptForDestination(pubChange.GetID())));
+    for (const CInputCoin& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
+    OracleSubmit payload;
+    payload.nSubmitterID = nSubmitterID;
+    payload.nTargetHeight = (uint32_t)nHeight;
+    payload.nPriceMilligrams = nPriceMilligrams;
+    payload.nPrevRaw = fixPrev.nRaw;
+    payload.nPrevBraked = fixPrev.nBraked;
+    payload.nPrevFixHeight = fixPrev.nFixHeight;
+    payload.nPrevOwnLastSubmitHeight = sub.nLastSubmitHeight;
+    payload.hashPrevBlockBind = hashPrevBlock;
+    {
+        const CTransaction txForSig(mtx);
+        if (!key.Sign(OracleSubmitSigHash(payload, OracleHashPrevouts(txForSig), BillHashOutputs(txForSig)),
+                      payload.vchSig)) {
+            strFail = "Failed to sign the oracle submission!"; return false;
+        }
+    }
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << payload;
+    mtx.vchOraclePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+
+    const CTransaction txToSign(mtx);
+    unsigned int nIn = 0;
+    for (const CInputCoin& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL),
+                              coin.txout.scriptPubKey, sigdata)) {
+            strFail = "Signing oracle submission inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit the oracle submission! Reject reason: " + FormatStateMessage(state);
         return false;
     }
     txidOut = walletTx.tx->GetHash();

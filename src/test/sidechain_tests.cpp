@@ -564,4 +564,85 @@ BOOST_AUTO_TEST_CASE(depositaddress)
 
 }
 
+
+// ---------------------------------------------------------------------------
+// D-1: two identical deposits must require two identical coinbase outputs.
+//
+// A miner builds the coinbase, so this cannot be caught by an integration gate
+// driven by the honest builder - it emits both outputs and the defect stays
+// hidden. It is only reachable by a DISHONEST builder, which is exactly what
+// these tests construct: the required outputs are asked for against a coinbase
+// that is one output short.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(deposit_payout_claim_is_consumed)
+{
+    const CScript script = CScript() << OP_DUP << OP_HASH160
+        << ToByteVector(CKeyID(uint160(std::vector<unsigned char>(20, 0x11))))
+        << OP_EQUALVERIFY << OP_CHECKSIG;
+    const CTxOut required(CAmount(100000), script);
+
+    // A miner who pays BOTH deposits: two identical outputs, two claims.
+    {
+        std::vector<CTxOut> vout{required, required};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(ClaimDepositPayoutOutput(required, vout, setClaimed));
+        BOOST_CHECK(ClaimDepositPayoutOutput(required, vout, setClaimed));
+        BOOST_CHECK_EQUAL(setClaimed.size(), 2u);
+    }
+
+    // THE DEFECT. A miner who pays ONE deposit and pockets the other. The
+    // second claim must FAIL - one output cannot settle two debts.
+    {
+        std::vector<CTxOut> vout{required};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(ClaimDepositPayoutOutput(required, vout, setClaimed));
+        BOOST_CHECK(!ClaimDepositPayoutOutput(required, vout, setClaimed));
+    }
+
+    // Claiming must not be confused by unrelated outputs sitting in between,
+    // nor consume one that does not match.
+    {
+        const CTxOut other(CAmount(777), CScript() << OP_TRUE);
+        std::vector<CTxOut> vout{other, required, other};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(ClaimDepositPayoutOutput(required, vout, setClaimed));
+        BOOST_CHECK_EQUAL(setClaimed.count(1), 1u);
+        BOOST_CHECK(!ClaimDepositPayoutOutput(required, vout, setClaimed));
+    }
+
+    // Value and script must BOTH match - same script at a different value is a
+    // different debt and must not be raided to satisfy this one.
+    {
+        const CTxOut wrongValue(CAmount(99999), script);
+        std::vector<CTxOut> vout{wrongValue};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(!ClaimDepositPayoutOutput(required, vout, setClaimed));
+    }
+}
+
+// A deposit that is owed nothing must not demand an output (D-2, unit level).
+BOOST_AUTO_TEST_CASE(deposit_payout_owed_nothing)
+{
+    CTxOut out;
+
+    // Dust: payout at or below the fee leaves nothing worth paying.
+    SidechainDeposit dust;
+    dust.strDest = "1BitcoinEaterAddressDontSendf59kuE";
+    dust.amtUserPayout = SIDECHAIN_DEPOSIT_FEE;
+    BOOST_CHECK(!GetDepositPayoutOutput(dust, out));
+
+    // Withdrawal-bundle change return: recorded, paid to nobody.
+    SidechainDeposit ret;
+    ret.strDest = SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST;
+    ret.amtUserPayout = CAmount(500000);
+    BOOST_CHECK(!GetDepositPayoutOutput(ret, out));
+
+    // Undecodable destination - depositor-supplied, so untrusted input. This
+    // must not be able to stop the chain; the deposit is simply not paid.
+    SidechainDeposit junk;
+    junk.strDest = "s130_notavalidaddress";
+    junk.amtUserPayout = CAmount(500000);
+    BOOST_CHECK(!GetDepositPayoutOutput(junk, out));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

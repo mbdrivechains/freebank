@@ -149,6 +149,7 @@ BITCOIN_CORE_H = \
   deposit.h \
   pool.h \
   settle.h \
+  oracle.h \
   l1client.h \
   sidechain.h \
   sidechainclient.h \
@@ -344,6 +345,7 @@ libbitcoin_common_a_SOURCES = \
   deposit.cpp \
   pool.cpp \
   settle.cpp \
+  oracle.cpp \
   chainparams.cpp \
   coins.cpp \
   compressor.cpp \

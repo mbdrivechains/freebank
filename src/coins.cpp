@@ -8,6 +8,7 @@
 #include <deposit.h>
 #include <house.h>
 #include <note.h>
+#include <oracle.h>
 #include <pool.h>
 #include <consensus/consensus.h>
 #include <random.h>
@@ -259,6 +260,13 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
             // Pool outputs (Phase 3.7) self-tag from the payload via the single
             // shared tagger - connect == rollforward == mempool by construction.
             ApplyPoolCoinTags(tx, i, coin);
+
+            // Oracle bond escrow (Phase G-1) self-tags from the tx alone: the
+            // shape gate pinned vout[0] of every BOND as the bond script, so
+            // connect == rollforward with no threaded id. SUBMIT tags nothing.
+            if (tx.nVersion == TRANSACTION_ORACLE_VERSION &&
+                    tx.nOracleOp == ORACLE_OP_BOND && i == 0)
+                coin.SetOracleBond();
 
             cache.AddCoin(COutPoint(txid, i), std::move(coin), overwrite);
         }

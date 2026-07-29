@@ -553,6 +553,16 @@ void DumpBMMCache();
 void LoadBMMCache();
 
 /** Dump the cache of mainchain block hashes to disk */
+//! Minimum client version able to read the BMM/main-block/withdrawal cache
+//! files. Bump ONLY when their format changes - not on every release, or every
+//! upgrade silently discards its own caches.
+//!
+//! It was 160000, hardcoded, a leftover of the Bitcoin Core 0.16 rebrand.
+//! FreeBank's CLIENT_VERSION is 20500, and the loader bails when the file's
+//! required version exceeds CLIENT_VERSION, so every cache was written on
+//! shutdown and silently never read back.
+static const int FREEBANK_CACHE_MIN_VERSION = 20500;
+
 void DumpMainBlockCache();
 
 /** Load the cache of mainchain block hashes from disk */

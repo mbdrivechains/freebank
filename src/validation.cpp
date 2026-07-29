@@ -38,6 +38,7 @@
 #include <note.h>
 #include <deposit.h>
 #include <pool.h>
+#include <oracle.h>
 #include <settle.h>
 #include <sidechainclient.h>
 
@@ -400,6 +401,14 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           CHouse& houseAOut, CHouse& houseBOut);
 
+bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
+                          const std::function<bool(uint32_t, COracleSubmitter&)>& fnGetSubmitter,
+                          const std::function<bool(const std::vector<unsigned char>&)>& fnHaveKey,
+                          const CGoldFix& fixPrev, uint32_t nNextSubmitterID,
+                          COracleSubmitter& subOut, bool& fFreshBondOut, uint64_t& nPriceOut,
+                          bool fMempool = false);
+
 /** Verify a reserve proof set (declared outpoints + per-coin recency signatures)
  * against the live UTXO state, summing the proven liquid value into amountOut.
  * This is the "prove you own N liquid base-coin sats as of nAsOfHeight" primitive
@@ -449,7 +458,8 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
         // here rather than rely on the script coincidence (3.7 review).
         if (coin.fBitAsset || coin.fBitAssetControl || coin.fBill ||
                 coin.fBillEscrow || coin.fHouseEscrow || coin.fNote ||
-                coin.fDeposit || coin.fPoolEscrow || coin.fLpShare)
+                coin.fDeposit || coin.fPoolEscrow || coin.fLpShare ||
+                coin.fOracleBond)
             return state.DoS(100, false, REJECT_INVALID, prefix + "-coin-tagged");
 
         // v1 script restriction: single-key P2PKH / P2WPKH matching the declared
@@ -750,7 +760,7 @@ static bool IsCurrentForFeeEstimation()
  * failure. Node policy only - consensus is untouched. Cost is bounded: only
  * v12/v13 txs do work, and the one-op-per-house guard caps them at one per
  * house. */
-/** SLOT-KEYED house-slot extraction: returns true
+/** SLOT-KEYED house-slot extraction (T-s5, the reorg-F5 rule): returns true
  * iff mtx takes a one-op-per-house-per-block slot, with the touched house
  * id(s) - nB is nonzero only for the dual-slot v16 exchange. Guards MUST key
  * on this property, never on per-op enumerated lists in callers - the DR-2
@@ -794,6 +804,41 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     return false;
 }
 
+/** SLOT-KEYED oracle-slot extraction (T-o3, the reorg-F5 rule transplanted to
+ * the v17 family). Returns true iff mtx takes an oracle slot: EVERY
+ * well-formed v17 op does - a SUBMIT or returning BOND takes its submitter's
+ * one-op-per-block slot (nSubmitterID != 0), a fresh BOND takes the single
+ * per-block fresh-registration slot (nSubmitterID == 0, fFreshBond true).
+ * nSubmitterID is the leading-4-bytes of BOTH payloads (the leading-8 ATMP
+ * contract, oracle.h). Oracle slots are DISJOINT from house slots by
+ * construction - v17 touches no CHouse record and GetHouseSlotIDs ignores
+ * v17 - so the two helpers partition the guard space and neither caller
+ * consults the other (the cross-family audit, spec s6 T-o3). */
+static bool GetOracleSlotID(const CTransaction& mtx, uint32_t& nSubmitterID, bool& fFreshBond,
+                            uint32_t* pnTargetHeight = nullptr)
+{
+    nSubmitterID = 0;
+    fFreshBond = false;
+    if (pnTargetHeight)
+        *pnTargetHeight = 0;
+    // The leading-EIGHT contract (oracle.h): {u32 nSubmitterID, u32
+    // nTargetHeight} lead BOTH payloads, so a guard can key on either without
+    // decoding. The target height became guard-relevant with the validity
+    // window - two of one submitter's ops can now be valid at once, and
+    // displacement must prefer the fresher.
+    if (mtx.nVersion != TRANSACTION_ORACLE_VERSION || mtx.vchOraclePayload.size() < 8)
+        return false;
+    if (mtx.nOracleOp != ORACLE_OP_SUBMIT && mtx.nOracleOp != ORACLE_OP_BOND)
+        return false;
+    memcpy(&nSubmitterID, mtx.vchOraclePayload.data(), 4);
+    if (pnTargetHeight)
+        memcpy(pnTargetHeight, mtx.vchOraclePayload.data() + 4, 4);
+    if (mtx.nOracleOp == ORACLE_OP_SUBMIT)
+        return nSubmitterID != 0;   // shape rejects id-0 submits; guard-key mirrors it
+    fFreshBond = (nSubmitterID == 0);
+    return true;
+}
+
 static void EvictStaleHouseNoteOps()
 {
     AssertLockHeld(cs_main);
@@ -830,6 +875,32 @@ static void EvictStaleHouseNoteOps()
 
         auto fnGetPool = [](uint32_t nID, CPool& pool) { return ppooltree->GetPool(nID, pool); };
 
+        // Oracle closures + priors, lazy-loaded on the first v17 (the
+        // ConnectBlock pattern): confirmed DB state IS the pre-block state
+        // every pooled v17 must bind.
+        bool fOracleLoaded = false;
+        CGoldFix oracleFixPrev;
+        uint32_t nOracleSubIDNext = 0;
+        auto fnGetOracleSub = [](uint32_t nID, COracleSubmitter& sub) {
+            return phousetree->GetOracleSubmitter(nID, sub);
+        };
+        auto fnHaveOracleKey = [](const std::vector<unsigned char>& vchKey) {
+            uint32_t nDummy;
+            return phousetree->GetOracleSubmitterIDByKey(vchKey, nDummy);
+        };
+        // The window's anchor: the block at nTargetHeight-1 on THIS branch.
+        // Mempool-side that is always the active chain (same idiom as the
+        // attestation as-of resolver above).
+        auto fnGetOracleAnchor = [](uint32_t nH, uint256& hashOut) {
+            if ((int64_t)nH > (int64_t)chainActive.Height())
+                return false;
+            const CBlockIndex* p = chainActive[(int)nH];
+            if (!p)
+                return false;
+            hashOut = p->GetBlockHash();
+            return true;
+        };
+
         for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
             const CTransaction& mtx = mi->GetTx();
             const bool fHouseTx = (mtx.nVersion == TRANSACTION_HOUSE_VERSION);
@@ -837,7 +908,8 @@ static void EvictStaleHouseNoteOps()
             const bool fDepositTx = (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION);
             const bool fPoolTx = (mtx.nVersion == TRANSACTION_POOL_VERSION);
             const bool fSettleTx = (mtx.nVersion == TRANSACTION_SETTLE_VERSION);
-            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx)
+            const bool fOracleTx = (mtx.nVersion == TRANSACTION_ORACLE_VERSION);
+            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fOracleTx)
                 continue;
 
             CValidationState stateStale;
@@ -874,7 +946,7 @@ static void EvictStaleHouseNoteOps()
                 CHouse houseA, houseB;
                 if (!CheckSettleOperation(mtx, stateStale, nNextHeight, fnGetHouse, houseA, houseB))
                     fStale = true;
-            } else { // fPoolTx: a connected pool op moved the priors every
+            } else if (fPoolTx) { // a connected pool op moved the priors every
                      // pooled loser bound; a governance op can close the house
                      // a pending CREATE needs Open. Re-run the real check.
                 CPool poolResult;
@@ -882,6 +954,30 @@ static void EvictStaleHouseNoteOps()
                 bool fHouseChanged = false, fPoolRetired = false;
                 if (!CheckPoolOperation(mtx, stateStale, nNextHeight, fnGetPool, fnGetHouse,
                         poolResult, houseResult, fHouseChanged, fPoolRetired))
+                    fStale = true;
+            } else { // fOracleTx: an op is valid from its nTargetHeight for
+                     // nOracleOpWindow heights, on the branch its bind anchors
+                     // to. So a tip change does NOT automatically strand it -
+                     // it goes stale only when the window is exhausted, the
+                     // branch moved out from under its anchor, or its priors
+                     // were overtaken (a fix landing kills every older payload;
+                     // an inclusion kills that submitter's other outstanding
+                     // ones). Re-run the real contextual check, never a height
+                     // list - which is why this arm needed no change when the
+                     // point rule became a window.
+                if (!fOracleLoaded) {
+                    fOracleLoaded = true;
+                    phousetree->GetGoldFix(oracleFixPrev);   // stays null if absent
+                    uint32_t nLastSub = 0;
+                    phousetree->GetLastOracleSubmitterID(nLastSub);
+                    nOracleSubIDNext = nLastSub + 1;
+                }
+                COracleSubmitter subResult;
+                bool fFreshBond = false;
+                uint64_t nPrice = 0;
+                if (!CheckOracleOperation(mtx, stateStale, nNextHeight, fnGetOracleAnchor,
+                        fnGetOracleSub, fnHaveOracleKey, oracleFixPrev, nOracleSubIDNext,
+                        subResult, fFreshBond, nPrice, true /* fMempool */))
                     fStale = true;
             }
 
@@ -1182,7 +1278,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return error("%s: CheckBillOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
         }
 
-        // Settle ops (v16): contextual admission + the dual-slot guard.
+        // Settle ops (v16, T-s5): contextual admission + the dual-slot guard.
         // The exchange takes BOTH houses' one-op-per-block slots, so it cannot
         // co-reside with ANY pooled house-slot-taking op touching either house
         // (ordered first in a template, either one bricks the other inside
@@ -1541,7 +1637,115 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
         }
 
-        // Mirror settle guard, slot-keyed: the INCOMING tx takes a
+        // Contextual oracle checks (Phase G-1, T-o3). Every v17 op is height-
+        // AND branch-bound to exactly the next block on this tip, so admission
+        // runs the REAL contextual check at tip+1 with the same closures
+        // ConnectBlock uses (confirmed DB state IS the pre-block state a
+        // pooled op must bind; there is no unconfirmed-chaining to layer in).
+        // Then the slot guards: consensus allows ONE oracle op per submitter
+        // per block and ONE fresh bond per block, and v17 slot collisions
+        // spend no common coin, so two pooled ops in one slot would brick our
+        // own BMM template inside TestBlockValidity (the DR-2 class). One
+        // exception (spec s3, the ATTEST-displaces rationale transplanted): a
+        // newer SUBMIT for the same submitter DISPLACES the pooled one - a
+        // submitter's own residue must never block the duty the fix depends
+        // on. (A re-sign that respends the same funding outpoint takes the
+        // RBF/conflict path long before this block; displacement covers
+        // re-signs funded from a different outpoint.)
+        if (tx.nVersion == TRANSACTION_ORACLE_VERSION) {
+            auto fnGetOracleSub = [](uint32_t nID, COracleSubmitter& sub) {
+                return phousetree->GetOracleSubmitter(nID, sub);
+            };
+            auto fnHaveOracleKey = [](const std::vector<unsigned char>& vchKey) {
+                uint32_t nDummy;
+                return phousetree->GetOracleSubmitterIDByKey(vchKey, nDummy);
+            };
+            CGoldFix oracleFixPrev;
+            phousetree->GetGoldFix(oracleFixPrev);   // stays null if absent
+            uint32_t nLastSub = 0;
+            phousetree->GetLastOracleSubmitterID(nLastSub);
+            COracleSubmitter subResult;
+            bool fFreshBond = false;
+            uint64_t nPrice = 0;
+            auto fnGetOracleAnchor = [](uint32_t nH, uint256& hashOut) {
+                if ((int64_t)nH > (int64_t)chainActive.Height())
+                    return false;
+                const CBlockIndex* p = chainActive[(int)nH];
+                if (!p)
+                    return false;
+                hashOut = p->GetBlockHash();
+                return true;
+            };
+            if (!CheckOracleOperation(tx, state, GetSpendHeight(view), fnGetOracleAnchor,
+                    fnGetOracleSub, fnHaveOracleKey, oracleFixPrev, nLastSub + 1,
+                    subResult, fFreshBond, nPrice, true /* fMempool */))
+                return error("%s: CheckOracleOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+
+            const bool fIncomingSubmit = (tx.nOracleOp == ORACLE_OP_SUBMIT);
+            const uint32_t nInID = fFreshBond ? 0 : subResult.nSubmitterID;
+            uint32_t nInTarget = 0;
+            {
+                uint32_t nDummyID = 0;
+                bool fDummyFresh = false;
+                GetOracleSlotID(tx, nDummyID, fDummyFresh, &nInTarget);
+            }
+            std::vector<CTransactionRef> vDisplace;
+            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                const CTransaction& mtx = mi->GetTx();
+                uint32_t nTheirs = 0, nTheirTarget = 0;
+                bool fTheirsFresh = false;
+                if (!GetOracleSlotID(mtx, nTheirs, fTheirsFresh, &nTheirTarget))
+                    continue;
+                if (fFreshBond) {
+                    // One fresh registration per block: while one is pooled, a
+                    // second waits (same key would collide at dup-key inside
+                    // the template, different keys at the fresh-bond slot). A
+                    // pooled op on an EXISTING id cannot collide with a fresh
+                    // registration - the id it will be assigned is not in the
+                    // DB yet, so no admitted op can reference it.
+                    if (fTheirsFresh)
+                        return state.DoS(0, false, REJECT_DUPLICATE, "oracle-op-in-mempool");
+                } else if (!fTheirsFresh && nTheirs == nInID) {
+                    // NEVER displace a tx the incomer SPENDS. A re-sign is
+                    // routinely funded from its predecessor's 0-conf change
+                    // (the predecessor's own inputs are already spent-in-wallet,
+                    // so AvailableCoins offers exactly that change), and the
+                    // window made this the common case rather than a rarity -
+                    // under the old one-block rule the predecessor was swept and
+                    // abandoned before a re-sign existed. Evicting it here
+                    // removes the incomer's parent while the incomer is not yet
+                    // in the pool to be removed with it: CheckInputs then passes
+                    // off a cached coin whose parent is gone, and
+                    // CheckInputsFromMempoolAndCache aborts the node on
+                    // assert(!coinFromDisk.IsSpent()). Every peer holding the
+                    // predecessor runs the same path, so one submitter's routine
+                    // per-block re-sign would abort the network.
+                    bool fSpendsPooled = false;
+                    for (const CTxIn& in : tx.vin) {
+                        if (in.prevout.hash == mtx.GetHash()) { fSpendsPooled = true; break; }
+                    }
+                    // Displace only with a submission signed at or after the
+                    // pooled one. Under the validity window both can be live at
+                    // once, so an unconditional displace would let out-of-order
+                    // relay (or a hostile peer replaying a stale-but-valid
+                    // re-sign) swap a fresher price for a staler one.
+                    if (!fSpendsPooled && fIncomingSubmit && mtx.nOracleOp == ORACLE_OP_SUBMIT &&
+                            nInTarget >= nTheirTarget)
+                        vDisplace.push_back(mi->GetSharedTx());
+                    else
+                        return state.DoS(0, false, REJECT_DUPLICATE, "oracle-op-in-mempool");
+                }
+            }
+            for (const CTransactionRef& ref : vDisplace) {
+                LogPrintf("%s: newer oracle submission for submitter %u displaces pooled %s\n",
+                          __func__, nInID, ref->GetHash().ToString());
+                // EXPIRY, not CONFLICT: the MempoolEntryRemoved wallet-wedge
+                // rationale, verbatim from the ATTEST displacement below.
+                pool.removeRecursive(*ref, MemPoolRemovalReason::EXPIRY);
+            }
+        }
+
+        // Mirror settle guard, slot-keyed (T-s5): the INCOMING tx takes a
         // house slot and the mempool holds a v16 settle touching that house -
         // the two cannot ride one block. Default: reject the incomer. The ONE
         // exception (J2): an otherwise-valid ATTEST *displaces* the pooled
@@ -4047,7 +4251,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
     return true;
 }
 
-/** Contextual checks for a v16 SETTLE_OP_EXCHANGE (settlement spec s4
+/** Contextual checks for a v16 SETTLE_OP_EXCHANGE (PHASE3_7_SETTLEMENT.md s4
  * checks 8-13; check 14 - the dual house slots - is enforced at the
  * ConnectBlock/ATMP staging layer). Side-effect-free and fJustCheck-symmetric:
  * reads houses through the caller's closure, writes nothing. On success,
@@ -4058,7 +4262,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
  * (deliberate: they would re-enter the R-i7 template-brick class; the
  * attest-recency conjunct in HouseParEligible is the substitute) - so the only
  * non-input dependency is the two CHouse records, covered by the dual slots +
- * the ATMP guard matrix. */
+ * the ATMP guard matrix (T-s5). */
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           CHouse& houseAOut, CHouse& houseBOut)
@@ -4083,10 +4287,11 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     // the undo-idempotence invariant (s6.1): connect requires prior==0 or
     // height-prior >= cadence, so a stored stamp can never equal the connect
     // height of a later settle - "already undone" and "to-undo" cannot collide.
-    auto fnCadenceOK = [nHeight](const CHouse& h) {
+    const uint32_t nSettleCadence = Params().GetConsensus().nSettleCadence;
+    auto fnCadenceOK = [nHeight, nSettleCadence](const CHouse& h) {
         if (h.nLastSettleHeight == 0) return true;
         if (nHeight < 0 || (uint32_t)nHeight < h.nLastSettleHeight) return false;
-        return (uint32_t)nHeight - h.nLastSettleHeight >= SETTLE_CADENCE_BLOCKS;
+        return (uint32_t)nHeight - h.nLastSettleHeight >= nSettleCadence;
     };
     if (!fnCadenceOK(houseA) || !fnCadenceOK(houseB))
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-cadence");
@@ -4146,6 +4351,178 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     houseBOut = houseB;
     houseBOut.nMintedUnits -= x.nUnitsBNotes;
     houseBOut.nLastSettleHeight = (uint32_t)nHeight;
+    return true;
+}
+
+/** Gold oracle contextual checks (Phase G-1, spec v2 s2-s3). Per-tx only -
+ * the quorum + median are the CALLER's post-loop business. External linkage
+ * for the unit gates (the CheckSettleOperation pattern). */
+/** Is nHeight inside the op's validity window? nTargetHeight is the FIRST
+ * height at which the op may connect; it stays valid for nOracleOpWindow
+ * heights in total. k=1 (the pre-2026-07-28 rule) is the degenerate case, and
+ * it starved the oracle: under BMM the candidate for H+1 is templated in the
+ * same call that connects H, so an op signed against tip H could never reach
+ * it. Window signed off in ORACLE_WINDOW_PROPOSAL.md. */
+static bool OracleHeightInWindow(uint32_t nTargetHeight, int nHeight, uint32_t nWindow)
+{
+    if (nHeight < 0 || (uint32_t)nHeight < nTargetHeight)
+        return false;
+    return (uint32_t)nHeight - nTargetHeight < nWindow;
+}
+
+bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
+                          const std::function<bool(uint32_t, COracleSubmitter&)>& fnGetSubmitter,
+                          const std::function<bool(const std::vector<unsigned char>&)>& fnHaveKey,
+                          const CGoldFix& fixPrev, uint32_t nNextSubmitterID,
+                          COracleSubmitter& subOut, bool& fFreshBondOut, uint64_t& nPriceOut,
+                          bool fMempool)
+{
+    fFreshBondOut = false;
+    nPriceOut = 0;
+    if (!CheckOracleTransactionShape(tx, state))
+        return false;
+
+    // CHAIN-STATE-RELATIVE rejects score 0 in the mempool and 100 at connect
+    // [proposal row 7]. A peer relaying an op that expired in flight, or that
+    // anchors to a block we just reorged away from, or whose priors a fix
+    // overtook, is behaving honestly against a tip that differs from ours -
+    // and at DoS(100) a single such tx bans it outright (DEFAULT_BANSCORE
+    // is 100), partitioning a small signet exactly when the oracle needs relay
+    // most. Under the window, late arrival is a NORMAL event, not an attack.
+    // INTRINSIC rejects (bad sig, wrong key, malformed payload) keep 100 on
+    // every path - those are never honest.
+    const int nStateDoS = fMempool ? 0 : 100;
+    const uint32_t nWindow = Params().GetConsensus().nOracleOpWindow;
+    const uint256 hashPrevouts = OracleHashPrevouts(tx);
+    const uint256 hashOutputs = BillHashOutputs(tx);
+
+    if (tx.nOracleOp == ORACLE_OP_SUBMIT) {
+        OracleSubmit x;
+        DecodeOraclePayload(tx.vchOraclePayload, x);   // shape guaranteed decode
+
+        // (1) height window + branch binding. The op may connect anywhere in
+        // [nTargetHeight, nTargetHeight + k), and hashPrevBlockBind must be the
+        // block at nTargetHeight-1 ON THE CONNECTING BRANCH - so a fork below
+        // the signing tip still rejects it, preserving the C-5 cross-branch
+        // closure that the old parent-hash equality provided [C-5/F-4fid].
+        if (!OracleHeightInWindow(x.nTargetHeight, nHeight, nWindow))
+            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-height");
+        uint256 hashAnchor;
+        if (!fnGetBlockHashAt(x.nTargetHeight - 1, hashAnchor) || hashAnchor != x.hashPrevBlockBind)
+            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-branch");
+
+        // (2) known submitter, bonded in a PRIOR block [E-2].
+        COracleSubmitter sub;
+        if (!fnGetSubmitter(x.nSubmitterID, sub))
+            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-unknown-submitter");
+        if (sub.nBondHeight == 0 || sub.nBondHeight >= (uint32_t)nHeight)
+            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-bond-height");
+
+        // (3) priors byte-exact - fix (shared pre-block state, all
+        // submissions bind the same one) + own liveness stamp.
+        if (x.nPrevRaw != fixPrev.nRaw || x.nPrevBraked != fixPrev.nBraked ||
+                x.nPrevFixHeight != fixPrev.nFixHeight)
+            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-priors-mismatch");
+        if (x.nPrevOwnLastSubmitHeight != sub.nLastSubmitHeight)
+            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-priors-mismatch");
+
+        // (4) the submitter's signature over the shared digest.
+        CPubKey pubkey(sub.vchPubKey);
+        if (!pubkey.IsFullyValid() ||
+                !pubkey.Verify(OracleSubmitSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
+
+        subOut = sub;
+        subOut.nLastSubmitHeight = (uint32_t)nHeight;   // credit even sub-quorum [A-3]
+        nPriceOut = x.nPriceMilligrams;
+        return true;
+    }
+
+    OracleBond x;
+    DecodeOraclePayload(tx.vchOraclePayload, x);
+
+    // Same window as SUBMIT (BOND was the observed starvation casualty too).
+    // No branch bind on BOND, unchanged: its funding inputs give cross-branch
+    // exclusivity through the UTXO set, and a returning id additionally binds
+    // the record it overwrites byte-exact.
+    if (!OracleHeightInWindow(x.nTargetHeight, nHeight, nWindow))
+        return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-height");
+
+    // Bond escrow output pinned at vout[0]: the length-distinct escrow form
+    // carrying the registered key. The coin is tagged fOracleBond at AddCoins
+    // and spend-gated in CheckTxInputs (T-o3): only a same-key BOND may
+    // consolidate it - the record-tracked outpoint plus the tag close the
+    // anyone-can-spend exposure.
+    if (tx.vout.empty() || tx.vout[0].nValue <= 0 ||
+            !IsOracleBondScript(tx.vout[0].scriptPubKey))
+        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-out");
+    // The escrow must carry THIS submitter's registered key, not merely the
+    // right SHAPE. Shape alone let the key that signs prices diverge from the
+    // key that owns the bond: the spend gate pins consolidation to the script's
+    // embedded key, so a mismatched escrow is unspendable by its own submitter
+    // (silently burned), and at promotion the bond would not be the stake of
+    // the party being slashed.
+    if (tx.vout[0].scriptPubKey != OracleBondScript(x.vchSubmitterPubKey))
+        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-out-key");
+
+    if (x.nSubmitterID == 0) {
+        // Fresh registration: the key must be new; the dense id is assigned
+        // here (house-charter precedent). One per block via the caller's
+        // fresh-bond slot.
+        if (fnHaveKey(x.vchSubmitterPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-dup-key");
+        if (nNextSubmitterID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-id-seed");
+        CPubKey pubkey(x.vchSubmitterPubKey);
+        if (!pubkey.IsFullyValid() ||
+                !pubkey.Verify(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
+        subOut = COracleSubmitter();
+        subOut.nSubmitterID = nNextSubmitterID;
+        subOut.vchPubKey = x.vchSubmitterPubKey;
+        subOut.bondOutpoint = COutPoint(tx.GetHash(), 0);
+        subOut.nBondHeight = (uint32_t)nHeight;
+        fFreshBondOut = true;
+        return true;
+    }
+
+    // Returning id: record must exist, key must match, priors byte-exact
+    // against the record being overwritten [C-3].
+    COracleSubmitter sub;
+    if (!fnGetSubmitter(x.nSubmitterID, sub))
+        return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-unknown-submitter");
+    if (sub.vchPubKey != x.vchSubmitterPubKey)
+        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-key-mismatch");
+    if (x.nPrevBondHeight != sub.nBondHeight ||
+            x.nPrevLastSubmitHeight != sub.nLastSubmitHeight ||
+            x.nPrevUnbondRequestHeight != sub.nUnbondRequestHeight ||
+            x.outPrevBond != sub.bondOutpoint)
+        return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-priors-mismatch");
+    // A returning bond MUST consume the record's current bond coin. Without
+    // this the value ratchet in CheckTxInputs is opt-in: that ratchet only
+    // fires on bond coins actually spent, so a re-bond could simply ABANDON the
+    // old escrow, post a 1-satoshi vout[0], and repoint the record at it - a
+    // penalty-free unbond, in a design whose stated rule is that a bond leaves
+    // escrow only into another bond. Requiring the spend makes the ratchet
+    // unconditional for returning bonds. (Null outpoint = the record's coin was
+    // already consumed on a branch we since left; nothing to require.)
+    if (!sub.bondOutpoint.IsNull()) {
+        bool fSpendsOwnBond = false;
+        for (const CTxIn& in : tx.vin) {
+            if (in.prevout == sub.bondOutpoint) { fSpendsOwnBond = true; break; }
+        }
+        if (!fSpendsOwnBond)
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-not-consolidated");
+    }
+    CPubKey pubkey(x.vchSubmitterPubKey);
+    if (!pubkey.IsFullyValid() ||
+            !pubkey.Verify(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
+        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
+    subOut = sub;
+    subOut.bondOutpoint = COutPoint(tx.GetHash(), 0);
+    subOut.nBondHeight = (uint32_t)nHeight;
+    subOut.nUnbondRequestHeight = 0;   // a re-bond cancels a pending unbond
     return true;
 }
 
@@ -5173,7 +5550,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         // pattern for future dual-record ops. Two WriteHouse calls per settle
         // means a crash can land between them; the skip branch makes the undo
         // per-house resumable instead of demanding -reindex. Provably
-        // unambiguous: connect required nHeight - prior >= SETTLE_CADENCE_BLOCKS
+        // unambiguous: connect required nHeight - prior >= nSettleCadence
         // (or prior == 0), so a stored stamp equal to the payload prior can
         // only mean "already undone", never "still connected". Restoration is
         // byte-exact from the payload alone: connect required both counters
@@ -5211,6 +5588,105 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write settle undo house %u!", side.nID);
                     return DISCONNECT_FAILED;
+                }
+            }
+        }
+
+        // Gold oracle undo (Phase G-1, spec s3): priors ride in every SUBMIT
+        // payload; the fix skip-guard discriminator is nFixHeight == this
+        // height ("not yet undone" - at most one fix lands per block, so the
+        // stored height strictly increases across accept-blocks). Submitter
+        // stamps restore per-tx with their own skip-if-prior.
+        if (fHouseUndo && tx.nVersion == TRANSACTION_ORACLE_VERSION) {
+            if (tx.nOracleOp == ORACLE_OP_SUBMIT) {
+                OracleSubmit ox;
+                if (!DecodeOraclePayload(tx.vchOraclePayload, ox)) {
+                    error("DisconnectBlock(): Failed to decode oracle submit payload!");
+                    return DISCONNECT_FAILED;
+                }
+                CGoldFix fix;
+                if (phousetree->GetGoldFix(fix) && fix.nFixHeight == (uint32_t)pindex->nHeight) {
+                    if (ox.nPrevFixHeight == 0) {
+                        if (!phousetree->EraseGoldFix()) {
+                            error("DisconnectBlock(): Failed to erase genesis gold fix!");
+                            return DISCONNECT_FAILED;
+                        }
+                    } else {
+                        CGoldFix prior;
+                        prior.nRaw = ox.nPrevRaw;
+                        prior.nBraked = ox.nPrevBraked;   // path-dependent: only
+                        prior.nFixHeight = ox.nPrevFixHeight;   // restorable because bound
+                        if (!phousetree->WriteGoldFix(prior)) {
+                            error("DisconnectBlock(): Failed to write gold fix undo!");
+                            return DISCONNECT_FAILED;
+                        }
+                    }
+                }
+                COracleSubmitter sub;
+                if (!phousetree->GetOracleSubmitter(ox.nSubmitterID, sub)) {
+                    error("DisconnectBlock(): Failed to read oracle submitter %u!", ox.nSubmitterID);
+                    return DISCONNECT_FAILED;
+                }
+                if (sub.nLastSubmitHeight != ox.nPrevOwnLastSubmitHeight) {
+                    if (sub.nLastSubmitHeight != (uint32_t)pindex->nHeight) {
+                        error("DisconnectBlock(): Oracle submit undo stamp mismatch submitter %u!", ox.nSubmitterID);
+                        return DISCONNECT_FAILED;
+                    }
+                    sub.nLastSubmitHeight = ox.nPrevOwnLastSubmitHeight;
+                    if (!phousetree->WriteOracleSubmitter(sub)) {
+                        error("DisconnectBlock(): Failed to write oracle submitter undo %u!", ox.nSubmitterID);
+                        return DISCONNECT_FAILED;
+                    }
+                }
+            } else if (tx.nOracleOp == ORACLE_OP_BOND) {
+                OracleBond ob;
+                if (!DecodeOraclePayload(tx.vchOraclePayload, ob)) {
+                    error("DisconnectBlock(): Failed to decode oracle bond payload!");
+                    return DISCONNECT_FAILED;
+                }
+                if (ob.nSubmitterID == 0) {
+                    // Fresh bond: the id was assigned at connect - find it by
+                    // key. Absent = already undone (crash-resume). Fresh ids
+                    // are LIFO across disconnects, so it must be the last.
+                    uint32_t nID = 0;
+                    if (phousetree->GetOracleSubmitterIDByKey(ob.vchSubmitterPubKey, nID)) {
+                        uint32_t nLast = 0;
+                        phousetree->GetLastOracleSubmitterID(nLast);
+                        if (nID != nLast) {
+                            error("DisconnectBlock(): Fresh oracle bond undo out of order (%u != %u)!", nID, nLast);
+                            return DISCONNECT_FAILED;
+                        }
+                        if (!phousetree->RemoveOracleSubmitter(nID) ||
+                                !phousetree->WriteLastOracleSubmitterID(nID - 1)) {
+                            error("DisconnectBlock(): Failed to remove fresh oracle bond %u!", nID);
+                            return DISCONNECT_FAILED;
+                        }
+                    }
+                } else {
+                    COracleSubmitter sub;
+                    if (!phousetree->GetOracleSubmitter(ob.nSubmitterID, sub)) {
+                        error("DisconnectBlock(): Failed to read oracle submitter %u!", ob.nSubmitterID);
+                        return DISCONNECT_FAILED;
+                    }
+                    if (sub.nBondHeight != ob.nPrevBondHeight) {   // skip-if-prior
+                        if (sub.nBondHeight != (uint32_t)pindex->nHeight) {
+                            error("DisconnectBlock(): Oracle bond undo stamp mismatch submitter %u!", ob.nSubmitterID);
+                            return DISCONNECT_FAILED;
+                        }
+                        sub.nBondHeight = ob.nPrevBondHeight;
+                        sub.nLastSubmitHeight = ob.nPrevLastSubmitHeight;
+                        sub.nUnbondRequestHeight = ob.nPrevUnbondRequestHeight;
+                        // The outpoint is mutated at connect like the stamps,
+                        // so it must be restored like them - otherwise the
+                        // record points at this disconnected tx's vout[0],
+                        // which no longer exists, orphaning the prior bond and
+                        // diverging from a node that synced the same branch.
+                        sub.bondOutpoint = ob.outPrevBond;
+                        if (!phousetree->WriteOracleSubmitter(sub)) {
+                            error("DisconnectBlock(): Failed to write oracle bond undo %u!", ob.nSubmitterID);
+                            return DISCONNECT_FAILED;
+                        }
+                    }
                 }
             }
         }
@@ -5659,6 +6135,19 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     std::vector<uint32_t> vPoolRemove;          // pools RETIREd (deleted) this block
     std::set<uint32_t> setPoolTouched;          // ONE pool op per pool per block (decision 3)
 
+    // Gold oracle staging (Phase G-1, consensus-INERT; rides the HouseDB
+    // batch + marker, so fHouseDBReplay covers it). The median is applied
+    // POST-LOOP - the file's first cross-tx per-block aggregate (spec s3).
+    std::vector<uint64_t> vOracleBlockPrices;           // valid submissions this block
+    std::set<uint32_t> setOracleDistinct;               // distinct submitters [A-1]
+    std::set<uint32_t> setOracleSubTouched;             // ONE oracle op per submitter per block
+    std::map<uint32_t, COracleSubmitter> mapOracleSubUpdate;
+    std::vector<COracleSubmitter> vOracleSubNew;        // fresh bonds this block
+    bool fOracleFreshBondThisBlock = false;             // the id-0 guard slot
+    uint32_t nOracleSubIDNext = 0;                      // lazily seeded
+    CGoldFix oracleFixPrev;                             // pre-block fix (null if none)
+    bool fOracleFixLoaded = false;
+
     // Side-DB lifecycle (3.4 review): HouseDB/BillDB carry a best-block
     // marker written ATOMICALLY with each block's effects. Normally the
     // marker sits at the parent; if it is at THIS block or a descendant, the
@@ -5841,6 +6330,11 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 amountPrev = prev.dtx.vout[prev.nBurnIndex].nValue;
             }
 
+            // Coinbase outputs already spoken for by an earlier deposit in
+            // THIS block. Without this, two identical deposits are both
+            // satisfied by one output and the miner keeps the difference (D-1).
+            std::set<size_t> setClaimedPayouts;
+
             // Check deposit payout amounts & find coinbase output
             for (const SidechainDeposit& d : vDeposit) {
 
@@ -5856,18 +6350,19 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     return state.DoS(90, error("%s: invalid sidechain deposit amount:\n%s", __func__, d.ToString()), REJECT_INVALID, "invalid-deposit-amount");
                 }
 
+                // D-2: ask the SAME question the builder asked. A deposit that
+                // is owed nothing (dust at or below the fee, or an undecodable
+                // depositor-supplied destination) is recorded but not paid, and
+                // demanding an output for it made the node reject its own
+                // blocks forever - deposits are strictly ordered, so the queue
+                // could never move past one.
+                CTxOut required;
+                if (!GetDepositPayoutOutput(d, required))
+                    continue;
+
                 // Now check coinbase outputs
-                bool fFound = false;
-                for (const CTxOut& o : block.vtx[0]->vout) {
-                    if (o.nValue == d.amtUserPayout - SIDECHAIN_DEPOSIT_FEE &&
-                            o.scriptPubKey == GetScriptForDestination(
-                                DecodeDestination(d.strDest)))
-                    {
-                        fFound = true;
-                        break;
-                    }
-                }
-                if (!fFound) {
+                if (!ClaimDepositPayoutOutput(required, block.vtx[0]->vout,
+                                              setClaimedPayouts)) {
                     return state.DoS(90, error("%s: sidechain deposit missing output:\n%s", __func__, d.ToString()), REJECT_INVALID, "invalid-deposit-missing-output");
                 }
             }
@@ -6388,6 +6883,83 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             }
         }
 
+        // Gold oracle ops (Phase G-1, consensus-INERT: this maintains the fix
+        // + submitter records; NOTHING reads them). Rides the HouseDB batch,
+        // so fHouseDBReplay skips it like every sibling family.
+        if (!fHouseDBReplay && tx.nVersion == TRANSACTION_ORACLE_VERSION) {
+            if (!fOracleFixLoaded) {
+                fOracleFixLoaded = true;
+                phousetree->GetGoldFix(oracleFixPrev);   // stays null if absent
+            }
+            if (nOracleSubIDNext == 0) {
+                uint32_t nLastSub = 0;
+                phousetree->GetLastOracleSubmitterID(nLastSub);
+                nOracleSubIDNext = nLastSub + 1;
+            }
+            auto fnGetSubmitter = [&](uint32_t nID, COracleSubmitter& sub) {
+                std::map<uint32_t, COracleSubmitter>::const_iterator it = mapOracleSubUpdate.find(nID);
+                if (it != mapOracleSubUpdate.end()) { sub = it->second; return true; }
+                for (const COracleSubmitter& s2 : vOracleSubNew)
+                    if (s2.nSubmitterID == nID) { sub = s2; return true; }
+                return phousetree->GetOracleSubmitter(nID, sub);
+            };
+            auto fnHaveKey = [&](const std::vector<unsigned char>& vchKey) {
+                for (const std::pair<const uint32_t, COracleSubmitter>& kv : mapOracleSubUpdate)
+                    if (kv.second.vchPubKey == vchKey) return true;
+                for (const COracleSubmitter& s2 : vOracleSubNew)
+                    if (s2.vchPubKey == vchKey) return true;
+                uint32_t nDummy;
+                return phousetree->GetOracleSubmitterIDByKey(vchKey, nDummy);
+            };
+            COracleSubmitter subResult;
+            bool fFreshBond = false;
+            uint64_t nPrice = 0;
+            // The window anchor MUST be resolved from pindex, never chainActive:
+            // a reorg connect runs on a side branch where chainActive[] is the
+            // wrong chain entirely. GetAncestor walks THIS block's ancestry, so
+            // an op signed on a competing branch fails the bind - which is the
+            // cross-branch closure the old parent-hash equality gave us, and
+            // pindex->pprev was literally its k=1 case.
+            auto fnGetAnchor = [pindex](uint32_t nH, uint256& hashOut) {
+                // STRICTLY prior heights only. Under TestBlockValidity pindex is
+                // a temporary index whose phashBlock is null, so answering for
+                // nH == pindex->nHeight would null-deref in GetBlockHash. The
+                // resolver is only ever asked for nTargetHeight-1 <= nHeight-1.
+                if ((int64_t)nH >= (int64_t)pindex->nHeight)
+                    return false;
+                const CBlockIndex* p = pindex->GetAncestor((int)nH);
+                if (!p || !p->phashBlock)
+                    return false;
+                hashOut = p->GetBlockHash();
+                return true;
+            };
+            if (!CheckOracleOperation(tx, state, pindex->nHeight, fnGetAnchor,
+                    fnGetSubmitter, fnHaveKey, oracleFixPrev, nOracleSubIDNext,
+                    subResult, fFreshBond, nPrice))
+                return error("ConnectBlock(): CheckOracleOperation on %s failed with %s",
+                    tx.GetHash().ToString(), FormatStateMessage(state));
+            // One oracle op per submitter per block - CONSENSUS, not an ATMP
+            // nicety: the BMM sequencer bypasses its own mempool [A-1].
+            if (setOracleSubTouched.count(subResult.nSubmitterID))
+                return state.DoS(100, error("ConnectBlock(): second oracle op for submitter %u this block",
+                    subResult.nSubmitterID), REJECT_INVALID, "bad-oracle-multiple-ops");
+            setOracleSubTouched.insert(subResult.nSubmitterID);
+            if (tx.nOracleOp == ORACLE_OP_SUBMIT) {
+                vOracleBlockPrices.push_back(nPrice);
+                setOracleDistinct.insert(subResult.nSubmitterID);
+                mapOracleSubUpdate[subResult.nSubmitterID] = subResult;
+            } else if (fFreshBond) {
+                if (fOracleFreshBondThisBlock)
+                    return state.DoS(100, error("ConnectBlock(): second fresh oracle bond this block"),
+                        REJECT_INVALID, "bad-oracle-multiple-ops");
+                fOracleFreshBondThisBlock = true;
+                vOracleSubNew.push_back(subResult);
+                nOracleSubIDNext++;
+            } else {
+                mapOracleSubUpdate[subResult.nSubmitterID] = subResult;
+            }
+        }
+
         CTxUndo undoDummy;
         if (i > 0) {
             blockundo.vtxundo.push_back(CTxUndo());
@@ -6734,7 +7306,33 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         for (const std::pair<const uint32_t, CHouse>& p : mapHouseUpdate)
             vHouseWrite.push_back(p.second);
         const uint32_t nLastHouseID = nHouseIDNext - 1;
-        if (!phousetree->WriteBlockEffects(vHouseWrite, vHouseNew.size() ? &nLastHouseID : nullptr, pindex->GetBlockHash()))
+
+        // Gold oracle: the post-loop median - the file's first cross-tx
+        // per-block aggregate (spec s3; the settle-s5.2 checklist applies).
+        // Quorum counts DISTINCT submitters [A-1]; a sub-quorum block carries
+        // the fix unchanged (submitter liveness credit already staged
+        // per-tx [A-3]). Oracle effects ride the SAME atomic batch + marker.
+        CGoldFix oracleFixNew;
+        bool fOracleFixWrite = false;
+        if (setOracleDistinct.size() >= chainparams.GetConsensus().nOracleQuorumMin) {
+            oracleFixNew.nRaw = OracleLowerMedian(vOracleBlockPrices);
+            const uint32_t nElapsed = oracleFixPrev.IsNull()
+                ? 1 : (uint32_t)pindex->nHeight - oracleFixPrev.nFixHeight;
+            oracleFixNew.nBraked = OracleBrakedNext(oracleFixPrev.nBraked, oracleFixNew.nRaw,
+                nElapsed, chainparams.GetConsensus().nOracleBrakePpmPerBlock,
+                chainparams.GetConsensus().nOracleBrakeElapsedCap);
+            oracleFixNew.nFixHeight = (uint32_t)pindex->nHeight;
+            fOracleFixWrite = true;
+        }
+        std::vector<COracleSubmitter> vOracleSubWrite = vOracleSubNew;
+        for (const std::pair<const uint32_t, COracleSubmitter>& p : mapOracleSubUpdate)
+            vOracleSubWrite.push_back(p.second);
+        const uint32_t nLastOracleSubID = nOracleSubIDNext ? nOracleSubIDNext - 1 : 0;
+
+        if (!phousetree->WriteBlockEffects(vHouseWrite, vHouseNew.size() ? &nLastHouseID : nullptr, pindex->GetBlockHash(),
+                fOracleFixWrite ? &oracleFixNew : nullptr, false,
+                vOracleSubWrite.empty() ? nullptr : &vOracleSubWrite, nullptr,
+                vOracleSubNew.size() ? &nLastOracleSubID : nullptr))
             return state.Error("Failed to write house index!");
     }
 
@@ -9249,6 +9847,15 @@ bool LoadBlockIndex(const CChainParams& chainparams)
         pblocktree->WriteFlag("txindex", fTxIndex);
         pblocktree->WriteFlag("sidechain", fSidechainIndex);
     }
+
+    // Stamp the undo record format. Also on a RESUMED reindex - fReindex set
+    // from the on-disk flag with the block index already partly rebuilt, so
+    // needs_init is false - because the rev*.dat this run is producing ARE
+    // current-format, and without the stamp the startup gate would abort a
+    // resumable reindex and demand yet another one.
+    if (needs_init || fReindex)
+        pblocktree->WriteDiskFormatVersion(nDiskFormatVersion);
+
     return true;
 }
 
@@ -9756,7 +10363,32 @@ void LoadBMMCache()
         int nVersionRequired, nVersionThatWrote;
         filein >> nVersionRequired;
         filein >> nVersionThatWrote;
-        if (nVersionRequired > CLIENT_VERSION) {
+        // LEGACY STAMP. Every cache file in existence before FREEBANK_CACHE_MIN_VERSION
+        // landed says "required 160000" - Bitcoin Core 0.16's number, written
+        // unconditionally by this fork's own binaries. The nVersionThatWrote field
+        // proves that provenance (the live evidence chain reads
+        // required=160000 wrote=20500), and the format has never changed in fork
+        // history, so these files are readable and must be read.
+        //
+        // Rejecting them is not a cosmetic strictness: the disk-format gate forces
+        // a -reindex on any datadir without a marker, and a -reindex against an
+        // unloaded main-block cache resets the chain to height 0. Refusing legacy
+        // files would therefore DESTROY every existing datadir on first upgrade -
+        // exactly the disaster-recovery flow this whole fix exists to restore.
+        const bool fLegacyStamp = (nVersionRequired == 160000 &&
+                                   nVersionThatWrote <= CLIENT_VERSION);
+        if (nVersionRequired > CLIENT_VERSION && !fLegacyStamp) {
+            // NEVER silent. This returned quietly for every cache, on every
+            // startup, because the dump hardcoded Bitcoin Core's 160000 while
+            // FreeBank's CLIENT_VERSION is 20500 - so 160000 > 20500 was always
+            // true. The BMM caches were written faithfully on shutdown and
+            // never once read back. It cost a broken -reindex (empty cache ->
+            // GetMainPrevBlockHash returns null -> every replayed block fails
+            // bad-mc-prev) and stayed invisible precisely because it said
+            // nothing.
+            LogPrintf("%s: SKIPPED - file requires client version %d, this is %d. "
+                      "Cache not loaded; it will be rebuilt and rewritten.\n",
+                      __func__, nVersionRequired, CLIENT_VERSION);
             return;
         }
 
@@ -9815,7 +10447,7 @@ void DumpBMMCache()
     }
 
     try {
-        fileout << 160000; // version required to read: 0.16.00 or later
+        fileout << FREEBANK_CACHE_MIN_VERSION; // minimum client version able to read this
         fileout << CLIENT_VERSION; // version that wrote the file
 
         // Broadcasted Withdrawal Bundle hash cache
@@ -9861,7 +10493,32 @@ void LoadMainBlockCache()
         int nVersionRequired, nVersionThatWrote;
         filein >> nVersionRequired;
         filein >> nVersionThatWrote;
-        if (nVersionRequired > CLIENT_VERSION) {
+        // LEGACY STAMP. Every cache file in existence before FREEBANK_CACHE_MIN_VERSION
+        // landed says "required 160000" - Bitcoin Core 0.16's number, written
+        // unconditionally by this fork's own binaries. The nVersionThatWrote field
+        // proves that provenance (the live evidence chain reads
+        // required=160000 wrote=20500), and the format has never changed in fork
+        // history, so these files are readable and must be read.
+        //
+        // Rejecting them is not a cosmetic strictness: the disk-format gate forces
+        // a -reindex on any datadir without a marker, and a -reindex against an
+        // unloaded main-block cache resets the chain to height 0. Refusing legacy
+        // files would therefore DESTROY every existing datadir on first upgrade -
+        // exactly the disaster-recovery flow this whole fix exists to restore.
+        const bool fLegacyStamp = (nVersionRequired == 160000 &&
+                                   nVersionThatWrote <= CLIENT_VERSION);
+        if (nVersionRequired > CLIENT_VERSION && !fLegacyStamp) {
+            // NEVER silent. This returned quietly for every cache, on every
+            // startup, because the dump hardcoded Bitcoin Core's 160000 while
+            // FreeBank's CLIENT_VERSION is 20500 - so 160000 > 20500 was always
+            // true. The BMM caches were written faithfully on shutdown and
+            // never once read back. It cost a broken -reindex (empty cache ->
+            // GetMainPrevBlockHash returns null -> every replayed block fails
+            // bad-mc-prev) and stayed invisible precisely because it said
+            // nothing.
+            LogPrintf("%s: SKIPPED - file requires client version %d, this is %d. "
+                      "Cache not loaded; it will be rebuilt and rewritten.\n",
+                      __func__, nVersionRequired, CLIENT_VERSION);
             return;
         }
 
@@ -9897,7 +10554,7 @@ void DumpMainBlockCache()
     }
 
     try {
-        fileout << 160000; // version required to read: 0.16.00 or later
+        fileout << FREEBANK_CACHE_MIN_VERSION; // minimum client version able to read this
         fileout << CLIENT_VERSION; // version that wrote the file
         fileout << count; // Number of Withdrawal Bundle hashes in file
 
@@ -9932,7 +10589,7 @@ void DumpWithdrawalIDCache()
     }
 
     try {
-        fileout << 160000; // version required to read: 0.16.00 or later
+        fileout << FREEBANK_CACHE_MIN_VERSION; // minimum client version able to read this
         fileout << CLIENT_VERSION; // version that wrote the file
         fileout << count; // Number of Withdrawal IDs in file
 
@@ -9965,7 +10622,32 @@ void LoadWithdrawalIDCache()
         int nVersionRequired, nVersionThatWrote;
         filein >> nVersionRequired;
         filein >> nVersionThatWrote;
-        if (nVersionRequired > CLIENT_VERSION) {
+        // LEGACY STAMP. Every cache file in existence before FREEBANK_CACHE_MIN_VERSION
+        // landed says "required 160000" - Bitcoin Core 0.16's number, written
+        // unconditionally by this fork's own binaries. The nVersionThatWrote field
+        // proves that provenance (the live evidence chain reads
+        // required=160000 wrote=20500), and the format has never changed in fork
+        // history, so these files are readable and must be read.
+        //
+        // Rejecting them is not a cosmetic strictness: the disk-format gate forces
+        // a -reindex on any datadir without a marker, and a -reindex against an
+        // unloaded main-block cache resets the chain to height 0. Refusing legacy
+        // files would therefore DESTROY every existing datadir on first upgrade -
+        // exactly the disaster-recovery flow this whole fix exists to restore.
+        const bool fLegacyStamp = (nVersionRequired == 160000 &&
+                                   nVersionThatWrote <= CLIENT_VERSION);
+        if (nVersionRequired > CLIENT_VERSION && !fLegacyStamp) {
+            // NEVER silent. This returned quietly for every cache, on every
+            // startup, because the dump hardcoded Bitcoin Core's 160000 while
+            // FreeBank's CLIENT_VERSION is 20500 - so 160000 > 20500 was always
+            // true. The BMM caches were written faithfully on shutdown and
+            // never once read back. It cost a broken -reindex (empty cache ->
+            // GetMainPrevBlockHash returns null -> every replayed block fails
+            // bad-mc-prev) and stayed invisible precisely because it said
+            // nothing.
+            LogPrintf("%s: SKIPPED - file requires client version %d, this is %d. "
+                      "Cache not loaded; it will be rebuilt and rewritten.\n",
+                      __func__, nVersionRequired, CLIENT_VERSION);
             return;
         }
 

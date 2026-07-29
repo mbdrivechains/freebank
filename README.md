@@ -53,9 +53,35 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
   receipts, subordinated to notes in the insolvency waterfall.
 - **Clearing pools**: on-chain AMM pools between a house's notes and the base coin —
   swaps, LP shares, and orderly pool retirement. RPCs: `createpool`, `listpools`,
-  `swapnote`, `addliquidity`, `removeliquidity`, `listmylp`, `retirepool`.
+  `swapnote`, `addpoolliquidity`, `removepoolliquidity`, `listmylp`, `retirepool`.
 - **Metric denomination (display)**: RPCs report values in grams alongside base units at
   a fixed launch scale (`getgramrate`). Presentation-only — no consensus rule reads it.
+
+## Robustness
+
+Consensus code is only as trustworthy as what tries to break it. Recent work
+(v0.2.6) is mostly adversarial:
+
+- **Adversarial deposit shapes.** The deposit path had no hostile coverage — the
+  happy path was all that was ever exercised. It now has a gate, and that gate
+  found two defects fixed in this release — a duplicate-deposit theft vector (one
+  coinbase output could satisfy two deposits) and a dust deposit that permanently
+  halted the peg.
+- **Two-node convergence.** Nothing previously ran *two* nodes against one chain, so
+  a rule written differently in the block producer than in the block validator was
+  invisible to the whole suite: one node agrees with itself by construction. A second
+  node now boots before the first block exists and independently validates every block
+  from genesis, and both must match on tip, the full UTXO set, and every side-database
+  (bills, houses, pools, oracle, the deposit accumulator) at each checkpoint.
+- **Recovery.** `-reindex` is verified to reproduce the chain exactly, including from a
+  datadir written by an earlier version.
+- **On-disk format guard.** Coin and undo records are versioned; a node reading records
+  it cannot parse refuses to start and names the remedy, rather than silently
+  misparsing them into wrong coin metadata.
+- **Reorg coverage** across every operation family, asserting that disconnect is an
+  exact inverse — not merely that state changed.
+
+21 integration gates and 372 unit tests. All must pass to merge.
 
 ## Wallet (preview)
 
@@ -77,6 +103,12 @@ make -j"$(nproc)"
 ```
 
 Binaries land in `src/`: `freebankd`, `freebank-cli`, `freebank-tx`.
+
+> **These native binaries are NOT portable.** They link against your system's
+> libraries and run only on the machine/distro that built them. The published
+> release binaries are built statically (Linux via `depends`, ldd-gated to base
+> libraries only; macOS via the repo's `macos-arm64` workflow) — use those, or a
+> `depends` static build, for anything you intend to run on another host.
 
 Run the unit tests:
 
@@ -121,5 +153,22 @@ Alpha. Consensus surfaces (bills, houses, notes, attestation/insolvency, redempt
 economics, term deposits, clearing pools, deposits/withdrawals, the transport layer) have
 unit + integration coverage and adversarial review; the full peg-out cycle is verified
 end-to-end against the CUSF enforcer (upstream ≥ `135115b`) on regtest. Reserve and
-solvency parameters are provisional pending
-simulation. Not yet audited; do not use with real value.
+solvency parameters are provisional pending simulation. Not yet audited; do not use with
+real value.
+
+**Known open issues in this release.** Stated plainly because you should know them
+before running a node, not after:
+
+- **Deposit CTIP rollback (reorg).** The deposit database's pointer is not rolled back
+  when a block is disconnected, so a node that experienced a reorg across a
+  deposit-bearing block can compute deposit payouts differently from a freshly synced
+  node. Diagnosed and scoped; not yet fixed. It needs a reorg to trigger, and it
+  predates this release.
+- **Payload signature malleability.** FreeBank operation signatures are verified
+  outside the script interpreter and accept non-canonical (lax-DER, high-S) encodings.
+  Because the payloads are covered by the txid, a third party can alter a transaction's
+  id without invalidating it, which can break dependent operation chains and any
+  off-chain accounting keyed on txids.
+
+Neither is exploitable for value today — this is test-coin software — but both are
+consensus-level and both are on the list before any release that carries value.

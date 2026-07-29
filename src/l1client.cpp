@@ -18,6 +18,7 @@
 #include <validation.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <mutex>
 #include <set>
@@ -90,7 +91,7 @@ public:
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
 
     /* The init-time REST reachability probe borrows the private RestGet. */
-    friend bool ::ProbeMainchainRest(std::string& strError);
+    friend bool ::ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch);
 
 private:
     /*
@@ -577,15 +578,77 @@ bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
     }
 }
 
-bool ProbeMainchainRest(std::string& strError)
+/** Hex compares case-insensitively; a pin must not fail on 00AB vs 00ab. */
+static bool HexEqualNoCase(const std::string& a, const std::string& b)
 {
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
+
+bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
+{
+    if (pfIdentityMismatch) *pfIdentityMismatch = false;
     EnforcerL1Client client;
     std::string strBody;
-    if (client.RestGet("/rest/chaininfo.json", strBody) && !strBody.empty())
-        return true;
-    strError = strprintf("mainchain REST endpoint %s did not answer /rest/chaininfo.json",
-                         gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST));
-    return false;
+    if (!client.RestGet("/rest/chaininfo.json", strBody) || strBody.empty()) {
+        strError = strprintf("mainchain REST endpoint %s did not answer /rest/chaininfo.json",
+                             gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST));
+        return false;
+    }
+
+    // L1 IDENTITY PIN. Reachability alone is not identity: a REST endpoint that
+    // answers is not necessarily the L1 this node's history was built against.
+    // Failure observed 2026-07-28: a second freebankd took the DEFAULT
+    // -mainchainrest and silently BMM'd against a different node's mainchain -
+    // one that is wiped nightly. Everything looked healthy; the probe was
+    // satisfied because a mainchain replied.
+    //
+    // NOTE the pinned fields. `chain` alone catches signet-vs-mainnet (the
+    // threat the plan docs anticipated) but NOT signet-vs-signet, and the
+    // genesis hash catches neither: Core's signet genesis is HARDCODED and does
+    // not derive from the challenge, so two custom signets share it byte for
+    // byte (verified on these two chains). The `signetchallenge` IS the network
+    // identity for signet, and it is already in this same response.
+    UniValue info;
+    if (!info.read(strBody) || !info.isObject()) {
+        strError = "mainchain REST /rest/chaininfo.json was unparseable";
+        return false;
+    }
+
+    const std::string strWantChain = gArgs.GetArg("-mainchainchain", "");
+    if (!strWantChain.empty()) {
+        const UniValue& chain = find_value(info, "chain");
+        if (!chain.isStr() || chain.get_str() != strWantChain) {
+            strError = strprintf("mainchain identity mismatch: -mainchainchain=%s but %s reports "
+                                 "chain=%s. Refusing to start against the wrong L1.",
+                                 strWantChain, gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST),
+                                 chain.isStr() ? chain.get_str() : "(absent)");
+            if (pfIdentityMismatch) *pfIdentityMismatch = true;
+            return false;
+        }
+    }
+
+    const std::string strWantChallenge = gArgs.GetArg("-mainchainchallenge", "");
+    if (!strWantChallenge.empty()) {
+        const UniValue& chal = find_value(info, "signet_challenge");
+        if (!chal.isStr() || !HexEqualNoCase(chal.get_str(), strWantChallenge)) {
+            strError = strprintf("mainchain identity mismatch: -mainchainchallenge=%s but %s "
+                                 "reports signet_challenge=%s. This is a DIFFERENT signet - "
+                                 "refusing to start against the wrong L1.",
+                                 strWantChallenge,
+                                 gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST),
+                                 chal.isStr() ? chal.get_str() : "(absent)");
+            if (pfIdentityMismatch) *pfIdentityMismatch = true;
+            return false;
+        }
+    }
+    return true;
 }
 
 bool EnforcerL1Client::RestGetRawTx(const uint256& txid, CMutableTransaction& tx)

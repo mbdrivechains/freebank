@@ -65,6 +65,27 @@ struct Params {
      */
     uint32_t nRuleChangeActivationThreshold;
     uint32_t nMinerConfirmationWindow;
+    /** SETTLE_EXCHANGE per-house cadence in blocks (eligibility comparison in
+     *  CheckSettleOperation, never a sweep). Consensus-critical: a per-node
+     *  override would fork the chain, so this lives here and ONLY here —
+     *  no CLI/conf knob may ever set it. */
+    uint32_t nSettleCadence;
+    /** Gold oracle (Phase G-1, consensus-inert). Same never-a-CLI-knob rule.
+     *  Quorum = DISTINCT registered submitters required in one block for a
+     *  new fix; brake = max fall of the braked view, ppm per elapsed block,
+     *  elapsed capped; unbond delay is provisional (decorative while inert). */
+    uint32_t nOracleQuorumMin;
+    uint32_t nOracleBrakePpmPerBlock;
+    uint32_t nOracleBrakeElapsedCap;
+    uint32_t nOracleUnbondDelay;
+    /** How many heights a v17 op stays valid, counting its nTargetHeight as the
+     * first. MUST be >= 2: under BMM the candidate for the next block is
+     * templated in the same call that connects the current one, so an op signed
+     * against tip H can never reach the H+1 candidate - k=1 starves the oracle
+     * completely. See docs-local/ORACLE_WINDOW_PROPOSAL.md (operator-signed
+     * 2026-07-28). Every STORED height stays a connect height; only this
+     * validity predicate widened. */
+    uint32_t nOracleOpWindow;
     BIP9Deployment vDeployments[MAX_VERSION_BITS_DEPLOYMENTS];
     /** Proof of work parameters */
     uint256 powLimit;

@@ -1071,7 +1071,7 @@ public:
      * nMinOut is the consensus slippage guard. */
     bool SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID, bool fNoteToBtx, uint64_t nAmountIn, uint64_t nMinOut, const CAmount& nFee);
 
-    /** Settlement ceremony (Phase 3.7 pt2). ProposeSettle: export the
+    /** Settlement ceremony (Phase 3.7 pt2, T-s6). ProposeSettle: export the
      * round-1 blob presenting this wallet's counterparty-issued paper (largest
      * single-key holding; if fragmented, fires ONE consolidating TransferNote
      * toward the largest key and reports it via txidConsolidate - re-run once
@@ -1114,6 +1114,22 @@ public:
     /** Take the locked till back out of consensus custody, once the clause has
      * been lifted (3.5 D11). */
     bool ReleaseReserves(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+
+    /** Gold oracle (Phase G-1, T-o4). BondOracleSubmitter: register a fresh
+     * submitter key (nSubmitterID 0, dense id assigned at connect and reported
+     * via nAssignedIDOut) or re-bond/top-up a returning one, CONSOLIDATING its
+     * existing bond coin - only a same-key BOND may spend it, so leaving it
+     * behind would orphan the value from the record. SubmitOraclePrice: one
+     * price valid from the next height for nOracleOpWindow blocks (v17 binds a
+     * target height + its signing-tip anchor), so it tolerates missing a
+     * template; it is still re-signed every block by design, and a re-sign
+     * displaces its own pooled predecessor.
+     * Price unit is milligrams of gold per 1000 ECX - the chain's convention;
+     * callers holding grams/ECX must convert (x 1e6). */
+    bool BondOracleSubmitter(std::string& strFail, uint256& txidOut, uint32_t& nAssignedIDOut,
+                             uint32_t nSubmitterID, const CAmount& amountBond, const CAmount& nFee);
+    bool SubmitOraclePrice(std::string& strFail, uint256& txidOut,
+                           uint32_t nSubmitterID, uint64_t nPriceMilligrams, const CAmount& nFee);
 
     void ListAccountCreditDebit(const std::string& strAccount, std::list<CAccountingEntry>& entries);
     bool AddAccountingEntry(const CAccountingEntry&);

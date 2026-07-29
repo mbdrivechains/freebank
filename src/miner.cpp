@@ -442,14 +442,13 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             continue;
         }
 
-        // Payout deposit
-        if (deposit.amtUserPayout > SIDECHAIN_DEPOSIT_FEE) {
-            CTxDestination dest = DecodeDestination(deposit.strDest);
-            if (IsValidDestination(dest)) {
-                CTxOut depositOut(deposit.amtUserPayout - SIDECHAIN_DEPOSIT_FEE, GetScriptForDestination(dest));
-                vOut.push_back(depositOut);
-            }
-        }
+        // Payout deposit. The decision of WHETHER a payout is owed, and of what
+        // shape, belongs to GetDepositPayoutOutput and to nothing else - the
+        // validator asks the same function. Two independent copies of this rule
+        // is what D-2 was.
+        CTxOut depositOut;
+        if (GetDepositPayoutOutput(deposit, depositOut))
+            vOut.push_back(depositOut);
 
         // Add serialization of deposit
         vOut.push_back(CTxOut(0, deposit.GetScript()));

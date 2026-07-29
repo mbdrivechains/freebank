@@ -14,6 +14,7 @@
 #include <uint256.h>
 
 #include <limits.h>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -312,6 +313,47 @@ void SortWithdrawalBundleByHeight(std::vector<SidechainWithdrawalBundle>& vWithd
 
 // Erase all SidechainWithdrawal from a vector which do not have WITHDRAWAL_UNSPENT status
 void SelectUnspentWithdrawal(std::vector<SidechainWithdrawal>& vWithdrawal);
+
+/**
+ * Does this deposit require a payout output in the coinbase, and if so, what?
+ *
+ * SINGLE SOURCE OF TRUTH for the block BUILDER (miner.cpp) and the block
+ * VALIDATOR (validation.cpp).
+ *
+ * D-2 existed precisely because these were two independent implementations that
+ * disagreed. The builder declined to pay a deposit whose destination does not
+ * decode, or whose payout does not exceed SIDECHAIN_DEPOSIT_FEE; the validator
+ * demanded a payout output unconditionally. The node therefore looped building
+ * blocks its OWN validator rejected ("invalid-deposit-missing-output"), and
+ * because deposits are processed in strict CTIP order and can never be skipped,
+ * the deposit queue stuck permanently. Any depositor could trigger it with dust.
+ *
+ * Returns false when nothing is owed (bundle-change return, dust at or below the
+ * fee, or an undecodable destination) - such a deposit is still RECORDED, it is
+ * simply not paid out. Returns true and fills `out` otherwise.
+ *
+ * Callers must pass a deposit whose amtUserPayout is already the CTIP INCREMENT,
+ * not the cumulative burn.
+ */
+bool GetDepositPayoutOutput(const SidechainDeposit& deposit, CTxOut& out);
+
+/**
+ * Claim a coinbase output satisfying `required`, marking it consumed.
+ *
+ * D-1: the old check scanned the coinbase for a matching (value, scriptPubKey)
+ * and broke on the FIRST hit without consuming it. Two deposits in one block to
+ * the same destination for the same CTIP increment therefore produce two
+ * IDENTICAL requirements that a SINGLE coinbase output satisfies - so a miner
+ * could emit one output instead of two, pocket the second deposit, and every
+ * node would accept the block. No attacker is needed: a depositor sending the
+ * same amount twice to the same address is enough.
+ *
+ * Two identical deposits require two identical outputs. `setClaimed` carries
+ * the indices already spoken for by earlier deposits in the same block.
+ */
+bool ClaimDepositPayoutOutput(const CTxOut& required,
+                              const std::vector<CTxOut>& vout,
+                              std::set<size_t>& setClaimed);
 
 std::string GenerateDepositAddress(const std::string& strDestIn);
 

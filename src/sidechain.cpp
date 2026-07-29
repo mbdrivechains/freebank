@@ -6,6 +6,8 @@
 
 #include <clientversion.h>
 #include <core_io.h>
+#include <base58.h>
+#include <script/standard.h>
 #include <hash.h>
 #include <streams.h>
 #include <utilmoneystr.h>
@@ -290,4 +292,48 @@ bool ParseDepositAddress(const std::string& strAddressIn, std::string& strAddres
         return false;
 
     return true;
+}
+
+bool GetDepositPayoutOutput(const SidechainDeposit& deposit, CTxOut& out)
+{
+    // Withdrawal-bundle change return: recorded in the DB, paid to nobody.
+    if (deposit.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST)
+        return false;
+
+    // Nothing left after the deposit fee. Note the comparison is strict: a
+    // payout EQUAL to the fee would leave a zero-value output, which is not
+    // worth creating and which the old validator demanded anyway - the dust
+    // case that halted the deposit queue.
+    if (deposit.amtUserPayout <= SIDECHAIN_DEPOSIT_FEE)
+        return false;
+
+    // strDest is depositor-chosen data carried up from the L1 transaction, so
+    // it is untrusted input and may be anything at all. An undecodable
+    // destination is a user error, not a reason to stop the chain: the deposit
+    // is recorded and the value simply stays burned on the mainchain.
+    const CTxDestination dest = DecodeDestination(deposit.strDest);
+    if (!IsValidDestination(dest))
+        return false;
+
+    out = CTxOut(deposit.amtUserPayout - SIDECHAIN_DEPOSIT_FEE,
+                 GetScriptForDestination(dest));
+    return true;
+}
+
+bool ClaimDepositPayoutOutput(const CTxOut& required,
+                              const std::vector<CTxOut>& vout,
+                              std::set<size_t>& setClaimed)
+{
+    for (size_t i = 0; i < vout.size(); i++) {
+        // Skip outputs an earlier deposit in this block already claimed. This
+        // single line IS the D-1 fix: without it one output settles every
+        // identical debt and the miner keeps the rest.
+        if (setClaimed.count(i))
+            continue;
+        if (vout[i] == required) {
+            setClaimed.insert(i);
+            return true;
+        }
+    }
+    return false;
 }

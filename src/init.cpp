@@ -531,11 +531,14 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-enforceraddr=<addr:port>", _("CUSF enforcer gRPC address for -mainchaintransport=enforcer (default: 127.0.0.1:50051)"));
     strUsage += HelpMessageOpt("-grpcurlbin=<path>", _("grpcurl binary used by -mainchaintransport=enforcer (default: grpcurl)"));
     strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; probed at startup (default: 127.0.0.1:38332)"));
+    strUsage += HelpMessageOpt("-mainchainchain=<name>", _("L1 IDENTITY PIN: refuse to start unless the mainchain reports this chain name (main/test/signet/regtest). Reachability is not identity - a second node taking the default -mainchainrest will happily follow SOMEONE ELSE'S mainchain."));
+    strUsage += HelpMessageOpt("-mainchainchallenge=<hex>", _("L1 IDENTITY PIN for signet: refuse to start unless the mainchain reports this signet_challenge. Required to tell two custom signets apart - they share a chain name AND a genesis hash (Core's signet genesis is hardcoded, not derived from the challenge)."));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
     strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
     strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
     strUsage += HelpMessageOpt("-deferwindow=<n>", _("Regtest only: override the option-clause deferral window in blocks (default: 12960 = 90 days; integration-gate knob)"));
     strUsage += HelpMessageOpt("-launchsatspergram=<n>", _("Regtest only: override the launch presentation scale in satoshis per gram of gold (default: 4822613; presentation only, NOT consensus)"));
+    strUsage += HelpMessageOpt("-diskformatversion=<n>", _("Regtest only: write and demand this on-disk undo/coins record format version (default: compiled-in; exists so the format gate itself can be tested)"));
 
     return strUsage;
 }
@@ -976,11 +979,16 @@ bool AppInitParameterInteraction()
                                "(the mainchain node's REST endpoint; the node needs bitcoind -rest -txindex). "
                                "Without it this node would reject deposit-bearing blocks and fork off the network."));
         std::string strProbeError;
-        bool fRestUp = false;
-        for (int i = 0; i < 12 && !fRestUp; i++) {
+        bool fRestUp = false, fWrongL1 = false;
+        for (int i = 0; i < 12 && !fRestUp && !fWrongL1; i++) {
             if (i > 0) MilliSleep(5000);
-            fRestUp = ProbeMainchainRest(strProbeError);
+            fRestUp = ProbeMainchainRest(strProbeError, &fWrongL1);
         }
+        // A wrong-L1 answer is deterministic, so stop immediately and say only
+        // that. Appending the "-rest -txindex" advice would be actively
+        // misleading: the node IS serving REST, it is simply the wrong node.
+        if (fWrongL1)
+            return InitError(strProbeError);
         if (!fRestUp)
             return InitError(strprintf(_("%s (after 60s of retries). The mainchain node must run with "
                                          "-rest -txindex, reachable at -mainchainrest=<host:port>. Without "
@@ -1033,6 +1041,23 @@ bool AppInitParameterInteraction()
             return InitError(_("-launchsatspergram out of range."));
         g_launchSatsPerGram = nScale;
         LogPrintf("REGTEST override: launch scale %d sats/gram\n", g_launchSatsPerGram);
+    }
+
+    // Regtest-only: lets the disk-format gate itself be exercised (bring a chain
+    // up under one version, restart demanding another, watch it refuse). NOT a
+    // compatibility knob - it changes the marker, never the record layout, and
+    // on a real network the only readable format is the compiled-in one.
+    if (gArgs.IsArgSet("-diskformatversion") &&
+            chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-diskformatversion is a regtest-only test override; on other "
+                           "networks the on-disk record format is fixed by the binary."));
+    if (chainparams.NetworkIDString() == CBaseChainParams::REGTEST &&
+            gArgs.IsArgSet("-diskformatversion")) {
+        const int64_t nFmt = gArgs.GetArg("-diskformatversion", FREEBANK_DISK_FORMAT_VERSION);
+        if (nFmt < 1 || nFmt > 1000000)
+            return InitError(_("-diskformatversion out of range."));
+        nDiskFormatVersion = (int)nFmt;
+        LogPrintf("REGTEST override: on-disk record format version %d\n", nDiskFormatVersion);
     }
 
     // ********************************************************* Step 3: parameter-to-internal-flags
@@ -1576,6 +1601,26 @@ bool AppInitMain()
                     break;
                 }
 
+                // rev*.dat records carry no version and no length, so a build
+                // that appended a Coin field misreads every record an older
+                // build wrote - and the field-shifted case can PARSE, restoring
+                // coins with the WRONG custody tags rather than erroring.
+                // Refuse to start instead. Only a full -reindex repairs it:
+                // WriteUndoDataForBlock skips any block whose undo position is
+                // already set, so -reindex-chainstate preserves the stale bytes.
+                // mapBlockIndex.size() > 1 = "something past genesis exists";
+                // genesis alone has no undo data to misread.
+                if (!fReindex && mapBlockIndex.size() > 1) {
+                    int nOnDisk = 0;
+                    const bool fStamped = pblocktree->ReadDiskFormatVersion(nOnDisk);
+                    if (!fStamped || nOnDisk != nDiskFormatVersion) {
+                        strLoadError = strprintf(_("This datadir's undo data (blocks/rev*.dat) is record format %s, but this build reads and writes format %d. Restart with -reindex to regenerate it (-reindex-chainstate is NOT sufficient)."),
+                                                 fStamped ? std::to_string(nOnDisk) : std::string("unstamped (pre-versioning)"),
+                                                 nDiskFormatVersion);
+                        break;
+                    }
+                }
+
                 // Check for changed -prune state.  What we are concerned about is a user who has pruned blocks
                 // in the past, but is now trying to run unpruned.
                 if (fHavePruned && !fPruneMode) {
@@ -1603,6 +1648,26 @@ bool AppInitMain()
                 if (!pcoinsdbview->Upgrade()) {
                     strLoadError = _("Error upgrading chainstate database");
                     break;
+                }
+
+                // Same positional-record hazard on the chainstate side, where
+                // the DOWNGRADE direction is the silent one: an older build
+                // reads fewer fields, ignores the trailing bytes and reports
+                // nothing at all, having quietly dropped fOracleBond and the
+                // rest. Skipped only when the chainstate holds nothing yet
+                // (fresh, or just wiped by -reindex / -reindex-chainstate). A
+                // half-flushed chainstate still has head blocks, and
+                // ReplayBlocks below reads exactly those records - hence the
+                // GetHeadBlocks arm rather than a bare best-block test.
+                if (!pcoinsdbview->GetBestBlock().IsNull() || !pcoinsdbview->GetHeadBlocks().empty()) {
+                    int nOnDisk = 0;
+                    const bool fStamped = pcoinsdbview->ReadDiskFormatVersion(nOnDisk);
+                    if (!fStamped || nOnDisk != nDiskFormatVersion) {
+                        strLoadError = strprintf(_("This datadir's chainstate is record format %s, but this build reads and writes format %d. Restart with -reindex-chainstate (or -reindex) to rebuild it."),
+                                                 fStamped ? std::to_string(nOnDisk) : std::string("unstamped (pre-versioning)"),
+                                                 nDiskFormatVersion);
+                        break;
+                    }
                 }
 
                 // ReplayBlocks is a no-op if we cleared the coinsviewdb with -reindex or -reindex-chainstate

@@ -34,7 +34,14 @@ static const std::string DEFAULT_MAINCHAIN_REST = "127.0.0.1:38332";
  *  /rest/chaininfo.json). Returns false with strError set if it does not
  *  answer; init fails loud on that rather than letting a node without REST
  *  reject the first deposit-bearing block and fork off the network. */
-bool ProbeMainchainRest(std::string& strError);
+/** Probe the mainchain REST endpoint and check the L1 identity pin.
+ *
+ * Sets *pfIdentityMismatch when the endpoint answered but is the WRONG L1.
+ * That distinction decides retry policy: an unreachable node is worth waiting
+ * for (an orchestrator may start it moments after this one), but a mismatch is
+ * deterministic - retrying it only delays a certain failure by a minute.
+ */
+bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch = nullptr);
 
 /**
  * L1Client - the mainchain I/O behind SidechainClient.

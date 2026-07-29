@@ -17,6 +17,13 @@
  *  (coinbase or not, height). The serialization contains a dummy value of
  *  zero. This is be compatible with older versions which expect to see
  *  the transaction version there.
+ *
+ *  NO version byte and NO length prefix: every field below is positional, so
+ *  appending one shifts every record an earlier binary wrote. Bump
+ *  FREEBANK_DISK_FORMAT_VERSION (coins.h) on ANY change here. Only a full
+ *  -reindex repairs a mismatch: WriteUndoDataForBlock skips any block whose
+ *  undo position is already set, so -reindex-chainstate leaves the stale
+ *  rev*.dat bytes exactly where they are.
  */
 class TxInUndoSerializer
 {
@@ -57,6 +64,12 @@ public:
         ::Serialize(s, txout->fPoolEscrow);
         ::Serialize(s, txout->fLpShare);
         ::Serialize(s, txout->nLpUnits);
+        // Oracle bond escrow (Phase G-1) for the SAME reason as the pool tags
+        // above, and more sharply: the bond script is anyone-can-spend, so this
+        // tag IS the coin's entire protection. Omitting it here let a reorg over
+        // any bond consolidation restore the coin UNTAGGED - free to sweep, and
+        // a consensus split between reorged and freshly-synced nodes.
+        ::Serialize(s, txout->fOracleBond);
     }
 
     explicit TxInUndoSerializer(const Coin* coin) : txout(coin) {}
@@ -100,6 +113,7 @@ public:
         ::Unserialize(s, txout->fPoolEscrow);
         ::Unserialize(s, txout->fLpShare);
         ::Unserialize(s, txout->nLpUnits);
+        ::Unserialize(s, txout->fOracleBond);
     }
 
     explicit TxInUndoDeserializer(Coin* coin) : txout(coin) {}

@@ -7,6 +7,7 @@
 #include <bill.h>
 #include <gramscale.h>
 #include <house.h>
+#include <oracle.h>
 #include <pool.h>
 #include <note.h>
 #include <bmmcache.h>
@@ -1156,6 +1157,97 @@ UniValue getpool(const JSONRPCRequest& request)
     return PoolToJSON(pool);
 }
 
+UniValue getgoldfix(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "getgoldfix\n"
+            "\nThe on-chain gold fix: one shared price, in milligrams of gold\n"
+            "per 1000 ECX. Returns null before the first fix has ever formed.\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"raw\":         n,  the median of the last quorum block's submissions\n"
+            "  \"braked\":      n,  the damped view: tracks raw up freely, bounded down\n"
+            "  \"fixheight\":   n,  height at which this fix formed\n"
+            "  \"ageblocks\":   n   tip - fixheight (derived, not stored)\n"
+            "}\n"
+            "\nConsensus-INERT in this phase: both views are maintained and served,\n"
+            "but nothing in the credit rules reads them.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getgoldfix", "")
+            + HelpExampleRpc("getgoldfix", "")
+        );
+
+    LOCK(cs_main);
+
+    CGoldFix fix;
+    // No fix yet is a normal state, not an error - the chain runs from genesis
+    // with no price until a quorum first forms.
+    if (!phousetree->GetGoldFix(fix) || fix.IsNull())
+        return NullUniValue;
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("raw", (uint64_t)fix.nRaw);
+    obj.pushKV("braked", (uint64_t)fix.nBraked);
+    obj.pushKV("fixheight", (uint64_t)fix.nFixHeight);
+    const int nTip = chainActive.Height();
+    if (nTip >= 0 && (uint32_t)nTip >= fix.nFixHeight)
+        obj.pushKV("ageblocks", (uint64_t)((uint32_t)nTip - fix.nFixHeight));
+    return obj;
+}
+
+UniValue listoraclesubmitters(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "listoraclesubmitters\n"
+            "\nList the bonded gold-price submitters, with liveness derived from\n"
+            "their stored heights (nothing about reliability is stored directly).\n"
+            "\nResult (array of):\n"
+            "{\n"
+            "  \"id\":                n,\n"
+            "  \"pubkey\":            \"hex\",\n"
+            "  \"bondtxid\":          \"hex\",  the bond escrow coin\n"
+            "  \"bondvout\":          n,\n"
+            "  \"bondheight\":        n,\n"
+            "  \"lastsubmitheight\":  n,   0 = has never submitted\n"
+            "  \"blockssincesubmit\": n,   derived; omitted if never\n"
+            "  \"unbondrequestheight\": n  0 = none pending\n"
+            "}\n"
+            "\nHONEST LIMIT: a gap in these heights does NOT prove a submitter was\n"
+            "absent. Consensus cannot distinguish \"did not submit\" from \"the block\n"
+            "producer did not include it\" - the sequencer authors these records.\n"
+            "Do not read this as a reliability score, and note that nothing here\n"
+            "may be used to slash: no penalty exists in this phase, and these\n"
+            "counters accrued under rules that did not bind.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listoraclesubmitters", "")
+            + HelpExampleRpc("listoraclesubmitters", "")
+        );
+
+    LOCK(cs_main);
+
+    const int nTip = chainActive.Height();
+    UniValue ret(UniValue::VARR);
+    for (const COracleSubmitter& sub : phousetree->GetOracleSubmitters()) {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("id", (uint64_t)sub.nSubmitterID);
+        obj.pushKV("pubkey", HexStr(sub.vchPubKey));
+        // Separate txid/vout, not COutPoint::ToString() - that is a DEBUG form
+        // ("COutPoint(61dc76ef37, 0)"): abbreviated hash, unparseable, and
+        // useless to any caller wanting to look the coin up.
+        obj.pushKV("bondtxid", sub.bondOutpoint.hash.ToString());
+        obj.pushKV("bondvout", (uint64_t)sub.bondOutpoint.n);
+        obj.pushKV("bondheight", (uint64_t)sub.nBondHeight);
+        obj.pushKV("lastsubmitheight", (uint64_t)sub.nLastSubmitHeight);
+        if (sub.nLastSubmitHeight != 0 && nTip >= 0 && (uint32_t)nTip >= sub.nLastSubmitHeight)
+            obj.pushKV("blockssincesubmit", (uint64_t)((uint32_t)nTip - sub.nLastSubmitHeight));
+        obj.pushKV("unbondrequestheight", (uint64_t)sub.nUnbondRequestHeight);
+        ret.push_back(obj);
+    }
+    return ret;
+}
+
 UniValue getgramrate(const JSONRPCRequest& request)
 {
     if (request.fHelp || request.params.size() != 0)
@@ -1222,6 +1314,9 @@ static const CRPCCommand commands[] =
     { "pools",              "getpool",                      &getpool,                       {"id"}},
 
     { "freebank",           "getgramrate",                  &getgramrate,                   {}},
+
+    { "oracle",             "getgoldfix",                   &getgoldfix,                    {}},
+    { "oracle",             "listoraclesubmitters",         &listoraclesubmitters,          {}},
 
     /* BitAssets */
     { "BitAssets",          "listassets",                   &listassets,                    {}},

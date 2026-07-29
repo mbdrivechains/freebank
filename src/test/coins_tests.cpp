@@ -870,4 +870,43 @@ BOOST_AUTO_TEST_CASE(ccoins_write)
                     CheckWriteCoins(parent_value, child_value, parent_value, parent_flags, child_flags, parent_flags);
 }
 
+// Byte-length pins for the two positional on-disk records. THIS is what makes
+// FREEBANK_DISK_FORMAT_VERSION more than a good intention: appending a field to
+// Coin::Serialize or TxInUndoSerializer::Serialize without bumping the version
+// fails here, at build time, in the same commit - instead of on an upgraded
+// node months later, where a field-shifted parse restores coins with the wrong
+// custody tags. If you changed the format deliberately: bump the constant AND
+// these two numbers together.
+//
+// The arithmetic, so a failure is diagnosable rather than a mystery:
+//   prefix   VARINT(nHeight*2 + fCoinBase) with nHeight=1        ->  1
+//   txout    VARINT(CompressAmount(1000)=4)                      ->  1
+//            VARINT(1 + 6 special) then the 1-byte OP_RETURN     ->  2
+//   tags     fBitAsset 1 + fBitAssetControl 1 + nAssetID 4       ->  6
+//            fBill 1 + fBillEscrow 1 + nBillID 4                 ->  6
+//            fHouseEscrow 1 + nHouseID 4                         ->  5
+//            fNote 1 + nNoteUnits 8 + nDemandHeight 4            -> 13
+//            fDeposit 1 + principal 8 + rate 4 + mat 4 + orig 4  -> 21
+//            fPoolEscrow 1 + fLpShare 1 + nLpUnits 8             -> 10
+//            fOracleBond 1                                       ->  1
+//   Coin = 1 + 3 + 62 = 66. TxInUndo adds the one-byte legacy version dummy
+//   that is emitted whenever nHeight > 0, so 67.
+BOOST_AUTO_TEST_CASE(disk_record_format_pin)
+{
+    Coin c;
+    c.out.nValue = 1000;
+    c.out.scriptPubKey = CScript() << OP_RETURN;  // uncompressible, 1 byte
+    c.nHeight = 1;
+    c.fCoinBase = false;
+
+    BOOST_CHECK_EQUAL(::GetSerializeSize(c, SER_DISK, CLIENT_VERSION), (size_t)66);
+
+    const TxInUndoSerializer undoser(&c);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(undoser, SER_DISK, CLIENT_VERSION), (size_t)67);
+
+    // A bump without updating the pins above is also a mistake - the sizes are
+    // the evidence for the version, so they move together.
+    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 1);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

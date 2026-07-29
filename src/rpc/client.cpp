@@ -250,6 +250,12 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "reclaimpledge", 1, "partner" },
     { "reclaimpledge", 2, "fee" },
     { "gethouse", 0, "id" },
+    { "bondoraclesubmitter", 0, "id" },
+    { "bondoraclesubmitter", 1, "bond" },
+    { "bondoraclesubmitter", 2, "fee" },
+    { "submitoracleprice", 0, "id" },
+    { "submitoracleprice", 1, "price" },
+    { "submitoracleprice", 2, "fee" },
 };
 
 class CRPCConvertTable

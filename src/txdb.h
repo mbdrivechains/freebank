@@ -48,6 +48,12 @@ static const int64_t nMaxBlockDBAndTxIndexCache = 1024;
 //! Max memory allocated to coin DB specific cache (MiB)
 static const int64_t nMaxCoinsDBCache = 8;
 
+//! The on-disk record format version this node writes and demands. Equals
+//! FREEBANK_DISK_FORMAT_VERSION except under the regtest-only
+//! -diskformatversion override, which exists so the startup gate can be tested
+//! (bring a chain up under one version, restart demanding another).
+extern int nDiskFormatVersion;
+
 struct CDiskTxPos : public CDiskBlockPos
 {
     unsigned int nTxOffset; // after header
@@ -90,6 +96,12 @@ public:
 
     //! Attempt to update from an older database format. Returns whether an error occurred.
     bool Upgrade();
+
+    //! Read the record-format marker. Returns false when ABSENT, which means
+    //! "written by a build that predates the marker" - treat as unknown, never
+    //! as current. Written by BatchWrite in the same batch that opens the
+    //! transition, so it lands no later than the first record it describes.
+    bool ReadDiskFormatVersion(int &nVersion) const;
     size_t EstimateSize() const override;
 };
 
@@ -133,6 +145,11 @@ public:
     bool WriteTxIndex(const std::vector<std::pair<uint256, CDiskTxPos> > &vect);
     bool WriteFlag(const std::string &name, bool fValue);
     bool ReadFlag(const std::string &name, bool &fValue);
+    //! Record-format marker for blocks/rev*.dat. It lives HERE rather than in
+    //! the chainstate because this DB is wiped by exactly the operation that
+    //! regenerates undo data (a full -reindex) and not by -reindex-chainstate.
+    bool WriteDiskFormatVersion(int nVersion);
+    bool ReadDiskFormatVersion(int &nVersion);
     bool LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&, const uint256&)> insertBlockIndex);
 };
 
@@ -178,6 +195,8 @@ public:
 };
 
 /** Access to the house database (blocks/Houses/) */
+#include <oracle.h>
+
 class HouseDB : public CDBWrapper
 {
 public:
@@ -190,7 +209,25 @@ public:
      * lifecycle. ConnectBlock skips already-applied blocks after a crash and
      * aborts on divergence instead of double-applying (which the ATTEST
      * priors check would turn into a permanent canonical-chain rejection). */
-    bool WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock);
+    bool WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock,
+                           const CGoldFix* pFix = nullptr, bool fEraseFix = false,
+                           const std::vector<COracleSubmitter>* pvSubmitter = nullptr,
+                           const std::vector<uint32_t>* pvSubmitterRemove = nullptr,
+                           const uint32_t* pnLastSubmitterID = nullptr);
+
+    /** Gold oracle (Phase G-1, consensus-INERT). Readers: oracle module +
+     * RPC only - consult the inertness tripwire in oracle.h before adding a
+     * call site; promotion is a signed design phase, not a call site. */
+    bool GetGoldFix(CGoldFix& fix);
+    bool WriteGoldFix(const CGoldFix& fix);
+    bool EraseGoldFix();
+    bool WriteOracleSubmitter(const COracleSubmitter& sub);
+    bool RemoveOracleSubmitter(const uint32_t nID);
+    bool WriteLastOracleSubmitterID(const uint32_t nID);
+    bool GetOracleSubmitter(const uint32_t nID, COracleSubmitter& sub);
+    bool GetOracleSubmitterIDByKey(const std::vector<unsigned char>& vchPubKey, uint32_t& nID);
+    bool GetLastOracleSubmitterID(uint32_t& nID);
+    std::vector<COracleSubmitter> GetOracleSubmitters();
     bool GetBestBlock(uint256& hashBlock);
     bool WriteBestBlock(const uint256& hashBlock);
 

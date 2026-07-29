@@ -13,11 +13,6 @@
 #include <streams.h>
 #include <version.h>
 
-// Per-house settlement cadence (blocks). 144 mainnet-notional; the signet demo
-// runs 12. Runtime-set at init (HOUSE_ATTEST_CADENCE precedent); wiring lands
-// with the contextual checks. PROVISIONAL (P-2).
-uint32_t SETTLE_CADENCE_BLOCKS = 144;
-
 uint256 SettleHashPrevouts(const CTransaction& tx)
 {
     CHashWriter ss(SER_GETHASH, 0);
@@ -122,7 +117,7 @@ bool CheckSettleTransactionShape(const CTransaction& tx, CValidationState& state
 {
     // Context-free only (no DB, no ECDSA): payload decode + structural rules.
     // Priors, eligibility, cadence, approver-set ranges and all signatures run
-    // contextually in CheckSettleOperation.
+    // contextually in CheckSettleOperation (T-s3).
     if (tx.nSettleOp != SETTLE_OP_EXCHANGE)
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-op");
     if (tx.vchSettlePayload.size() > MAX_SETTLE_PAYLOAD)

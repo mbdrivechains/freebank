@@ -6,7 +6,7 @@
 #define BITCOIN_SETTLE_H
 
 // Phase 3.7 part 2 - SETTLEMENT / PAR-ATTRACTOR (Phase A): SETTLE_EXCHANGE.
-// Design: the Phase-A settlement spec (bilateral par-exchange).
+// Design: docs-local/PHASE3_7_SETTLEMENT.md (operator-signed 2026-07-26).
 //
 // Settlement is a TRANSACTION, not an epoch. Two par-eligible houses co-sign
 // one v16 tx: each presents an exact-sum bundle of the OTHER's notes; both
@@ -38,7 +38,7 @@ static const uint8_t SETTLE_OP_EXCHANGE = 1;   // bilateral co-signed par-exchan
 
 // The residual band around par, basis points. Par is 1 unit = 1 sat; a mode-1
 // residual must satisfy |dU|*(10^4 - band) <= residual*10^4 <= |dU|*(10^4 + band).
-// PROVISIONAL (P-2, ARCH s8's +/-0.5%): NOT sim-validated - the settlement simulation owns
+// PROVISIONAL (P-2, ARCH s8's +/-0.5%): NOT sim-validated - OQ-SIM-SETTLE owns
 // this number before any mainnet parameter lock.
 static const uint32_t SETTLE_PAR_BAND_BPS = 50;
 
@@ -49,9 +49,10 @@ static const CAmount SETTLE_MIN_RESIDUAL = 10000;
 // Per-house settlement cadence, blocks: a house may enter at most one exchange
 // per window (nLastSettleHeight + cadence <= height). An eligibility comparison,
 // never a sweep - nothing happens ON a schedule; the schedule gates when
-// parties may act. Runtime-set like HOUSE_ATTEST_CADENCE (144 mainnet-notional;
-// the signet demo runs 12). PROVISIONAL (P-2; Scottish twice-weekly ~ 504).
-extern uint32_t SETTLE_CADENCE_BLOCKS;
+// parties may act. Per-network: Consensus::Params::nSettleCadence (main 144,
+// regtest 12). Consensus-critical, deliberately NOT runtime-settable — the
+// HOUSE_ATTEST_CADENCE -attestcadence pattern is a fork hazard; do not copy
+// it. PROVISIONAL sizing (P-2; Scottish twice-weekly ~ 504).
 
 // Max note inputs per presented bundle (bounds per-tx loops; the wallet
 // consolidates to typically one coin per side first). MAX_POOL_LP_INPUTS scale.

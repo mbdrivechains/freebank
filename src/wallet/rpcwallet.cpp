@@ -5147,6 +5147,137 @@ UniValue attesthouse(const JSONRPCRequest& request)
     return response;
 }
 
+UniValue bondoraclesubmitter(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() > 3)
+        throw std::runtime_error(
+            "bondoraclesubmitter\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, optional) submitter ID to re-bond / top up.\n"
+            "              Omit or 0 to register a NEW submitter key.\n"
+            "2. \"bond\"   (numeric or string, optional) bond to escrow, default 1.0\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nEscrow a bond and register (or re-bond) a gold-price submitter.\n"
+            "A fresh registration takes a new wallet key and is assigned a dense\n"
+            "ID by consensus when it confirms - one fresh registration per block.\n"
+            "Re-bonding an existing ID CONSOLIDATES its current bond coin into\n"
+            "the new one (only a same-key bond may spend it) and cancels any\n"
+            "pending unbond request.\n"
+            "\nNOTE: the oracle is consensus-INERT in this phase. The fix it\n"
+            "maintains is recorded and served over RPC, but nothing in the\n"
+            "credit rules reads it, and no bond is ever slashed.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("bondoraclesubmitter", "")
+            + HelpExampleCli("bondoraclesubmitter", "2 5.0")
+            + HelpExampleRpc("bondoraclesubmitter", "2, 5.0")
+        );
+
+    ObserveSafeMode();
+
+    uint32_t nSubmitterID = 0;
+    if (request.params.size() >= 1 && !request.params[0].isNull())
+        nSubmitterID = request.params[0].get_int();
+
+    CAmount amountBond = COIN;
+    if (request.params.size() >= 2 && !request.params[1].isNull())
+        amountBond = AmountFromValue(request.params[1]);
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3 && !request.params[2].isNull())
+        nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    uint32_t nAssignedID = 0;
+    std::string strFail = "";
+    if (!pwallet->BondOracleSubmitter(strFail, txid, nAssignedID, nSubmitterID, amountBond, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    response.pushKV("submitterid", (uint64_t)nAssignedID);
+    if (nSubmitterID == 0)
+        response.pushKV("note", "ID is assigned by consensus at confirmation - "
+                                "re-read it from listoraclesubmitters once this confirms");
+    return response;
+}
+
+UniValue submitoracleprice(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "submitoracleprice\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) this wallet's submitter ID\n"
+            "2. \"price\"  (numeric, required) milligrams of gold per 1000 ECX\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nSubmit one gold price. It becomes valid at the next height and\n"
+            "stays valid for a short window of blocks on the branch it was signed\n"
+            "against, so missing one block template is survivable. Re-submit every\n"
+            "block anyway: a re-sign displaces your own pooled one, and only ONE\n"
+            "of your outstanding submissions can ever confirm.\n"
+            "\nQUORUM IS PER BLOCK: a fix forms only when enough DISTINCT\n"
+            "submitters land in the SAME block. Submitters that scatter across\n"
+            "blocks are each credited for liveness while no fix ever forms.\n"
+            "\nUNITS: the chain stores milligrams of gold per 1000 ECX. A rates\n"
+            "feed quoting grams per ECX must multiply by 1e6.\n"
+            "\nThe median of a block's submissions becomes the raw fix once a\n"
+            "quorum of distinct submitters is present; the braked view follows it\n"
+            "up freely but is limited on the way down. Consensus-INERT: nothing\n"
+            "in the credit rules reads either view yet.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("submitoracleprice", "1 800000000")
+            + HelpExampleRpc("submitoracleprice", "1, 800000000")
+        );
+
+    ObserveSafeMode();
+
+    const uint32_t nSubmitterID = request.params[0].get_int();
+    const int64_t nPriceSigned = request.params[1].get_int64();
+    if (nPriceSigned <= 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Price must be positive!");
+    const uint64_t nPrice = (uint64_t)nPriceSigned;
+
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3 && !request.params[2].isNull())
+        nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->SubmitOraclePrice(strFail, txid, nSubmitterID, nPrice, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    response.pushKV("targetheight", (uint64_t)(chainActive.Height() + 1));
+    return response;
+}
+
 // DEFER / RENEW: identical RPC shape, so one implementation with a flag.
 static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
 {
@@ -6162,6 +6293,9 @@ static const CRPCCommand commands[] =
     { "houses",             "renewdeferral",                    &renewdeferral,                 {"id", "fee"} },
     { "houses",             "releasereserves",                  &releasereserves,               {"id", "fee"} },
     { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee"} },
+
+    { "oracle",             "bondoraclesubmitter",              &bondoraclesubmitter,           {"id", "bond", "fee"} },
+    { "oracle",             "submitoracleprice",                &submitoracleprice,             {"id", "price", "fee"} },
 };
 
 void RegisterWalletRPCCommands(CRPCTable &t)

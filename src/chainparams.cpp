@@ -84,6 +84,14 @@ public:
         consensus.fPowNoRetargeting = true;
         consensus.nRuleChangeActivationThreshold = 1916; // 95% of 2016
         consensus.nMinerConfirmationWindow = 2016; // nPowTargetTimespan / nPowTargetSpacing
+        consensus.nSettleCadence = 144; // ~1 day of settlement exclusivity per house pair
+        consensus.nOracleQuorumMin = 3;
+        consensus.nOracleBrakePpmPerBlock = 347;  // ~5%/day / 144 blocks
+        consensus.nOracleBrakeElapsedCap = 144;   // censor-charge bounded to one day's fall
+        consensus.nOracleUnbondDelay = 2016;      // provisional; decorative while inert
+        consensus.nOracleOpWindow = 6;            // ~1h at 144 blk/day: a price older than the
+                                                  // row-1 hourly cadence promise can never enter a
+                                                  // fix; 6 << the 144 brake cap; 2.1% of G3's ~2d
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 1199145601; // January 1, 2008
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = 1230767999; // December 31, 2008
@@ -189,6 +197,13 @@ public:
         consensus.fPowNoRetargeting = true;
         consensus.nRuleChangeActivationThreshold = 108; // 75% for bitassetss
         consensus.nMinerConfirmationWindow = 144; // Faster than normal for regtest (144 instead of 2016)
+        consensus.nSettleCadence = 12; // fast settle windows for tests + demo-rhythm chains
+        consensus.nOracleQuorumMin = 3;
+        consensus.nOracleBrakePpmPerBlock = 100000; // 10%/block: brake behavior testable in few blocks
+        consensus.nOracleBrakeElapsedCap = 12;
+        consensus.nOracleUnbondDelay = 16;
+        consensus.nOracleOpWindow = 3;            // mechanical floor 2 + 1 margin; small enough
+                                                  // that the gate proves expiry in 3 blocks
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;

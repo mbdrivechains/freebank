@@ -2,7 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-// Settlement primitive gates: codec round-trip +
+// T-s1 gates (docs-local/PHASE3_7_SETTLEMENT.md s11): codec round-trip +
 // trailing-byte reject; digest vectors (field sensitivity, sig-field
 // exclusion, prevouts/outputs binding); CHouse v6-record read defaults
 // nLastSettleHeight to 0 (and a future version still hard-fails); u128
@@ -11,6 +11,7 @@
 #include <settle.h>
 
 #include <bill.h>           // BillHashOutputs
+#include <chainparams.h>    // CreateChainParams (per-network cadence pins)
 #include <coins.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
@@ -330,7 +331,7 @@ BOOST_AUTO_TEST_CASE(settle_tx_trailer_roundtrip)
     BOOST_CHECK(pback.vchSettlePayload.empty());
 }
 
-// ---------------------------------------------------------------- shape + input gates
+// ---------------------------------------------------------------- T-s2 gates
 
 static std::vector<unsigned char> FreshPubKey()
 {
@@ -342,7 +343,7 @@ static std::vector<unsigned char> FreshPubKey()
 
 /** A SHAPE-valid mode-1 exchange tx: real compressed keys, 1-coin bundles,
  * dU = 15000 with the residual at exact par, residual output pinned at
- * vout[0]. (Signatures are dummies - verification is contextual.) */
+ * vout[0]. (Signatures are dummies - verification is contextual, T-s3.) */
 static CMutableTransaction ShapeValidTx(SettleExchange& x,
                                         const std::vector<unsigned char>& pkA,
                                         const std::vector<unsigned char>& pkB)
@@ -582,7 +583,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     }
 }
 
-// ---------------------------------------------------------------- contextual gates
+// ---------------------------------------------------------------- T-s3 gates
 
 static std::vector<unsigned char> PK(const CKey& k)
 {
@@ -743,7 +744,8 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
         CMutableTransaction mtx = BuildSignedSettle(x, hA, thin, apprA, apprB, presA, presB, 1);
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, {{1, hA}, {2, thin}}, H), "bad-settle-house-ineligible");
     }
-    // Cadence: A settled 50 blocks ago (< SETTLE_CADENCE_BLOCKS = 144).
+    // Cadence: A settled 50 blocks ago (< nSettleCadence = 144; the suite
+    // fixture selects MAIN params).
     {
         CHouse recent = hA;
         recent.nLastSettleHeight = H - 50;
@@ -806,6 +808,15 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
         mtx.vout[0].nValue = 15001;
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-approver");
     }
+}
+
+// The cadence is per-network consensus (main 144, regtest 12) and must never
+// grow a runtime knob — pin the values so a chainparams edit is a loud test
+// failure, not a silent consensus change.
+BOOST_AUTO_TEST_CASE(settle_cadence_per_network)
+{
+    BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nSettleCadence, 144U);
+    BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nSettleCadence, 12U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

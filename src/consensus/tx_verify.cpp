@@ -8,6 +8,7 @@
 #include <house.h>
 #include <note.h>
 #include <deposit.h>
+#include <oracle.h>
 #include <pool.h>
 #include <settle.h>
 #include <consensus/consensus.h>
@@ -216,6 +217,12 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
             return false;
     }
 
+    // Oracle transactions (Phase G-1): context-free shape checks
+    if (tx.nVersion == TRANSACTION_ORACLE_VERSION) {
+        if (!CheckOracleTransactionShape(tx, state))
+            return false;
+    }
+
     // Check for negative or overflow output values
     CAmount nValueOut = 0;
     std::vector<CTxOut>::const_iterator it;
@@ -343,6 +350,23 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     uint64_t nSettleUnitsAIn = 0;
     uint64_t nSettleUnitsBIn = 0;
 
+    // For an oracle BOND (v17, Phase G-1), any spent bond escrow coin must
+    // carry THIS submitter's bond script - the registered pubkey is in the
+    // script, so re-bond/top-up consolidation is key-pinned by script
+    // comparison and a cross-submitter sweep fails here, never a db lookup.
+    // Decode once up front; a failed decode leaves the flag false and the
+    // bond guard below rejects any bond-coin spend fail-closed.
+    CScript expectedOracleBondScript;
+    bool fHaveOracleBond = false;
+    CAmount nOracleBondIn = 0;
+    if (tx.nVersion == TRANSACTION_ORACLE_VERSION && tx.nOracleOp == ORACLE_OP_BOND) {
+        OracleBond ob;
+        if (DecodeOraclePayload(tx.vchOraclePayload, ob)) {
+            expectedOracleBondScript = OracleBondScript(ob.vchSubmitterPubKey);
+            fHaveOracleBond = true;
+        }
+    }
+
     uint32_t nAssetIDFound = 0;
     CAmount nValueIn = 0;
     unsigned int nBillTitleIn = 0;
@@ -395,7 +419,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (i < nBundleEnd) {
                 const bool fSideA = i < settle.nCountANotes;
                 if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
-                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID)
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID ||
+                        coin.fOracleBond)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
                 if (coin.nHouseID != (fSideA ? settle.nHouseA : settle.nHouseB))
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-issuer");
@@ -409,7 +434,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 nUnits += coin.nNoteUnits;
             } else {
                 if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
-                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID)
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID ||
+                        coin.fOracleBond)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
             }
         }
@@ -506,6 +532,40 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nLpUnitsIn += coin.nLpUnits;
         }
 
+        // Oracle bond guard (Phase G-1, T-o3): a bond escrow coin sits on an
+        // anyone-can-spend script, so this tag gate IS its whole protection -
+        // a plain tx sweeping it is a bond drain and rejected. The only
+        // sanctioned spender is a v17 BOND whose payload key matches the
+        // coin's script (re-bond / top-up consolidation by the SAME
+        // submitter); a SUBMIT eroding its own bond is rejected with the
+        // rest. No unbond-withdraw op exists in the scaffold - deliberate,
+        // the delay is decorative while inert (spec s2) - so until promotion
+        // a bond leaves escrow only by consolidating into a new bond.
+        if (coin.fOracleBond) {
+            if (!fHaveOracleBond)
+                return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-oracle-bond");
+            if (coin.out.scriptPubKey != expectedOracleBondScript)
+                return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-input-key");
+            // Sum what is being consolidated: the new escrow may not be worth
+            // LESS (checked after the loop). Without that, "consolidation" is a
+            // penalty-free unbond - re-bond spending a 1 BTX coin, re-post
+            // vout[0] at one satoshi, take the rest as plain change - and the
+            // scaffold's claim that a bond can only leave escrow into another
+            // bond becomes false. Overflow-safe: MoneyRange holds per coin.
+            if (nOracleBondIn > MAX_MONEY - coin.out.nValue)
+                return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-value-overflow");
+            nOracleBondIn += coin.out.nValue;
+        }
+
+        // Oracle txs cannot spend any OTHER colored coin: submissions and
+        // bonds are funded from plain value only (mirrors every family's
+        // colored-input rule; keeps oracle-awareness out of the instrument
+        // guards above - the s8.7 multi-tag lesson).
+        if (tx.nVersion == TRANSACTION_ORACLE_VERSION &&
+                (coin.nAssetID || coin.fBill || coin.fBillEscrow || coin.fHouseEscrow ||
+                 coin.fNote || coin.fDeposit || coin.fPoolEscrow || coin.fLpShare))
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-colored-input");
+
         // Note guard: a note coin is locked to its house's v13 TRANSFER /
         // REDEEM / CLAIM (its base value is dust; the claim amount is
         // nNoteUnits) - or, since Phase 3.7, its pool's v15 CREATE / ADD_LIQ /
@@ -595,6 +655,17 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                  (coin.fHouseEscrow && tx.nDepositOp != DEPOSIT_OP_CLAIM))) {
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-colored-input");
         }
+    }
+
+    // Oracle bond conservation: a BOND that consolidates existing bond coins
+    // must re-escrow at least what it took in. The shape gate already pins
+    // vout[0] as the bond output with nValue > 0, so this is the ratchet that
+    // makes "a bond leaves escrow only into another bond" true rather than
+    // aspirational - otherwise a re-bond is an instant, penalty-free unbond.
+    // Topping UP is always allowed; only shrinking is refused.
+    if (nOracleBondIn > 0) {
+        if (tx.vout.empty() || tx.vout[0].nValue < nOracleBondIn)
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-value-decrease");
     }
 
     if (tx.nVersion == TRANSACTION_BILL_VERSION) {

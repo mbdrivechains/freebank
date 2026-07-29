@@ -19,6 +19,23 @@
 
 #include <unordered_map>
 
+//! On-disk record format version for BOTH Coin (chainstate/) and
+//! TxInUndoSerializer (blocks/rev*.dat). Neither record carries a length or a
+//! version of its own - they are flat positional field concatenations, and
+//! FreeBank has only ever APPENDED (deposit terms, pool/LP tags, fOracleBond).
+//! So a binary cannot read a record written by a binary with a different field
+//! set, and the failure is not always loud: reading a NEWER record with an
+//! OLDER build succeeds, ignores the trailing bytes, and silently clears the
+//! custody tags. fOracleBond cleared leaves an anyone-can-spend bond coin with
+//! nothing protecting it (tx_verify.cpp's bond guard IS its whole protection),
+//! and diverges that node from a fresh sync.
+//!
+//! BUMP THIS whenever Coin::Serialize or TxInUndoSerializer::Serialize changes,
+//! including a pure append. The byte-length pins in coins_tests
+//! (disk_record_format_pin) fail if you do not. Bumping forces every existing
+//! datadir to -reindex on upgrade; that is the intended cost, not a regression.
+static const int FREEBANK_DISK_FORMAT_VERSION = 1;
+
 /**
  * A UTXO entry.
  *
@@ -95,9 +112,14 @@ public:
     bool fLpShare;
     uint64_t nLpUnits;
 
+    //! Is this a gold-oracle submitter bond escrow output (Phase G-1)? The
+    //! coin carries no id - the registered pubkey is IN the bond script, so
+    //! the spend gate pins ownership by script comparison, never a lookup.
+    bool fOracleBond;
+
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, uint32_t nAssetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), nAssetID(nAssetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, uint32_t nAssetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), nAssetID(nAssetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, uint32_t nAssetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), nAssetID(nAssetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, uint32_t nAssetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), nAssetID(nAssetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
 
     void SetBill(bool fEscrowIn, uint32_t nBillIDIn) {
         fBill = !fEscrowIn;
@@ -138,6 +160,10 @@ public:
         nLpUnits = nUnitsIn;
     }
 
+    void SetOracleBond() {
+        fOracleBond = true;
+    }
+
     void Clear() {
         out.SetNull();
         fCoinBase = false;
@@ -161,10 +187,11 @@ public:
         fPoolEscrow = false;
         fLpShare = false;
         nLpUnits = 0;
+        fOracleBond = false;
     }
 
     //! empty constructor
-    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), nAssetID(0), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0) { }
+    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), nAssetID(0), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) { }
 
     bool IsCoinBase() const {
         return fCoinBase;
@@ -207,6 +234,10 @@ public:
         ::Serialize(s, fPoolEscrow);
         ::Serialize(s, fLpShare);
         ::Serialize(s, nLpUnits);
+        // Appended last (the fPoolEscrow precedent). Any append here is a disk
+        // format break: bump FREEBANK_DISK_FORMAT_VERSION so the startup gate
+        // demands the reindex, instead of leaving it to whoever notices.
+        ::Serialize(s, fOracleBond);
     }
 
     template<typename Stream>
@@ -235,6 +266,7 @@ public:
         ::Unserialize(s, fPoolEscrow);
         ::Unserialize(s, fLpShare);
         ::Unserialize(s, nLpUnits);
+        ::Unserialize(s, fOracleBond);
     }
 
     bool IsSpent() const {
