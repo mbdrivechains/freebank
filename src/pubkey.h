@@ -179,13 +179,43 @@ public:
     /**
      * Verify a DER signature (~72 bytes).
      * If this public key is not fully valid, the return value will be false.
+     *
+     * NOTE: this parses with lax DER and normalizes high-S before verifying,
+     * so it tolerates malleated encodings by construction. Payload signatures
+     * (the version-tagged trailer, committed by the txid) must use
+     * VerifyStrict instead - see SECURITY_GATE_SIGNOFF_A5.md.
      */
     bool Verify(const uint256& hash, const std::vector<unsigned char>& vchSig) const;
+
+    /**
+     * Strict-encoding verify for RAW payload signatures (A5): the signature
+     * must be minimal DER (CheckStrictDER - the padding axis), low-S
+     * (CheckLowS - the high-S axis), AND verify. For one (key, message) there
+     * is exactly one byte-string that passes, so a payload sig routed through
+     * this cannot be re-encoded by a relayer to shift the txid.
+     */
+    bool VerifyStrict(const uint256& hash, const std::vector<unsigned char>& vchSig) const;
 
     /**
      * Check whether a signature is normalized (lower-S).
      */
     static bool CheckLowS(const std::vector<unsigned char>& vchSig);
+
+    /**
+     * Check whether a RAW DER signature - one carrying NO trailing sighash-type
+     * byte, which is what every FreeBank payload signature is - uses the strict
+     * canonical encoding of BIP66. This is IsValidSignatureEncoding
+     * (script/interpreter.cpp) with the sighash byte taken out of the three
+     * length relations; the R/S minimality and sign rules are identical.
+     *
+     * Always pair it with CheckLowS: this catches the DER-padding axis, CheckLowS
+     * catches the high-S axis, and BOTH are needed before a payload signature is
+     * non-malleable. Payload sigs live in the version-tagged trailer, so the
+     * script layer's standardness encoding checks never touch them.
+     * (SECURITY_GATE_SIGNOFF_A5.md - VerifyStrict routes every payload-verify
+     * site through this predicate; landed with the A5 swap.)
+     */
+    static bool CheckStrictDER(const std::vector<unsigned char>& vchSig);
 
     //! Recover a public key from a compact signature.
     bool RecoverCompact(const uint256& hash, const std::vector<unsigned char>& vchSig);

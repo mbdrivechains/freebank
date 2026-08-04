@@ -164,20 +164,12 @@ CBlock TestChain100Setup::CreateAndProcessBlock(const CScript& scriptPubKey)
     return result;
 }
 
-CBlock TestChain100Setup::CreateAndProcessBlock(const std::vector<CMutableTransaction>& vtx, const CScript& scriptPubKey)
-{
-    const CChainParams& chainparams = Params();
-    CBlock block;
-
-    std::string strError = "";
-    BlockAssembler(chainparams).GenerateBMMBlock(block, strError, nullptr, std::vector<CMutableTransaction>(), uint256(), scriptPubKey);
-
-    std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
-    ProcessNewBlock(chainparams, shared_pblock, true, nullptr, true /* fUnitTest */);
-
-    CBlock result = block;
-    return result;
-}
+// NB: the old CreateAndProcessBlock(vtx, scriptPubKey) overload was removed
+// (C2b, 2026-08-01): it silently passed an EMPTY vector to GenerateBMMBlock
+// instead of vtx, and the miner-side vtx branch it would need dereferences an
+// uninitialised BlockAssembler::pblock member. Its only caller
+// (txvalidationcache_tests) now injects coins instead of mining them. See
+// docs-local/TEST_BASELINE.md C2b before reintroducing it.
 
 CScript TestChain100Setup::GetCoinbaseScript() const
 {

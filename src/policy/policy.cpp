@@ -9,6 +9,7 @@
 
 #include <bill.h>
 #include <house.h>
+#include <note.h>
 
 #include <consensus/validation.h>
 #include <validation.h>
@@ -188,6 +189,18 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 
         // House pledge prevouts likewise (RECLAIM spends them)
         if (tx.nVersion == TRANSACTION_HOUSE_VERSION && coin.fHouseEscrow)
+            continue;
+
+        // B3 consensus-custody prevouts (pre-auth demanded notes): spent by
+        // PROTEST / discharge / voluntary REDEEM / CLAIM with an empty
+        // scriptSig - the note consensus rules govern them (payload sig
+        // against the keyid the script embeds). Same class as the two
+        // carve-outs above. NB (queued observation): v13 CLAIM spending
+        // fHouseEscrow and v16 SETTLE spending escrow have NO carve-out and
+        // relay today only because deployed chains run fRequireStandard=false
+        // - a pre-mainnet policy item, tracked in SIGNOFF_QUEUE.md.
+        if (tx.nVersion == TRANSACTION_NOTE_VERSION && coin.fNote &&
+                NoteDemandIsPreAuth(coin.nDemandHeight))
             continue;
 
         const CTxOut& prev = coin.out;

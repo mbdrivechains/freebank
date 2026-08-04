@@ -34,7 +34,12 @@
 //! including a pure append. The byte-length pins in coins_tests
 //! (disk_record_format_pin) fail if you do not. Bumping forces every existing
 //! datadir to -reindex on upgrade; that is the intended cost, not a regression.
-static const int FREEBANK_DISK_FORMAT_VERSION = 1;
+//!
+//! v2 (D-3): CDiskBlockIndex grew hashLastDeposit (chain.h) - a block-index
+//! entry format change, same positional-append hazard as the records above.
+//! The forced -reindex also BACK-FILLS the new field for historical blocks,
+//! which is what makes the deposit-CTIP reorg revert correct for them.
+static const int FREEBANK_DISK_FORMAT_VERSION = 2;
 
 /**
  * A UTXO entry.

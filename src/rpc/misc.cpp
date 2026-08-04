@@ -859,6 +859,11 @@ static UniValue BillToJSON(const CBill& bill, bool fIncludeBody)
     obj.pushKV("drawer_pubkey", HexStr(bill.vchDrawerPubKey));
     obj.pushKV("acceptor_pubkey", HexStr(bill.vchAcceptorPubKey));
     obj.pushKV("holder_pubkey", HexStr(bill.vchHolderPubKey));
+    // B1: 0 unless a discount house holds this bill in its loan book. Exposed
+    // because the deep-reorg gate byte-compares CBill across nodes, and this is
+    // the field that discriminates the canonical-minimal encoding - without it
+    // the comparison silently cannot see the one field ops 5-8 move.
+    obj.pushKV("owner_house_id", (uint64_t)bill.nOwnerHouseID);
     obj.pushKV("issue_txid", bill.txidIssue.ToString());
     obj.pushKV("escrow_outpoint", bill.outEscrow.hash.ToString() + ":" + itostr(bill.outEscrow.n));
     obj.pushKV("title_outpoint", bill.outTitle.hash.ToString() + ":" + itostr(bill.outTitle.n));
@@ -897,6 +902,78 @@ UniValue listbills(const JSONRPCRequest& request)
     for (const CBill& bill : pbilltree->GetBills())
         ret.push_back(BillToJSON(bill, false /* fIncludeBody */));
 
+    return ret;
+}
+
+UniValue listloanbook(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() > 1)
+        throw std::runtime_error(
+            "listloanbook ( house_id )\n"
+            "\nThe discounted bills a house holds - its loan book (Phase 3.9).\n"
+            "With no argument, every house-held bill on the chain.\n"
+            "\nArguments:\n"
+            "1. house_id      (numeric, optional) restrict to one house\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"house_id\": n,             (numeric) 0 when unfiltered\n"
+            "  \"count\": n,                (numeric) bills held\n"
+            "  \"face_total\": n,           (numeric) summed face, sats\n"
+            "  \"recorded_face\": n,        (numeric) the house's own nLoanBookFace\n"
+            "  \"face_matches\": true|false,(boolean) the two agree - the state invariant\n"
+            "  \"wtd_avg_maturity\": n,     (numeric) sum(face*maturity)/sum(face), as a height\n"
+            "  \"bills\": [ ... ]           (array) the bill records\n"
+            "}\n"
+            "\nface_total is summed from the BILL records; recorded_face is the counter the\n"
+            "house carries. They must be equal - that is the loan-book state invariant, and\n"
+            "publishing both is what makes a divergence visible rather than latent.\n"
+            "\nwtd_avg_maturity is the book's DURATION - the half of match funding a face\n"
+            "total cannot show, and the quantity the rule is actually computed against.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listloanbook", "3")
+            + HelpExampleRpc("listloanbook", "3")
+        );
+
+    const uint32_t nFilter = request.params.size() > 0 ? (uint32_t)request.params[0].get_int() : 0;
+
+    LOCK(cs_main);
+
+    UniValue bills(UniValue::VARR);
+    uint64_t nCount = 0;
+    CAmount amountFace = 0;
+    for (const CBill& bill : pbilltree->GetBills()) {
+        if (bill.nOwnerHouseID == 0)
+            continue;
+        if (nFilter != 0 && bill.nOwnerHouseID != nFilter)
+            continue;
+        bills.push_back(BillToJSON(bill, false /* fIncludeBody */));
+        nCount++;
+        amountFace += bill.amount;
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("house_id", (uint64_t)nFilter);
+    ret.pushKV("count", nCount);
+    ret.pushKV("face_total", amountFace);
+    ret.pushKV("face_total_grams", GramsUV((int64_t)amountFace));
+    if (nFilter != 0) {
+        CHouse house;
+        const bool fHave = phousetree->GetHouse(nFilter, house);
+        ret.pushKV("recorded_face", fHave ? house.nLoanBookFace : 0);
+        ret.pushKV("face_matches", fHave && house.nLoanBookFace == (uint64_t)amountFace);
+        // The book's DURATION, which is the half of match funding a face total
+        // cannot show: sum(face * maturity) / sum(face). Published as a height
+        // so it reads against the tip directly. Derived from the house's own
+        // 128-bit weight, so a divergence from the records shows up as
+        // face_matches false rather than as a quietly wrong average.
+        if (fHave && house.nLoanBookFace > 0) {
+            const unsigned __int128 nAvg = house.LoanWtMaturity() / (unsigned __int128)house.nLoanBookFace;
+            ret.pushKV("wtd_avg_maturity", (uint64_t)nAvg);
+        } else {
+            ret.pushKV("wtd_avg_maturity", (uint64_t)0);
+        }
+    }
+    ret.pushKV("bills", bills);
     return ret;
 }
 
@@ -953,6 +1030,22 @@ static UniValue HouseToJSON(const CHouse& house)
     // deposit op is checked byte-exact, not just via the depositunits counter.
     obj.pushKV("depositwtmathi", house.nDepositWtMatHi);
     obj.pushKV("depositwtmatlo", house.nDepositWtMatLo);
+    // B1 loan book: face value of the bills this house holds, and the same
+    // 128-bit weighted-maturity accumulator on the ASSET side. These three are
+    // exactly what a DISCOUNT / HRETIRE / HCLAIM moves, so the reorg gate folds
+    // them into its canonical signature - without them a byte-compare across
+    // nodes cannot see the loan-book half of the undo at all, and (because the
+    // gate's field reader defaults a missing key to 0) would pass GREEN against
+    // a completely broken one.
+    obj.pushKV("loanbookface", house.nLoanBookFace);
+    obj.pushKV("loanwtmathi", house.nLoanWtMatHi);
+    obj.pushKV("loanwtmatlo", house.nLoanWtMatLo);
+    // The CUSTODY key. Already load-bearing for redemption; B1 makes it the one
+    // place a discounted bill's title may land (check 14) and the only address
+    // an HRETIRE may pay (check 28). Publishing it is what lets an observer
+    // verify either of those from the chain alone - without it "the title landed
+    // on the house's consensus-known key" is unfalsifiable from outside.
+    obj.pushKV("redemptiondestpk", HexStr(house.vchRedemptionDestPK));
     obj.pushKV("insolventdepositprincipal", house.nInsolventDepositPrincipal);
     // The BINDING cap is the min of the two (3.5 D2): capital (lambda*escrow)
     // and reserve (attested till / rho). Publish all three - the market prices
@@ -982,12 +1075,21 @@ static UniValue HouseToJSON(const CHouse& house)
     {
         const int nTipHeight = chainActive.Height();
         obj.pushKV("effective_status", StatusName(HouseEffectiveStatus(house, nTipHeight)));
-        uint32_t nStress = house.nStressSinceHeight;
+        // The merged three-origin derivation (T-b4) - a hand-rolled copy here
+        // went stale the moment the protest origin landed.
+        const uint32_t nStress = HouseStressOrigin(house, nTipHeight);
         const uint32_t nDeadline = house.nLastAttestHeight + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE;
-        if ((uint32_t)nTipHeight > nDeadline && (nStress == 0 || nDeadline + 1 < nStress))
-            nStress = nDeadline + 1;
         if (nStress != 0)
             obj.pushKV("stress_since", (uint64_t)nStress);
+        // A protest-stressed house must show its cause: without these a
+        // stressed effective_status with healthy attest numbers is opaque.
+        // Shown inert too (protest_open 0, heights set): a protest builder
+        // needs the raw record for its payload priors (T-b5 inert-at-zero).
+        if (house.ProtestLive() || house.nProtestHeight != 0) {
+            obj.pushKV("protest_open", (uint64_t)house.nProtestOpen);
+            obj.pushKV("protest_height", (uint64_t)house.nProtestHeight);
+            obj.pushKV("protest_demand_height", (uint64_t)house.nProtestDemandHeight);
+        }
         obj.pushKV("attest_deadline", (uint64_t)nDeadline);
         obj.pushKV("lastattestheight", (uint64_t)house.nLastAttestHeight);
         obj.pushKV("lastattestreserves", ValueFromAmount(house.amountLastAttestReserves));
@@ -1306,6 +1408,7 @@ static const CRPCCommand commands[] =
 
     { "bills",              "listbills",                    &listbills,                     {}},
     { "bills",              "getbill",                      &getbill,                       {"id"}},
+    { "bills",              "listloanbook",                 &listloanbook,                  {"house_id"}},
 
     { "houses",             "listhouses",                   &listhouses,                    {}},
     { "houses",             "gethouse",                     &gethouse,                      {"id"}},

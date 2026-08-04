@@ -13,6 +13,7 @@
 #include <oracle.h>
 
 #include <bill.h>           // BillHashOutputs (the shared hashOutputs form)
+#include <test/strictsig_util.h>  // A5 malleation vectors
 #include <chainparams.h>
 #include <coins.h>
 #include <consensus/tx_verify.h>
@@ -459,6 +460,37 @@ BOOST_AUTO_TEST_CASE(oracle_contextual_gates)
         db.erase(1);
         BOOST_CHECK_EQUAL(Run(bad, fixNull, 1), "bad-oracle-sig-invalid");
         db[1] = subOut;                    // restore (subOut zeroed by Run - rebuild)
+        db[1].nSubmitterID = 1;
+        db[1].vchPubKey = PK(k1);
+        db[1].nBondHeight = H - 10;
+    }
+
+    // A5: a malleated-but-still-valid payload sig is rejected end-to-end (not
+    // just by the wrapper in isolation). Both axes, at a real op site: the
+    // high-S flip and the DER-padded form each verify under legacy Verify yet
+    // must be refused by the contextual check now that BOND routes through
+    // VerifyStrict. Proves the swap is wired into the validation path.
+    {
+        CMutableTransaction canon = BuildBondTx(k1, 0, H);
+        OracleBond x;
+        BOOST_CHECK(DecodeOraclePayload(canon.vchOraclePayload, x));
+        const std::vector<unsigned char> sigCanon = x.vchSig;
+
+        for (const std::vector<unsigned char>& sigMal :
+             {A5HighSFlip(sigCanon), A5DerPad(sigCanon)}) {
+            BOOST_CHECK(sigMal != sigCanon);
+            BOOST_CHECK(CPubKey(PK(k1)).Verify(               // legacy accepts it
+                OracleBondSigHash(x, OracleHashPrevouts(CTransaction(canon)),
+                                  BillHashOutputs(CTransaction(canon))),
+                sigMal));
+            CMutableTransaction bad = canon;
+            OracleBond xm = x;
+            xm.vchSig = sigMal;
+            bad.vchOraclePayload = Encode(xm);
+            db.erase(1);
+            BOOST_CHECK_EQUAL(Run(bad, fixNull, 1), "bad-oracle-sig-invalid");
+        }
+        db[1] = subOut;                    // restore
         db[1].nSubmitterID = 1;
         db[1].vchPubKey = PK(k1);
         db[1].nBondHeight = H - 10;

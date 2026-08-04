@@ -160,7 +160,26 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
                 if (DecodeNotePayload(tx.vchNotePayload, x)) { nNoteHouse = x.nHouseID; vNoteUnits = x.vUnits; nNoteDemandHeight = x.nDemandHeight; }
             } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
                 NoteDemand d;
-                if (DecodeNotePayload(tx.vchNotePayload, d)) { nNoteHouse = d.nHouseID; vNoteUnits = d.vUnits; nNoteDemandHeight = (uint32_t)nHeight; }
+                if (DecodeNotePayload(tx.vchNotePayload, d)) {
+                    nNoteHouse = d.nHouseID; vNoteUnits = d.vUnits;
+                    // B3: a fresh demand stamps THIS height; the delta-1b
+                    // upgrade re-stamps the PRIOR height (tx_verify has forced
+                    // it to equal the spent coins'), so the clock is preserved
+                    // rather than reset. The pre-auth bit rides in the same
+                    // field - see NOTE_DEMAND_PREAUTH_BIT (D-i: no Coin format
+                    // change, so no fleet -reindex).
+                    const uint32_t nBase = d.nPriorDemandHeight != 0
+                                         ? d.nPriorDemandHeight : (uint32_t)nHeight;
+                    nNoteDemandHeight = NoteDemandTag(nBase, d.fPreAuth != 0);
+                }
+            } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
+                // Re-issued UNCHANGED: same units, same tag. A protest asserts
+                // a claim; it must not alter it.
+                NoteProtest pro;
+                if (DecodeNotePayload(tx.vchNotePayload, pro)) {
+                    nNoteHouse = pro.nHouseID; vNoteUnits = pro.vUnits;
+                    nNoteDemandHeight = pro.nDemandTag;
+                }
             } else if (tx.nNoteOp == NOTE_OP_REDEEM) {
                 // The dynamic-brassage spread (3.5) is an escrow output at
                 // vout[1] - payload-driven like every other note tag, so
@@ -228,11 +247,16 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
             bool overwrite = check ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
             Coin coin(tx.vout[i], nHeight, fCoinbase, fAsset, fControl, fAsset ? nID : 0);
 
-            if (fBillTx) {
-                if (tx.nBillOp == BILL_OP_ISSUE && i < 2)
-                    coin.SetBill(i == 1 /* fEscrow */, nBillID);
-                else if (tx.nBillOp == BILL_OP_ENDORSE && i == 0)
-                    coin.SetBill(false, nBillID);
+            // The shared payload-pure tagger decides WHICH v11 outputs are
+            // tagged and how - one decision point, so the mempool view, the
+            // wallet's funding skip and the wallet's note collector cannot
+            // drift from consensus. It leaves the dense bill id at 0 (it does
+            // not exist until the issuing tx connects); the threaded id is
+            // stamped on immediately below.
+            if (tx.nVersion == TRANSACTION_BILL_VERSION) {
+                ApplyBillCoinTags(tx, i, coin);
+                if (fBillTx && (coin.fBill || coin.fBillEscrow))
+                    coin.nBillID = nBillID;
             }
 
             if (fHouseTx) {

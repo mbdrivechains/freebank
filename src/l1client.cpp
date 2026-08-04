@@ -12,6 +12,7 @@
 #include <univalue.h>
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
+#include <primitives/block.h>
 #include <streams.h>
 #include <txdb.h>
 #include <util.h>
@@ -92,6 +93,7 @@ public:
 
     /* The init-time REST reachability probe borrows the private RestGet. */
     friend bool ::ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch);
+    friend EnforcerIdentity (::ProbeEnforcerIdentity)(std::string& strError, bool* pfStale);
 
 private:
     /*
@@ -649,6 +651,116 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
         }
     }
     return true;
+}
+
+EnforcerIdentity ClassifyEnforcerIdentity(bool fEnfTipOK, int nEnfTipHeight,
+                                          bool fRestOK, int nRestTipHeight,
+                                          bool fMemberQueryOK, bool fEnfTipOnRestChain,
+                                          int nStaleWarnDepth, bool* pfStale,
+                                          std::string& strDetail)
+{
+    if (pfStale) *pfStale = false;
+
+    // Any read we could not obtain = NOT-READY, never a mismatch. Keeping
+    // "couldn't check" strictly separate from "wrong chain" is the whole point:
+    // a mismatch refuses startup, so it must be a POSITIVE disagreement, never
+    // the absence of an answer.
+    if (!fEnfTipOK) {
+        strDetail = "enforcer GetChainTip unavailable (down, grpcurl missing, or unsynced)";
+        return ENFORCER_IDENTITY_NOTREADY;
+    }
+    if (nEnfTipHeight < 1) {
+        strDetail = "enforcer at genesis only (still syncing headers)";
+        return ENFORCER_IDENTITY_NOTREADY;
+    }
+    if (!fRestOK) {
+        strDetail = "mainchain REST tip height unavailable";
+        return ENFORCER_IDENTITY_NOTREADY;
+    }
+
+    // Staleness is a WARN, not a refuse: a frozen-but-correct enforcer's tip is
+    // still a block on the REST active chain (MATCH below). Surface it; do not
+    // brick on it. (Computed before the membership verdict so a stale MATCH
+    // still carries the flag.)
+    if (pfStale && nStaleWarnDepth > 0 && nEnfTipHeight < nRestTipHeight - nStaleWarnDepth)
+        *pfStale = true;
+
+    if (!fMemberQueryOK) {
+        strDetail = "mainchain REST membership query failed";
+        return ENFORCER_IDENTITY_NOTREADY;
+    }
+
+    if (fEnfTipOnRestChain) {
+        strDetail = strprintf("enforcer tip @%d is on the challenge-pinned REST node's active chain",
+                              nEnfTipHeight);
+        return ENFORCER_IDENTITY_MATCH;
+    }
+
+    strDetail = strprintf("enforcer tip @%d is NOT on the challenge-pinned REST node's active chain "
+                          "(a different L1, or an abandoned fork)", nEnfTipHeight);
+    return ENFORCER_IDENTITY_MISMATCH;
+}
+
+EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale)
+{
+    EnforcerL1Client client;
+
+    // 1. Enforcer chain tip (gRPC ValidatorService/GetChainTip).
+    L1BlockHeader enfTip;
+    bool fEnfTipOK = client.GetChainTip(enfTip);
+    int nEnfTip = fEnfTipOK ? enfTip.nHeight : -1;
+
+    // 2. REST tip height, from the SAME node the REST identity pin validated.
+    bool fRestOK = false;
+    int nRestTip = -1;
+    std::string strBody;
+    if (client.RestGet("/rest/chaininfo.json", strBody) && !strBody.empty()) {
+        UniValue info;
+        if (info.read(strBody) && info.isObject()) {
+            const UniValue& blocks = find_value(info, "blocks");
+            if (blocks.isNum()) {
+                nRestTip = blocks.get_int();
+                fRestOK = true;
+            }
+        }
+    }
+
+    // 3. Membership: is the enforcer's tip a block on the REST node's ACTIVE
+    //    chain? /rest/headers/1/<hash> returns that one header iff it is on the
+    //    active chain (chainActive.Contains), else an EMPTY but HTTP-200 body -
+    //    so RestGet succeeds either way and the empty-vs-present distinction is
+    //    an unambiguous "not on my chain" rather than a transport error.
+    bool fMemberOK = false, fMember = false;
+    if (fEnfTipOK) {
+        std::string strHdr;
+        if (client.RestGet("/rest/headers/1/" + enfTip.hashBlock.ToString() + ".hex", strHdr)) {
+            fMemberOK = true;
+            while (!strHdr.empty() && (strHdr.back() == '\n' || strHdr.back() == '\r' || strHdr.back() == ' '))
+                strHdr.pop_back();
+            if (strHdr.empty()) {
+                fMember = false; // present-but-empty == not on the active chain
+            } else if (IsHex(strHdr)) {
+                // Belt-and-braces: confirm the returned header really IS the
+                // enforcer tip (guards a misbehaving REST from a false MATCH).
+                try {
+                    CBlockHeader hdr;
+                    CDataStream ss(ParseHex(strHdr), SER_NETWORK, PROTOCOL_VERSION);
+                    ss >> hdr;
+                    fMember = (hdr.GetHash() == enfTip.hashBlock);
+                } catch (const std::exception&) {
+                    fMemberOK = false; // unparseable == couldn't check, not a mismatch
+                }
+            } else {
+                fMemberOK = false; // unexpected non-hex body == couldn't check
+            }
+        }
+    }
+
+    std::string strDetail;
+    EnforcerIdentity r = ClassifyEnforcerIdentity(fEnfTipOK, nEnfTip, fRestOK, nRestTip,
+                                                  fMemberOK, fMember, 20, pfStale, strDetail);
+    strError = strDetail;
+    return r;
 }
 
 bool EnforcerL1Client::RestGetRawTx(const uint256& txid, CMutableTransaction& tx)
@@ -1850,15 +1962,19 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
 
         if (error) throw boost::system::system_error(error);
 
-        // HTTP request (package the json for sending)
+        // HTTP request (package the json for sending). HTTP/1.0 + Connection:
+        // close, same rationale as RestGet: a 1.0 client must not be sent a
+        // chunked reply (RFC 7230 3.3.1), so the body is Content-Length-framed
+        // or close-delimited. CRLF endings per the RFC - the old bare-\n
+        // endings worked only by evhttp leniency.
         boost::asio::streambuf output;
         std::ostream os(&output);
-        os << "POST / HTTP/1.1\n";
-        os << "Host: 127.0.0.1\n";
-        os << "Content-Type: application/json\n";
-        os << "Authorization: Basic " << EncodeBase64(auth) << std::endl;
-        os << "Connection: close\n";
-        os << "Content-Length: " << json.size() << "\n\n";
+        os << "POST / HTTP/1.0\r\n";
+        os << "Host: 127.0.0.1\r\n";
+        os << "Content-Type: application/json\r\n";
+        os << "Authorization: Basic " << EncodeBase64(auth) << "\r\n";
+        os << "Connection: close\r\n";
+        os << "Content-Length: " << json.size() << "\r\n\r\n";
         os << json;
 
         // Send the request
@@ -1882,28 +1998,103 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
                 throw boost::system::system_error(e);
         }
 
-        std::stringstream ss;
-        ss << data;
+        // Structural response parse. The old positional parse (skip 5 CRs,
+        // then a whitespace-delimited `>>` token read) was silently tuned to
+        // 0.16-evhttp's exact header emission - which is 6 CRs before the
+        // body, not 5, so it only worked because `>>` skipped the leftover
+        // line as whitespace - and truncated any body containing a space.
+        // That boundary miscount is also why the earlier "read the rest as
+        // the body" fix returned an empty body for EVERY call and stalled
+        // the whole peg. Parse the framing explicitly instead.
 
-        // Get response code
-        ss.ignore(std::numeric_limits<std::streamsize>::max(), ' ');
-        int code;
-        ss >> code;
+        // Split headers from body at the first blank line.
+        size_t headerEnd = data.find("\r\n\r\n");
+        size_t bodyStart;
+        if (headerEnd != std::string::npos) {
+            bodyStart = headerEnd + 4;
+        } else {
+            headerEnd = data.find("\n\n"); // LF-only server tolerance
+            if (headerEnd == std::string::npos)
+                return false;
+            bodyStart = headerEnd + 2;
+        }
+        const std::string headers = data.substr(0, headerEnd);
 
-        // Check response code
+        // Status code: second token of the status line.
+        size_t sp = headers.find(' ');
+        if (sp == std::string::npos)
+            return false;
+        int code = atoi(headers.substr(sp + 1, 4).c_str());
         if (code != 200)
             return false;
 
-        // Skip the rest of the header
-        for (size_t i = 0; i < 5; i++)
-            ss.ignore(std::numeric_limits<std::streamsize>::max(), '\r');
+        // Case-insensitive scan for the framing headers.
+        std::string lower;
+        lower.reserve(headers.size());
+        for (char c : headers)
+            lower.push_back(std::tolower(static_cast<unsigned char>(c)));
 
-        // Parse json response;
-        std::string JSON;
-        ss >> JSON;
+        bool fChunked = false;
+        size_t te = lower.find("transfer-encoding:");
+        if (te != std::string::npos) {
+            size_t eol = lower.find('\n', te);
+            fChunked = lower.substr(te, eol - te).find("chunked") != std::string::npos;
+        }
+
+        // Extract the body: de-chunk / Content-Length prefix / close-delimited.
+        // Chunked should never happen against an HTTP/1.0 request, but a
+        // noncompliant server or interposed proxy must not feed the JSON
+        // parser chunk-size lines (a bare hex size even parses as valid
+        // JSON - silent garbage, not an error).
+        std::string body;
+        const std::string raw = data.substr(bodyStart);
+        if (fChunked) {
+            size_t pos = 0;
+            for (;;) {
+                size_t eol = raw.find("\r\n", pos);
+                if (eol == std::string::npos)
+                    return false;
+                unsigned long sz = strtoul(raw.substr(pos, eol - pos).c_str(), nullptr, 16);
+                if (sz == 0)
+                    break;
+                pos = eol + 2;
+                if (pos + sz > raw.size())
+                    return false;
+                body.append(raw, pos, sz);
+                pos += sz;
+                if (raw.compare(pos, 2, "\r\n") == 0)
+                    pos += 2;
+            }
+        } else {
+            size_t cl = lower.find("content-length:");
+            if (cl != std::string::npos) {
+                unsigned long n = strtoul(lower.c_str() + cl + 15, nullptr, 10);
+                if (raw.size() < n)
+                    return false; // short read
+                body = raw.substr(0, n);
+            } else {
+                body = raw; // close-delimited (Connection: close is requested)
+            }
+        }
+
         std::stringstream jss;
-        jss << JSON;
+        jss << body;
         boost::property_tree::json_parser::read_json(jss, ptree);
+
+        // JSON-RPC-level errors. This L1 can answer HTTP 200 with
+        // {"error":{...},"id":...} and NO "result" node, and every caller
+        // does a bare get_child("result") - so returning true here would
+        // throw "No such node" out through the caller's RPC handler. The
+        // old truncating parse never hit this only because the SPACE in the
+        // error message crashed read_json first: the truncation bug was
+        // doubling as the error handler. Handle it explicitly - and now the
+        // actual error message reaches the log instead of being destroyed.
+        if (!ptree.get_child_optional("result")) {
+            boost::optional<boost::property_tree::ptree&> err = ptree.get_child_optional("error");
+            LogPrintf("ERROR Sidechain client (sendRequestToMainchain): mainchain RPC error: %s\n",
+                      err ? err->get<std::string>("message", "(no message)") : "(no result node)");
+            return false;
+        }
     } catch (std::exception &exception) {
         LogPrintf("ERROR Sidechain client (sendRequestToMainchain): %s\n", exception.what());
         return false;

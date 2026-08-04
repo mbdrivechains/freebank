@@ -346,6 +346,7 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->hashMainBlock  = diskindex.hashMainBlock;
                 pindexNew->hashWithdrawalBundle    = diskindex.hashWithdrawalBundle;
+                pindexNew->hashLastDeposit = diskindex.hashLastDeposit;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
@@ -405,6 +406,31 @@ bool CSidechainTreeDB::WriteSidechainIndex(const std::vector<std::pair<uint256, 
             batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, hashNonAmount);
         }
     }
+
+    return WriteBatch(batch, true);
+}
+
+bool CSidechainTreeDB::WriteDepositDisconnect(const std::vector<uint256>& vEraseID, const uint256& hashPrevLastDeposit)
+{
+    CDBBatch batch(*this);
+
+    for (const uint256& id : vEraseID) {
+        // NEVER erase the row the restored baseline points at. Rows are keyed
+        // by GetID() (the non-amount hash) and nothing stops the same deposit
+        // object appearing in a disconnected block AND being pprev's baseline,
+        // so an unfiltered erase can leave DB_LAST_SIDECHAIN_DEPOSIT dangling.
+        // That fails OPEN: GetLastDeposit finds no row, ConnectBlock takes its
+        // "no deposits yet" branch (no CTIP-input check, amountPrev = 0) and
+        // authorises a payout of the entire cumulative CTIP.
+        if (id == hashPrevLastDeposit)
+            continue;
+        batch.Erase(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, id));
+    }
+
+    if (hashPrevLastDeposit.IsNull())
+        batch.Erase(DB_LAST_SIDECHAIN_DEPOSIT);
+    else
+        batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, hashPrevLastDeposit);
 
     return WriteBatch(batch, true);
 }
@@ -606,18 +632,29 @@ bool CSidechainTreeDB::HaveDepositNonAmount(const uint256& hashNonAmount)
     return false;
 }
 
-bool CSidechainTreeDB::GetLastDeposit(SidechainDeposit& deposit)
+bool CSidechainTreeDB::GetLastDeposit(SidechainDeposit& deposit, bool* pfPointerSet)
 {
+    if (pfPointerSet) *pfPointerSet = false;
+
     // Look up the last deposit non amount hash
     uint256 objid;
     if (!Read(DB_LAST_SIDECHAIN_DEPOSIT, objid))
         return false;
 
+    if (pfPointerSet) *pfPointerSet = true;
+
     // Read the last deposit
     if (ReadSidechain(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, objid), deposit))
         return true;
 
+    // Pointer set but row missing: a DANGLING baseline. Still false, but
+    // *pfPointerSet distinguishes it from "no deposits yet" - see the header.
     return false;
+}
+
+bool CSidechainTreeDB::GetLastDepositID(uint256& hashID)
+{
+    return Read(DB_LAST_SIDECHAIN_DEPOSIT, hashID);
 }
 
 bool CSidechainTreeDB::GetLastWithdrawalBundleHash(uint256& hash)
@@ -916,12 +953,23 @@ bool BillDB::WriteBills(const std::vector<CBill>& vBill)
     return WriteBatch(batch, true);
 }
 
-bool BillDB::WriteBlockEffects(const std::vector<CBill>& vBill, const uint32_t* pnLastID, const uint256& hashBestBlock)
+bool BillDB::WriteBlockEffects(const std::vector<CBill>& vBill, const std::vector<uint32_t>& vRemove,
+                               const uint32_t* pnLastID, const uint256& hashBestBlock)
 {
     CDBBatch batch(*this);
     for (const CBill& bill : vBill) {
         batch.Write(std::make_pair(DB_BILL, bill.nBillID), bill);
         batch.Write(std::make_pair(DB_BILL_HASH, bill.billID), bill.nBillID);
+    }
+    // Removals need the record's hash to erase the index row too, so each one
+    // is read BEFORE the batch is applied. A row that is already gone is not an
+    // error: the undo must stay replayable.
+    for (const uint32_t nID : vRemove) {
+        CBill bill;
+        if (!GetBill(nID, bill))
+            continue;
+        batch.Erase(std::make_pair(DB_BILL, nID));
+        batch.Erase(std::make_pair(DB_BILL_HASH, bill.billID));
     }
     if (pnLastID)
         batch.Write(DB_BILL_LAST_ID, *pnLastID);

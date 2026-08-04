@@ -27,6 +27,20 @@ static bool IsNoteP2PKH(const CScript& script)
            script[2] == 0x14 && script[23] == OP_EQUALVERIFY && script[24] == OP_CHECKSIG;
 }
 
+CScript NotePreAuthScript(const std::vector<unsigned char>& vchPubKey)
+{
+    const CKeyID keyid = CPubKey(vchPubKey).GetID();
+    return CScript() << std::vector<unsigned char>(keyid.begin(), keyid.end()) << OP_DROP << OP_TRUE;
+}
+
+bool IsNotePreAuthScript(const CScript& script)
+{
+    // <20-byte push> OP_DROP OP_TRUE - the escrow family with a keyid-sized
+    // push (the escrows push 32). Shape only; WHICH keyid is contextual.
+    return script.size() == 23 && script[0] == 0x14 &&
+           script[21] == OP_DROP && script[22] == OP_TRUE;
+}
+
 uint256 NoteHashPrevouts(const CTransaction& tx)
 {
     CHashWriter ss(SER_GETHASH, 0);
@@ -80,6 +94,27 @@ uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/demand");
+    ss << nHouseID;
+    ss << vUnits;
+    ss << hashOutputs;
+    return ss.GetHash();
+}
+
+uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
+                           const std::vector<unsigned char>& vchPayoutScript)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/preauth");   // domain-separated: NOT the demand digest
+    ss << nHouseID;
+    ss << vUnits;
+    ss << vchPayoutScript;
+    return ss.GetHash();
+}
+
+uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/protest");
     ss << nHouseID;
     ss << vUnits;
     ss << hashOutputs;
@@ -160,6 +195,7 @@ template bool DecodeNotePayload<NoteTransfer>(const std::vector<unsigned char>&,
 template bool DecodeNotePayload<NoteRedeem>(const std::vector<unsigned char>&, NoteRedeem&);
 template bool DecodeNotePayload<NoteClaim>(const std::vector<unsigned char>&, NoteClaim&);
 template bool DecodeNotePayload<NoteDemand>(const std::vector<unsigned char>&, NoteDemand&);
+template bool DecodeNotePayload<NoteProtest>(const std::vector<unsigned char>&, NoteProtest&);
 
 static bool IsValidNotePubKey(const std::vector<unsigned char>& vch)
 {
@@ -169,8 +205,12 @@ static bool IsValidNotePubKey(const std::vector<unsigned char>& vch)
     return pubkey.IsFullyValid();
 }
 
-/** vout[0..nUnits-1] must each be a dust-valued P2PKH note output. */
-static bool CheckNoteOutputs(const CTransaction& tx, size_t nUnits, CValidationState& state)
+/** vout[0..nUnits-1] must each be a dust-valued note output: P2PKH normally,
+ * or (fCustody, B3) the consensus-custody shape a pre-auth re-issue moves the
+ * coins onto. Shape only; the exact keyid inside a custody script is
+ * contextual (it must be the demanding holder's - CheckNoteOperation). */
+static bool CheckNoteOutputs(const CTransaction& tx, size_t nUnits, CValidationState& state,
+                             bool fCustody = false)
 {
     if (nUnits == 0 || nUnits > MAX_NOTE_OUTPUTS)
         return state.DoS(100, false, REJECT_INVALID, "bad-note-units-count");
@@ -179,7 +219,8 @@ static bool CheckNoteOutputs(const CTransaction& tx, size_t nUnits, CValidationS
     for (size_t i = 0; i < nUnits; i++) {
         if (tx.vout[i].nValue != NOTE_DUST_VALUE)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-output-value");
-        if (!IsNoteP2PKH(tx.vout[i].scriptPubKey))
+        if (fCustody ? !IsNotePreAuthScript(tx.vout[i].scriptPubKey)
+                     : !IsNoteP2PKH(tx.vout[i].scriptPubKey))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-output-script");
     }
     return true;
@@ -193,7 +234,7 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
     // Reserved v1.5 bearer op-codes are inert in v1 (unreachable).
     if (tx.nNoteOp == NOTE_OP_LOCK || tx.nNoteOp == NOTE_OP_UNLOCK)
         return state.DoS(100, false, REJECT_INVALID, "bad-note-op-reserved");
-    if (tx.nNoteOp < NOTE_OP_MINT || tx.nNoteOp > NOTE_OP_DEMAND)
+    if (tx.nNoteOp < NOTE_OP_MINT || tx.nNoteOp > NOTE_OP_PROTEST)
         return state.DoS(100, false, REJECT_INVALID, "bad-note-op");
 
     // 100 outputs x u64 + M approver sigs + (MINT, R-i7) up to 64 reserve proofs
@@ -257,11 +298,36 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
         if (!DecodeNotePayload(tx.vchNotePayload, redeem))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-payload");
 
-        if (!IsValidNotePubKey(redeem.vchHolderPubKey) ||
-                redeem.vchHolderSig.empty() || redeem.vchHolderSig.size() > 80)
+        // A DISCHARGE (B3) carries no fresh holder signature - that is its
+        // entire point - so the holder-sig requirement applies only to the
+        // plain form. The holder KEY is always required: it is what the
+        // pre-auth digest verifies against, and what the burned inputs must
+        // hash to either way.
+        if (!IsValidNotePubKey(redeem.vchHolderPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-auth");
+        if (!redeem.fPreAuthDischarge &&
+                (redeem.vchHolderSig.empty() || redeem.vchHolderSig.size() > 80))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-auth");
         if (redeem.fBrassage > 1)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-flag");
+        if (redeem.fPreAuthDischarge > 1)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-flag");
+        // Discharge fields are all-or-nothing, both directions (the T-b2 demand
+        // rule, same reasoning): units+script+sig present iff discharging.
+        if (redeem.fPreAuthDischarge) {
+            uint64_t nAuthTotal = 0;
+            if (!SumNoteUnits(redeem.vPreAuthUnits, nAuthTotal))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-units");
+            if (redeem.vchPayoutScript.empty() || redeem.vchPayoutScript.size() > MAX_NOTE_PAYOUT_SCRIPT)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-script");
+            if (redeem.vchPreAuthSig.empty() || redeem.vchPreAuthSig.size() > 80)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sig");
+            if (!redeem.vchHolderSig.empty())
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-extra-sig");
+        } else if (!redeem.vPreAuthUnits.empty() || !redeem.vchPayoutScript.empty() ||
+                   !redeem.vchPreAuthSig.empty()) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-unexpected");
+        }
         // vout[0] = holder payout; vout[1] = the brassage escrow output when
         // flagged. The spread AMOUNT, the escrow script and the >= U payout are
         // contextual (they need the house record and the spent inputs' units).
@@ -276,13 +342,53 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
         uint64_t total = 0;
         if (!SumNoteUnits(dem.vUnits, total))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-units");
-        // The notes are RE-ISSUED, not surrendered: same dust P2PKH shape as a
-        // transfer, to the same holder.
-        if (!CheckNoteOutputs(tx, dem.vUnits.size(), state))
+        // The notes are RE-ISSUED, not surrendered. A plain (Deferred-era)
+        // demand keeps the dust-P2PKH transfer shape; a PRE-AUTH demand moves
+        // the coins onto the consensus-custody script - the holder signed away
+        // unilateral control, and the house must be able to discharge alone.
+        if (!CheckNoteOutputs(tx, dem.vUnits.size(), state, dem.fPreAuth != 0))
             return false;
         if (!IsValidNotePubKey(dem.vchHolderPubKey) ||
                 dem.vchHolderSig.empty() || dem.vchHolderSig.size() > 80)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-auth");
+        // B3: the PRE-AUTH leg. Shape only - WHICH house states require or
+        // forbid it is contextual (T-b3), because it depends on the house
+        // record. Here we pin that the flag is a real boolean and that the two
+        // pre-auth fields are present exactly when it is set: a payload
+        // carrying a payout script with fPreAuth clear would be a standing
+        // authorisation consensus never checks, and fPreAuth set with no script
+        // would be a discharge target that cannot exist.
+        if (dem.fPreAuth > 1)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-flag");
+        if (dem.fPreAuth) {
+            // A payout script must be a plausible standard script - it is what
+            // the house is forced to pay, and consensus compares it literally.
+            if (dem.vchPayoutScript.empty() || dem.vchPayoutScript.size() > MAX_NOTE_PAYOUT_SCRIPT)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-script");
+            if (dem.vchPreAuthSig.empty() || dem.vchPreAuthSig.size() > 80)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-sig");
+        } else if (!dem.vchPayoutScript.empty() || !dem.vchPreAuthSig.empty()) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-unexpected");
+        }
+    }
+    else if (tx.nNoteOp == NOTE_OP_PROTEST) {
+        NoteProtest pro;
+        if (!DecodeNotePayload(tx.vchNotePayload, pro))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-payload");
+
+        uint64_t total = 0;
+        if (!SumNoteUnits(pro.vUnits, total))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-units");
+        // Same spend-and-re-issue shape as a pre-auth DEMAND: the coins stay in
+        // consensus custody (only pre-auth coins can be protested), re-issued
+        // to the same holder's custody script. Standing is proven by the
+        // holder's payload signature - the custody script is script-level open,
+        // so the scriptSig proves nothing here.
+        if (!CheckNoteOutputs(tx, pro.vUnits.size(), state, /*fCustody=*/true))
+            return false;
+        if (!IsValidNotePubKey(pro.vchHolderPubKey) ||
+                pro.vchHolderSig.empty() || pro.vchHolderSig.size() > 80)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-auth");
     }
     else if (tx.nNoteOp == NOTE_OP_CLAIM) {
         NoteClaim claim;

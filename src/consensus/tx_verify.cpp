@@ -272,24 +272,45 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                          strprintf("%s: inputs missing/spent", __func__));
     }
 
-    // For a note TRANSFER/REDEEM, every spent note coin must be a P2PKH to the
+    // For a note TRANSFER/REDEEM, every spent note coin must be locked to the
     // declared sender/holder (so the payload sig actually authorizes THESE
     // notes). Decode once up front; the payload already passed shape.
+    //
+    // B3: the pin is TAG-AWARE. An ordinary note coin sits on the holder's
+    // P2PKH; a PRE-AUTH demanded coin sits on the holder's consensus-custody
+    // script (script-level open so the house can discharge alone - see
+    // note.h). Both scripts derive from the SAME payload key; each spent coin
+    // is compared against the one its own tag implies, so a custody coin can
+    // never satisfy a P2PKH pin or vice versa.
     CScript expectedNoteScript;
+    CScript expectedNoteCustodyScript;
     bool fHaveExpectedNote = false;
+    bool fNoteDischarge = false;
     if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
+        std::vector<unsigned char> vchNoteKey;
         if (tx.nNoteOp == NOTE_OP_TRANSFER) {
             NoteTransfer x;
-            if (DecodeNotePayload(tx.vchNotePayload, x)) { expectedNoteScript = NoteScriptForPubKey(x.vchSenderPubKey); fHaveExpectedNote = true; }
+            if (DecodeNotePayload(tx.vchNotePayload, x)) vchNoteKey = x.vchSenderPubKey;
         } else if (tx.nNoteOp == NOTE_OP_REDEEM) {
             NoteRedeem r;
-            if (DecodeNotePayload(tx.vchNotePayload, r)) { expectedNoteScript = NoteScriptForPubKey(r.vchHolderPubKey); fHaveExpectedNote = true; }
+            if (DecodeNotePayload(tx.vchNotePayload, r)) { vchNoteKey = r.vchHolderPubKey; fNoteDischarge = r.fPreAuthDischarge != 0; }
         } else if (tx.nNoteOp == NOTE_OP_CLAIM) {
             NoteClaim c;
-            if (DecodeNotePayload(tx.vchNotePayload, c)) { expectedNoteScript = NoteScriptForPubKey(c.vchHolderPubKey); fHaveExpectedNote = true; }
+            if (DecodeNotePayload(tx.vchNotePayload, c)) vchNoteKey = c.vchHolderPubKey;
         } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
             NoteDemand d;
-            if (DecodeNotePayload(tx.vchNotePayload, d)) { expectedNoteScript = NoteScriptForPubKey(d.vchHolderPubKey); fHaveExpectedNote = true; }
+            if (DecodeNotePayload(tx.vchNotePayload, d)) vchNoteKey = d.vchHolderPubKey;
+        } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
+            // The protest's standing IS this pin: only the demand's holder may
+            // protest, and with the coins in custody the scriptSig proves
+            // nothing - the payload key must match the coin's embedded keyid.
+            NoteProtest pro;
+            if (DecodeNotePayload(tx.vchNotePayload, pro)) vchNoteKey = pro.vchHolderPubKey;
+        }
+        if (!vchNoteKey.empty()) {
+            expectedNoteScript = NoteScriptForPubKey(vchNoteKey);
+            expectedNoteCustodyScript = NotePreAuthScript(vchNoteKey);
+            fHaveExpectedNote = true;
         }
     }
 
@@ -585,7 +606,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // here: neither fNoteOpOK nor fPoolOpOK -> rejected, fail-closed.)
             const bool fNoteOpOK = tx.nVersion == TRANSACTION_NOTE_VERSION &&
                     (tx.nNoteOp == NOTE_OP_TRANSFER || tx.nNoteOp == NOTE_OP_REDEEM ||
-                     tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_DEMAND);
+                     tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_DEMAND ||
+                     tx.nNoteOp == NOTE_OP_PROTEST);
             const bool fPoolOpOK = tx.nVersion == TRANSACTION_POOL_VERSION &&
                     (tx.nPoolOp == POOL_OP_CREATE || tx.nPoolOp == POOL_OP_ADD_LIQ ||
                      tx.nPoolOp == POOL_OP_SWAP);
@@ -593,7 +615,11 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-note-coin");
             if (nNoteHouseIn != 0 && coin.nHouseID != nNoteHouseIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-inputs-mixed-house");
-            if (fHaveExpectedNote && coin.out.scriptPubKey != expectedNoteScript)
+            // Tag-aware holder pin (B3): a pre-auth coin lives on the holder's
+            // custody script, everything else on their P2PKH. Same key either
+            // way - the coin's own tag selects which lock it must carry.
+            if (fHaveExpectedNote && coin.out.scriptPubKey !=
+                    (NoteDemandIsPreAuth(coin.nDemandHeight) ? expectedNoteCustodyScript : expectedNoteScript))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-input-not-holder");
             if (fPoolOpOK) {
                 // Only UNDEMANDED notes may enter a pool (operator decision 4):
@@ -608,9 +634,27 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // a per-note property, and mixing demanded with undemanded (or
             // notes demanded at different dates) inside one op would make the
             // output tag - and the interest owed - ambiguous.
-            if (nNoteIn > 0 && coin.nDemandHeight != nDemandHeightIn)
+            //
+            // B3 discharge carve-out: a DISCHARGE compares the tag with the
+            // PROTESTED marker normalized away. A holder may protest a SUBSET
+            // of a demand's coins (consensus keeps no per-demand registry to
+            // forbid it), splitting one demand into marked and unmarked coins
+            // - but the pre-auth digest binds the demand's FULL unit vector,
+            // so a discharge must burn them all in one tx. Without the
+            // normalization a partially-protested demand becomes permanently
+            // undischargeable and the teeth fire against a house that cannot
+            // pay - the exact injustice the pre-auth exists to rule out. The
+            // marker still reaches the contextual layer per-coin (the D-v
+            // decrement counts marked inputs via fnGetCoin); only THIS
+            // equality relaxes, and only for a discharge - a PROTEST must
+            // still see marked and unmarked apart or its per-coin idempotence
+            // check dissolves.
+            uint32_t nTagCmp = coin.nDemandHeight;
+            if (fNoteDischarge)
+                nTagCmp &= ~NOTE_DEMAND_PROTESTED_BIT;
+            if (nNoteIn > 0 && nTagCmp != nDemandHeightIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-inputs-mixed-demand");
-            nDemandHeightIn = coin.nDemandHeight;
+            nDemandHeightIn = nTagCmp;
             nNoteHouseIn = coin.nHouseID;
             nNoteIn++;
             if (coin.nNoteUnits > (uint64_t)MAX_MONEY || nNoteUnitsIn > (uint64_t)MAX_MONEY - coin.nNoteUnits)
@@ -697,10 +741,54 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nBillTitleIn != 0 || nBillEscrowIn != 1)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-claim-inputs");
         }
-        else {
-            // ISSUE
+        else if (tx.nBillOp == BILL_OP_DISCOUNT) {
+            BillDiscount d;
+            if (!DecodeBillPayload(tx.vchBillPayload, d))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-payload");
+            nBillIDPayload = d.nBillID;
+            // A discount takes the title and plain house funding, nothing else:
+            // the consideration is MINTED in this same transaction, never spent.
+            // That is also why B1 widens no cross-family input guard - no fNote
+            // coin is spent, so the note guard above (which already rejects
+            // every v11 note spend as "bad-txns-spend-note-coin") is untouched.
+            if (nBillTitleIn != 1 || nBillEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-inputs");
+        }
+        else if (tx.nBillOp == BILL_OP_RECOURSE) {
+            // RECOURSE spends NO tagged coin at all - the payer pays the holder
+            // out of plain value, which is exactly what makes it work against an
+            // uncooperative holder. nBillIDIn is therefore 0, and nBillIDPayload
+            // is deliberately LEFT at 0: assigning the payload's bill id here
+            // would make the shared id-match below reject every single recourse.
+            if (nBillTitleIn != 0 || nBillEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-inputs");
+        }
+        else if (tx.nBillOp == BILL_OP_HRETIRE) {
+            BillHRetire h;
+            if (!DecodeBillPayload(tx.vchBillPayload, h))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-payload");
+            nBillIDPayload = h.nBillID;
+            if (nBillTitleIn != 0 || nBillEscrowIn != 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-inputs");
+        }
+        else if (tx.nBillOp == BILL_OP_HCLAIM) {
+            BillHClaim h;
+            if (!DecodeBillPayload(tx.vchBillPayload, h))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaim-payload");
+            nBillIDPayload = h.nBillID;
+            if (nBillTitleIn != 0 || nBillEscrowIn != 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaim-inputs");
+        }
+        else if (tx.nBillOp == BILL_OP_ISSUE) {
             if (nBillTitleIn != 0 || nBillEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-inputs");
+        }
+        else {
+            // Unreachable: CheckTransaction's shape gate rejects every op outside
+            // 1..8 before an input is ever looked at. Fail closed regardless -
+            // an unhandled op here would otherwise skip the structure rules
+            // entirely and be admitted on the id-match alone.
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-op");
         }
 
         if (nBillIDPayload != nBillIDIn)
@@ -756,6 +844,16 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // mint or destroy an interest claim.
             if (x.nDemandHeight != nDemandHeightIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-transfer-demand-mismatch");
+            // B3: a PRE-AUTHORISED demanded note is NOT transferable, and this
+            // is load-bearing rather than conservative. The pre-auth binds a
+            // payout SCRIPT that the house is later forced to pay; if the coin
+            // could move, the new holder would own a claim the house discharges
+            // to the OLD holder's script - the house pays, the protest clears,
+            // and the wrong party is paid. An ordinary (Deferred-era) demanded
+            // note stays transferable exactly as before: that secondary exit is
+            // deliberate, and B3 does not touch it.
+            if (NoteDemandIsPreAuth(nDemandHeightIn))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-transfer-preauth");
             // Conservation: no minting via transfer. Out-units == in-units.
             uint64_t out = 0;
             if (!SumNoteUnits(x.vUnits, out))
@@ -773,8 +871,32 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-input-house-mismatch");
             // Demanding an already-demanded note would silently RESET its
             // clock, throwing away accrued interest.
-            if (nDemandHeightIn != 0)
+            //
+            // B3 (delta-1b) carves out EXACTLY ONE transition: a plain demanded
+            // note may be UPGRADED to pre-auth, keeping its ORIGINAL height. It
+            // exists to close the RELEASE hole - a recovered house takes its
+            // till back with no queue-cleared precondition, so a Deferred-era
+            // queue (whose demands carry no pre-auth) could otherwise be
+            // stonewalled with no protest path. The carve-out is safe for the
+            // reason the original guard exists: it strictly ADDS house-side
+            // obligation and takes nothing from the holder, and the clock is
+            // PRESERVED, not reset - which the height equality below enforces.
+            const bool fUpgrade = (nDemandHeightIn != 0) && d.fPreAuth &&
+                                  !NoteDemandIsPreAuth(nDemandHeightIn);
+            if (nDemandHeightIn != 0 && !fUpgrade)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-already-demanded");
+            if (fUpgrade && NoteDemandHeightOf(nDemandHeightIn) == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-upgrade-height");
+            // The payload's prior-height claim must be EXACTLY what the spent
+            // coins carry on an upgrade, and absent on a fresh demand - it is
+            // what AddCoins re-stamps, so an unchecked value would let an
+            // upgrade back-date its own clock and mint interest.
+            if (fUpgrade) {
+                if (d.nPriorDemandHeight != NoteDemandHeightOf(nDemandHeightIn))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-upgrade-prior");
+            } else if (d.nPriorDemandHeight != 0) {
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-prior-unexpected");
+            }
             if (nHouseEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-op-spends-escrow");
             // The notes are re-issued, not surrendered: units conserved exactly.
@@ -784,6 +906,43 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (out != nNoteUnitsIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-conservation");
         }
+        else if (tx.nNoteOp == NOTE_OP_PROTEST) {
+            NoteProtest pro;
+            if (!DecodeNotePayload(tx.vchNotePayload, pro))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-payload");
+            if (nNoteIn == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-inputs");
+            if (pro.nHouseID != nNoteHouseIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-input-house-mismatch");
+            // Only a PRE-AUTHORISED demand can be protested. That is the whole
+            // justice of the teeth: the house can discharge a pre-auth demand
+            // ALONE, so "it went stale" has exactly one meaning - the house
+            // chose not to pay. A plain demand would let a holder withhold
+            // their redeem signature and then protest an innocent house.
+            if (!NoteDemandIsPreAuth(nDemandHeightIn))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-not-preauth");
+            // A coin already carrying the PROTESTED marker has had its protest:
+            // the marker is what keys the D-v counter's decrement, so a second
+            // protest of the same coin would inflate the counter and freeze the
+            // insolvency clock's clear. Per-coin idempotence, for free.
+            if (NoteDemandIsProtested(nDemandHeightIn))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-already");
+            if (nHouseEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-op-spends-escrow");
+            // Re-issued unchanged: units conserved exactly, and the tag (height
+            // AND pre-auth bit) is preserved by AddCoins from the payload - a
+            // protest must not become a way to alter the claim it asserts.
+            uint64_t out = 0;
+            if (!SumNoteUnits(pro.vUnits, out))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-units");
+            if (out != nNoteUnitsIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-conservation");
+            // The re-issue carries the input tag PLUS the protested marker -
+            // that is the one bit a protest is allowed to change, and the only
+            // way a later discharge can know it is retiring this protest.
+            if (pro.nDemandTag != (nDemandHeightIn | NOTE_DEMAND_PROTESTED_BIT))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-tag-mismatch");
+        }
         else if (tx.nNoteOp == NOTE_OP_REDEEM) {
             NoteRedeem r;
             if (!DecodeNotePayload(tx.vchNotePayload, r))
@@ -792,6 +951,14 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-inputs");
             if (r.nHouseID != nNoteHouseIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-input-house-mismatch");
+            // A DISCHARGE may burn only PRE-AUTH demanded coins: it executes a
+            // standing authorisation, and only those coins carry one. (The
+            // uniformity rule above makes this one check cover every input.)
+            // The converse - a plain redeem OF pre-auth coins - stays legal:
+            // the holder cooperating voluntarily, with their fresh payload
+            // signature; the discharge variant is additive, never exclusive.
+            if (r.fPreAuthDischarge && !NoteDemandIsPreAuth(nDemandHeightIn))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-not-preauth");
             // A redeem never touches escrow - the house pays from its own till
             if (nHouseEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-spends-escrow");

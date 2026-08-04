@@ -183,6 +183,10 @@ bool CPubKey::Verify(const uint256 &hash, const std::vector<unsigned char>& vchS
     return secp256k1_ecdsa_verify(secp256k1_context_verify, &sig, hash.begin(), &pubkey);
 }
 
+bool CPubKey::VerifyStrict(const uint256 &hash, const std::vector<unsigned char>& vchSig) const {
+    return CheckStrictDER(vchSig) && CheckLowS(vchSig) && Verify(hash, vchSig);
+}
+
 bool CPubKey::RecoverCompact(const uint256 &hash, const std::vector<unsigned char>& vchSig) {
     if (vchSig.size() != COMPACT_SIGNATURE_SIZE)
         return false;
@@ -277,6 +281,64 @@ bool CExtPubKey::Derive(CExtPubKey &out, unsigned int _nChild) const {
         return false;
     }
     return (!secp256k1_ecdsa_signature_normalize(secp256k1_context_verify, nullptr, &sig));
+}
+
+/* static */ bool CPubKey::CheckStrictDER(const std::vector<unsigned char>& vchSig) {
+    // Format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S]
+    // with NO sighash byte - the three length relations below are the only
+    // difference from the script-layer IsValidSignatureEncoding.
+
+    // Minimum and maximum size constraints (one byte less than the script form
+    // at each end, since there is no sighash byte).
+    if (vchSig.size() < 8) return false;
+    if (vchSig.size() > 72) return false;
+
+    // A signature is of type 0x30 (compound).
+    if (vchSig[0] != 0x30) return false;
+
+    // Make sure the length covers the entire signature.
+    if (vchSig[1] != vchSig.size() - 2) return false;
+
+    // Extract the length of the R element.
+    unsigned int lenR = vchSig[3];
+
+    // Make sure the length of the S element is still inside the signature.
+    if (5 + lenR >= vchSig.size()) return false;
+
+    // Extract the length of the S element.
+    unsigned int lenS = vchSig[5 + lenR];
+
+    // Verify that the length of the signature matches the sum of the length
+    // of the elements.
+    if ((size_t)(lenR + lenS + 6) != vchSig.size()) return false;
+
+    // Check whether the R element is an integer.
+    if (vchSig[2] != 0x02) return false;
+
+    // Zero-length integers are not allowed for R.
+    if (lenR == 0) return false;
+
+    // Negative numbers are not allowed for R.
+    if (vchSig[4] & 0x80) return false;
+
+    // Null bytes at the start of R are not allowed, unless R would
+    // otherwise be interpreted as a negative number.
+    if (lenR > 1 && (vchSig[4] == 0x00) && !(vchSig[5] & 0x80)) return false;
+
+    // Check whether the S element is an integer.
+    if (vchSig[lenR + 4] != 0x02) return false;
+
+    // Zero-length integers are not allowed for S.
+    if (lenS == 0) return false;
+
+    // Negative numbers are not allowed for S.
+    if (vchSig[lenR + 6] & 0x80) return false;
+
+    // Null bytes at the start of S are not allowed, unless S would otherwise be
+    // interpreted as a negative number.
+    if (lenS > 1 && (vchSig[lenR + 6] == 0x00) && !(vchSig[lenR + 7] & 0x80)) return false;
+
+    return true;
 }
 
 /* static */ int ECCVerifyHandle::refcount = 0;

@@ -934,12 +934,13 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
             // therefore cannot spend an unconfirmed bill output either
             // (bad-bill-input-id-mismatch) - chaining bill ops within the
             // mempool is unsupported, and fails closed.
-            if (ptx->nVersion == TRANSACTION_BILL_VERSION) {
-                if (ptx->nBillOp == BILL_OP_ISSUE && outpoint.n < 2)
-                    coin.SetBill(outpoint.n == 1 /* fEscrow */, 0);
-                else if (ptx->nBillOp == BILL_OP_ENDORSE && outpoint.n == 0)
-                    coin.SetBill(false, 0);
-            }
+            // The shared payload-pure tagger, so this view cannot drift from
+            // AddCoins. It leaves the bill id at 0, which is exactly the
+            // fail-closed behaviour described above; a DISCOUNT's minted note
+            // outputs get their REAL {house, units} tag from the payload, so
+            // they behave like any other unconfirmed note and can chain.
+            if (ptx->nVersion == TRANSACTION_BILL_VERSION)
+                ApplyBillCoinTags(*ptx, outpoint.n, coin);
 
             // House pledge outputs stay tagged while unconfirmed for the same
             // reason as bills above: only the consensus spend guard protects

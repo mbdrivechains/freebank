@@ -4015,18 +4015,23 @@ UniValue demandnote(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "demandnote\n"
             "\nArguments:\n"
-            "1. \"id\"     (numeric, required) the house ID number\n"
-            "2. \"units\"  (numeric, required) note units to demand (an undemanded holder's coins must sum exactly to this)\n"
-            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
-            "\nLodge a demand against a SUSPENDED house (option clause). The notes\n"
-            "are not surrendered - they are re-issued to you stamped with the demand\n"
-            "height, and interest accrues at 5%/yr from that date. Demanded notes\n"
-            "stay transferable, so you can sell at a market discount instead of\n"
-            "waiting out the window.\n"
+            "1. \"id\"       (numeric, required) the house ID number\n"
+            "2. \"units\"    (numeric, required) note units to demand (an undemanded holder's coins must sum exactly to this)\n"
+            "3. \"fee\"      (numeric or string, optional) default 0.001\n"
+            "4. \"payout\"   (string, optional) address the discharge must pay (pre-auth mode; default: the holder's own key)\n"
+            "\nLodge a redemption demand. One op, two modes, keyed on house status:\n"
+            "- DEFERRED (option clause running): the 3.5 plain demand - notes are\n"
+            "  re-issued to you stamped with the demand height, interest accrues at\n"
+            "  5%/yr from that date, and the notes stay transferable.\n"
+            "- OPEN/STRESSED: the B3 formal demand - notes move onto the consensus\n"
+            "  custody script with a STANDING payout authorisation, so the house\n"
+            "  can (and must) discharge unilaterally within the demand window;\n"
+            "  in-window discharge pays par exactly. Custody notes cannot\n"
+            "  transfer; if the window lapses, protestnote starts the teeth.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("demandnote", "1 25000")
@@ -4038,6 +4043,13 @@ UniValue demandnote(const JSONRPCRequest& request)
     const uint64_t nUnits = request.params[1].get_int64();
     CAmount nFee = 100000;
     if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+    CScript scriptPayout;
+    if (request.params.size() >= 4 && !request.params[3].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[3].get_str());
+        if (!IsValidDestination(dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid payout address");
+        scriptPayout = GetScriptForDestination(dest);
+    }
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -4045,12 +4057,108 @@ UniValue demandnote(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->DemandNote(strFail, txid, nHouseID, nUnits, nFee)) {
+    if (!pwallet->DemandNote(strFail, txid, nHouseID, nUnits, nFee, scriptPayout)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue protestnote(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "protestnote\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nProtest this wallet's OLDEST pre-auth demand whose window the house\n"
+            "let lapse (B3). The marked coins start (or join) the house's ONE\n"
+            "continuous insolvency clock: the house is effectively Stressed until\n"
+            "it discharges every protested claim, and expiry without discharge is\n"
+            "the waterfall. Reserves are not redemption - an attestation cannot\n"
+            "clear a protest.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("protestnote", "1")
+            + HelpExampleRpc("protestnote", "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->ProtestNote(strFail, txid, nHouseID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue dischargedemands(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "dischargedemands\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number (this wallet must fund its payouts)\n"
+            "2. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nDischarge the OLDEST outstanding pre-auth demand against the house\n"
+            "(B3): pay the pre-authorised script the consensus floor - par inside\n"
+            "the window, par + 5%/yr from window lapse after it - using the\n"
+            "holder's standing authorisation; no holder action is needed. One\n"
+            "discharge per call (it takes the house slot); call again next block\n"
+            "while \"remaining\" > 0. Discharging a protested demand retires its\n"
+            "marks, and the insolvency clock clears when the queue is empty.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nResult:\n"
+            "{\n"
+            "  \"txid\": \"...\",     (string) the discharge transaction\n"
+            "  \"remaining\": n     (numeric) further dischargeable demands found\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("dischargedemands", "1")
+            + HelpExampleRpc("dischargedemands", "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    uint32_t nRemaining = 0;
+    std::string strFail = "";
+    if (!pwallet->DischargeDemands(strFail, txid, nRemaining, nHouseID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    response.pushKV("remaining", (uint64_t)nRemaining);
     return response;
 }
 
@@ -4148,12 +4256,21 @@ UniValue listmynotes(const JSONRPCRequest& request)
         // Presentation-only gram view of the holding (units are base-native sats).
         obj.pushKV("grams", GramsUV((int64_t)kv.second.units));
         obj.pushKV("demanded_units", kv.second.demandedUnits);
+        // B3: the formal-demand view - custody units, protested units, and the
+        // oldest pre-auth demand height (the discharge deadline's anchor).
+        if (kv.second.preauthUnits > 0) {
+            obj.pushKV("preauth_units", kv.second.preauthUnits);
+            obj.pushKV("protested_units", kv.second.protestedUnits);
+            obj.pushKV("oldest_demand_height", (uint64_t)kv.second.oldestDemandHeight);
+        }
         obj.pushKV("coins", (uint64_t)kv.second.coins);
         obj.pushKV("house_status", std::string(1, eff));
         // Par redemption is open through Stressed, blocked once Deferred/Insolvent.
         obj.pushKV("redeemable", eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED);
-        // Option clause: a demand can only be lodged against a suspended (Deferred) house.
-        obj.pushKV("demandable", eff == HOUSE_STATUS_DEFERRED);
+        // B3: a demand can be lodged in every live state - plain while the
+        // clause runs (Deferred), pre-auth/formal at Open or Stressed.
+        obj.pushKV("demandable", eff == HOUSE_STATUS_DEFERRED ||
+                                 eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED);
         if (haveHouse) {
             obj.pushKV("house_tier", (uint64_t)house.nTier);
             obj.pushKV("house_minted_units", house.nMintedUnits);
@@ -5437,6 +5554,10 @@ UniValue retirebill(const JSONRPCRequest& request)
             "2. \"fee\"  (numeric or string, optional) default 0.001\n"
             "\nRetire a bill: the drawee (acceptor) pays face to the current\n"
             "holder and reclaims the escrow bond.\n"
+            "\nIf a discount house holds the bill this dispatches to the house-held\n"
+            "form (op 8's twin, op 7) automatically - same authority, same money, and\n"
+            "the face lands on the owning house's pinned custody key. The bill leaves\n"
+            "that house's loan book as it retires.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("retirebill", "1")
@@ -5483,6 +5604,10 @@ UniValue claimbillescrow(const JSONRPCRequest& request)
             "2. \"fee\"  (numeric or string, optional) default 0.001\n"
             "\nDefault settlement: after maturity + grace the current holder\n"
             "claims the escrow bond.\n"
+            "\nIf a discount house holds the bill this dispatches to the house-held\n"
+            "form (op 8), whose authority is the owning house's M-of-N QUORUM rather\n"
+            "than the single custody key - so run it from the HOUSE's wallet, and the\n"
+            "proceeds go to that house's custody key.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("claimbillescrow", "1")
@@ -5509,6 +5634,190 @@ UniValue claimbillescrow(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
 
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+//
+// Phase 3.9 (B1) - the discount ceremony. Three messages because a discount
+// carries TWO authorities over ONE digest that binds both the input set and the
+// output set: neither side can sign until the transaction is complete, and only
+// the buying house can complete it.
+//
+
+UniValue proposediscount(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
+        throw std::runtime_error(
+            "proposediscount\n"
+            "\nArguments:\n"
+            "1. \"id\"           (numeric, required) the bill to sell\n"
+            "2. \"houseid\"      (numeric, required) the house asked to buy it\n"
+            "3. \"price\"        (numeric or string, required) note-units offered; 0 < price <= face\n"
+            "4. \"expiryblocks\" (numeric, optional, default 252) blocks from now the offer stays live\n"
+            "\nRound 1, from the SELLER's wallet: offer this wallet's bill to a discount\n"
+            "house. Returns an unsigned proposal blob to hand to the house, which runs\n"
+            "signdiscount. Nothing is signed here - the seller's protection is that\n"
+            "completediscount re-verifies every term against the chain before signing.\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"status\": \"proposed\",\n"
+            "  \"proposal\": \"hex\"    (string) hand this to the buying house\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("proposediscount", "1 3 0.95")
+            + HelpExampleRpc("proposediscount", "1, 3, 0.95")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nBillID = request.params[0].get_int();
+    const uint32_t nHouseID = request.params[1].get_int();
+    const CAmount amountPrice = AmountFromValue(request.params[2]);
+    uint32_t nExpiryBlocks = 0;
+    if (request.params.size() >= 4) nExpiryBlocks = request.params[3].get_int();
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    std::string strHex, strFail;
+    if (!pwallet->ProposeDiscount(strFail, strHex, nBillID, nHouseID, amountPrice, nExpiryBlocks)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", "proposed");
+    response.pushKV("proposal", strHex);
+    return response;
+}
+
+UniValue signdiscount(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "signdiscount\n"
+            "\nArguments:\n"
+            "1. \"proposal\" (string, required) the hex blob from the seller's proposediscount\n"
+            "2. \"fee\"      (numeric or string, optional) default 0.001; must clear the\n"
+            "                endorsement fee floor for the bill's chain length\n"
+            "\nRound 2, from the BUYING HOUSE's wallet: assemble and fund the whole\n"
+            "transaction, mint the priced note leg to the seller, prove live reserves\n"
+            "(rho-at-mint), and sign the house quorum plus the house's own inputs.\n"
+            "Returns the part-signed transaction for the seller's completediscount.\n"
+            "\nEvery claim in the proposal is re-derived from the chain here; only the\n"
+            "price and the expiry are the seller's to set.\n"
+            "\nResult:\n"
+            "{ \"hex\": \"...\" }   (string) hand this back to the seller\n"
+            "\nExamples:\n"
+            + HelpExampleCli("signdiscount", "\"<proposalhex>\"")
+            + HelpExampleRpc("signdiscount", "\"<proposalhex>\"")
+        );
+
+    ObserveSafeMode();
+    const std::string strProposal = request.params[0].get_str();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    std::string strHexTx, strFail;
+    if (!pwallet->SignDiscount(strFail, strHexTx, strProposal, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("hex", strHexTx);
+    return response;
+}
+
+UniValue completediscount(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "completediscount\n"
+            "\nArguments:\n"
+            "1. \"hex\" (string, required) the part-signed tx from the house's signdiscount\n"
+            "\nRound 3 (final), from the SELLER's wallet: re-verify every term against\n"
+            "the chain - the custody key, the face, the maturity, and that the whole\n"
+            "price reaches this wallet and nothing else in the transaction pays it -\n"
+            "then sign the endorsement link, the shared digest and the title input, and\n"
+            "broadcast. Returns the discount txid.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("completediscount", "\"<txhex>\"")
+            + HelpExampleRpc("completediscount", "\"<txhex>\"")
+        );
+
+    ObserveSafeMode();
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->CompleteDiscount(strFail, txid, request.params[0].get_str())) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue recoursebill(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "recoursebill\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the dishonoured bill\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "\nTake recourse on a dishonoured bill: a liable party pays the current\n"
+            "holder at or above its best alternative and takes the position by\n"
+            "subrogation. No title spend and no holder signature are involved, which is\n"
+            "what makes it work against an uncooperative holder.\n"
+            "\nThe payer key is chosen automatically: the first key of the liable set\n"
+            "this wallet holds - the drawer, or any endorser up to and including the one\n"
+            "that delivered the bill to the current holder. The acceptor is NOT liable\n"
+            "(its escrow bond already answers). Never legal on house-held paper.\n"
+            "\nThe payment is the floor: face-or-escrow, whichever is larger, on an\n"
+            "ACTIVE bill past maturity + grace; the deficiency (face - escrow) on one\n"
+            "already defaulted.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("recoursebill", "1")
+            + HelpExampleRpc("recoursebill", "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nBillID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->RecourseBill(strFail, txid, nBillID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
     return response;
@@ -6259,13 +6568,19 @@ static const CRPCCommand commands[] =
     { "bills",              "endorsebill",                      &endorsebill,                   {"id", "topubkey", "fee"} },
     { "bills",              "retirebill",                       &retirebill,                    {"id", "fee"} },
     { "bills",              "claimbillescrow",                  &claimbillescrow,               {"id", "fee"} },
+    { "bills",              "proposediscount",                  &proposediscount,               {"id", "houseid", "price", "expiryblocks"} },
+    { "bills",              "signdiscount",                     &signdiscount,                  {"proposal", "fee"} },
+    { "bills",              "completediscount",                 &completediscount,              {"hex"} },
+    { "bills",              "recoursebill",                     &recoursebill,                  {"id", "fee"} },
     { "bills",              "listmybills",                      &listmybills,                   {} },
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
     { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee"} },
     { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress"} },
     { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
     { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
-    { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee"} },
+    { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout"} },
+    { "notes",              "protestnote",                      &protestnote,                   {"id", "fee"} },
+    { "notes",              "dischargedemands",                 &dischargedemands,              {"id", "fee"} },
     { "notes",              "listmynotes",                      &listmynotes,                   {} },
     { "deposits",           "originatedeposit",                 &originatedeposit,              {"id", "principal", "ratebps", "maturity", "fee"} },
     { "deposits",           "transferdeposit",                  &transferdeposit,               {"id", "principal", "fee"} },

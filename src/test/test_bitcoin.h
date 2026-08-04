@@ -80,9 +80,9 @@ struct TestChain100Setup : public TestingSetup {
 
     // Create a new block with coinbase paying to scriptPubKey, and try to add
     // it to the current chain.
+    // (The vtx-taking overload was removed in C2b — it silently dropped vtx and
+    // the miner branch it needs is broken; see docs-local/TEST_BASELINE.md C2b.)
     CBlock CreateAndProcessBlock(const CScript& scriptPubKey);
-
-    CBlock CreateAndProcessBlock(const std::vector<CMutableTransaction>& vtx, const CScript& scriptPubKey);
 
     CScript GetCoinbaseScript() const;
 

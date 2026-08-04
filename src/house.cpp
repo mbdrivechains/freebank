@@ -206,18 +206,51 @@ bool IsValidHouseClassID(const std::string& strClassID)
     return true;
 }
 
-uint32_t HouseStressOrigin(const CHouse& house, int nHeight)
+// The ATTEST-FAMILY origin: the EARLIER of the ratio breach recorded by
+// ATTEST and the (derived) missed-cadence deadline; an in-band attestation
+// preserves nStressSinceHeight, so the window clock never resets without
+// a real recovery (T4). Kept separate from the protest origin because the
+// two have SEPARATE CLEARS: ATTEST may materialize or clear only this
+// family (HouseAttestNewStressOrigin below must never see the protest
+// origin - copying it into nStressSinceHeight would let a T4 recovery
+// clear a protest, and folding it into the recovery test would make
+// nNewStress != 0 whenever a protest lives, so a deferral could never be
+// lifted and every protest-era episode would expire into insolvency).
+static uint32_t AttestFamilyStressOrigin(const CHouse& house, int nHeight)
 {
-    // The stress origin is the EARLIER of the ratio breach recorded by ATTEST
-    // and the (derived) missed-cadence deadline; an in-band attestation
-    // preserves nStressSinceHeight, so the window clock never resets without
-    // a real recovery (T4).
     uint32_t nStress = house.nStressSinceHeight;
     const uint32_t nDeadline = house.nLastAttestHeight
                              + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE;
     if (nHeight >= 0 && (uint32_t)nHeight > nDeadline &&
         (nStress == 0 || nDeadline + 1 < nStress))
         nStress = nDeadline + 1;
+    return nStress;
+}
+
+uint32_t HouseStressOrigin(const CHouse& house, int nHeight)
+{
+    uint32_t nStress = AttestFamilyStressOrigin(house, nHeight);
+
+    // B3 T-b4: the protest is the THIRD origin, merged earliest-wins like
+    // the other two but with its OWN clear - only a discharge that takes
+    // nProtestOpen to zero removes it (the REDEEM arm clears the heights
+    // there). Reserves are not redemption.
+    if (house.ProtestLive()) {
+        uint32_t nProtest = house.nProtestHeight;
+        // Option-clause overlap: discharge is impossible while DEFERRED
+        // (bad-note-redeem-deferred) and an episode (HOUSE_DEFER_WINDOW,
+        // 90d) dwarfs the fuse (HOUSE_STRESSED_WINDOW, 1wk), so a protest
+        // that rode through a LAWFUL suspension re-arms at the recovery
+        // stamp instead of surfacing pre-burnt - the teeth are only just
+        // if the house can always discharge alone (sheet Delta-2). An
+        // episode that ended before the protest existed extends nothing
+        // (max), and stacking episodes to push the fuse is already capped
+        // by confidence death.
+        if (house.nDeferEndedHeight > nProtest)
+            nProtest = house.nDeferEndedHeight;
+        if (nProtest != 0 && (nStress == 0 || nProtest < nStress))
+            nStress = nProtest;
+    }
     return nStress;
 }
 
@@ -348,16 +381,57 @@ uint32_t HouseDepositWAM(const CHouse& house, int nHeight)
     return remaining > (unsigned __int128)0xffffffffULL ? 0xffffffffU : (uint32_t)remaining;
 }
 
-uint32_t HouseLoanBookSliceWAM(const CHouse& /*house*/, int /*nHeight*/)
+uint64_t HouseLoanBookExcess(const CHouse& house)
 {
-    // v1 STUB: no discounting op exists, so the performing loan book L is
-    // structurally 0 and the deposit-funded slice max(0, L - escrow) is 0.
-    return 0;
+    // NEVER a bare subtraction: ActiveEscrow() is a signed CAmount and
+    // nLoanBookFace is unsigned, so `nLoanBookFace - ActiveEscrow()` promotes to
+    // unsigned and WRAPS whenever the book sits inside permanent capital - which
+    // is the common case and the state of every house that has never discounted.
+    const CAmount amountEscrow = house.ActiveEscrow();
+    const uint64_t nEscrow = amountEscrow > 0 ? (uint64_t)amountEscrow : 0;
+    return house.nLoanBookFace > nEscrow ? house.nLoanBookFace - nEscrow : 0;
+}
+
+uint64_t HouseLoanBookSlice(const CHouse& house)
+{
+    const uint64_t nExcess = HouseLoanBookExcess(house);
+    return nExcess < house.nDepositUnits ? nExcess : house.nDepositUnits;
+}
+
+unsigned __int128 HouseLoanBookDuration(const CHouse& house, int nHeight)
+{
+    if (house.nLoanBookFace == 0)
+        return 0;   // zero-book guard (the sibling HouseDepositWAM's discipline)
+    const unsigned __int128 wt = house.LoanWtMaturity();
+    const uint64_t h = nHeight > 0 ? (uint64_t)nHeight : 0;
+    const unsigned __int128 hf = (unsigned __int128)h * (unsigned __int128)house.nLoanBookFace;
+    // Matured-but-unexited bills carry a negative per-bill term; the SUM is
+    // clamped rather than each term, which is a documented (lenient)
+    // approximation - see PHASE3_9_DISCOUNT.md s3.1 approximation (ii).
+    return wt > hf ? wt - hf : 0;
+}
+
+unsigned __int128 HouseDepositDuration(const CHouse& house, int nHeight)
+{
+    if (house.nDepositUnits == 0)
+        return 0;
+    const unsigned __int128 wt = house.DepositWtMaturity();
+    const uint64_t h = nHeight > 0 ? (uint64_t)nHeight : 0;
+    const unsigned __int128 hp = (unsigned __int128)h * (unsigned __int128)house.nDepositUnits;
+    return wt > hp ? wt - hp : 0;
 }
 
 bool HouseMatchFundingOK(const CHouse& house, int nHeight)
 {
-    return HouseDepositWAM(house, nHeight) >= HouseLoanBookSliceWAM(house, nHeight);
+    const uint64_t nSlice = HouseLoanBookSlice(house);
+    if (nSlice == 0)
+        return true;   // no deposits, or a book inside permanent capital
+    // Cross-multiplied to avoid division. Ceilings (house.h): L < 2^51 and
+    // DepositDuration < 2^73 give a left side < 2^124; slice < 2^51 and
+    // BookDuration < 2^71 give a right side < 2^122. Both fit u128.
+    const unsigned __int128 lhs = (unsigned __int128)house.nLoanBookFace * HouseDepositDuration(house, nHeight);
+    const unsigned __int128 rhs = (unsigned __int128)nSlice * HouseLoanBookDuration(house, nHeight);
+    return lhs >= rhs;
 }
 
 uint32_t HouseAttestNewStressOrigin(const CHouse& house, const CAmount& amountReserves, int nHeight)
@@ -372,7 +446,11 @@ uint32_t HouseAttestNewStressOrigin(const CHouse& house, const CAmount& amountRe
     // Effective origin BEFORE this attestation moves the cadence clock: a
     // below-floor or in-band attestation must MATERIALIZE a lazy missed-
     // cadence origin (writing nLastAttestHeight would otherwise erase it).
-    const uint32_t nEffStress = HouseStressOrigin(house, nHeight);
+    // ATTEST-FAMILY ONLY (T-b4): the protest origin must never enter this
+    // value - it is not ATTEST's to materialize (a later T4 would clear
+    // it) nor ATTEST's to block (the caller's recovery test nNewStress==0
+    // lifts a deferral, which must stay reachable under a live protest).
+    const uint32_t nEffStress = AttestFamilyStressOrigin(house, nHeight);
     if (nR100 < nFloorTarget)
         return nEffStress ? nEffStress : (uint32_t)nHeight;    // T2: below floor
     if (nR100 >= nBufferTarget)

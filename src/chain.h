@@ -212,6 +212,15 @@ public:
     uint256 hashMainBlock;
     uint256 hashWithdrawalBundle;
 
+    //! D-3: the deposit-CTIP baseline as of this block - the GetID() of the
+    //! last sidechain deposit in this block's chain (null = none yet). Unlike
+    //! hashWithdrawalBundle this is DERIVED state, not header data: set when
+    //! the block connects (own last deposit, else inherited from pprev), so
+    //! DisconnectBlock can restore DB_LAST_SIDECHAIN_DEPOSIT from pprev's
+    //! value. Recomputed for every block by -reindex; entries written by a
+    //! pre-D-3 binary carry null (the disk-format gate forces the reindex).
+    uint256 hashLastDeposit;
+
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     int32_t nSequenceId;
 
@@ -239,6 +248,7 @@ public:
 
         hashWithdrawalBundle = uint256();
         hashMainBlock = uint256();
+        hashLastDeposit = uint256();
     }
 
     CBlockIndex()
@@ -401,6 +411,11 @@ public:
         READWRITE(nTime);
         READWRITE(hashMainBlock);
         READWRITE(hashWithdrawalBundle);
+        // D-3 deposit-CTIP baseline. Appending here grew the block-index
+        // entry format: FREEBANK_DISK_FORMAT_VERSION was bumped with it, so
+        // the startup gate refuses pre-D-3 datadirs and -reindex rebuilds
+        // (and back-fills this field for) every entry.
+        READWRITE(hashLastDeposit);
     }
 
     uint256 GetBlockHash() const

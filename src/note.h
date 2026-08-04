@@ -51,9 +51,63 @@ static const uint8_t NOTE_OP_CLAIM    = 6;
 // Phase 3.5 option clause: the holder LODGES A DEMAND while the house is
 // suspended, which starts their interest clock (5%/yr from the date of demand).
 static const uint8_t NOTE_OP_DEMAND   = 7;
+// Phase 3.5b / B3: a holder whose PRE-AUTHORISED demand has gone undischarged
+// for HOUSE_DEMAND_WINDOW protests, putting the house on the stress cascade.
+static const uint8_t NOTE_OP_PROTEST  = 8;
+
+// PRE-AUTH MARKER (B3 D-i, operator-signed 2026-08-04: the HIGH BIT of the
+// coin's nDemandHeight, NOT a new Coin field). A new bool would have changed
+// the Coin serialization => a disk-format bump => a one-time -reindex on every
+// datadir, which on the evidence chain is an F4-runbook operation rather than a
+// binary swap. The high bit costs a mask at the read sites and is safe for
+// ~40k years of heights. Revisit only at the next FORCED format bump.
+//
+// A pre-auth demanded coin is one whose holder has signed a STANDING
+// redemption authorisation, so the house can discharge it UNILATERALLY. That
+// is what makes the protest teeth just: "the demand went stale" can then only
+// mean the house chose not to pay.
+static const uint32_t NOTE_DEMAND_PREAUTH_BIT = 0x80000000;
+// T-b3: the PROTESTED marker, stamped by NOTE_OP_PROTEST onto the re-issued
+// coins. It exists because the D-v counter needs an EXACT decrement: CHouse
+// carries only {count, oldest height}, so without a per-coin marker consensus
+// could not tell whether a discharged demand was among the PROTESTED ones -
+// the decrement would be a heuristic, and a heuristic on the insolvency clock
+// is a hole. With the marker: discharge of a marked coin decrements, discharge
+// of an unmarked pre-auth coin does not, and a second protest of a marked coin
+// is idempotence-rejected for free. Same no-format-bump class as the pre-auth
+// bit (D-i); plain heights stay safe below 2^30 (~20k years at 10 minutes).
+static const uint32_t NOTE_DEMAND_PROTESTED_BIT = 0x40000000;
+static const uint32_t NOTE_DEMAND_TAG_BITS = NOTE_DEMAND_PREAUTH_BIT | NOTE_DEMAND_PROTESTED_BIT;
+// T-b3 CONSENSUS CUSTODY (build-level resolution of a contradiction inside the
+// signed sheet, queued for ratification in SIGNOFF_QUEUE.md). The sheet
+// requires the house to discharge UNILATERALLY, but note coins are real P2PKH:
+// the house cannot produce the holder's scriptSig, so a pre-auth demand's
+// re-issued coins CANNOT stay on the holder's P2PKH. Two candidate fixes were
+// weighed: (A) a tag-keyed script-check skip inside CheckInputs (+ a policy
+// mirror) - the first such skip in the codebase, core-path surgery; or (B) the
+// pre-auth re-issue moves the coins onto a CUSTODY script - the proven escrow
+// family (<push> OP_DROP OP_TRUE), script-level open, protected entirely by
+// the consensus layers: the tx_verify holder pin (the embedded keyid), the
+// contextual pre-auth digest, and the discharge floor. (B) is built: zero core
+// surgery, and it makes the demand's meaning literal on-chain - the holder
+// relinquished unilateral control the moment they signed the pre-auth. The
+// holder's remaining rights (protest; voluntary redeem; insolvency claim) are
+// all exercised through payload signatures, which never needed the scriptSig.
+inline bool NoteDemandIsPreAuth(uint32_t nTag) { return (nTag & NOTE_DEMAND_PREAUTH_BIT) != 0; }
+inline bool NoteDemandIsProtested(uint32_t nTag) { return (nTag & NOTE_DEMAND_PROTESTED_BIT) != 0; }
+inline uint32_t NoteDemandHeightOf(uint32_t nTag) { return nTag & ~NOTE_DEMAND_TAG_BITS; }
+inline uint32_t NoteDemandTag(uint32_t nHeight, bool fPreAuth)
+{
+    return fPreAuth ? (nHeight | NOTE_DEMAND_PREAUTH_BIT) : nHeight;
+}
 
 // Dust base-value each note UTXO carries (it holds the claim, not value).
 static const CAmount NOTE_DUST_VALUE = 1000;
+
+// B3: bound on a pre-auth payout script. Standard scripts are well under this
+// (P2PKH 25, P2WSH 34, a large bare multisig ~200); the cap exists so a demand
+// cannot carry an unbounded blob that every discharge must then compare.
+static const size_t MAX_NOTE_PAYOUT_SCRIPT = 256;
 
 // Max note outputs per MINT/TRANSFER (bounds payload + per-tx loops). PROVISIONAL (N-1).
 static const size_t MAX_NOTE_OUTPUTS = 100;
@@ -139,8 +193,30 @@ struct NoteDemand {
     std::vector<uint64_t> vUnits;                         // parallel to the re-issued note outputs
     std::vector<unsigned char> vchHolderPubKey;           // must hash to every spent note input
     std::vector<unsigned char> vchHolderSig;
+    // ---- B3 (Phase 3.5b): the PRE-AUTHORISED mode -------------------------
+    // 1 => this demand carries a standing redemption authorisation so the house
+    // can discharge it ALONE. REQUIRED at Open/Stressed (the states B3 opens
+    // DEMAND to), FORBIDDEN at Deferred - where the option clause governs and
+    // today's semantics are preserved byte-for-byte. One op, two modes, no
+    // ambiguity.
+    uint8_t fPreAuth;
+    // Δ1b UPGRADE ONLY: the height the spent notes already carry, so the clock
+    // is PRESERVED rather than reset. 0 on a fresh demand (AddCoins then stamps
+    // the connect height). It lives in the PAYLOAD for the same reason
+    // NoteTransfer::nDemandHeight does - AddCoins is self-contained, so connect
+    // and rollforward tag identically with nothing threaded through; tx_verify
+    // forces this to equal the spent coins' height, so a lie here cannot mint
+    // or destroy an interest claim.
+    uint32_t nPriorDemandHeight;
+    // The script the discharge must pay. Bound by vchPreAuthSig, which is a
+    // SEPARATE digest from vchHolderSig (NotePreAuthSigHash - domain-separated,
+    // never a NoteDemandSigHash reuse), because the two authorise different
+    // things: one the re-issue, one a future payout the holder will not be
+    // present to sign.
+    std::vector<unsigned char> vchPayoutScript;
+    std::vector<unsigned char> vchPreAuthSig;
 
-    NoteDemand() : nHouseID(0) {}
+    NoteDemand() : nHouseID(0), fPreAuth(0), nPriorDemandHeight(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -150,6 +226,56 @@ struct NoteDemand {
         READWRITE(vUnits);
         READWRITE(vchHolderPubKey);
         READWRITE(vchHolderSig);
+        READWRITE(fPreAuth);
+        READWRITE(nPriorDemandHeight);
+        READWRITE(vchPayoutScript);
+        READWRITE(vchPreAuthSig);
+    }
+};
+
+/** PROTEST (Phase 3.5b / B3, op 8): the holder of a PRE-AUTHORISED demand that
+ * has sat undischarged for HOUSE_DEMAND_WINDOW blocks puts the house onto the
+ * stress cascade. The demanded notes are spent and re-issued UNCHANGED (the
+ * DEMAND idiom) - conservation exact - which both proves standing (only the
+ * demand's holder can spend them) and keeps the op self-contained.
+ *
+ * Effects on CHouse: nProtestOpen++ (a COUNTER - see house.h), nProtestHeight
+ * takes the earliest live value, nProtestDemandHeight the oldest protested
+ * demand. From there NOTHING NEW IS NEEDED: the third stress origin makes the
+ * house effectively Stressed, which prices exits through brassage, drops
+ * par-eligibility, blocks discounting and minting, and expires into Insolvent
+ * and the waterfall if the house still will not pay.
+ *
+ * Priors ride in the payload for the undo (the nPrevLastActivation idiom). */
+struct NoteProtest {
+    uint32_t nHouseID;
+    std::vector<uint64_t> vUnits;                         // parallel to the re-issued note outputs
+    std::vector<unsigned char> vchHolderPubKey;           // must hash to every spent note input
+    std::vector<unsigned char> vchHolderSig;
+    // The tag the spent notes carry (height WITH the pre-auth bit), re-stamped
+    // unchanged onto the re-issued outputs. In the payload for AddCoins'
+    // self-containment; tx_verify forces it to match the spent coins.
+    uint32_t nDemandTag;
+    // undo priors (must match the DB at connect)
+    uint32_t nPrevProtestOpen;
+    uint32_t nPrevProtestHeight;
+    uint32_t nPrevProtestDemandHeight;
+
+    NoteProtest() : nHouseID(0), nDemandTag(0), nPrevProtestOpen(0),
+                    nPrevProtestHeight(0), nPrevProtestDemandHeight(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(vUnits);
+        READWRITE(vchHolderPubKey);
+        READWRITE(vchHolderSig);
+        READWRITE(nDemandTag);
+        READWRITE(nPrevProtestOpen);
+        READWRITE(nPrevProtestHeight);
+        READWRITE(nPrevProtestDemandHeight);
     }
 };
 
@@ -169,8 +295,20 @@ struct NoteRedeem {
     uint8_t fBrassage;
     std::vector<unsigned char> vchHolderPubKey;           // must hash to every spent note input; receives the payout
     std::vector<unsigned char> vchHolderSig;
+    // ---- B3 T-b3: the PRE-AUTHORISED DISCHARGE ----------------------------
+    // 1 => the house executes a standing authorisation ALONE: the holder's
+    // fresh vchHolderSig is not required; instead vchPreAuthSig is verified
+    // over NotePreAuthSigHash(nHouseID, vPreAuthUnits, vchPayoutScript) against
+    // the holder key on the burned coins. vPreAuthUnits is re-supplied VERBATIM
+    // from the demand because the digest binds the VECTOR, which cannot be
+    // reconstructed from an unordered burned-coin set - consensus checks
+    // sum(vPreAuthUnits) == burned units, so a lie cannot change what is owed.
+    uint8_t fPreAuthDischarge;
+    std::vector<uint64_t> vPreAuthUnits;
+    std::vector<unsigned char> vchPayoutScript;
+    std::vector<unsigned char> vchPreAuthSig;
 
-    NoteRedeem() : nHouseID(0), fBrassage(0) {}
+    NoteRedeem() : nHouseID(0), fBrassage(0), fPreAuthDischarge(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -180,6 +318,10 @@ struct NoteRedeem {
         READWRITE(fBrassage);
         READWRITE(vchHolderPubKey);
         READWRITE(vchHolderSig);
+        READWRITE(fPreAuthDischarge);
+        READWRITE(vPreAuthUnits);
+        READWRITE(vchPayoutScript);
+        READWRITE(vchPreAuthSig);
     }
 };
 
@@ -220,6 +362,18 @@ struct NoteClaim {
  * an ordinary key-spend and the tag propagates via the v13 op (Bills pattern). */
 CScript NoteScriptForPubKey(const std::vector<unsigned char>& vchPubKey);
 
+/** B3 consensus-custody lock for PRE-AUTH demanded coins:
+ *   <20-byte holder keyid> OP_DROP OP_TRUE
+ * The escrow family (house.cpp:183), 20-byte push where the escrows push 32 -
+ * distinguished from them by coin tags, never by script inspection. Script-
+ * level open so the HOUSE can build the discharge alone; the embedded keyid
+ * keeps the tx_verify holder pin byte-compare exact (protest / voluntary
+ * redeem / insolvency claim all still require the HOLDER's payload signature
+ * against the key this keyid pins). See the custody note at
+ * NOTE_DEMAND_PROTESTED_BIT for why P2PKH cannot carry a pre-auth coin. */
+CScript NotePreAuthScript(const std::vector<unsigned char>& vchPubKey);
+bool IsNotePreAuthScript(const CScript& script);
+
 /** SHA256d over every input outpoint of tx - the tx-unique element bound into
  * the mint sighash so reused M-of-N approver signatures cannot authorize a
  * second, differently-funded mint (MINT spends only fungible plain inputs, so
@@ -231,6 +385,13 @@ uint256 NoteTransferSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUni
 uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs);
 uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs);
 uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
+/** B3: the STANDING authorisation. Domain-separated from every other note
+ * digest because it authorises a payout the holder will not be present to sign,
+ * and binds the payout SCRIPT rather than a transaction's outputs - the
+ * discharge that satisfies it does not exist yet when this is signed. */
+uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
+                           const std::vector<unsigned char>& vchPayoutScript);
+uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
 
 /** Deferral interest (Phase 3.5 D6): nUnits held demanded for nBlocks, at
  * HOUSE_DEFER_INTEREST_BPS per year, pro-rated by block. Simple (not

@@ -308,4 +308,50 @@ BOOST_AUTO_TEST_CASE(l1client_blinded_m6id)
     BOOST_CHECK(CTransaction(mtxBlind).GetHash() == m6id);
 }
 
+// A7: the gRPC enforcer identity-pin decision logic. Kept pure (no gRPC/REST I/O)
+// precisely so its classification - the part that decides whether a node REFUSES
+// to start - is nailed down by vectors rather than by a live two-chain harness.
+BOOST_AUTO_TEST_CASE(l1client_enforcer_identity_classify)
+{
+    const int K = 20; // stale-warn depth
+    bool fStale = false;
+    std::string d;
+
+    // enforcer tip on the REST active chain -> MATCH, not stale
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 100, true, 100, true, true, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_MATCH);
+    BOOST_CHECK(!fStale);
+
+    // correct but lagging within K -> still MATCH, not stale (lag-immune)
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 95, true, 100, true, true, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_MATCH);
+    BOOST_CHECK(!fStale);
+
+    // correct but lagging BEYOND K -> MATCH + stale WARN (never a refuse)
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 50, true, 100, true, true, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_MATCH);
+    BOOST_CHECK(fStale);
+
+    // enforcer tip NOT on the REST active chain -> MISMATCH (wrong L1 / abandoned fork).
+    // This is the D-4 shape and the only path that refuses startup.
+    fStale = false;
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 100, true, 100, true, false, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_MISMATCH);
+
+    // Every "couldn't obtain a reading" path is NOT-READY, never MISMATCH:
+    //   enforcer tip unavailable
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(false, -1, true, 100, false, false, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_NOTREADY);
+    //   enforcer at genesis only (syncing)
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 0, true, 100, true, false, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_NOTREADY);
+    //   REST tip height unavailable
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 100, false, -1, true, false, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_NOTREADY);
+    //   membership query itself failed (transport) -> NOT-READY even though a
+    //   false fEnfTipOnRestChain is present; couldn't-check must not refuse.
+    BOOST_CHECK_EQUAL((int)ClassifyEnforcerIdentity(true, 100, true, 100, false, false, K, &fStale, d),
+                      (int)ENFORCER_IDENTITY_NOTREADY);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

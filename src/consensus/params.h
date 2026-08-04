@@ -70,6 +70,17 @@ struct Params {
      *  override would fork the chain, so this lives here and ONLY here —
      *  no CLI/conf knob may ever set it. */
     uint32_t nSettleCadence;
+    /** B3 bearer par-redemption: blocks a PRE-AUTHORISED demand may sit
+     *  undischarged before its holder may PROTEST (Phase 3.5b, D-ii signed
+     *  2026-08-04). Consensus-critical, and it lives HERE and only here for the
+     *  same reason nSettleCadence does — settle.h:54 warns that the
+     *  HOUSE_ATTEST_CADENCE/-attestcadence extern-plus-CLI pattern is a fork
+     *  hazard; do not copy it. No CLI/conf knob may ever set this.
+     *
+     *  It prices ONE thing: how long an honest house may be offline before a
+     *  holder can put it on the stress cascade. Too small punishes honest
+     *  downtime; too large lets a stonewaller idle. */
+    uint32_t nDemandWindow;
     /** Gold oracle (Phase G-1, consensus-inert). Same never-a-CLI-knob rule.
      *  Quorum = DISTINCT registered submitters required in one block for a
      *  new fix; brake = max fall of the braked view, ppm per elapsed block,

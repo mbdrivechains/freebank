@@ -4,8 +4,10 @@
 
 #include <house.h>
 
+#include <bill.h>            // MAX_BILL_TENOR_BLOCKS, LOAN_BOOK_MAX_FACE (B1)
 #include <coins.h>
 #include <consensus/validation.h>
+#include <deposit.h>         // MAX_DEPOSIT_TERM_BLOCKS (B1 max-magnitude vectors)
 #include <key.h>
 #include <note.h>
 #include <script/standard.h>
@@ -522,12 +524,13 @@ BOOST_AUTO_TEST_CASE(house_v4_to_v5_migration)
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << house;
     std::vector<char> bytes(ss.begin(), ss.end());
-    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)7);
+    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)HOUSE_SER_VERSION);
     bytes[0] = (char)4;                 // stamp as v4
     // Drop the v5 addendum (four zeroed u64 deposit fields, 32B), the v6
-    // addendum (zeroed u32 nDeferEndedHeight, 4B) AND the v7 addendum (zeroed
-    // u32 nLastSettleHeight, 4B) - all post-date v4.
-    bytes.resize(bytes.size() - 40);
+    // addendum (zeroed u32 nDeferEndedHeight, 4B), the v7 addendum (zeroed u32
+    // nLastSettleHeight, 4B) AND the v8 addendum (three zeroed u64 loan-book
+    // fields, 24B) - all post-date v4.
+    bytes.resize(bytes.size() - 64);
 
     CDataStream ssV4(bytes, SER_NETWORK, PROTOCOL_VERSION);
     CHouse h2;
@@ -563,10 +566,11 @@ BOOST_AUTO_TEST_CASE(house_v5_to_v6_migration)
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << house;
     std::vector<char> bytes(ss.begin(), ss.end());
-    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)7);
+    BOOST_REQUIRE_EQUAL((uint8_t)bytes[0], (uint8_t)HOUSE_SER_VERSION);
     bytes[0] = (char)5;                 // stamp as v5
-    // Drop the zeroed u32 nDeferEndedHeight (v6) + zeroed u32 nLastSettleHeight (v7).
-    bytes.resize(bytes.size() - 8);
+    // Drop the zeroed u32 nDeferEndedHeight (v6), the zeroed u32
+    // nLastSettleHeight (v7) and the three zeroed u64 loan-book fields (v8).
+    bytes.resize(bytes.size() - 32);
 
     CDataStream ssV5(bytes, SER_NETWORK, PROTOCOL_VERSION);
     CHouse h2;
@@ -1286,6 +1290,272 @@ BOOST_AUTO_TEST_CASE(house_release_renew_sighash_prevouts_binding)
     BOOST_CHECK(HouseRenewSigHash(id, 0, pvA, outs) != HouseRenewSigHash(id, 0, pvB, outs));
     // Domain separation between the two ops holds too.
     BOOST_CHECK(HouseReleaseSigHash(id, pvA, outs) != HouseRenewSigHash(id, 0, pvA, outs));
+}
+
+//
+// Phase 3.9 (B1) - the loan book L and match-funding. T-d1 gate.
+//
+
+/** A house with one active partner pledging amountEscrow. */
+static CHouse LoanBookHouse(CAmount amountEscrow)
+{
+    CHouse h;
+    h.nHouseID = 3;
+    h.nTier = 1;
+    h.nThresholdM = 1;
+    HousePartner p;
+    p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    p.amountPledge = amountEscrow;
+    p.status = HOUSE_PARTNER_ACTIVE;
+    h.vPartner.push_back(p);
+    return h;
+}
+
+BOOST_AUTO_TEST_CASE(house_loan_book_helper_boundaries)
+{
+    // THE regression that matters: the obvious mathematical form of the excess -
+    // max(0, nLoanBookFace - ActiveEscrow()) - is a uint64 minus an int64, so it
+    // WRAPS whenever the book sits inside permanent capital. That is the state of
+    // every house at genesis, and it made the slice come out as the whole deposit
+    // book, which then drove a division by a zero loan book: a remote SIGFPE
+    // reachable by the FIRST term deposit on a chain with no bills at all.
+    {
+        CHouse h = LoanBookHouse(100000000);
+        h.nDepositUnits = 20000000;
+        h.SetDepositWtMaturity((unsigned __int128)20000000 * 5000);
+        BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);     // MUST NOT wrap
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK(HouseLoanBookDuration(h, 1000) == 0); // MUST NOT divide by zero
+        BOOST_CHECK(HouseMatchFundingOK(h, 1000));
+    }
+    {
+        // Same, with no escrow at all.
+        CHouse h = LoanBookHouse(0);
+        h.nDepositUnits = 20000000;
+        h.SetDepositWtMaturity((unsigned __int128)20000000 * 5000);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK(HouseMatchFundingOK(h, 1000));
+    }
+
+    // D == 0 is structurally vacuous however large the book: the flagship
+    // mint-funded flow can never punish itself (the failure that killed the
+    // bare-ActiveEscrow pin).
+    {
+        CHouse h = LoanBookHouse(100000000);
+        h.nLoanBookFace = 300000000;
+        h.SetLoanWtMaturity((unsigned __int128)300000000 * 100000);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 200000000);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);      // no deposits
+        BOOST_CHECK(HouseMatchFundingOK(h, 1000));
+    }
+
+    // A book inside permanent capital needs no matching, deposits or not.
+    {
+        CHouse h = LoanBookHouse(100000000);
+        h.nLoanBookFace = 40000000;
+        h.SetLoanWtMaturity((unsigned __int128)40000000 * 8740);
+        h.nDepositUnits = 20000000;
+        h.SetDepositWtMaturity((unsigned __int128)20000000 * 5320);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK(HouseMatchFundingOK(h, 100));
+    }
+
+    // Exactly at the capacity boundary: L == E is still no excess.
+    {
+        CHouse h = LoanBookHouse(100000000);
+        h.nLoanBookFace = 100000000;
+        h.SetLoanWtMaturity((unsigned __int128)100000000 * 8740);
+        h.nDepositUnits = 20000000;
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
+        BOOST_CHECK(HouseMatchFundingOK(h, 100));
+        // One satoshi past it, the excess appears.
+        h.nLoanBookFace = 100000001;
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(house_match_funding_duration_rule)
+{
+    // The spec's scene 2: L = 200M face of ~60-day paper, E = 100M, D = 50M of
+    // 30-day money. slice = min(200M-100M, 50M) = 50M > 0, and short money
+    // funding long assets fails.
+    const int h0 = 100;
+    CHouse h = LoanBookHouse(100000000);
+    h.nLoanBookFace = 200000000;
+    h.SetLoanWtMaturity((unsigned __int128)200000000 * (h0 + 8640));
+    h.nDepositUnits = 50000000;
+    h.SetDepositWtMaturity((unsigned __int128)50000000 * (h0 + 4320));
+
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 50000000);
+    BOOST_CHECK(HouseLoanBookDuration(h, h0) == (unsigned __int128)200000000 * 8640);
+    BOOST_CHECK(HouseDepositDuration(h, h0) == (unsigned __int128)50000000 * 4320);
+    BOOST_CHECK(!HouseMatchFundingOK(h, h0));
+
+    // Cure 1: longer deposits. The rule is L*DepDur >= slice*BookDur. Here
+    // slice == D, and BookDur == L * avgRemaining, so the requirement collapses
+    // to "the deposits' average remaining term must reach the BOOK's average
+    // remaining term" - 8640 blocks. That is what proportional attribution
+    // means: the deposit-funded sliver carries the book's average maturity, so
+    // its size never softens the term requirement (spec s3.1 approximation (i)).
+    h.SetDepositWtMaturity((unsigned __int128)50000000 * (h0 + 8640));
+    BOOST_CHECK(HouseMatchFundingOK(h, h0));              // exact equality passes
+    h.SetDepositWtMaturity((unsigned __int128)50000000 * (h0 + 8639));
+    BOOST_CHECK(!HouseMatchFundingOK(h, h0));             // one block short fails
+
+    // Cure 2: deposits mature and are withdrawn (never blocked, B1 OD-4), so the
+    // slice collapses and the rule goes vacuous.
+    h.nDepositUnits = 0;
+    h.SetDepositWtMaturity(0);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+    BOOST_CHECK(HouseMatchFundingOK(h, h0));
+
+    // Cure 3: more permanent capital lifts the book back inside capacity.
+    h.nDepositUnits = 50000000;
+    h.SetDepositWtMaturity((unsigned __int128)50000000 * (h0 + 4320));
+    BOOST_CHECK(!HouseMatchFundingOK(h, h0));
+    h.vPartner[0].amountPledge = 200000000;               // TOPUP
+    BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
+    BOOST_CHECK(HouseMatchFundingOK(h, h0));
+}
+
+BOOST_AUTO_TEST_CASE(house_match_funding_no_ratchet_on_runoff)
+{
+    // Duration, not average maturity. Under an AVERAGE-based rule, retiring the
+    // SHORT bill raises the book's average and can flip a compliant house into
+    // violation - so a drawee paying his own bill early could freeze his bank,
+    // and "let the book run off" would be a cure that makes things worse. With a
+    // duration comparison, any bill leaving reduces book duration.
+    const int h0 = 0;
+    CHouse h = LoanBookHouse(0);                          // E = 0 so slice == min(L, D)
+    // Book: 100M @ remaining 10, 100M @ remaining 10000.
+    h.nLoanBookFace = 200000000;
+    h.SetLoanWtMaturity((unsigned __int128)100000000 * 10 + (unsigned __int128)100000000 * 10000);
+    h.nDepositUnits = 200000000;
+    h.SetDepositWtMaturity((unsigned __int128)200000000 * 6000);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 200000000);
+    // slice == L, so the rule reduces to DepDur >= BookDur.
+    const unsigned __int128 bookDurBefore = HouseLoanBookDuration(h, h0);
+    BOOST_CHECK(HouseDepositDuration(h, h0) >= bookDurBefore);
+    BOOST_CHECK(HouseMatchFundingOK(h, h0));
+
+    // The acceptor of the SHORT bill retires it (shipped RETIRE has no maturity
+    // gate, so this is always available to him).
+    h.nLoanBookFace -= 100000000;
+    h.SetLoanWtMaturity(h.LoanWtMaturity() - (unsigned __int128)100000000 * 10);
+    BOOST_CHECK(HouseLoanBookDuration(h, h0) < bookDurBefore);   // duration FELL
+    BOOST_CHECK(HouseMatchFundingOK(h, h0));                     // still compliant
+
+    // The average, by contrast, doubled: 5005 -> 10000. An average-based rule
+    // with DepositWAM 6000 would now be in violation, with no act of the house.
+    const uint64_t avgAfter = (uint64_t)(h.LoanWtMaturity() / h.nLoanBookFace);
+    BOOST_CHECK_EQUAL(avgAfter, 10000);
+}
+
+BOOST_AUTO_TEST_CASE(house_match_funding_max_magnitude)
+{
+    // The cross-multiplication must not overflow at the stated ceilings:
+    // L <= MAX_MONEY < 2^51 and DepositDuration < 2^73 give a left side < 2^124;
+    // slice < 2^51 and BookDuration < 2^71 give a right side < 2^122.
+    CHouse h = LoanBookHouse(0);
+    h.nLoanBookFace = (uint64_t)MAX_MONEY;
+    h.SetLoanWtMaturity((unsigned __int128)MAX_MONEY * MAX_BILL_TENOR_BLOCKS);
+    h.nDepositUnits = (uint64_t)MAX_MONEY;
+    h.SetDepositWtMaturity((unsigned __int128)MAX_MONEY * MAX_DEPOSIT_TERM_BLOCKS);
+
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), (uint64_t)MAX_MONEY);
+    const unsigned __int128 bookDur = HouseLoanBookDuration(h, 0);
+    const unsigned __int128 depDur = HouseDepositDuration(h, 0);
+    BOOST_CHECK(bookDur == (unsigned __int128)MAX_MONEY * MAX_BILL_TENOR_BLOCKS);
+    BOOST_CHECK(depDur == (unsigned __int128)MAX_MONEY * MAX_DEPOSIT_TERM_BLOCKS);
+    // Both products are representable, and the longer deposit book wins.
+    const unsigned __int128 lhs = (unsigned __int128)h.nLoanBookFace * depDur;
+    const unsigned __int128 rhs = (unsigned __int128)HouseLoanBookSlice(h) * bookDur;
+    BOOST_CHECK(lhs > rhs);
+    BOOST_CHECK(lhs / h.nLoanBookFace == depDur);      // no wrap occurred
+    BOOST_CHECK(HouseMatchFundingOK(h, 0));
+    BOOST_CHECK_EQUAL(LOAN_BOOK_MAX_FACE, (uint64_t)MAX_MONEY);
+}
+
+BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
+{
+    // v8 adds the loan book. A v7 record must read at its old layout with the
+    // book defaulting to empty - which is exactly right, since no discount op
+    // existed before v8, so L was structurally 0 on every pre-B1 record.
+    CHouse h = LoanBookHouse(100000000);
+    h.houseID = uint256S("0a0b");
+    h.strClassID = "ayr";
+    h.vchRedemptionDestPK = std::vector<unsigned char>(33, 0x02);
+    h.nMintedUnits = 90000000;
+    h.nLoanBookFace = 40000000;
+    h.SetLoanWtMaturity((unsigned __int128)40000000 * 8740);
+
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << h;
+    std::vector<unsigned char> vch(ss.begin(), ss.end());
+    BOOST_CHECK_EQUAL(vch[0], HOUSE_SER_VERSION);
+    // TRIPWIRE, and it has now fired once (B3 T-b1, v8 -> v9): bumping the
+    // record version MUST come here, because the v7 synthesis below strips a
+    // FIXED number of trailing bytes and every new version adds more. Update
+    // BOTH this pin and the addendum arithmetic together, or the synthesis
+    // silently builds a malformed record and the migration it claims to prove
+    // proves nothing.
+    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 9);
+
+    CHouse back;
+    CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
+    ssIn >> back;
+    BOOST_CHECK_EQUAL(back.nLoanBookFace, h.nLoanBookFace);
+    BOOST_CHECK(back.LoanWtMaturity() == h.LoanWtMaturity());
+    BOOST_CHECK_EQUAL(back.nMintedUnits, h.nMintedUnits);
+
+    // Re-writing reproduces the same bytes (byte-exact reorg compare).
+    CDataStream ssOut(SER_NETWORK, PROTOCOL_VERSION);
+    ssOut << back;
+    BOOST_CHECK(std::vector<unsigned char>(ssOut.begin(), ssOut.end()) == vch);
+
+    // A v7 record (the live HouseDB's current layout) must read with the book
+    // defaulting to empty: synthesise one by stamping v7 and dropping the
+    // 24-byte v8 addendum from a record whose book is zero.
+    {
+        CHouse v8zero = LoanBookHouse(100000000);
+        v8zero.nHouseID = 12;
+        v8zero.strClassID = "clyde";
+        v8zero.nMintedUnits = 5000;
+        v8zero.nLastSettleHeight = 990;               // the v7 leg must survive
+        CDataStream ssZ(SER_NETWORK, PROTOCOL_VERSION);
+        ssZ << v8zero;
+        std::vector<char> b(ssZ.begin(), ssZ.end());
+        BOOST_REQUIRE_EQUAL((uint8_t)b[0], (uint8_t)HOUSE_SER_VERSION);
+        b[0] = (char)7;
+        // Strip EVERY post-v7 addendum, newest first:
+        //   v8 loan book   = 3 x uint64 = 24 bytes
+        //   v9 protest     = 3 x uint32 = 12 bytes
+        static const size_t V8_ADDENDUM = 3 * sizeof(uint64_t);
+        static const size_t V9_ADDENDUM = 3 * sizeof(uint32_t);
+        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM));
+        CDataStream ssV7(b, SER_NETWORK, PROTOCOL_VERSION);
+        CHouse h7;
+        ssV7 >> h7;                                   // must not throw
+        BOOST_CHECK_EQUAL(h7.nHouseID, 12);
+        BOOST_CHECK_EQUAL(h7.nLastSettleHeight, 990);
+        BOOST_CHECK_EQUAL(h7.nLoanBookFace, 0);       // empty book, as every pre-B1 house
+        BOOST_CHECK(h7.LoanWtMaturity() == 0);
+        // ...and no live protest, as every pre-B3 house (v9 defaults)
+        BOOST_CHECK_EQUAL(h7.nProtestOpen, 0u);
+        BOOST_CHECK_EQUAL(h7.nProtestHeight, 0u);
+        BOOST_CHECK(!h7.ProtestLive());
+        BOOST_CHECK(HouseMatchFundingOK(h7, 1000));   // and vacuously compliant
+    }
+
+    // A FUTURE version is a hard read failure - consensus state is never
+    // silently defaulted.
+    vch[0] = HOUSE_SER_VERSION + 1;
+    CHouse bad;
+    CDataStream ssBad(vch, SER_NETWORK, PROTOCOL_VERSION);
+    BOOST_CHECK_THROW(ssBad >> bad, std::ios_base::failure);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

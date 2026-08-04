@@ -209,7 +209,10 @@ static const uint32_t HOUSE_CD_MAX_SUSPENDED    = 38880;   // ~9 months
 // at its old layout and the field defaults to 0 (never settled) - an
 // un-upgraded record can never silently misread, and reindexed vs
 // non-reindexed nodes hold identical bytes.
-static const uint8_t HOUSE_SER_VERSION = 7;
+// v8 (Phase 3.9 / B1): the loan book - nLoanBookFace plus the 128-bit
+// maturity-weight accumulator. A v7 record defaults to an empty book, which is
+// exactly what every pre-B1 house has (no discount op existed).
+static const uint8_t HOUSE_SER_VERSION = 9;
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -315,6 +318,68 @@ struct CHouse {
     // never a sweep. Mutated only by the settle connect/undo (payload-prior
     // bound, ATTEST pattern).
     uint32_t nLastSettleHeight;
+    // The LOAN BOOK L (Phase 3.9 / B1): bills bought for the house's own
+    // account. An ASSET, "reported not counted as backing" (ARCH:428) - it
+    // enters NO cap, NO reserve and NO insolvency pot. It exists so the
+    // match-funding rule can bind and so Tx-14/Tx-15 have a substrate.
+    // nLoanBookFace = Sigma(bill.amount) over house-held bills, in sats, valued
+    // at FACE (B1 OD-2: face is what canon attests, what matures, and is already
+    // in the immutable bill record). nLoanWtMat{Hi,Lo} = the 128-bit
+    // Sigma(face_i * maturity_height_i) accumulator - one term overflows u64 -
+    // stored as two u64 words, the nDepositWtMat{Hi,Lo} pattern.
+    //
+    // INVARIANT (T-d3 gate): bill.nOwnerHouseID != 0 <=> the bill is in exactly
+    // one house's book <=> its status is 'a'. Both terminal house ops (HRETIRE,
+    // HCLAIM) clear the owner and exit the book in the same step, so
+    // Sigma{bill.amount : nOwnerHouseID == H} == H.nLoanBookFace always.
+    uint64_t nLoanBookFace;
+    uint64_t nLoanWtMatHi;
+    uint64_t nLoanWtMatLo;
+    // PROTEST state (Phase 3.5b / B3, D-v operator-decided 2026-08-04). A bearer
+    // whose PRE-AUTHORISED demand goes undischarged for HOUSE_DEMAND_WINDOW may
+    // protest, which stamps a THIRD stress origin (HouseStressOrigin) that an
+    // ATTESTATION CANNOT CLEAR - only a discharge can. Reserves are not
+    // redemption, and that asymmetry is the whole mechanism.
+    //
+    // nProtestOpen is a COUNTER, NOT A FLAG, and the distinction is the design.
+    // With a flag, a stonewalling house pays ONE holder just before each window
+    // expiry, clears the protest, and the next protest starts a FRESH insolvency
+    // clock - the queue drains at one holder per WINDOW and expiry never
+    // arrives. It looks compliant and is not. The counter keeps ONE continuous
+    // clock: protest increments, a covering discharge decrements, and the origin
+    // clears only at ZERO. This is forced by the rule the stress machine already
+    // states (HouseStressOrigin: "the window clock never resets without a real
+    // recovery" - T4); a flag would have broken an invariant the code had
+    // already learned.
+    //
+    // GRANULARITY (T-b3 build refinement of the signed D-v, preserving its
+    // invariant exactly): the unit counted is the LIVE MARKED COIN, not the
+    // protest op. A protest increments by the number of coins it re-issues
+    // with the PROTESTED marker; burning a marked coin (either redeem mode)
+    // decrements by one. Per-op counting has no exact inverse - one op can
+    // mark N coins whose burns arrive in separate transactions, and "which
+    // burn was the last of ITS op" is unanswerable without a per-demand
+    // registry. Per-coin, increment and decrement are exact mirrors, the
+    // counter is zero exactly when no protested claim is outstanding, and the
+    // state stays O(1).
+    //
+    // nProtestHeight is STICKY-EARLIEST: a later protest never moves it forward,
+    // matching HouseStressOrigin's own earliest-wins merge.
+    // nProtestDemandHeight is the demand height of the OLDEST protested demand,
+    // so a discharge knows which coins clear it.
+    //
+    // INERT-AT-ZERO (T-b5): when the counter reaches zero the heights are NOT
+    // cleared - they go inert (every consumer gates on ProtestLive()) and the
+    // next FRESH episode overwrites them (the PROTEST arm branches on the
+    // counter). This is what makes the reorg path exact and O(1): the REDEEM
+    // undo recounts marked burns from the undo coins and re-adds, with no
+    // height restore needed - a clear would strand the pre-clear values
+    // (sticky from protests whose coins were burned in EARLIER txs) beyond
+    // any undo data the clearing tx carries. The DERIVED origin still
+    // vanishes exactly at zero; only the representation persists.
+    uint32_t nProtestOpen;
+    uint32_t nProtestHeight;
+    uint32_t nProtestDemandHeight;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -323,7 +388,9 @@ struct CHouse {
                nDeferInvokedHeight(0), nDeferRenewals(0), nDeferCumBlocks(0),
                nDeferActivations(0), nDeferLastActivation(0), nDeferEndedHeight(0),
                nDepositUnits(0), nDepositWtMatHi(0), nDepositWtMatLo(0),
-               nInsolventDepositPrincipal(0), nLastSettleHeight(0) {}
+               nInsolventDepositPrincipal(0), nLastSettleHeight(0),
+               nLoanBookFace(0), nLoanWtMatHi(0), nLoanWtMatLo(0),
+               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0) {}
 
     /** The 128-bit weighted-maturity accumulator Sigma(principal_i * maturity_i). */
     unsigned __int128 DepositWtMaturity() const
@@ -334,6 +401,17 @@ struct CHouse {
     {
         nDepositWtMatHi = (uint64_t)(v >> 64);
         nDepositWtMatLo = (uint64_t)v;
+    }
+
+    /** The loan book's 128-bit accumulator Sigma(face_i * maturity_i). */
+    unsigned __int128 LoanWtMaturity() const
+    {
+        return ((unsigned __int128)nLoanWtMatHi << 64) | (unsigned __int128)nLoanWtMatLo;
+    }
+    void SetLoanWtMaturity(unsigned __int128 v)
+    {
+        nLoanWtMatHi = (uint64_t)(v >> 64);
+        nLoanWtMatLo = (uint64_t)v;
     }
 
     /** Cap escrow E (CM-2): the sum of ACTIVE pledges only. */
@@ -416,7 +494,26 @@ struct CHouse {
         if (nSerVersion >= 7) {
             READWRITE(nLastSettleHeight);
         }
+        // v8 (Phase 3.9 / B1): the loan book. A v7 record defaults to an empty
+        // book - which is exactly right, since no discount op existed before
+        // this version, so L was structurally 0 on every pre-B1 record.
+        if (nSerVersion >= 8) {
+            READWRITE(nLoanBookFace);
+            READWRITE(nLoanWtMatHi);
+            READWRITE(nLoanWtMatLo);
+        }
+        // v9 (Phase 3.5b / B3): protest state. A v8 record defaults to no live
+        // protest - structurally correct, since no PROTEST op existed before
+        // this version, so every pre-B3 record had zero of them by construction.
+        if (nSerVersion >= 9) {
+            READWRITE(nProtestOpen);
+            READWRITE(nProtestHeight);
+            READWRITE(nProtestDemandHeight);
+        }
     }
+
+    /** Is a protest live? (counter semantics - see the field comments.) */
+    bool ProtestLive() const { return nProtestOpen > 0; }
 
     /** The height at which the current deferral episode expires (0 if the house
      * is not deferring). One renewal extends it by a second full window. */
@@ -788,9 +885,18 @@ bool IsHouseEscrowScript(const CScript& script);
 /** True if strClassID is [a-z0-9]{1,MAX_HOUSE_CLASS_ID_BYTES}. */
 bool IsValidHouseClassID(const std::string& strClassID);
 
-/** The effective stress origin of a house at nHeight: the stored ratio-breach
- * height (nStressSinceHeight), the derived missed-cadence deadline + 1 if that
- * is earlier (or the only origin), or 0 if the house is not stressed. */
+/** The effective stress origin of a house at nHeight, EARLIEST-WINS across
+ * three origins with separate clears (B3 T-b4):
+ *   - the stored ratio-breach height (nStressSinceHeight, ATTEST-written,
+ *     cleared by a T4 recovery attestation);
+ *   - the derived missed-cadence deadline + 1 (cleared by any attestation
+ *     moving nLastAttestHeight);
+ *   - the protest origin while nProtestOpen > 0 (cleared ONLY by discharge
+ *     to a zero counter - an attestation cannot touch it; reserves are not
+ *     redemption). If a deferral episode overlapped the protest, this origin
+ *     is max(nProtestHeight, nDeferEndedHeight): discharge is impossible
+ *     while suspended, so the fuse re-arms at the recovery stamp.
+ * 0 if the house is not stressed. */
 uint32_t HouseStressOrigin(const CHouse& house, int nHeight);
 
 /** The consensus status of a house AT nHeight, deriving the two height-
@@ -808,7 +914,8 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight);
 /** The nStressSinceHeight value an accepted attestation of amountReserves at
  * nHeight leaves behind (T2 below-floor / T4 recovery-with-hysteresis /
  * in-band preserve; D9). Pure - the write itself happens in the ATTEST
- * contextual branch. */
+ * contextual branch. Operates on the ATTEST FAMILY only: a live protest
+ * neither enters the returned value nor blocks the T4 zero (T-b4). */
 uint32_t HouseAttestNewStressOrigin(const CHouse& house, const CAmount& amountReserves, int nHeight);
 
 /** CAPITAL cap (CM-2): lambda_tier * active escrow. */
@@ -855,15 +962,71 @@ bool HouseParEligible(const CHouse& house, int nHeight);
  * nHeight, clamped to >= 0. 0 if no deposits. 128-bit intermediate (Phase 3.8). */
 uint32_t HouseDepositWAM(const CHouse& house, int nHeight);
 
-/** Weighted-average maturity of the DEPOSIT-FUNDED slice of the loan book -
- * max(0, L - escrow_capacity). A v1 STUB returning 0: no discounting op exists,
- * so L is structurally 0. The forward hook for the discounting module. */
-uint32_t HouseLoanBookSliceWAM(const CHouse& house, int nHeight);
+//
+// The loan book L and the match-funding rule (Phase 3.9 / B1).
+//
+// ARCH:377 compares deposit maturity against "the deposit-funded slice of the
+// loan book (the book beyond what escrow capacity supports)" - TWO conjuncts,
+// and the B1 bake-off proved that implementing either one alone is broken:
+//   * capacity = lambda*E makes the slice mathematically UNREACHABLE, because
+//     CM-2 already enforces N + D <= lambda*E, so any book funded by the house's
+//     own liabilities satisfies L <= lambda*E identically. The rule ships inert.
+//   * capacity = ActiveEscrow alone caps the bill book at 1:1 with equity and
+//     deletes lambda leverage - the credit-creation thesis becomes unreachable
+//     through the very op built to deliver it.
+// So: excess = beyond permanent capital, slice = min(excess, D) = bounded by the
+// term money that actually exists. D == 0 => slice == 0 structurally, so the
+// flagship mint-funded flow is never touched however large the book grows.
+//
+// EVERY helper below is written in explicit unsigned form with explicit guards.
+// That is not style: the obvious mathematical notation - max(0, nLoanBookFace -
+// ActiveEscrow()) - is a uint64_t minus an int64_t, which WRAPS whenever L < E
+// (the flagship case, and the state of every house at genesis), and the
+// average-maturity helper it fed then divided by a zero book. The pair is a
+// remote SIGFPE reachable by the first term deposit on a chain with no bills at
+// all. Do not "simplify" these back.
+//
 
-/** The consensus match-funding rule (attestation-checked): the deposits'
- * weighted-average maturity must be >= that of the deposit-funded loan slice, so
- * a house cannot fund long assets with short money. VACUOUSLY TRUE in v1 (the
- * loan slice is 0); ships now, enforces for real when discounting lands. */
+/** Book face beyond permanent capital: max(0, L - ActiveEscrow), unsigned. */
+uint64_t HouseLoanBookExcess(const CHouse& house);
+
+/** The DEPOSIT-FUNDED slice of the loan book: min(excess, D), in sats. */
+uint64_t HouseLoanBookSlice(const CHouse& house);
+
+/** Dollar-duration of the loan book at nHeight: Sigma(face_i * remaining_i),
+ * computed as WtMat - nHeight*L and clamped at 0.
+ *
+ * Duration, not average maturity (B1 rev 2). A face-weighted AVERAGE RISES when
+ * below-average paper leaves the book, and shipped RETIRE has no maturity gate -
+ * so under an average-based rule a drawee could push his own bank into violation
+ * simply by paying his bill early, and "let the book run off" would be a cure
+ * that makes things worse. Duration falls whenever any bill leaves.
+ *
+ * Magnitude: L <= MAX_MONEY < 2^51 and every remaining term <= MAX_BILL_TENOR_
+ * BLOCKS < 2^20, so the result is < 2^71. */
+unsigned __int128 HouseLoanBookDuration(const CHouse& house, int nHeight);
+
+/** Dollar-duration of the term-deposit book, the mirror of the above.
+ * D <= MAX_MONEY < 2^51 and every remaining term <= MAX_DEPOSIT_TERM_BLOCKS
+ * < 2^22, so the result is < 2^73. */
+unsigned __int128 HouseDepositDuration(const CHouse& house, int nHeight);
+
+/** The consensus match-funding rule: term money must cover the duration of the
+ * slice of the book it funds, so a house cannot fund long assets with short
+ * money (the Ayr Bank failure mode, INHERITANCE:139).
+ *
+ * Vacuous when the slice is 0 (no deposits, or a book inside permanent capital).
+ * Otherwise cross-multiplied to avoid division:
+ *     L * DepositDuration >= slice * BookDuration
+ * Both sides are < 2^124 under the ceilings above, so the u128 arithmetic cannot
+ * overflow (max-magnitude vectors in house_tests).
+ *
+ * Enforced as a POST-STATE gate on exactly the two ops that move its operands -
+ * BILL_OP_DISCOUNT (moves L) and DEPOSIT_OP_ORIGINATE (moves D). It is
+ * deliberately NOT checked at attestation, minting, withdrawal, redemption or
+ * partner exit: a violation is a derived, non-terminal, self-curing condition
+ * with no clock and no status change, and a depositor's contractual exit is
+ * never hostage to the house's book (B1 OD-4). */
 bool HouseMatchFundingOK(const CHouse& house, int nHeight);
 
 template <typename T>

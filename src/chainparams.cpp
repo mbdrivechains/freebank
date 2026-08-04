@@ -85,6 +85,7 @@ public:
         consensus.nRuleChangeActivationThreshold = 1916; // 95% of 2016
         consensus.nMinerConfirmationWindow = 2016; // nPowTargetTimespan / nPowTargetSpacing
         consensus.nSettleCadence = 144; // ~1 day of settlement exclusivity per house pair
+        consensus.nDemandWindow = 1008;  // B3: ~1 week at 10-min — comfortably over honest downtime
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 347;  // ~5%/day / 144 blocks
         consensus.nOracleBrakeElapsedCap = 144;   // censor-charge bounded to one day's fall
@@ -198,6 +199,7 @@ public:
         consensus.nRuleChangeActivationThreshold = 108; // 75% for bitassetss
         consensus.nMinerConfirmationWindow = 144; // Faster than normal for regtest (144 instead of 2016)
         consensus.nSettleCadence = 12; // fast settle windows for tests + demo-rhythm chains
+        consensus.nDemandWindow = 12;  // B3: gate-testable; ~8.4h on the 30s demo signet
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 100000; // 10%/block: brake behavior testable in few blocks
         consensus.nOracleBrakeElapsedCap = 12;

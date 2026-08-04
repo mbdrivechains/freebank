@@ -56,6 +56,14 @@ bool AppInitLockDataDirectory();
  */
 bool AppInitMain();
 
+/** Distinct process exit code for a CONFIRMED mainchain L1 identity mismatch (A7),
+ *  so systemd RestartPreventExitStatus can HALT (and alarm) a wrong-chain node
+ *  instead of crash-looping it, while transient init failures (exit 1) still
+ *  restart-and-retry. Set fMainchainIdentityMismatch, then AppInit returns false
+ *  and main() maps it to this code. */
+static const int EXIT_CODE_MAINCHAIN_IDENTITY = 66;
+extern bool fMainchainIdentityMismatch;
+
 /** The help message mode determines what help message to show */
 enum HelpMessageMode {
     HMM_BITCOIND,

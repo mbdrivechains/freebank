@@ -74,6 +74,7 @@ struct BitAssetTransactionData;
 class CBlockIndex;
 class CCoinControl;
 class COutput;
+struct CBill;
 class CReserveKey;
 class CScript;
 class CScheduler;
@@ -1000,8 +1001,47 @@ public:
 
     bool IssueBill(CTransactionRef& tx, std::string& strFail, const std::vector<unsigned char>& vchBody, const CAmount& nAmount, const CAmount& nAmountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const CAmount& nFee);
     bool EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const std::vector<unsigned char>& vchToPubKey, const CAmount& nFee);
+    /** RETIRE / CLAIM auto-dispatch to their HOUSE-HELD twins (ops 7/8) when the
+     * bill sits in a loan book. The drawee retiring its own acceptance should not
+     * have to know who bought the paper, and ops 3/4 hard-reject a house-held
+     * bill, so a separate RPC would be a dead end the caller discovers only as a
+     * consensus reject string. The AUTHORITY differs, though: op 3 and op 7 are
+     * both the acceptor's, but op 4 is the holder's while op 8 is the owning
+     * HOUSE's quorum - so a house-held claim runs from the house's wallet. */
     bool RetireBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
     bool ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
+
+    /** Discount ceremony (Phase 3.9, B1 T-d7). Three messages, because a discount
+     * carries TWO authorities over ONE digest that binds both hashPrevouts and
+     * hashOutputs: the seller's title and the buying house's issue. Neither side
+     * can sign until the transaction is complete, and the house is the only side
+     * that can complete it (it funds, it mints, it proves its reserves).
+     *
+     * ProposeDiscount (SELLER): the offer - bill, house, price, expiry. Unsigned
+     * and advisory, exactly like the settle round-1 blob; the seller's protection
+     * is that round 3 re-verifies every term before signing anything.
+     * SignDiscount (HOUSE): assembles + funds the whole transaction, mints the
+     * note leg to the seller, proves rho-at-mint live reserves, signs its quorum
+     * and its own inputs. CompleteDiscount (SELLER): re-verifies the terms,
+     * signs the endorsement link + the shared digest + the title input, and
+     * broadcasts. */
+    bool ProposeDiscount(std::string& strFail, std::string& strHexOut, uint32_t nBillID,
+                         uint32_t nHouseID, const CAmount& amountPrice, uint32_t nExpiryBlocks);
+    bool SignDiscount(std::string& strFail, std::string& strHexTxOut,
+                      const std::string& strHexProposal, const CAmount& nFee);
+    bool CompleteDiscount(std::string& strFail, uint256& txidOut, const std::string& strHexTx);
+    /** RECOURSE (op 6): a liable party (drawer, or any endorser up to and
+     * including the one that delivered the bill to the holder) pays the holder at
+     * or above its best alternative and takes the position by subrogation. Single
+     * authority, no title spend, no holder cooperation - which is the whole point.
+     * The payer key is chosen automatically: the first key of the liable set this
+     * wallet holds. */
+    bool RecourseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
+    /** Ops 7/8 themselves. Not on the RPC surface - RetireBill/ClaimBillEscrow
+     * dispatch here - but members rather than file statics because they need
+     * the private SelectCoins. */
+    bool HouseHeldRetireBill(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
+    bool HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
 
     // Discount houses (Phase 3.1). v1 is the single-wallet handshake (this
     // wallet plays every partner) - the bills-issue precedent; multi-party
@@ -1016,9 +1056,22 @@ public:
      * works as the payee — note-ness comes from the tx payload tagging). */
     bool TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
     bool RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
-    /** Option clause (3.5): lodge a demand while the house is suspended, which
-     * starts the holder's interest clock (5%/yr from the date of demand). */
-    bool DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    /** DEMAND, one op two modes keyed on house status (B3):
+     * - Deferred: the 3.5 option-clause demand (plain; interest from demand).
+     * - Open/Stressed: the B3 formal demand - coins move onto the consensus-
+     *   custody script and carry a standing pre-authorisation so the house can
+     *   discharge alone. scriptPayout empty => the holder's own P2PKH. */
+    bool DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptPayout = CScript());
+    /** B3 PROTEST: mark the wallet's OLDEST lapsed (window-expired) unprotested
+     * pre-auth demand against the house - starts/joins the continuous
+     * insolvency clock (the D-v counter). */
+    bool ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const CAmount& nFee);
+    /** B3 discharge (house side): find the OLDEST fully-collectable pre-auth
+     * demand against this house in the UTXO set and discharge it unilaterally
+     * (pay the pre-authorised script the consensus floor). One tx per call -
+     * a discharge takes the house slot, so batching would self-collide.
+     * nRemainingOut = further dischargeable demands found after this one. */
+    bool DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t& nRemainingOut, uint32_t nHouseID, const CAmount& nFee);
     /** Insolvency waterfall (3.4): burn nUnits and take the pro-rata
      * entitlement from the house's escrow pot. */
     bool ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
@@ -1026,7 +1079,10 @@ public:
     /** A wallet's note position in one house (drives listmynotes / the GUI hold view). */
     struct WalletNoteHolding {
         uint64_t units = 0;         // total note units this wallet holds for the house
-        uint64_t demandedUnits = 0; // subset stamped with a demand (3.5 option clause)
+        uint64_t demandedUnits = 0; // subset stamped with a demand (any mode)
+        uint64_t preauthUnits = 0;  // subset on consensus custody (B3 formal demand)
+        uint64_t protestedUnits = 0;// subset carrying the PROTESTED marker
+        uint32_t oldestDemandHeight = 0; // earliest pre-auth demand height (0 = none)
         uint32_t coins = 0;         // number of note UTXOs
     };
     /** Aggregate this wallet's note holdings across every house (houses with units>0 only). */

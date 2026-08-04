@@ -648,8 +648,9 @@ BOOST_AUTO_TEST_CASE(deposit_match_funding_helpers)
     BOOST_CHECK_EQUAL(HouseDepositWAM(house, 1000), 6000);
     BOOST_CHECK_EQUAL(HouseDepositWAM(house, 7000), 0);      // at the average maturity
     BOOST_CHECK_EQUAL(HouseDepositWAM(house, 8000), 0);      // past it -> clamped 0
-    // The loan-book slice is a v1 stub (0), so match-funding is always satisfied.
-    BOOST_CHECK_EQUAL(HouseLoanBookSliceWAM(house, 1000), 0);
+    // With an EMPTY loan book the slice is 0, so match-funding is satisfied no
+    // matter what the deposits look like (B1: D>0 alone never binds).
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(house), 0);
     BOOST_CHECK(HouseMatchFundingOK(house, 1000));
     BOOST_CHECK(HouseMatchFundingOK(house, 8000));           // even when all matured
 }

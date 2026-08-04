@@ -43,6 +43,42 @@ static const std::string DEFAULT_MAINCHAIN_REST = "127.0.0.1:38332";
  */
 bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch = nullptr);
 
+/** Result of the enforcer-side (gRPC) L1 identity probe. */
+enum EnforcerIdentity {
+    ENFORCER_IDENTITY_MATCH,     // enforcer tip is a block on the REST node's active chain
+    ENFORCER_IDENTITY_MISMATCH,  // enforcer tip is NOT (wrong L1, or an abandoned fork)
+    ENFORCER_IDENTITY_NOTREADY,  // could not determine (enforcer down/syncing, REST transient)
+};
+
+/**
+ * A7 gRPC L1 IDENTITY PIN. The REST pin (ProbeMainchainRest) validates the REST
+ * node's identity via chain + signet_challenge. BMM and peg data ALSO flow over
+ * a SEPARATE channel - the enforcer gRPC at -enforceraddr - which the REST pin
+ * does not cover; a wrong-mainchain enforcer reproduces the 2026-07-28 incident
+ * through it. This asserts the enforcer indexes the SAME L1 as the (already
+ * challenge-pinned) REST node, TRANSITIVELY: check the enforcer's chain tip is a
+ * block on the REST node's ACTIVE chain (/rest/headers/1/<tip> returns the header
+ * iff on the active chain, else an empty 200 - so "not my chain" is cleanly
+ * distinguishable from a transport failure).
+ *
+ * Tip membership (not a fixed-depth anchor) is deliberate: the enforcer sources
+ * its blocks from the mainchain node, so enforcer_tip <= rest_tip always, making
+ * a correct-but-lagging enforcer's tip a real block on the REST chain (MATCH, no
+ * false mismatch from boot sync-skew) while a wrong chain OR an abandoned fork
+ * (the D-4 shape) leaves the tip off the active chain (MISMATCH). One attempt;
+ * the caller debounces across a retry window. *pfStale set (a WARN, not a refuse)
+ * when the enforcer trails REST far enough to look frozen.
+ */
+EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale = nullptr);
+
+/** Pure decision for ProbeEnforcerIdentity, split out for unit tests (no I/O).
+ *  nStaleWarnDepth>0: set *pfStale if the enforcer tip trails REST by more than it. */
+EnforcerIdentity ClassifyEnforcerIdentity(bool fEnfTipOK, int nEnfTipHeight,
+                                          bool fRestOK, int nRestTipHeight,
+                                          bool fMemberQueryOK, bool fEnfTipOnRestChain,
+                                          int nStaleWarnDepth, bool* pfStale,
+                                          std::string& strDetail);
+
 /**
  * L1Client - the mainchain I/O behind SidechainClient.
  *

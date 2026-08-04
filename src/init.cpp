@@ -71,6 +71,7 @@
 #endif
 
 bool fFeeEstimatesInitialized = false;
+bool fMainchainIdentityMismatch = false;
 static const bool DEFAULT_PROXYRANDOMIZE = true;
 static const bool DEFAULT_REST_ENABLE = false;
 static const bool DEFAULT_STOPAFTERBLOCKIMPORT = false;
@@ -535,6 +536,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-mainchainchallenge=<hex>", _("L1 IDENTITY PIN for signet: refuse to start unless the mainchain reports this signet_challenge. Required to tell two custom signets apart - they share a chain name AND a genesis hash (Core's signet genesis is hardcoded, not derived from the challenge)."));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
     strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
+    strUsage += HelpMessageOpt("-housefailfast", _("Regtest only when disabled: set 0 to bypass the wallet's one-op-per-house fail-fast so ops reach ATMP (integration-gate knob; changes WHICH LAYER refuses, never whether it is refused - consensus is untouched; default: 1)"));
     strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
     strUsage += HelpMessageOpt("-deferwindow=<n>", _("Regtest only: override the option-clause deferral window in blocks (default: 12960 = 90 days; integration-gate knob)"));
     strUsage += HelpMessageOpt("-launchsatspergram=<n>", _("Regtest only: override the launch presentation scale in satoshis per gram of gold (default: 4822613; presentation only, NOT consensus)"));
@@ -994,6 +996,67 @@ bool AppInitParameterInteraction()
                                          "-rest -txindex, reachable at -mainchainrest=<host:port>. Without "
                                          "it this node would reject deposit-bearing blocks and fork off the "
                                          "network."), strProbeError));
+
+        // A7 #4: outside regtest the L1 is a signet, and the gRPC enforcer
+        // identity pin below is TRANSITIVE on the REST challenge pin. Without a
+        // challenge armed, both pins degrade to reachability-only - exactly the
+        // 2026-07-28 gap. Require it. (Regtest has no signet_challenge and runs
+        // the local drivechain-patched bench, so it is exempt.)
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST &&
+                gArgs.GetArg("-mainchainchallenge", "").empty())
+            return InitError(_("-mainchaintransport=enforcer requires -mainchainchallenge=<hex> outside "
+                               "regtest: the L1 is a signet and, without its signet_challenge, this node "
+                               "cannot tell two custom signets apart - the 2026-07-28 wrong-L1 failure. "
+                               "The gRPC enforcer identity check is transitive on this pin."));
+
+        // A7: gRPC ENFORCER identity pin. The REST pin above proves the REST
+        // node's identity; this proves the ENFORCER (a separate channel carrying
+        // BMM + peg data) indexes the SAME L1, by asserting its chain tip is a
+        // block on that REST node's active chain. Debounced across the same
+        // warm-up window: a genuinely wrong enforcer stays off-chain the whole
+        // ~60s and refuses; a transient skew (e.g. an unscripted restart during
+        // a chain reset) self-heals to a pass. Never bricks on an UNREACHABLE
+        // enforcer - that failure is loud at runtime (BMM simply cannot proceed).
+        {
+            bool fVerified = false, fRefuse = false;
+            std::string strIdErr;
+            int nNotReady = 0, nMismatch = 0;
+            for (int i = 0; i < 12 && !fVerified && !fRefuse; i++) {
+                if (i > 0) MilliSleep(5000);
+                bool fStale = false;
+                std::string strDetail;
+                EnforcerIdentity r = ProbeEnforcerIdentity(strDetail, &fStale);
+                if (r == ENFORCER_IDENTITY_MATCH) {
+                    if (fStale)
+                        InitWarning(strprintf(_("mainchain enforcer L1 identity OK but the enforcer "
+                                                "looks stale (%s)."), strDetail));
+                    fVerified = true;
+                } else if (r == ENFORCER_IDENTITY_MISMATCH) {
+                    strIdErr = strDetail;
+                    nMismatch++;
+                    if (i == 11) fRefuse = true;   // persisted the whole window
+                } else {                            // NOT-READY
+                    // If we have never seen a disagreement and the enforcer is
+                    // simply not answering, stop waiting early and warn - do not
+                    // burn the full 60s on an absent enforcer (regtest, or a
+                    // node brought up before its enforcer).
+                    if (nMismatch == 0 && ++nNotReady >= 2)
+                        break;
+                }
+            }
+            if (fRefuse) {
+                fMainchainIdentityMismatch = true;
+                return InitError(strprintf(_("mainchain ENFORCER identity mismatch: %s. The enforcer "
+                                             "gRPC channel (-enforceraddr) indexes a different L1 than "
+                                             "the challenge-pinned REST node. Refusing to start - this "
+                                             "is the gRPC half of the 2026-07-28 wrong-L1 failure."),
+                                           strIdErr));
+            }
+            if (!fVerified)
+                InitWarning(_("mainchain enforcer L1 identity UNVERIFIED at startup (enforcer "
+                              "unreachable or still syncing); continuing. A wrong enforcer would "
+                              "surface loudly at runtime when BMM cannot proceed."));
+        }
     }
     LogPrintf("Using mainchain transport: %s\n", strMainchainTransport);
 
@@ -1006,6 +1069,9 @@ bool AppInitParameterInteraction()
 
     // The attestation cadence and stress window are consensus parameters; the
     // overrides exist so integration gates need not mine a week of blocks.
+    if (!gArgs.GetBoolArg("-housefailfast", true) &&
+            chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-housefailfast=0 is a regtest-only integration-gate knob."));
     if ((gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow") ||
             gArgs.IsArgSet("-deferwindow")) &&
             chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
@@ -1581,6 +1647,25 @@ bool AppInitMain()
 
                 if (fRequestShutdown) break;
 
+                // Disk-format gate, EARLY half (D-3): the block-index entry
+                // format itself can change between format versions (v2 grew
+                // hashLastDeposit), so a stamped-mismatched datadir must be
+                // refused BEFORE LoadBlockIndex tries to deserialize entries
+                // it cannot parse - that failure would surface as a generic
+                // "Error loading block database" instead of naming the remedy.
+                // Unstamped = fresh datadir (nothing to misread) or
+                // pre-versioning (LoadBlockIndex fails with the generic error,
+                // as before); the main gate at the undo/chainstate checks
+                // below still covers everything this one cannot see yet.
+                if (!fReset) {
+                    int nOnDisk = 0;
+                    if (pblocktree->ReadDiskFormatVersion(nOnDisk) && nOnDisk != nDiskFormatVersion) {
+                        strLoadError = strprintf(_("This datadir's on-disk records (block index, blocks/rev*.dat, chainstate) are record format %d, but this build reads and writes format %d. Restart with -reindex to regenerate them (-reindex-chainstate is NOT sufficient)."),
+                                                 nOnDisk, nDiskFormatVersion);
+                        break;
+                    }
+                }
+
                 // LoadBlockIndex will load fTxIndex from the db, or set it if
                 // we're reindexing. It will also load fHavePruned if we've
                 // ever removed a block file from disk.
@@ -1717,6 +1802,39 @@ bool AppInitMain()
                     if (!CheckSideDBMarker(hashHouseBest) || !CheckSideDBMarker(hashBillBest) || !CheckSideDBMarker(hashPoolBest)) {
                         strLoadError = _("House/Bill/Pool database is out of sync with the chain state - restart with -reindex");
                         break;
+                    }
+
+                    // D-3: the same health question for the deposit DB, which
+                    // has no marker - its baseline pointer is the marker, and
+                    // the tip's cached hashLastDeposit is what it must equal.
+                    // Unlike the sibling check above, ahead-of-tip is NOT
+                    // tolerated, because for this DB it is not benign: both
+                    // directions are unhealable without a replay.
+                    //   BEHIND (new): a disconnect reverts the deposit DB
+                    //   synchronously while the chainstate rewind is still in
+                    //   memory, so a SIGKILL before the next flush (the
+                    //   unscoped-pkill class that caused D-4) restarts with the
+                    //   chain at the old tip and the DB a block behind; the
+                    //   next template re-pays an already-paid deposit, which
+                    //   every fresh sync rejects.
+                    //   AHEAD (pre-existing): ConnectBlock advances the pointer
+                    //   before the chainstate flush, so the same crash leaves
+                    //   the baseline ahead - and re-connecting that block then
+                    //   fails its own CTIP-input check forever. That node was
+                    //   already stuck; this turns a silent invalid-deposit-input
+                    //   loop into a named remedy.
+                    const CBlockIndex* pTipD = chainActive.Tip();
+                    if (pTipD) {
+                        uint256 hashDepositPtr;
+                        const bool fPtr = psidechaintree->GetLastDepositID(hashDepositPtr);
+                        const uint256 hashWant = pTipD->hashLastDeposit;
+                        const bool fAgree = fPtr ? (hashDepositPtr == hashWant) : hashWant.IsNull();
+                        if (!fAgree) {
+                            strLoadError = _("Deposit database is out of sync with the chain state "
+                                             "(the deposit CTIP baseline does not match the tip) - "
+                                             "restart with -reindex");
+                            break;
+                        }
                     }
                 }
 

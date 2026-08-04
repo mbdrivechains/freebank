@@ -163,12 +163,31 @@ public:
     bool WriteWithdrawalBundleUpdate(const SidechainWithdrawalBundle& withdrawalBundle);
     bool WriteLastWithdrawalBundleHash(const uint256& hash);
 
+    /** D-3 reorg revert, one atomic batch: erase the disconnected block's
+     *  deposit rows AND restore DB_LAST_SIDECHAIN_DEPOSIT to the pre-block
+     *  baseline (null = erase the pointer: no deposits in the remaining
+     *  chain). The row erase is load-bearing, not hygiene: the template
+     *  builder skips any deposit already in the DB (miner.cpp
+     *  HaveDepositNonAmount), so a stale row would keep the orphaned
+     *  deposit out of the re-mined branch forever and stall the CTIP
+     *  chain on the next deposit. */
+    bool WriteDepositDisconnect(const std::vector<uint256>& vEraseID, const uint256& hashPrevLastDeposit);
+
     bool GetWithdrawal(const uint256 & /* Withdrawal ID */, SidechainWithdrawal &withdrawal);
     bool GetWithdrawalBundle(const uint256 & /* Withdrawal Bundle ID */, SidechainWithdrawalBundle &withdrawalBundle);
     bool GetDeposit(const uint256 & /* Deposit ID */, SidechainDeposit &deposit);
     bool HaveDeposits();
     bool HaveDepositNonAmount(const uint256& hashNonAmount);
-    bool GetLastDeposit(SidechainDeposit& deposit);
+    /** The deposit-CTIP baseline. pfPointerSet (optional) distinguishes the two
+     *  ways this returns false: no pointer at all (no deposits yet - false) from
+     *  a pointer whose ROW is missing (true = a DANGLING baseline, i.e. a
+     *  corrupt DB). Callers that size payouts MUST tell them apart: treating a
+     *  dangling pointer as "no deposits yet" skips the CTIP-input check and sets
+     *  amountPrev=0, which authorises paying out the whole cumulative CTIP. */
+    bool GetLastDeposit(SidechainDeposit& deposit, bool* pfPointerSet = nullptr);
+    /** Raw read of the baseline pointer, without needing its row to exist.
+     *  Used as the deposit DB's crash-replay marker (D-3). */
+    bool GetLastDepositID(uint256& hashID);
     bool GetLastWithdrawalBundleHash(uint256& hash);
 
     bool HaveWithdrawalBundle(const uint256& hashWithdrawalBundle) const;
@@ -277,8 +296,15 @@ public:
     bool WriteBills(const std::vector<CBill>& vBill);
     bool WriteBill(const CBill& bill);
 
-    /** See HouseDB::WriteBlockEffects - same atomic per-block discipline. */
-    bool WriteBlockEffects(const std::vector<CBill>& vBill, const uint32_t* pnLastID, const uint256& hashBestBlock);
+    /** See HouseDB::WriteBlockEffects - same atomic per-block discipline.
+     * vRemove deletes bills whose ISSUE was disconnected in this block's undo
+     * (record row AND hash-index row), in the same atomic batch as the marker -
+     * the PoolDB::WriteBlockEffects shape. Without the removal path the undo
+     * side could not use this primitive at all, and the marker had to be
+     * written separately: a crash in between re-ran the undo on restart and
+     * double-popped the endorsement chain (R-3 / F-B1b). */
+    bool WriteBlockEffects(const std::vector<CBill>& vBill, const std::vector<uint32_t>& vRemove,
+                           const uint32_t* pnLastID, const uint256& hashBestBlock);
     bool GetBestBlock(uint256& hashBlock);
     bool WriteBestBlock(const uint256& hashBlock);
 

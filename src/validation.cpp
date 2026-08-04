@@ -471,7 +471,7 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
             return state.DoS(100, false, REJECT_INVALID, prefix + "-coin-script");
 
         const uint256 challenge = HouseAttestChallenge(houseID, nAsOfHeight, hashAsOf, p.outpoint);
-        if (!pub.Verify(challenge, p.vchSig))
+        if (!pub.VerifyStrict(challenge, p.vchSig))
             return state.DoS(100, false, REJECT_INVALID, prefix + "-proof-sig");
 
         amountSum += coin.out.nValue;
@@ -552,7 +552,10 @@ static void MaterializeInsolvency(CHouse& house, int nHeight,
 bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHeight, const CAmount& nTxFee,
                         const std::function<bool(uint32_t, CBill&)>& fnGetBill,
                         const std::function<bool(const uint256&)>& fnHaveBillHash,
-                        CBill& billOut);
+                        const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                        const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
+                        const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
+                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged);
 
 enum FlushStateMode {
     FLUSH_STATE_NONE,
@@ -778,8 +781,26 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
         memcpy(&nA, mtx.vchHousePayload.data(), 4);
         return nA != 0;
     }
+    // B1: DISCOUNT / HRETIRE / HCLAIM mutate a CHouse, so they take its slot.
+    // Every one of them carries the house id in payload bytes 4..8 (the
+    // leading-8 contract), which keeps this a PURE MEMCPY. Resolving ownership
+    // from BillDB instead would put an unpriced point-read inside every
+    // full-mempool guard scan AND go stale under reorg - producing two
+    // individually-valid pooled transactions that jointly brick the template.
+    // RECOURSE (op 6) takes no slot: it mutates no house record, so mempool
+    // slot accounting and consensus agree exactly.
+    if (mtx.nVersion == TRANSACTION_BILL_VERSION &&
+            (mtx.nBillOp == BILL_OP_DISCOUNT || mtx.nBillOp == BILL_OP_HRETIRE ||
+             mtx.nBillOp == BILL_OP_HCLAIM) && mtx.vchBillPayload.size() >= 8) {
+        memcpy(&nA, mtx.vchBillPayload.data() + 4, 4);
+        return nA != 0;
+    }
+    // PROTEST (B3 T-b3) writes the CHouse protest fields, so it takes the
+    // slot. DEMAND still does not - in either mode it re-issues coins and
+    // writes nothing onto the house record.
     if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
-            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM) &&
+            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
+             mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST) &&
             mtx.vchNotePayload.size() >= 4) {
         memcpy(&nA, mtx.vchNotePayload.data(), 4);
         return nA != 0;
@@ -800,6 +821,56 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
         memcpy(&nA, mtx.vchSettlePayload.data(), 4);
         memcpy(&nB, mtx.vchSettlePayload.data() + 4, 4);
         return nA != 0 && nB != 0;
+    }
+    return false;
+}
+
+/** The J2 displacement whitelist: which pooled slot-taker may an otherwise-
+ * valid ATTEST evict (rather than be refused by)? A VERSION whitelist, kept
+ * deliberately narrower than "third-party and re-issuable" - a v13 PROTEST
+ * meets that party test yet must never be displaceable (B3 sheet 4c): there
+ * the eviction itself is the attack, a perpetual-eviction defence at one
+ * attest per block. External linkage so the unit suite pins the whitelist
+ * structurally (b3_contextual_tests, the CheckNoteOperation idiom). */
+bool IsAttestDisplaceable(const CTransaction& mtx)
+{
+    return mtx.nVersion == TRANSACTION_SETTLE_VERSION ||
+           mtx.nVersion == TRANSACTION_BILL_VERSION;
+}
+
+/** DISPLACEMENT SAFETY: would evicting the pooled entry `mi` also remove a
+ * transaction that the incomer spends?
+ *
+ * Every displacement site MUST consult this before calling removeRecursive.
+ * Evicting the incomer's unconfirmed parent while the incomer is not yet in
+ * the pool to be removed with it leaves CheckInputs passing off a cached coin
+ * whose parent is gone; CheckInputsFromMempoolAndCache then ABORTS the node on
+ * assert(!coinFromDisk.IsSpent()). Every peer holding the parent runs the same
+ * path, so one submitter's routine op would abort the network.
+ *
+ * The test is over the whole DESCENDANT set, not the direct parents, because
+ * that is exactly what removeRecursive takes. A grandchild spend - the pooled
+ * op's change consumed by an ordinary send, whose change then funds the
+ * incomer - is the same abort, and a parent-only test misses it. (The first
+ * cut of the oracle guard was parent-only for this reason; the class was found
+ * during T-d5.)
+ *
+ * Cost: the walk runs ONLY on a matched slot/id collision, which the guards
+ * themselves keep at zero or one in the steady state. Callers must keep it
+ * inside the match and must hoist the incomer's prevout set out of the scan -
+ * moving it per pooled entry makes it O(pool^2) on every arrival, which is a
+ * relay-reachable DoS. */
+static bool SpendsPooledOrDescendant(const std::set<uint256>& setInPrevouts, CTxMemPool& pool,
+                                     CTxMemPool::txiter mi)
+{
+    AssertLockHeld(pool.cs);
+    if (setInPrevouts.empty())
+        return false;
+    CTxMemPool::setEntries setDescendants;
+    pool.CalculateDescendants(mi, setDescendants);   // includes mi itself
+    for (CTxMemPool::txiter it : setDescendants) {
+        if (setInPrevouts.count(it->GetTx().GetHash()))
+            return true;
     }
     return false;
 }
@@ -852,6 +923,13 @@ static void EvictStaleHouseNoteOps()
         auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
         auto fnHaveHouseHash = [](const uint256& hash) { return phousetree->HaveHouseHash(hash); };
         auto fnHaveClassID = [](const std::string& strClassID) { return phousetree->HaveClassID(strClassID); };
+        // Bill resolvers, CONFIRMED-state exactly as at ATMP (validation.cpp's
+        // v11 admission block). A bill op binds the record as it stands in
+        // BillDB; bill ops cannot chain in the mempool at all - unconfirmed
+        // bill coins carry dense id 0 and a spend dies bad-bill-input-id-mismatch
+        // (txmempool.cpp:932-943) - so there is no unconfirmed layer to model.
+        auto fnGetBill = [](uint32_t nID, CBill& bill) { return pbilltree->GetBill(nID, bill); };
+        auto fnHaveBillHash = [](const uint256& hash) { return pbilltree->HaveBillHash(hash); };
         // Attestation proofs and escrow read CONFIRMED state (parent-state
         // semantics: a mempool spend of a reserve coin does not invalidate an
         // attestation - both can ride the same block).
@@ -909,13 +987,41 @@ static void EvictStaleHouseNoteOps()
             const bool fPoolTx = (mtx.nVersion == TRANSACTION_POOL_VERSION);
             const bool fSettleTx = (mtx.nVersion == TRANSACTION_SETTLE_VERSION);
             const bool fOracleTx = (mtx.nVersion == TRANSACTION_ORACLE_VERSION);
-            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fOracleTx)
+            // ◄T-d5: v11 joins the sweep keyed UNCONDITIONALLY on the version,
+            // never on a per-op list. EVERY bill op can be staled by a chain
+            // event that spends no coin it holds: ops 5/7/8 read house state
+            // (status, ratio, attestation recency, the capital cap), ops 2/3/4
+            // read nOwnerHouseID, and op 6 reads the holder and the status. The
+            // codebase's own lesson applies verbatim - do NOT enumerate
+            // staleness causes; re-run the real contextual check at tip+1.
+            const bool fBillTx = (mtx.nVersion == TRANSACTION_BILL_VERSION);
+            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fOracleTx && !fBillTx)
                 continue;
 
             CValidationState stateStale;
             bool fStale = false;
 
-            if (fHouseTx) {
+            if (fBillTx) {
+                // THE FEE IS LOAD-BEARING AND THIS IS THE ONLY SWEEP ARM THAT
+                // TAKES ONE. CheckBillOperation's 4th parameter is the absolute
+                // per-tx fee, and ENDORSE and DISCOUNT both reject on
+                // nTxFee < BillEndorseFeeFloor(chain + 1). Every other family's
+                // contextual validator takes no fee at all, so there is no
+                // precedent here to copy - and the obvious stub, passing 0,
+                // would evict every pooled ENDORSE and DISCOUNT on any bill
+                // past BILL_ENDORSE_SOFT_CAP endorsements on EVERY tip change:
+                // silent, policy-level, and invisible to every consensus test.
+                // mi->GetFee() is the entry's own absolute fee - the same
+                // quantity ATMP passes as nFees at the v11 admission site, not
+                // the modified or descendant-inclusive figure.
+                CBill billResult;
+                CHouse houseResult;
+                bool fHouseChanged = false;
+                if (!CheckBillOperation(mtx, stateStale, nNextHeight, mi->GetFee(), fnGetBill,
+                        fnHaveBillHash, fnGetHouse, fnGetProofCoin, fnGetBlockHash,
+                        billResult, houseResult, fHouseChanged))
+                    fStale = true;
+            } else if (fHouseTx) {
                 CHouse houseResult;
                 if (!CheckHouseOperation(mtx, stateStale, nNextHeight, fnGetHouse, fnHaveHouseHash,
                         fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult))
@@ -989,7 +1095,7 @@ static void EvictStaleHouseNoteOps()
         // Log the REASON: an eviction here means the pool held a tx that would
         // have bricked the next template, and "why" is the only thing that
         // distinguishes an expected staleness from a consensus bug.
-        LogPrintf("%s: evicting now-invalid house/note op %s from mempool (%s)\n",
+        LogPrintf("%s: evicting now-invalid FreeBank op %s from mempool (%s)\n",
                   __func__, e.first->GetHash().ToString(), e.second);
         // EXPIRY, not CONFLICT: same wallet-notification rationale as the
         // ATTEST-displacement eviction - a CONFLICT-reason removal outside a
@@ -1273,9 +1379,127 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         if (tx.nVersion == TRANSACTION_BILL_VERSION) {
             auto fnGetBill = [](uint32_t nID, CBill& bill) { return pbilltree->GetBill(nID, bill); };
             auto fnHaveBillHash = [](const uint256& hash) { return pbilltree->HaveBillHash(hash); };
+            auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
+            // A DISCOUNT mints, so it carries the R-i7 reserve proof. As at the
+            // note MINT, the confirmed-state resolver IS the parent state the
+            // proof needs: a mempool spend of a proven reserve coin must not
+            // evict the discount, since the discount does not spend that coin
+            // and both can still ride the next block.
+            auto fnGetProofCoin = [](const COutPoint& out, Coin& coin) {
+                return pcoinsTip->GetCoin(out, coin) && !coin.IsSpent();
+            };
+            auto fnGetBlockHash = [](uint32_t nH, uint256& hash) {
+                if ((int64_t)nH > (int64_t)chainActive.Height())
+                    return false;
+                const CBlockIndex* p = chainActive[(int)nH];
+                if (!p)
+                    return false;
+                hash = p->GetBlockHash();
+                return true;
+            };
             CBill billResult;
-            if (!CheckBillOperation(tx, state, GetSpendHeight(view), nFees, fnGetBill, fnHaveBillHash, billResult))
+            CHouse houseResult;
+            bool fHouseChanged = false;
+            if (!CheckBillOperation(tx, state, GetSpendHeight(view), nFees, fnGetBill, fnHaveBillHash,
+                    fnGetHouse, fnGetProofCoin, fnGetBlockHash, billResult, houseResult, fHouseChanged))
                 return error("%s: CheckBillOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+
+            // PER-BILL EXCLUSIVITY: at most ONE pooled v11 op per bill. Runs
+            // AFTER CheckBillOperation so the incomer is already "otherwise
+            // valid" - the same discipline the settle guard below and the
+            // mirror guard state, and the reason a doomed transaction can
+            // never consume a live bill's slot.
+            //
+            // Bill ops on one bill have DISJOINT inputs by construction -
+            // ENDORSE and DISCOUNT spend the title, RETIRE / CLAIM / HRETIRE /
+            // HCLAIM spend the escrow, RECOURSE spends neither - so the
+            // double-spend rule never separates them, and yet no two of them
+            // can ride one block in EITHER order: each mutates the CBill the
+            // next one reads back through ConnectBlock's staged overlay, so
+            // the second fails inside TestBlockValidity, CreateNewBlock throws
+            // (miner.cpp:511-513), and no block ever forms to evict either one.
+            // That is the DR-2 permanent brick, curable only by -mempoolexpiry
+            // (~14 days). This is NOT a B1-only hazard: ENDORSE(X)+RETIRE(X),
+            // ENDORSE(X)+CLAIM(X), RECOURSE(X)+ENDORSE(X) and
+            // RECOURSE(X)+RETIRE(X) all have this shape in code that shipped
+            // before B1 existed.
+            //
+            // This is BROADER than the house-slot rule and is deliberately NOT
+            // expressed through GetHouseSlotIDs. RECOURSE takes no house slot
+            // at all - it mutates no CHouse and the extractor excludes it by
+            // design - yet two RECOURSEs by two different liable payers, each
+            // funded from its own coins and both valid at the tip, brick the
+            // template on bad-bill-recourse-priors. Bill state is its own
+            // exclusion domain; the slot guard and this guard partition the
+            // space and neither subsumes the other.
+            //
+            // Chaining is not a legitimate pattern being broken here: the
+            // dense nBillID is assigned only at connect, so unconfirmed bill
+            // coins carry id 0 and a bill op spending one dies
+            // bad-bill-input-id-mismatch (txmempool.cpp:932-943). Consensus,
+            // not wallet convention, already forbids the only shape this could
+            // have refused.
+            //
+            // ISSUE IS KEYED SEPARATELY AND MUST NEVER BE MEMCPY'd. It is the
+            // one v11 payload that does not lead with nBillID: BillIssue leads
+            // with the length-prefixed encrypted body, and no dense id exists
+            // until the op connects. Reading bytes 0..4 of an ISSUE yields
+            // attacker-chosen body bytes - it would miss the real collision AND
+            // let a crafted body impersonate any live bill id, censoring every
+            // op on that bill for one transaction fee.
+            //
+            // Two ISSUEs of the SAME body are their own brick pair, and a
+            // remote one: BillIssueSigHash binds the body-derived id, the
+            // amounts, the heights and the three pubkeys - but NOT the inputs -
+            // so anyone who sees an ISSUE on the wire can re-wrap that identical
+            // signed payload in a differently-funded transaction. ATMP resolves
+            // fnHaveBillHash against CONFIRMED state only while ConnectBlock's
+            // twin also scans the bills staged earlier in the block, so both are
+            // admitted and the second dies bad-bill-duplicate. The attacker's
+            // transaction never confirms, so the escrow is never actually
+            // spent - the cost is holding the balance, not paying it. The fix
+            // belongs HERE and not in fnHaveBillHash: that resolver's semantics
+            // must keep mirroring ConnectBlock's, which reads the block's staged
+            // bills and must never read the mempool.
+            //
+            // Both sides of the id compare are RAW payload reads. Comparing a
+            // deserialized billResult.nBillID against a native memcpy of the
+            // same little-endian field agrees only by accident of host
+            // endianness, and a guard that silently stops matching restores the
+            // brick with no test able to see it. The house arm below keys the
+            // same way.
+            const bool fIncomingIssue = (tx.nBillOp == BILL_OP_ISSUE);
+            uint32_t nBillIDNewLE = 0;
+            if (!fIncomingIssue && tx.vchBillPayload.size() >= 4)
+                memcpy(&nBillIDNewLE, tx.vchBillPayload.data(), 4);
+
+            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                const CTransaction& mtx = mi->GetTx();
+                if (mtx.nVersion != TRANSACTION_BILL_VERSION)
+                    continue;
+                // Cross-class pairs cannot collide and are skipped: a pooled
+                // ISSUE has no dense id, and no pooled op can name one, because
+                // ATMP's fnGetBill reads BillDB only.
+                if (fIncomingIssue != (mtx.nBillOp == BILL_OP_ISSUE))
+                    continue;
+                if (fIncomingIssue) {
+                    // Decode only when BOTH sides are issues - the REGISTER x
+                    // REGISTER precedent below - so the common case stays a
+                    // memcpy and only ISSUE traffic pays the decode. Compare
+                    // the BODY, not its hash: identity IS sha256(body), so
+                    // equal bodies are exactly the collision, and a memcmp
+                    // beats a SHA256 over each pooled issue.
+                    BillIssue issuePooled;
+                    if (DecodeBillPayload(mtx.vchBillPayload, issuePooled) &&
+                            issuePooled.vchEncryptedBody == billResult.vchEncryptedBody)
+                        return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
+                } else if (mtx.vchBillPayload.size() >= 4) {
+                    uint32_t nTheirs = 0;
+                    memcpy(&nTheirs, mtx.vchBillPayload.data(), 4);  // nBillID leads ops 2-8
+                    if (nTheirs == nBillIDNewLE)
+                        return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
+                }
+            }
         }
 
         // Settle ops (v16, T-s5): contextual admission + the dual-slot guard.
@@ -1466,9 +1690,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 const uint32_t nHouseTouched = houseResult.nHouseID;
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                     const CTransaction& mtx = mi->GetTx();
-                    // Another note mint/redeem/claim for the same house?
+                    // Another note mint/redeem/claim/protest for the same house?
                     if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
-                            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM) &&
+                            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
+                             mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST) &&
                             mtx.vchNotePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID is the leading field
@@ -1637,6 +1862,15 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
         }
 
+        // The incomer's parent txids, hoisted ONCE for every displacement site
+        // below (v17 oracle, and the house-slot mirror guard). Both consult it
+        // through SpendsPooledOrDescendant, which walks the pooled entry's
+        // descendant set - so this set must be built out here, never rebuilt
+        // per pooled entry, or the walk becomes O(pool^2) per arrival.
+        std::set<uint256> setInPrevouts;
+        for (const CTxIn& in : tx.vin)
+            setInPrevouts.insert(in.prevout.hash);
+
         // Contextual oracle checks (Phase G-1, T-o3). Every v17 op is height-
         // AND branch-bound to exactly the next block on this tip, so admission
         // runs the REAL contextual check at tip+1 with the same closures
@@ -1720,10 +1954,14 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     // assert(!coinFromDisk.IsSpent()). Every peer holding the
                     // predecessor runs the same path, so one submitter's routine
                     // per-block re-sign would abort the network.
-                    bool fSpendsPooled = false;
-                    for (const CTxIn& in : tx.vin) {
-                        if (in.prevout.hash == mtx.GetHash()) { fSpendsPooled = true; break; }
-                    }
+                    //
+                    // ◄T-d5: this test was DIRECT-PARENT only and that was not
+                    // enough - removeRecursive takes the whole descendant set,
+                    // so a re-sign funded from a GRANDCHILD (the predecessor's
+                    // change consumed by an ordinary send, whose change funds
+                    // the re-sign) aborted identically. Now shared with the
+                    // house-slot displacement below, which had no test at all.
+                    const bool fSpendsPooled = SpendsPooledOrDescendant(setInPrevouts, pool, mi);
                     // Displace only with a submission signed at or after the
                     // pooled one. Under the validity window both can be live at
                     // once, so an unconditional displace would let out-of-order
@@ -1745,19 +1983,42 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
         }
 
-        // Mirror settle guard, slot-keyed (T-s5): the INCOMING tx takes a
-        // house slot and the mempool holds a v16 settle touching that house -
-        // the two cannot ride one block. Default: reject the incomer. The ONE
-        // exception (J2): an otherwise-valid ATTEST *displaces* the pooled
-        // settle instead - the settle is evicted and the ATTEST accepted.
-        // Rationale: settles are re-signable; attestation deadlines are not
-        // deferrable, and without displacement a hostile BMM sequencer could
-        // park a co-signed settle in the mempool, never include it, and let
-        // this very guard block the house's routine ATTEST until it derives a
-        // PUBLIC Stressed episode at zero attacker cost. Runs after the family
-        // guard blocks, so the incomer has already passed its own contextual
-        // checks ("otherwise-valid"). Placement note: eviction happens even if
-        // the ATTEST later fails fee policy - acceptable, the settle re-signs.
+        // THE UNIVERSAL HOUSE-SLOT MIRROR GUARD, slot-keyed on BOTH sides
+        // (T-s5, widened ◄T-d5): the INCOMING tx takes a house slot and the
+        // mempool holds ANY op taking that same house's slot - the two cannot
+        // ride one block. Default: reject the incomer.
+        //
+        // ◄T-d5 — this loop's pooled side used to be hard-wired to v16, and
+        // widening it to GetHouseSlotIDs is the WHOLE cross-family fix. The
+        // incoming side already admitted every slot-taker except v16 (which the
+        // dual-slot guard above owns), and the helper already knew the v11 arm,
+        // so one filter was the only thing standing between this loop and the
+        // complete matrix. Every block between the v11 section and here is
+        // version-gated, so a v11 incomer reaches this point untouched.
+        //
+        // This is why the four per-family enumerated loops did NOT need v11
+        // arms (OD-8(b), reconsidered on evidence). They guard a strict
+        // SUPERSET of the slot class - NOTE_OP_DEMAND, POOL_OP_CREATE,
+        // REGISTER x REGISTER, one-op-per-POOL are all state-NEUTRAL or
+        // id-less, so GetHouseSlotIDs returns false for them BY DESIGN and
+        // they can only be expressed by enumeration. Leaving them alone and
+        // widening here keeps both properties with no duplication of intent:
+        // enumerated loops own the non-slot superset, this loop owns the slot
+        // class, and the per-bill guard owns the bill class. It also means the
+        // ATTEST-displacement ordering hazard never arises - that inversion
+        // exists only if the family loops learn v11 and start returning before
+        // control ever reaches here.
+        //
+        // THE DISPLACEMENT EXCEPTION (J2): an otherwise-valid ATTEST *displaces*
+        // a pooled op instead of being rejected by it - but only one it may
+        // safely displace. Attestation deadlines are not deferrable, and
+        // without displacement a hostile counterparty could park an op in the
+        // mempool, never include it, and let this very guard block the house's
+        // routine ATTEST until the cadence lapses and it derives a PUBLIC
+        // Stressed episode at zero attacker cost. Runs after the family guard
+        // blocks, so the incomer has already passed its own contextual checks
+        // ("otherwise-valid"). Eviction happens even if the ATTEST later fails
+        // fee policy - acceptable, the displaced op re-broadcasts.
         {
             uint32_t nInA = 0, nInB = 0;
             if (tx.nVersion != TRANSACTION_SETTLE_VERSION && GetHouseSlotIDs(tx, nInA, nInB)) {
@@ -1766,21 +2027,64 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 std::vector<CTransactionRef> vDisplace;
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                     const CTransaction& mtx = mi->GetTx();
-                    if (mtx.nVersion != TRANSACTION_SETTLE_VERSION)
-                        continue;
                     uint32_t nTheirA = 0, nTheirB = 0;
                     if (!GetHouseSlotIDs(mtx, nTheirA, nTheirB))
                         continue;
                     if (nTheirA == nInA || nTheirB == nInA) {
-                        if (fAttest)
+                        // DISPLACEABLE = exactly the families whose op is
+                        // created by a party OTHER than the house whose slot it
+                        // takes, and re-issuable by that party without the
+                        // house's cooperation, AND whose parking would hurt the
+                        // house: a v16 settle (the counterparty the house chose
+                        // - the shipped J2 rule) and the v11 house-slot ops,
+                        // whose HRETIRE is built by the DRAWEE. The drawee case
+                        // is the one that FORCES displacement rather than
+                        // merely allowing it: the house never chose that
+                        // counterparty and cannot decline, so rejection would
+                        // hand any drawee a free public Stressed episode.
+                        //
+                        // A pooled WINDDOWN, MINT, ORIGINATE, pool RETIRE is
+                        // the house's OWN work, and an ATTEST must never evict
+                        // it. And a v13 PROTEST (B3 sheet 4c) is third-party
+                        // and re-issuable - it MEETS the first two displaceable
+                        // tests - yet must stay NON-displaceable, because there
+                        // the eviction itself is the attack: displacement
+                        // exists to stop a counterparty PARKING an op to block
+                        // the house's attest deadline, but a protest cannot be
+                        // parked - it races to connect and is idempotent-done -
+                        // while a displaceable protest hands the house a
+                        // perpetual-eviction defence (attest every block,
+                        // freely, inside the cadence). The J2 hazard and the
+                        // 4c hazard are mirror images; the version whitelist
+                        // below is the line between them. Do not "simplify" it
+                        // to the party test above. Tested HERE rather than
+                        // relying on the family loops above having returned
+                        // first: that coupling is exactly the kind that
+                        // survives a refactor as a silent hole.
+                        const bool fDisplaceable = IsAttestDisplaceable(mtx);
+                        // NEVER displace a tx the incomer spends - the node
+                        // abort documented on the oracle guard above. This site
+                        // shipped WITHOUT the test, and it is reachable on the
+                        // ordinary path, not an exotic one: AttestHouse has no
+                        // HouseStateChangePending fail-fast (deliberately - it
+                        // is the displacer) and funds its fee from vFeePool,
+                        // which is everything AvailableCoins offers that failed
+                        // the depth>=1 reserve test - i.e. 0-conf coins by
+                        // construction. On a house whose confirmed coins are
+                        // all claimed as reserve proofs, the pooled op's own
+                        // change is the one thing SelectCoins can find.
+                        if (fAttest && fDisplaceable &&
+                                !SpendsPooledOrDescendant(setInPrevouts, pool, mi))
                             vDisplace.push_back(mi->GetSharedTx());
-                        else
+                        else if (mtx.nVersion == TRANSACTION_SETTLE_VERSION)
                             return state.DoS(0, false, REJECT_DUPLICATE, "house-op-settle-in-mempool");
+                        else
+                            return state.DoS(0, false, REJECT_DUPLICATE, "house-slot-op-in-mempool");
                     }
                 }
                 for (const CTransactionRef& ref : vDisplace) {
-                    LogPrintf("%s: ATTEST on house %u displaces pooled settle %s\n",
-                              __func__, nInA, ref->GetHash().ToString());
+                    LogPrintf("%s: ATTEST on house %u displaces pooled v%d %s\n",
+                              __func__, nInA, ref->nVersion, ref->GetHash().ToString());
                     // EXPIRY, not CONFLICT: CMainSignals::MempoolEntryRemoved
                     // deliberately drops BLOCK/CONFLICT removals (those reach
                     // wallets via block-connect paths) - but this eviction
@@ -2439,6 +2743,22 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
     AddCoins(inputs, tx, nHeight, nAssetIDOut, amountAssetInOut, nControlNOut, nNewAssetIDIn, nBillID, nHouseID);
 }
 
+static bool VerifyHouseApprovers(const CHouse& house, const std::vector<uint32_t>& vIndex,
+                                 const std::vector<std::vector<unsigned char>>& vSig,
+                                 const uint256& sighash, uint32_t nRequired,
+                                 CValidationState& state, const char* reject);
+
+/** Every payload ECDSA site is strict (A5, SECURITY_GATE_SIGNOFF_A5.md):
+ * canonical encoding AND a valid signature, so no confirmed op ever has a
+ * second valid encoding. B1's ops 5-8 were born this way; the A5 swap routed
+ * every other payload site through CPubKey::VerifyStrict, including the
+ * VerifyHouseApprovers choke-point that serves the 13 house-quorum ops. */
+static bool BillVerifyStrict(const std::vector<unsigned char>& vchPubKey,
+                             const uint256& hash, const std::vector<unsigned char>& vchSig)
+{
+    return CPubKey(vchPubKey).VerifyStrict(hash, vchSig);
+}
+
 /**
  * Contextual validation of a bill operation against bill state supplied by
  * the caller (BillDB directly for the mempool; BillDB plus this block's
@@ -2446,12 +2766,22 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
  * bill record: the new bill for ISSUE (nBillID unassigned), or the mutated
  * bill for ENDORSE / RETIRE / CLAIM. Shape and payload-signature checks that
  * need no context live in CheckBillTransactionShape (CheckTransaction).
+ *
+ * Since B1 the house resolvers ride along too (the CheckNoteOperation arity
+ * precedent): DISCOUNT / HRETIRE / HCLAIM mutate a CHouse, so they return
+ * houseOut + fHouseChanged and take that house's one-op-per-block slot.
+ * RECOURSE deliberately does not - it mutates no house record at all.
  */
 bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHeight, const CAmount& nTxFee,
                         const std::function<bool(uint32_t, CBill&)>& fnGetBill,
                         const std::function<bool(const uint256&)>& fnHaveBillHash,
-                        CBill& billOut)
+                        const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                        const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
+                        const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
+                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged)
 {
+    fHouseChanged = false;
+
     if (tx.nBillOp == BILL_OP_ISSUE) {
         BillIssue issue;
         if (!DecodeBillPayload(tx.vchBillPayload, issue))
@@ -2485,9 +2815,9 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         const uint256 sighash = BillIssueSigHash(billID, issue.amount,
                 tx.vout[1].nValue, issue.nMaturityHeight, issue.nGraceBlocks,
                 issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey);
-        if (!CPubKey(issue.vchDrawerPubKey).Verify(sighash, issue.vchDrawerSig))
+        if (!CPubKey(issue.vchDrawerPubKey).VerifyStrict(sighash, issue.vchDrawerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-drawer-sig");
-        if (!CPubKey(issue.vchAcceptorPubKey).Verify(sighash, issue.vchAcceptorSig))
+        if (!CPubKey(issue.vchAcceptorPubKey).VerifyStrict(sighash, issue.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-acceptor-sig");
 
         billOut = CBill();
@@ -2518,6 +2848,14 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
         if (bill.status != BILL_STATUS_ACTIVE)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-endorse-inactive");
+        // B1 check 27, UNCONDITIONAL: a bill inside a house's loan book leaves it
+        // only through HRETIRE or HCLAIM. There is deliberately NO carve-out for
+        // an insolvent owner house - one would open, at a publicly computable
+        // height, a window in which a single custody key could endorse an entire
+        // book to itself (E-4). Cannot fire on any historical block:
+        // nOwnerHouseID is 0 for every bill written before B1.
+        if (bill.nOwnerHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-endorse-house-held");
         if (endorse.endorsement.vchFrom != bill.vchHolderPubKey)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-endorse-not-holder");
 
@@ -2528,7 +2866,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-endorse-height");
 
         const uint256 sighash = BillEndorseSigHash(bill.billID, endorse.endorsement.vchTo, nAtHeight);
-        if (!CPubKey(endorse.endorsement.vchFrom).Verify(sighash, endorse.endorsement.vchSig))
+        if (!CPubKey(endorse.endorsement.vchFrom).VerifyStrict(sighash, endorse.endorsement.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-endorse-sig");
 
         // Fee escalation past the soft cap (Tx-4)
@@ -2552,9 +2890,15 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
         if (bill.status != BILL_STATUS_ACTIVE)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-inactive");
+        // B1 check 27: house-held paper retires through HRETIRE (op 7), which
+        // pays the consensus-pinned custody key and takes the bill out of the
+        // book. Valid at every owner-house status - the drawee is never blocked
+        // from discharging - it simply uses the op that keeps the book honest.
+        if (bill.nOwnerHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-house-held");
 
         const uint256 sighash = BillRetireSigHash(bill.billID, BillHashOutputs(tx));
-        if (!CPubKey(bill.vchAcceptorPubKey).Verify(sighash, retire.vchAcceptorSig))
+        if (!CPubKey(bill.vchAcceptorPubKey).VerifyStrict(sighash, retire.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-sig");
 
         // Retirement is the drawee paying face to the current holder
@@ -2576,6 +2920,11 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
         if (bill.status != BILL_STATUS_ACTIVE)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-claim-inactive");
+        // B1 check 27: the escrow on house-held paper is taken by HCLAIM (op 8),
+        // where the house QUORUM replaces the single holder signature - the
+        // custody key alone must never direct an escrow payout.
+        if (bill.nOwnerHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-claim-house-held");
 
         // Default: only past maturity + grace (uint64 sum - cannot wrap)
         if ((uint64_t)nHeight <= (uint64_t)bill.nMaturityHeight + bill.nGraceBlocks)
@@ -2584,11 +2933,359 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // The holder signs the exact output set - where the escrow goes is
         // the holder's choice, the signature is the authorization
         const uint256 sighash = BillClaimSigHash(bill.billID, BillHashOutputs(tx));
-        if (!CPubKey(bill.vchHolderPubKey).Verify(sighash, claim.vchHolderSig))
+        if (!CPubKey(bill.vchHolderPubKey).VerifyStrict(sighash, claim.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-claim-sig");
 
         billOut = bill;
         billOut.status = BILL_STATUS_DEFAULTED;
+        return true;
+    }
+
+    //
+    // Phase 3.9 (B1). Ops 5-8. Every one of them is reached only after
+    // CheckTxInputs, so all ECDSA lives here.
+    //
+
+    if (tx.nBillOp == BILL_OP_DISCOUNT) {
+        BillDiscount d;
+        if (!DecodeBillPayload(tx.vchBillPayload, d))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-payload");
+
+        // -- 12: the bill ------------------------------------------------
+        CBill bill;
+        if (!fnGetBill(d.nBillID, bill))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
+        if (bill.status != BILL_STATUS_ACTIVE)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-inactive");
+        if (bill.nOwnerHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-already-held");
+        if ((uint32_t)nHeight >= bill.nMaturityHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-matured");
+        // The two bill facts every house delta is computed from, pinned
+        // byte-exact. This is what makes the crash-replay arm and the
+        // disconnect inverse derivable from the PAYLOAD ALONE - no DB read, no
+        // dependence on any mutable field. Both are also bound into the shared
+        // digest, so a bill substitution fails on signature, not merely here.
+        if (d.amountFace != bill.amount || d.nBillMaturityHeight != bill.nMaturityHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-bill-mismatch");
+
+        // -- 13/14: the buying house --------------------------------------
+        CHouse house;
+        if (!fnGetHouse(d.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-no-house");
+        // Effective-Open only: a Stressed or Deferred house may not expand its
+        // book or its issue while holders are queueing (CM-3 rung 1).
+        if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-house-status");
+        if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
+                (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-attest-stale");
+        // The title must land on the house's consensus-known custody key, not on
+        // any key the approvers feel like naming - that is what makes HRETIRE's
+        // "pay the pinned custody key" a real constraint later.
+        if (d.vchCustodyPubKey != house.vchRedemptionDestPK)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-custody-key");
+
+        // -- 16: payment equality, and no side payment --------------------
+        // The seller is paid EXACTLY the price, in the note leg, and is paid
+        // nothing else anywhere in the transaction. Since shape pinned
+        // sum(vUnits) == amountPrice, requiring the units reaching the seller to
+        // equal the price forces EVERY note output to be the seller's.
+        // vout[0] is exempt: the mandatory title output pays the custody key,
+        // which shape check 4 already forced to differ from the seller.
+        const CScript scriptSeller = BillScriptForPubKey(bill.vchHolderPubKey);
+        const size_t nNoteEnd = (size_t)d.nNoteOutputs;   // notes at vout[1..nNoteEnd]
+        uint64_t nUnitsToSeller = 0;
+        // The j-1 index into vUnits is bounded here rather than resting on the
+        // shape gate having equated nNoteOutputs with vUnits.size() first.
+        for (size_t j = 1; j <= nNoteEnd && j < tx.vout.size() && j - 1 < d.vUnits.size(); j++) {
+            if (tx.vout[j].scriptPubKey == scriptSeller)
+                nUnitsToSeller += d.vUnits[j - 1];
+        }
+        if (nUnitsToSeller != (uint64_t)d.amountPrice)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-payment");
+        for (size_t j = nNoteEnd + 1; j < tx.vout.size(); j++) {
+            if (tx.vout[j].scriptPubKey == scriptSeller)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-seller-side-payment");
+        }
+
+        // -- 17: capital cap (CM-2) - the NOTE_OP_MINT conjunct verbatim ---
+        const uint64_t nPrice = (uint64_t)d.amountPrice;
+        if (house.nMintedUnits > (uint64_t)MAX_MONEY - nPrice ||
+                house.nMintedUnits + nPrice > (uint64_t)MAX_MONEY - house.nDepositUnits ||
+                house.nMintedUnits + nPrice + house.nDepositUnits > HouseCapitalCapUnits(house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-capital-cap");
+
+        // -- 18/19: rho-at-mint, both conjuncts -----------------------------
+        // A discount MINTS, so it carries the full R-i7 liveness burden a
+        // NOTE_OP_MINT does: recent published attestation AND freshly proven
+        // live reserves, binding on the minimum of the two. Anything less and a
+        // house could discount an entire book against reserves it has spent.
+        if (d.nAsOfHeight >= (uint32_t)nHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-reserve-future");
+        if ((uint32_t)nHeight - d.nAsOfHeight > HOUSE_ATTEST_STALENESS)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-reserve-stale");
+        CAmount amountLiveReserves = 0;
+        if (!VerifyReserveProofs(house.houseID, d.nAsOfHeight, d.vReserveProofs, tx.vin,
+                nHeight, fnGetProofCoin, fnGetBlockHash, amountLiveReserves, state,
+                "bad-bill-discount-reserve"))
+            return false;
+        const CAmount amountEffReserves = std::min(house.amountLastAttestReserves, amountLiveReserves);
+        const uint64_t nReserveCap = ((uint64_t)amountEffReserves * 100) / HOUSE_RESERVE_FLOOR_PCT;
+        if (house.nMintedUnits + nPrice > nReserveCap)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-reserve-cap");
+
+        // -- 20: book envelope ---------------------------------------------
+        if (house.nLoanBookFace > LOAN_BOOK_MAX_FACE - (uint64_t)d.amountFace)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-book-overflow");
+
+        // -- 21: priors byte-exact (the ATTEST pattern) ---------------------
+        // One prior per mutated field. These are what the disconnect restores
+        // to, so they must be the pre-state and nothing else.
+        if (d.nPrevMintedUnits != house.nMintedUnits ||
+                d.nPrevLoanBookFace != house.nLoanBookFace ||
+                d.nPrevLoanWtMatHi != house.nLoanWtMatHi ||
+                d.nPrevLoanWtMatLo != house.nLoanWtMatLo)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-priors");
+
+        // Effects on the house, computed before the post-state gate below.
+        house.nMintedUnits += nPrice;
+        house.nLoanBookFace += (uint64_t)d.amountFace;
+        house.SetLoanWtMaturity(house.LoanWtMaturity() +
+                (unsigned __int128)(uint64_t)d.amountFace * (unsigned __int128)d.nBillMaturityHeight);
+
+        // -- 22: post-state match funding -----------------------------------
+        // Derived, non-terminal, self-curing: the house must not END this op
+        // funding a longer book with shorter money. Nothing is stored and no
+        // clock starts - the cures (longer deposits, run-off, TOPUP, deposit
+        // maturity) are all inside the house's or its savers' own control.
+        if (!HouseMatchFundingOK(house, nHeight))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-match-funding");
+
+        // -- 23: expiry ------------------------------------------------------
+        if ((uint32_t)nHeight > d.nExpiryHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-expired");
+        if ((uint64_t)d.nExpiryHeight > (uint64_t)nHeight + BILL_DISCOUNT_MAX_EXPIRY_AHEAD)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-expiry-far");
+
+        // -- 24: a discount IS an endorsement, so Tx-4's fee floor applies ---
+        if (nTxFee < BillEndorseFeeFloor(bill.vEndorsement.size() + 1))
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-fee");
+
+        // -- 25: the link ----------------------------------------------------
+        if (d.endorsement.vchFrom != bill.vchHolderPubKey)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-not-holder");
+        const uint32_t nAtHeight = d.endorsement.nAtHeight;
+        if (nAtHeight > (uint32_t)nHeight || (uint32_t)nHeight - nAtHeight > BILL_ENDORSE_HEIGHT_SLACK)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-height");
+        // The stored link signature is the CLASSIC endorse digest, so the
+        // endorsement chain stays verifiable from CBill alone by anyone who
+        // never saw the discount payload.
+        if (!BillVerifyStrict(d.endorsement.vchFrom,
+                BillEndorseSigHash(bill.billID, d.endorsement.vchTo, nAtHeight),
+                d.endorsement.vchSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-link-sig");
+
+        // -- 26: authorization - two authorities, ONE shared digest ----------
+        // Seller and house quorum sign the same bytes, so neither side can
+        // alter any term after the other has signed.
+        const uint256 sighashDiscount = BillDiscountSigHash(d, bill.billID,
+                BillHashPrevouts(tx), BillHashOutputs(tx));
+        if (!BillVerifyStrict(bill.vchHolderPubKey, sighashDiscount, d.vchSellerSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-seller-sig");
+        if (!VerifyHouseApprovers(house, d.vApproverIndex, d.vApproverSig, sighashDiscount,
+                house.nThresholdM, state, "bad-bill-discount-approvers"))
+            return false;
+
+        billOut = bill;
+        billOut.vEndorsement.push_back(d.endorsement);
+        billOut.vchHolderPubKey = d.vchCustodyPubKey;
+        billOut.outTitle = COutPoint(tx.GetHash(), 0);
+        billOut.nOwnerHouseID = d.nHouseID;
+
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    if (tx.nBillOp == BILL_OP_HRETIRE || tx.nBillOp == BILL_OP_HCLAIM) {
+        // The two house-held terminal events share every structural check; only
+        // the maturity gate, the authority and the resulting status differ.
+        const bool fRetire = (tx.nBillOp == BILL_OP_HRETIRE);
+
+        BillHRetire hr;
+        BillHClaim hc;
+        if (fRetire) {
+            if (!DecodeBillPayload(tx.vchBillPayload, hr))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-payload");
+        } else {
+            if (!DecodeBillPayload(tx.vchBillPayload, hc))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaim-payload");
+        }
+        const uint32_t nBillID       = fRetire ? hr.nBillID : hc.nBillID;
+        const uint32_t nOwnerHouseID = fRetire ? hr.nOwnerHouseID : hc.nOwnerHouseID;
+        const CAmount  amountFace    = fRetire ? hr.amountFace : hc.amountFace;
+        const uint32_t nMaturity     = fRetire ? hr.nBillMaturityHeight : hc.nBillMaturityHeight;
+        const uint64_t nPrevFace     = fRetire ? hr.nPrevLoanBookFace : hc.nPrevLoanBookFace;
+        const uint64_t nPrevWtHi     = fRetire ? hr.nPrevLoanWtMatHi : hc.nPrevLoanWtMatHi;
+        const uint64_t nPrevWtLo     = fRetire ? hr.nPrevLoanWtMatLo : hc.nPrevLoanWtMatLo;
+
+        CBill bill;
+        if (!fnGetBill(nBillID, bill))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
+        if (bill.status != BILL_STATUS_ACTIVE)
+            return state.DoS(100, false, REJECT_INVALID,
+                fRetire ? "bad-bill-hretire-inactive" : "bad-bill-hclaim-inactive");
+        // The ownership pin. Payload shape already forced nOwnerHouseID != 0, so
+        // this also rejects an op aimed at a bill no house holds. Pinning it
+        // byte-exact is what makes ownership staleness after a reorg a
+        // SINGLE-TRANSACTION contextual failure the mempool sweep evicts, rather
+        // than a stale slot key that would brick a template.
+        if (nOwnerHouseID != bill.nOwnerHouseID || amountFace != bill.amount ||
+                nMaturity != bill.nMaturityHeight)
+            return state.DoS(100, false, REJECT_INVALID,
+                fRetire ? "bad-bill-hretire-bill-mismatch" : "bad-bill-hclaim-bill-mismatch");
+
+        CHouse house;
+        if (!fnGetHouse(nOwnerHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID,
+                fRetire ? "bad-bill-hretire-no-house" : "bad-bill-hclaim-no-house");
+        // NO status gate, deliberately: both are valid at every owner-house
+        // status including effective-Insolvent. The drawee must always be able
+        // to discharge its debt, and the destination is consensus-pinned.
+
+        if (fRetire) {
+            if (!BillVerifyStrict(bill.vchAcceptorPubKey,
+                    BillRetireSigHash(bill.billID, BillHashOutputs(tx)), hr.vchAcceptorSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-sig");
+            // Face paid to the current holder - which check 12 pinned to the
+            // house's custody key when the discount happened.
+            if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountFace)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-payment");
+        } else {
+            if ((uint64_t)nHeight <= (uint64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-hclaim-early");
+            // The QUORUM replaces the single holder signature of op 4: the
+            // custody key alone must never direct the escrow payout.
+            if (!VerifyHouseApprovers(house, hc.vApproverIndex, hc.vApproverSig,
+                    BillClaimSigHash(bill.billID, BillHashOutputs(tx)),
+                    house.nThresholdM, state, "bad-bill-hclaim-approvers"))
+                return false;
+        }
+
+        if (nPrevFace != house.nLoanBookFace || nPrevWtHi != house.nLoanWtMatHi ||
+                nPrevWtLo != house.nLoanWtMatLo)
+            return state.DoS(100, false, REJECT_INVALID,
+                fRetire ? "bad-bill-hretire-priors" : "bad-bill-hclaim-priors");
+
+        // The book exit. The state invariant (sum of face over house-held bills
+        // == nLoanBookFace, and likewise for the weight) makes both subtractions
+        // safe, but a wrap here would be a silent supply-shaped corruption, so
+        // the invariant is ENFORCED rather than assumed.
+        const unsigned __int128 nWeight =
+                (unsigned __int128)(uint64_t)amountFace * (unsigned __int128)nMaturity;
+        if (house.nLoanBookFace < (uint64_t)amountFace || house.LoanWtMaturity() < nWeight)
+            return state.DoS(100, false, REJECT_INVALID,
+                fRetire ? "bad-bill-hretire-book-underflow" : "bad-bill-hclaim-book-underflow");
+        house.nLoanBookFace -= (uint64_t)amountFace;
+        house.SetLoanWtMaturity(house.LoanWtMaturity() - nWeight);
+
+        billOut = bill;
+        billOut.status = fRetire ? BILL_STATUS_RETIRED : BILL_STATUS_DEFAULTED;
+        billOut.nOwnerHouseID = 0;
+
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    if (tx.nBillOp == BILL_OP_RECOURSE) {
+        BillRecourse r;
+        if (!DecodeBillPayload(tx.vchBillPayload, r))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-payload");
+
+        CBill bill;
+        if (!fnGetBill(r.nBillID, bill))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
+        // -- 30: NEVER on house-held paper ---------------------------------
+        // A bill in a book leaves it only through HRETIRE or HCLAIM, so one
+        // custody key can never pay itself and walk an asset out of the loan
+        // book, bypassing HCLAIM's quorum. It also puts the cure in the
+        // historical cascade order: drawee, then escrow, then the endorsers.
+        if (bill.nOwnerHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-house-held");
+        if (bill.status != BILL_STATUS_ACTIVE && bill.status != BILL_STATUS_DEFAULTED)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-status");
+        if (bill.status == BILL_STATUS_ACTIVE &&
+                (uint64_t)nHeight <= (uint64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-recourse-early");
+
+        // -- 31: the prior -------------------------------------------------
+        if (r.vchPrevHolderPubKey != bill.vchHolderPubKey)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-priors");
+        // Independent of the shape gate (the VerifyHouseApprovers precedent):
+        // one key paying itself must never be a way to take the position.
+        if (r.vchPayerPubKey == bill.vchHolderPubKey)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-self");
+
+        // -- 32: the liable set --------------------------------------------
+        // k is the INCLUSIVE index of the link that delivered the bill to the
+        // current holder, so the immediate endorser - the discount seller, the
+        // moment a house takes their paper - is liable. A holder who arrived by
+        // an earlier RECOURSE has no delivering link (recourse appends none), in
+        // which case the whole chain answers. The ACCEPTOR is deliberately NOT
+        // in the set: its escrow bond already answers, and including it enabled
+        // a verified default-then-self-recourse expropriation (E-1). Joint and
+        // several, as protest made it; the scan is bounded by the fee-priced
+        // chain length.
+        size_t nLiableEnd = bill.vEndorsement.size();       // one PAST the last liable link
+        for (size_t j = bill.vEndorsement.size(); j-- > 0; ) {
+            if (bill.vEndorsement[j].vchTo == bill.vchHolderPubKey) {
+                nLiableEnd = j + 1;
+                break;
+            }
+        }
+        bool fLiable = (r.vchPayerPubKey == bill.vchDrawerPubKey);
+        for (size_t j = 0; !fLiable && j < nLiableEnd; j++) {
+            if (bill.vEndorsement[j].vchFrom == r.vchPayerPubKey)
+                fLiable = true;
+        }
+        if (!fLiable)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-not-liable");
+
+        // -- 33: the floor --------------------------------------------------
+        // The floor must cover the holder's best alternative under the ENTIRE
+        // op set - a standing invariant that any future op touching bill value
+        // flows has to re-prove.
+        CAmount amountFloor = 0;
+        if (bill.status == BILL_STATUS_ACTIVE) {
+            // The holder still owns the escrow claim, so recourse must beat
+            // simply claiming it.
+            amountFloor = std::max(bill.amount, bill.amountEscrow);
+        } else {
+            // 'd': the escrow is already taken. Recourse buys the shortfall, and
+            // if there is none it buys nothing - refuse rather than let a payer
+            // take the position for free.
+            if (bill.amount <= bill.amountEscrow)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-no-deficiency");
+            amountFloor = bill.amount - bill.amountEscrow;
+        }
+        if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountFloor)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-payment");
+
+        // -- 34: authorization ----------------------------------------------
+        // The payer alone. Holder consent is structurally unnecessary: they are
+        // being paid at their own key, at or above their best alternative.
+        if (!BillVerifyStrict(r.vchPayerPubKey,
+                BillRecourseSigHash(r, bill.billID, BillHashPrevouts(tx), BillHashOutputs(tx)),
+                r.vchPayerSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-payer-sig");
+
+        // Effects: subrogation, and nothing else. No status change, no owner
+        // change (it is already 0), NO house record touched and no house slot
+        // taken - which is why fHouseChanged stays false here.
+        billOut = bill;
+        billOut.vchHolderPubKey = r.vchPayerPubKey;
         return true;
     }
 
@@ -2619,7 +3316,7 @@ static bool VerifyHouseApprovers(const CHouse& house, const std::vector<uint32_t
         const HousePartner& p = house.vPartner[vIndex[i]];
         if (p.status != HOUSE_PARTNER_ACTIVE)
             return state.DoS(100, false, REJECT_INVALID, reject);
-        if (!CPubKey(p.vchPubKey).Verify(sighash, vSig[i]))
+        if (!CPubKey(p.vchPubKey).VerifyStrict(sighash, vSig[i]))
             return state.DoS(100, false, REJECT_INVALID, reject);
     }
     return true;
@@ -2661,7 +3358,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         const uint256 declDigest = HouseDeclarationDigest(reg);
         for (size_t i = 0; i < reg.vPartnerPubKey.size(); i++) {
             const uint256 sighash = HouseRegisterSigHash(declDigest, i, reg.vPledgeAmount[i]);
-            if (!CPubKey(reg.vPartnerPubKey[i]).Verify(sighash, reg.vPartnerSig[i]))
+            if (!CPubKey(reg.vPartnerPubKey[i]).VerifyStrict(sighash, reg.vPartnerSig[i]))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-register-sig");
         }
 
@@ -2720,7 +3417,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         // Signature binds the exact output set (escrow value + destination)
         const uint256 sighash = HouseTopupSigHash(house.houseID, topup.nPartnerIndex, BillHashOutputs(tx));
-        if (!CPubKey(partner.vchPubKey).Verify(sighash, topup.vchSig))
+        if (!CPubKey(partner.vchPubKey).VerifyStrict(sighash, topup.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-topup-sig");
 
         partner.amountPledge += tx.vout[0].nValue;
@@ -2758,7 +3455,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         // New partner accepts (binds own key + pledge); M active partners approve
         const uint256 sighash = HouseAdmitSigHash(house.houseID, admit.vchNewPubKey, tx.vout[0].nValue);
-        if (!CPubKey(admit.vchNewPubKey).Verify(sighash, admit.vchNewSig))
+        if (!CPubKey(admit.vchNewPubKey).VerifyStrict(sighash, admit.vchNewSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-admit-new-sig");
         if (!VerifyHouseApprovers(house, admit.vApproverIndex, admit.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-admit-approver"))
@@ -2818,7 +3515,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         const uint256 sighash = HouseExitSigHash(house.houseID, ex.nPartnerIndex, BillHashOutputs(tx));
         bool fAuthorized = false;
         if (!ex.vchPartnerSig.empty()) {
-            if (!CPubKey(partner.vchPubKey).Verify(sighash, ex.vchPartnerSig))
+            if (!CPubKey(partner.vchPubKey).VerifyStrict(sighash, ex.vchPartnerSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-sig");
             fAuthorized = true;
         }
@@ -2942,7 +3639,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
             // The trigger partner signs the exact (forced) output set
             const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, BillHashOutputs(tx));
-            if (!CPubKey(partner.vchPubKey).Verify(sighash, rec.vchSig))
+            if (!CPubKey(partner.vchPubKey).VerifyStrict(sighash, rec.vchSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
 
             // Every still-live escrow coin (pledges + claim change) must be
@@ -3079,7 +3776,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         // The partner signs the exact output set - destination is their choice
         const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, BillHashOutputs(tx));
-        if (!CPubKey(partner.vchPubKey).Verify(sighash, rec.vchSig))
+        if (!CPubKey(partner.vchPubKey).VerifyStrict(sighash, rec.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
 
         // Prune the reclaimed outpoints (those spent by this tx) from the
@@ -3187,13 +3884,19 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         house.nLastAttestHeight = (uint32_t)nHeight;
         house.amountLastAttestReserves = att.amountReserves;
 
-        // Match-funding rule (Phase 3.8, attestation-checked): the deposits'
-        // weighted-average maturity must be >= that of the deposit-funded loan
-        // slice, so a house cannot fund long assets with short money. VACUOUS in
-        // v1 (the loan slice is 0 - no discounting op exists), so this never
-        // fires; it ships now and enforces for real when discounting lands.
-        if (!HouseMatchFundingOK(house, nHeight))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-attest-match-funding");
+        // Match-funding is NOT gated here (B1 check 36, OD-4). The hard reject
+        // that used to sit at this line - bad-house-attest-match-funding - is
+        // deleted: a house whose book has drifted out of match must ALWAYS be
+        // able to publish its numbers. Gating attestation on it created an
+        // un-attestable deadlock, and coupling it to the stress origin put a
+        // fully-reserved house on a 1,008-block clock to a waterfall with every
+        // cure closed. The rule now lives only on the two ops that MOVE an
+        // operand of it - BILL_OP_DISCOUNT and DEPOSIT_OP_ORIGINATE - as a
+        // post-state gate. It is derived, non-terminal and self-curing:
+        // withdrawal, redemption, exit and attestation are never gated.
+        // (Deleting it cannot change any historical block: pre-B1 the loan book
+        // is identically 0, so the slice is 0 and the predicate was vacuously
+        // true - it never rejected anything.)
 
         houseOut = house;
         return true;
@@ -3469,7 +4172,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // The sender authorizes the exact split + destinations (this is what
         // binds the trailer payload the legacy input sighash does not cover).
-        if (!CPubKey(xfer.vchSenderPubKey).Verify(
+        if (!CPubKey(xfer.vchSenderPubKey).VerifyStrict(
                 NoteTransferSigHash(xfer.nHouseID, xfer.vUnits, hashOutputs), xfer.vchSenderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-transfer-sig");
         return true; // no house-state change
@@ -3501,12 +4204,46 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-house-closed");
         }
 
-        // The holder authorizes burning U units AND (by binding hashOutputs)
-        // the exact payout - so they never surrender notes without the payment
-        // they signed for.
-        if (!CPubKey(redeem.vchHolderPubKey).Verify(
-                NoteRedeemSigHash(redeem.nHouseID, nNoteUnitsIn, hashOutputs), redeem.vchHolderSig))
-            return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-sig");
+        // Authorization, two modes (B3 T-b3):
+        // - PLAIN: the holder authorizes burning U units AND (by binding
+        //   hashOutputs) the exact payout - so they never surrender notes
+        //   without the payment they signed for.
+        // - DISCHARGE: the house executes the holder's STANDING authorisation
+        //   alone. The demand-time signature binds (house, unit vector, payout
+        //   script) - NOT this tx's outputs, which did not exist when it was
+        //   signed. What protects the holder instead is the consensus floor
+        //   and the exact-script payout below; what protects the house is that
+        //   the digest verifies against the holder key the burned coins'
+        //   custody scripts pin (tx_verify), so only the real authorisation
+        //   can move these coins.
+        if (redeem.fPreAuthDischarge) {
+            // The vector is re-supplied verbatim because the digest binds the
+            // VECTOR, unreconstructable from an unordered burned-coin set; the
+            // sum equality pins it to exactly these coins, so a discharge can
+            // neither short a demand nor batch strangers' units under one sig.
+            // (This also makes a discharge all-or-nothing per demand.)
+            uint64_t nAuthTotal = 0;
+            for (const uint64_t u : redeem.vPreAuthUnits)
+                nAuthTotal += u;   // overflow-checked at shape (SumNoteUnits)
+            if (nAuthTotal != nNoteUnitsIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sum");
+            if (!CPubKey(redeem.vchHolderPubKey).VerifyStrict(
+                    NotePreAuthSigHash(redeem.nHouseID, redeem.vPreAuthUnits, redeem.vchPayoutScript),
+                    redeem.vchPreAuthSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sig-invalid");
+        } else {
+            if (!CPubKey(redeem.vchHolderPubKey).VerifyStrict(
+                    NoteRedeemSigHash(redeem.nHouseID, nNoteUnitsIn, hashOutputs), redeem.vchHolderSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-sig");
+        }
+
+        // Brassage inputs, computed ONCE here because the discharge floor
+        // below needs the spread before the brassage block enforces it (the
+        // runner bears the spread - sheet delta-2: a discharge floor of
+        // U + interest with no spread deduction would make demand-then-
+        // discharge the universal brassage bypass below rho).
+        const uint32_t nBrassageBps = HouseBrassageBps(house);
+        const CAmount amountBrassageSpread = HouseBrassageAmount(nNoteUnitsIn, nBrassageBps);
 
         // DEFERRAL INTEREST (3.5 D6). Redeeming notes that were DEMANDED during
         // a suspension pays principal + 5%/yr accrued from the DATE OF DEMAND -
@@ -3516,14 +4253,31 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // has been queued for months is exactly the party with no bargaining
         // power left.
         {
-            uint32_t nDemandHeight = 0;
+            // One pass over the inputs: the (uniform) demand tag for the
+            // interest clock, and the count of PROTESTED coins for the D-v
+            // decrement below. THE TAG IS READ MASKED from here on - the raw
+            // field carries the B3 marker bits, and the first cut of this code
+            // read it raw, which on a pre-auth coin (bit 31 set) made
+            // nDemandHeight ~2^31, the accrual window compute as zero, and the
+            // interest floor vanish on exactly the coins B3 exists to protect.
+            uint32_t nDemandTag = 0;
+            uint32_t nProtestedBurned = 0;
             for (const CTxIn& in : tx.vin) {
                 Coin coin;
-                if (fnGetCoin(in.prevout, coin) && coin.fNote && coin.nDemandHeight != 0) {
-                    nDemandHeight = coin.nDemandHeight;   // tx_verify: uniform across inputs
-                    break;
-                }
+                if (!fnGetCoin(in.prevout, coin) || !coin.fNote)
+                    continue;
+                if (coin.nDemandHeight != 0 && nDemandTag == 0)
+                    nDemandTag = coin.nDemandHeight;   // tx_verify: uniform across inputs (marker normalized for a discharge)
+                if (NoteDemandIsProtested(coin.nDemandHeight))
+                    nProtestedBurned++;
             }
+            const uint32_t nDemandHeight = NoteDemandHeightOf(nDemandTag);
+            // A discharge with no demanded inputs is unreachable (tx_verify
+            // rejects it before contextual runs in every acceptance path);
+            // the belt exists so the floor logic below can never be skipped
+            // by a path this function cannot see.
+            if (redeem.fPreAuthDischarge && nDemandHeight == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-not-preauth");
             if (nDemandHeight != 0) {
                 // DR-2: the interest window is capped at the END of the deferral
                 // episode (the recovery attestation's height). The clause
@@ -3545,19 +4299,79 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 if (house.nDeferEndedHeight >= nDemandHeight &&
                         house.nDeferEndedHeight < nEndHeight)
                     nEndHeight = house.nDeferEndedHeight;
-                const uint32_t nBlocks = nEndHeight > nDemandHeight
-                                       ? nEndHeight - nDemandHeight : 0;
+                // D-iii (operator-signed 2026-08-04): a PRE-AUTH demand's clock
+                // starts at window LAPSE, not at demand - "pay in a week and it
+                // costs you par". This is what retires the shipped objection at
+                // the DEMAND status gate ("an interest clock the house never
+                // agreed to"): inside the window the house owes principal only.
+                // A plain (Deferred-era) demand keeps from-demand accrual
+                // untouched - that clock belongs to the option clause, not B3.
+                uint32_t nAccrualStart = nDemandHeight;
+                if (NoteDemandIsPreAuth(nDemandTag))
+                    nAccrualStart += Params().GetConsensus().nDemandWindow;
+                const uint32_t nBlocks = nEndHeight > nAccrualStart
+                                       ? nEndHeight - nAccrualStart : 0;
                 const CAmount amountInterest = NoteDeferralInterest(nNoteUnitsIn, nBlocks);
-                const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest;
-                // Sum everything paid to the holder's own script.
-                const CScript scriptHolder = NoteScriptForPubKey(redeem.vchHolderPubKey);
-                CAmount amountPaid = 0;
-                for (const CTxOut& out : tx.vout) {
-                    if (out.scriptPubKey == scriptHolder)
-                        amountPaid += out.nValue;
+                if (redeem.fPreAuthDischarge) {
+                    // The discharge pays the PRE-AUTHORISED script, not the
+                    // holder-key script - that is the standing instruction the
+                    // holder signed. vout[0] must BE that script (deterministic
+                    // position, mirroring CLAIM), and everything paid to it
+                    // must reach the floor U + interest - spread: the RUNNER
+                    // bears the brassage (sheet delta-2), spread to the pot via
+                    // the ordinary brassage block below, so the house's total
+                    // outlay is U + interest either way.
+                    const CScript scriptPayout(redeem.vchPayoutScript.begin(), redeem.vchPayoutScript.end());
+                    if (tx.vout[0].scriptPubKey != scriptPayout)
+                        return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-payout-script");
+                    const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest - amountBrassageSpread;
+                    CAmount amountPaid = 0;
+                    for (const CTxOut& out : tx.vout) {
+                        if (out.scriptPubKey == scriptPayout)
+                            amountPaid += out.nValue;
+                    }
+                    if (amountPaid < amountDue)
+                        return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-interest-short");
+                } else {
+                    const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest;
+                    // Sum everything paid to the holder's own script.
+                    const CScript scriptHolder = NoteScriptForPubKey(redeem.vchHolderPubKey);
+                    CAmount amountPaid = 0;
+                    for (const CTxOut& out : tx.vout) {
+                        if (out.scriptPubKey == scriptHolder)
+                            amountPaid += out.nValue;
+                    }
+                    if (amountPaid < amountDue)
+                        return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-interest-short");
                 }
-                if (amountPaid < amountDue)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-interest-short");
+            }
+            // D-v decrement: burning PROTESTED coins retires their share of the
+            // open-protest count, and the origin fields clear ONLY at zero -
+            // one continuous insolvency clock until the protested queue is
+            // GENUINELY clear (house.cpp T4: "the window clock never resets
+            // without a real recovery"). Counted per COIN, not per protest op:
+            // the counter is incremented by the number of marked coins a
+            // protest re-issues, so per-coin decrement is the exact inverse
+            // and partial-protest splits stay conserved. Applies to BOTH
+            // redeem modes - a voluntary holder-signed redeem satisfies the
+            // demand just as fully as a discharge. (CLAIM does not decrement:
+            // effective-Insolvent is terminal and the waterfall has replaced
+            // the protest machinery outright.) The clamp is defensive only -
+            // exact bookkeeping cannot underflow - because a REJECT here would
+            // let a counter bug brick redemption for every holder of the
+            // house, which is strictly worse than a wrong counter.
+            if (nProtestedBurned > 0) {
+                house.nProtestOpen = house.nProtestOpen > nProtestedBurned
+                                   ? house.nProtestOpen - nProtestedBurned : 0;
+                // T-b5: the heights are NOT cleared at zero - they go INERT
+                // (every consumer gates on ProtestLive()) and the next FRESH
+                // episode overwrites them (the PROTEST arm branches on the
+                // counter). This is what makes the reorg path exact and O(1):
+                // DisconnectBlock recounts marked burns from the undo coins
+                // and re-adds - no height restore is needed because no height
+                // was written. Clearing here would strand the pre-clear
+                // values (sticky-earliest, from protests whose coins were
+                // burned in EARLIER txs) beyond any undo data this tx has.
             }
         }
 
@@ -3579,8 +4393,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // Deferred - is equivalent: redemption is blocked at Deferred above,
         // so the gate can never pass here.)
         {
-            const uint32_t nBps = HouseBrassageBps(house);
-            const CAmount amountSpread = HouseBrassageAmount(nNoteUnitsIn, nBps);
+            const CAmount amountSpread = amountBrassageSpread;   // hoisted above (the discharge floor needs it first)
 
             const CScript scriptEscrow = HouseEscrowScript(house.houseID);
             if (amountSpread > 0) {
@@ -3627,21 +4440,142 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!fnGetHouse(dem.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
 
-        // A demand is only meaningful while the clause is running: at Open or
-        // Stressed the holder simply REDEEMS at par (and lodging a demand there
-        // would be a way to start an interest clock the house never agreed to),
-        // and at Insolvent the pro-rata waterfall replaces redemption.
-        if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_DEFERRED)
-            return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-not-deferred");
+        // One op, two modes, keyed on house status (B3 T-b3):
+        // - DEFERRED: the option clause is running; today's semantics byte-for-
+        //   byte - the holder queues, plain, and a pre-auth here is FORBIDDEN
+        //   (the clause's own machinery governs; grafting a discharge path
+        //   onto it would fork the queue's payout discipline).
+        // - OPEN / STRESSED: the B3 formal demand - pre-auth REQUIRED. The old
+        //   objection ("a demand at Open starts an interest clock the house
+        //   never agreed to") is retired by D-iii: inside the window the house
+        //   owes par exactly, and the clock the house DID agree to - by being
+        //   a note issuer - starts only when it lets the demand lapse.
+        // - INSOLVENT / wound down: the waterfall (or nothing) has replaced
+        //   redemption; nothing to demand.
+        {
+            const char chEff = HouseEffectiveStatus(house, nHeight);
+            if (chEff == HOUSE_STATUS_DEFERRED) {
+                if (dem.fPreAuth)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-forbidden");
+            } else if (chEff == HOUSE_STATUS_OPEN || chEff == HOUSE_STATUS_STRESSED) {
+                if (!dem.fPreAuth)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-required");
+            } else {
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-house-closed");
+            }
+        }
 
         // The holder authorizes the exact re-issue (units + outputs).
-        if (!CPubKey(dem.vchHolderPubKey).Verify(
+        if (!CPubKey(dem.vchHolderPubKey).VerifyStrict(
                 NoteDemandSigHash(dem.nHouseID, dem.vUnits, hashOutputs), dem.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-sig");
 
+        if (dem.fPreAuth) {
+            // The STANDING authorisation must verify NOW, at demand time - a
+            // demand carrying a bad pre-auth sig would be a claim the house
+            // can never discharge, and the teeth would fire against a house
+            // that was never actually authorized to pay.
+            if (!CPubKey(dem.vchHolderPubKey).VerifyStrict(
+                    NotePreAuthSigHash(dem.nHouseID, dem.vUnits, dem.vchPayoutScript), dem.vchPreAuthSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-sig-invalid");
+            // The payout script must not be THIS house's escrow script: the
+            // discharge's stray-escrow rule (an untracked escrow-script output
+            // would enter the UTXO set anyone-can-spend) makes such a payout
+            // UNBUILDABLE, so accepting the demand would hand the holder a
+            // claim whose non-payment is guaranteed - protest teeth against a
+            // house that cannot comply. Reject the poison at the door.
+            const CScript scriptPayout(dem.vchPayoutScript.begin(), dem.vchPayoutScript.end());
+            if (scriptPayout == HouseEscrowScript(house.houseID))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-script-escrow");
+            // The re-issue must land on the DEMANDING HOLDER's custody script
+            // exactly (shape only proved custody-shaped): the protest pin and
+            // the discharge digest both resolve through the keyid embedded
+            // here, so a stranger's keyid would strand the coins.
+            const CScript scriptCustody = NotePreAuthScript(dem.vchHolderPubKey);
+            for (size_t i = 0; i < dem.vUnits.size(); i++) {
+                if (tx.vout[i].scriptPubKey != scriptCustody)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-custody-script");
+            }
+        }
+
         // No house state changes: the units stay outstanding (a demanded note
         // is still a liability), so a demand does NOT take the one-op-per-house
-        // slot and any number of holders can queue in the same block.
+        // slot and any number of holders can queue in the same block. True in
+        // BOTH modes - the pre-auth writes nothing onto CHouse either; only a
+        // PROTEST does.
+        return true;
+    }
+
+    if (tx.nNoteOp == NOTE_OP_PROTEST) {
+        NoteProtest pro;
+        if (!DecodeNotePayload(tx.vchNotePayload, pro))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-payload");
+
+        CHouse house;
+        if (!fnGetHouse(pro.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+
+        // Valid at Open or Stressed only: at Deferred the option clause
+        // already governs (its queue is the declared, compensated form of
+        // exactly this grievance), and at effective Insolvent the waterfall
+        // has it. A protest at Stressed is deliberate - stress from one origin
+        // does not silence protests from another; the origins merge
+        // earliest-wins (T-b4).
+        {
+            const char chEff = HouseEffectiveStatus(house, nHeight);
+            if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-status");
+        }
+
+        // The window edge, INCLUSIVE at D + W: the sheet's "sat undischarged
+        // for HOUSE_DEMAND_WINDOW blocks" is first true at exactly that
+        // height. tx_verify has pinned pro.nDemandTag to the spent coins'
+        // tag (with the marker added), so the height read here is the real
+        // demand's; the zero check is defensive depth only.
+        const uint32_t nDemandH = NoteDemandHeightOf(pro.nDemandTag);
+        if (nDemandH == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-tag");
+        if ((int64_t)nHeight < (int64_t)nDemandH + (int64_t)Params().GetConsensus().nDemandWindow)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-early");
+
+        // Undo contract (the nPrevLastActivation idiom): the payload's priors
+        // must equal the record being overwritten, so a disconnect can restore
+        // it from the payload alone.
+        if (pro.nPrevProtestOpen != house.nProtestOpen ||
+                pro.nPrevProtestHeight != house.nProtestHeight ||
+                pro.nPrevProtestDemandHeight != house.nProtestDemandHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-prior");
+
+        // The holder authorizes the exact re-issue (units + outputs). With the
+        // coins in custody this signature IS the standing proof - the
+        // scriptSig is empty by design.
+        if (!CPubKey(pro.vchHolderPubKey).VerifyStrict(
+                NoteProtestSigHash(pro.nHouseID, pro.vUnits, hashOutputs), pro.vchHolderSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-sig");
+
+        // Custody preserved, same holder (shape proved custody-SHAPED only).
+        const CScript scriptCustody = NotePreAuthScript(pro.vchHolderPubKey);
+        for (size_t i = 0; i < pro.vUnits.size(); i++) {
+            if (tx.vout[i].scriptPubKey != scriptCustody)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-custody-script");
+        }
+
+        // Effects (D-v, the COUNTER): +1 per marked coin re-issued - the exact
+        // inverse of the REDEEM decrement, which counts marked coins burned.
+        // A FRESH episode (counter at zero - any heights present are inert
+        // leftovers of a fully-discharged queue, T-b5) OVERWRITES the
+        // heights; a LIVE episode takes sticky-earliest, so a later protest
+        // never advances the insolvency clock (house.cpp T4: the clock never
+        // resets without a real recovery).
+        const uint32_t nNewMarks = (uint32_t)pro.vUnits.size();
+        const bool fFreshEpisode = house.nProtestOpen == 0;
+        house.nProtestOpen += nNewMarks;   // bounded: <= MAX_NOTE_OUTPUTS per op, one op per house per block
+        if (fFreshEpisode || (uint32_t)nHeight < house.nProtestHeight)
+            house.nProtestHeight = (uint32_t)nHeight;
+        if (fFreshEpisode || nDemandH < house.nProtestDemandHeight)
+            house.nProtestDemandHeight = nDemandH;
+        houseOut = house;
+        fHouseChanged = true;
         return true;
     }
 
@@ -3660,7 +4594,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // The holder authorizes burning U units AND (hashOutputs) the exact
         // payout + escrow change they computed.
-        if (!CPubKey(claim.vchHolderPubKey).Verify(
+        if (!CPubKey(claim.vchHolderPubKey).VerifyStrict(
                 NoteClaimSigHash(claim.nHouseID, nNoteUnitsIn, hashOutputs), claim.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-sig");
 
@@ -3794,6 +4728,20 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
 
         house.nDepositUnits += total;
         house.SetDepositWtMaturity(house.DepositWtMaturity() + wtDelta);
+
+        // Post-state match funding (B1 check 36, OD-4). ORIGINATE is one of the
+        // two ops that MOVE an operand of the rule - it lengthens or shortens
+        // the deposit side - so it must leave the rule satisfied, exactly as a
+        // DISCOUNT must on the loan side. Its counterpart, the hard reject at
+        // HOUSE_OP_ATTEST, is deleted: publishing your numbers is never gated.
+        // WITHDRAW is deliberately NOT gated either - a depositor's contractual
+        // exit is never hostage to the house's book, and deposit maturation is
+        // the one way a violation self-cures.
+        // Cannot fire on any historical block: pre-B1 the loan book is 0, so the
+        // slice is 0 and the predicate is vacuously true.
+        if (!HouseMatchFundingOK(house, nHeight))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-originate-match-funding");
+
         houseOut = house;
         fHouseChanged = true;
         return true;
@@ -3823,7 +4771,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-transfer-terms-mismatch");
         // The sender authorizes the exact terms + destination (hashOutputs). This
         // binds the trailer payload the legacy input sighash does not cover.
-        if (!CPubKey(x.vchSenderPubKey).Verify(
+        if (!CPubKey(x.vchSenderPubKey).VerifyStrict(
                 DepositTransferSigHash(x.nHouseID, x.nPrincipal, x.nRateBps, x.nMaturityHeight,
                     x.nOriginationHeight, hashOutputs),
                 x.vchSenderSig))
@@ -3882,7 +4830,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // The holder authorizes the exact payout (binds hashOutputs) AND supplies
         // the P2PKH scriptSig on the burned receipt (SIGHASH_ALL) - both bind the
         // output set, so they never surrender the receipt without the payout.
-        if (!CPubKey(wd.vchHolderPubKey).Verify(
+        if (!CPubKey(wd.vchHolderPubKey).VerifyStrict(
                 DepositWithdrawSigHash(wd.nHouseID, receipt.nDepositPrincipal, receipt.nDepositMaturityHeight,
                     receipt.nDepositOriginationHeight, hashOutputs),
                 wd.vchHolderSig))
@@ -3924,7 +4872,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
 
         // The holder authorizes burning the receipt AND (hashOutputs) the exact
         // payout + escrow change.
-        if (!CPubKey(clm.vchHolderPubKey).Verify(
+        if (!CPubKey(clm.vchHolderPubKey).VerifyStrict(
                 DepositClaimSigHash(clm.nHouseID, receipt.nDepositPrincipal, hashOutputs), clm.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-sig");
 
@@ -4050,7 +4998,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         // The creator (who funds the seed and receives the LP coin) binds the
         // trailer to THIS tx; their note inputs' P2PKH scriptSigs authorize
         // the coins, this sig authorizes the pool semantics.
-        if (!CPubKey(create.vchCreatorPubKey).Verify(sighash, create.vchCreatorSig))
+        if (!CPubKey(create.vchCreatorPubKey).VerifyStrict(sighash, create.vchCreatorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-create-creator-sig");
 
         uint64_t toCreator = 0, supply0 = 0;
@@ -4117,7 +5065,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
             const HousePartner& partner = house.vPartner[ret.nTriggerPartnerIndex];
             if (partner.status == HOUSE_PARTNER_SETTLED)
                 return state.DoS(100, false, REJECT_INVALID, "bad-pool-retire-trigger-settled");
-            if (!CPubKey(partner.vchPubKey).Verify(sighash, ret.vchTriggerSig))
+            if (!CPubKey(partner.vchPubKey).VerifyStrict(sighash, ret.vchTriggerSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-pool-retire-trigger-sig");
         } else {
             if (!VerifyHouseApprovers(house, ret.vApproverIndex, ret.vApproverSig,
@@ -4206,7 +5154,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         return state.DoS(100, false, REJECT_INVALID, "bad-pool-wrong-escrow-outpoint");
 
     if (tx.nPoolOp == POOL_OP_ADD_LIQ) {
-        if (!CPubKey(add.vchProviderPubKey).Verify(PoolAddLiqSigHash(add, hashPrevouts, hashOutputs),
+        if (!CPubKey(add.vchProviderPubKey).VerifyStrict(PoolAddLiqSigHash(add, hashPrevouts, hashOutputs),
                 add.vchProviderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-add-sig");
         // The min-rule formula was verified context-free (payload-pure).
@@ -4215,7 +5163,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         pool.nLpSupply += add.nLpMinted;
     }
     else if (tx.nPoolOp == POOL_OP_REMOVE_LIQ) {
-        if (!CPubKey(rem.vchProviderPubKey).Verify(PoolRemoveLiqSigHash(rem, hashPrevouts, hashOutputs),
+        if (!CPubKey(rem.vchProviderPubKey).VerifyStrict(PoolRemoveLiqSigHash(rem, hashPrevouts, hashOutputs),
                 rem.vchProviderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-remove-sig");
         // The redeem formula was verified context-free (payload-pure).
@@ -4224,7 +5172,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         pool.nLpSupply -= rem.nBurnLp;
     }
     else { // POOL_OP_SWAP
-        if (!CPubKey(swap.vchTraderPubKey).Verify(PoolSwapSigHash(swap, hashPrevouts, hashOutputs),
+        if (!CPubKey(swap.vchTraderPubKey).VerifyStrict(PoolSwapSigHash(swap, hashPrevouts, hashOutputs),
                 swap.vchTraderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-swap-sig");
         // The x*y=k formula needs the pool's STORED fee - the one check that
@@ -4339,8 +5287,8 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     if (!VerifyHouseApprovers(houseB, x.vApproverIndexB, x.vApproverSigB,
             sighash, houseB.nThresholdM, state, "bad-settle-approver"))
         return false;
-    if (!CPubKey(x.vchPresentKeyOfANotes).Verify(sighash, x.vchPresentSigOfANotes) ||
-            !CPubKey(x.vchPresentKeyOfBNotes).Verify(sighash, x.vchPresentSigOfBNotes))
+    if (!CPubKey(x.vchPresentKeyOfANotes).VerifyStrict(sighash, x.vchPresentSigOfANotes) ||
+            !CPubKey(x.vchPresentKeyOfBNotes).VerifyStrict(sighash, x.vchPresentSigOfBNotes))
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
 
     // Mutations for the caller to stage: REDEEM semantics, twice, atomically -
@@ -4430,7 +5378,7 @@ bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int n
         // (4) the submitter's signature over the shared digest.
         CPubKey pubkey(sub.vchPubKey);
         if (!pubkey.IsFullyValid() ||
-                !pubkey.Verify(OracleSubmitSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
+                !pubkey.VerifyStrict(OracleSubmitSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
 
         subOut = sub;
@@ -4476,7 +5424,7 @@ bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int n
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-id-seed");
         CPubKey pubkey(x.vchSubmitterPubKey);
         if (!pubkey.IsFullyValid() ||
-                !pubkey.Verify(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
+                !pubkey.VerifyStrict(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
         subOut = COracleSubmitter();
         subOut.nSubmitterID = nNextSubmitterID;
@@ -4517,7 +5465,7 @@ bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int n
     }
     CPubKey pubkey(x.vchSubmitterPubKey);
     if (!pubkey.IsFullyValid() ||
-            !pubkey.Verify(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
+            !pubkey.VerifyStrict(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
         return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
     subOut = sub;
     subOut.bondOutpoint = COutPoint(tx.GetHash(), 0);
@@ -4789,6 +5737,15 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     bool fHouseUndo = false;
     bool fBillUndo = false;
     bool fPoolUndo = false;
+    // D-3: the deposit DB's equivalent of those markers IS its baseline
+    // pointer. fSideDB alone cannot tell a real tip-down disconnect (DB holds
+    // this block's deposit state) from a ReplayBlocks crash-rollback AFTER a
+    // completed reorg (DB already at the NEW tip) - and in the latter the
+    // revert would erase a row the new branch legitimately owns and drag the
+    // pointer back to an abandoned fork, with RollforwardBlock restoring
+    // neither. Require the DB to demonstrably hold this block's as-of value.
+    // Also makes a repeated disconnect idempotent.
+    bool fDepositUndo = false;
     if (fSideDB) {
         uint256 hashHouseBest;
         const bool fHaveHouseMarker = phousetree->GetBestBlock(hashHouseBest) && !hashHouseBest.IsNull();
@@ -4799,7 +5756,42 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         uint256 hashPoolBest;
         const bool fHavePoolMarker = ppooltree->GetBestBlock(hashPoolBest) && !hashPoolBest.IsNull();
         fPoolUndo = !fHavePoolMarker || hashPoolBest == pindex->GetBlockHash();
+        uint256 hashDepositLast;
+        const bool fHaveDepositPtr = psidechaintree->GetLastDepositID(hashDepositLast);
+        fDepositUndo = fHaveDepositPtr ? (hashDepositLast == pindex->hashLastDeposit)
+                                       : pindex->hashLastDeposit.IsNull();
     }
+
+    // D-3: sidechain deposits this block carried, collected during the walk
+    // below; their rows + the DB_LAST_SIDECHAIN_DEPOSIT baseline revert in one
+    // atomic batch after the loop (fSideDB only - real disconnects, never the
+    // VerifyDB throwaway pass).
+    std::vector<uint256> vDepositUndo;
+
+    // B1/R-3: the bill undo STAGES its reverted records and flushes them with
+    // the marker step-back in ONE atomic batch after the loop. Writing them
+    // individually and stepping the marker afterwards (as this loop used to)
+    // left a crash window in which the undo re-ran on restart and applied every
+    // non-idempotent inverse a second time - the ENDORSE arm popped
+    // vEndorsement twice and reassigned the holder from the wrong link. With
+    // one batch the marker moves if and only if the records did.
+    //
+    // The overlay is what the individual writes used to provide implicitly:
+    // two ops on the SAME bill can share a block, and the reverse walk must see
+    // the record as the later op's undo left it. mapBillUndo is consulted
+    // before BillDB for exactly that.
+    std::map<uint32_t, CBill> mapBillUndo;
+    std::vector<uint32_t> vBillUndoRemove;
+    bool fBillLastIDUndo = false;
+    uint32_t nBillLastIDUndo = 0;
+    auto fnGetBillUndo = [&](uint32_t nID, CBill& bill) {
+        std::map<uint32_t, CBill>::const_iterator it = mapBillUndo.find(nID);
+        if (it != mapBillUndo.end()) {
+            bill = it->second;
+            return true;
+        }
+        return pbilltree->GetBill(nID, bill);
+    };
 
     // undo transactions in reverse order
     for (int i = block.vtx.size() - 1; i >= 0; i--) {
@@ -4828,26 +5820,24 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
             if (tx.nBillOp == BILL_OP_ISSUE) {
                 uint32_t nIDLast = 0;
                 pbilltree->GetLastBillID(nIDLast);
+                if (fBillLastIDUndo)
+                    nIDLast = nBillLastIDUndo;      // a later ISSUE already undone
 
                 CBill bill;
-                if (!pbilltree->GetBill(nIDLast, bill) || bill.txidIssue != hash) {
+                if (!fnGetBillUndo(nIDLast, bill) || bill.txidIssue != hash) {
                     error("DisconnectBlock(): Bill issue undo mismatch!");
                     return DISCONNECT_FAILED;
                 }
-                if (!pbilltree->RemoveBill(nIDLast)) {
-                    error("DisconnectBlock(): Failed to remove bill!");
-                    return DISCONNECT_FAILED;
-                }
-                if (!pbilltree->WriteLastBillID(nIDLast - 1)) {
-                    error("DisconnectBlock(): Failed to undo bill ID #!");
-                    return DISCONNECT_FAILED;
-                }
+                mapBillUndo.erase(nIDLast);
+                vBillUndoRemove.push_back(nIDLast);
+                fBillLastIDUndo = true;
+                nBillLastIDUndo = nIDLast - 1;
             }
             else if (tx.nBillOp == BILL_OP_ENDORSE) {
                 BillEndorse endorse;
                 CBill bill;
                 if (!DecodeBillPayload(tx.vchBillPayload, endorse) ||
-                        !pbilltree->GetBill(endorse.nBillID, bill) ||
+                        !fnGetBillUndo(endorse.nBillID, bill) ||
                         bill.vEndorsement.empty()) {
                     error("DisconnectBlock(): Failed to undo bill endorsement!");
                     return DISCONNECT_FAILED;
@@ -4871,10 +5861,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     error("DisconnectBlock(): Failed to restore bill title outpoint!");
                     return DISCONNECT_FAILED;
                 }
-                if (!pbilltree->WriteBill(bill)) {
-                    error("DisconnectBlock(): Failed to write bill endorsement undo!");
-                    return DISCONNECT_FAILED;
-                }
+                mapBillUndo[bill.nBillID] = bill;
             }
             else if (tx.nBillOp == BILL_OP_RETIRE || tx.nBillOp == BILL_OP_CLAIM) {
                 uint32_t nBillID = 0;
@@ -4895,15 +5882,170 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
 
                 CBill bill;
-                if (!pbilltree->GetBill(nBillID, bill)) {
+                if (!fnGetBillUndo(nBillID, bill)) {
                     error("DisconnectBlock(): Failed to load bill for status undo!");
                     return DISCONNECT_FAILED;
                 }
                 bill.status = BILL_STATUS_ACTIVE;
-                if (!pbilltree->WriteBill(bill)) {
-                    error("DisconnectBlock(): Failed to write bill status undo!");
+                mapBillUndo[bill.nBillID] = bill;
+            }
+            //
+            // B1 (Phase 3.9). Every one of these is RESTORE-TO-VALUE from the
+            // payload's priors rather than apply-inverse, so a repeated
+            // disconnect is a no-op even before the atomic batch below.
+            //
+            else if (tx.nBillOp == BILL_OP_DISCOUNT) {
+                BillDiscount d;
+                CBill bill;
+                if (!DecodeBillPayload(tx.vchBillPayload, d) ||
+                        !fnGetBillUndo(d.nBillID, bill) ||
+                        bill.vEndorsement.empty()) {
+                    error("DisconnectBlock(): Failed to undo bill discount!");
                     return DISCONNECT_FAILED;
                 }
+                bill.vchHolderPubKey = bill.vEndorsement.back().vchFrom;
+                bill.vEndorsement.pop_back();
+                // Deterministic, not guessed: check 12 refused the discount
+                // unless the bill was unheld, so the pre-op value WAS 0.
+                bill.nOwnerHouseID = 0;
+
+                bill.outTitle.SetNull();
+                if (i > 0) {
+                    const CTxUndo& txundoBill = blockUndo.vtxundo[i - 1];
+                    for (size_t j = 0; j < tx.vin.size() && j < txundoBill.vprevout.size(); j++) {
+                        if (txundoBill.vprevout[j].fBill) {
+                            bill.outTitle = tx.vin[j].prevout;
+                            break;
+                        }
+                    }
+                }
+                if (bill.outTitle.IsNull()) {
+                    error("DisconnectBlock(): Failed to restore discounted bill title outpoint!");
+                    return DISCONNECT_FAILED;
+                }
+                mapBillUndo[bill.nBillID] = bill;
+            }
+            else if (tx.nBillOp == BILL_OP_RECOURSE) {
+                BillRecourse r;
+                CBill bill;
+                if (!DecodeBillPayload(tx.vchBillPayload, r) ||
+                        !fnGetBillUndo(r.nBillID, bill)) {
+                    error("DisconnectBlock(): Failed to undo bill recourse!");
+                    return DISCONNECT_FAILED;
+                }
+                // Subrogation reverses to the pinned prior holder and nothing
+                // else - no status, no owner, no house, no undo Coin. Two
+                // recourses on one bill in one block therefore unwind correctly
+                // in reverse: each carries its OWN prior.
+                bill.vchHolderPubKey = r.vchPrevHolderPubKey;
+                mapBillUndo[bill.nBillID] = bill;
+            }
+            else if (tx.nBillOp == BILL_OP_HRETIRE || tx.nBillOp == BILL_OP_HCLAIM) {
+                uint32_t nBillID = 0;
+                uint32_t nOwnerHouseID = 0;
+                if (tx.nBillOp == BILL_OP_HRETIRE) {
+                    BillHRetire h;
+                    if (!DecodeBillPayload(tx.vchBillPayload, h)) {
+                        error("DisconnectBlock(): Failed to decode bill hretire undo!");
+                        return DISCONNECT_FAILED;
+                    }
+                    nBillID = h.nBillID;
+                    nOwnerHouseID = h.nOwnerHouseID;
+                } else {
+                    BillHClaim h;
+                    if (!DecodeBillPayload(tx.vchBillPayload, h)) {
+                        error("DisconnectBlock(): Failed to decode bill hclaim undo!");
+                        return DISCONNECT_FAILED;
+                    }
+                    nBillID = h.nBillID;
+                    nOwnerHouseID = h.nOwnerHouseID;
+                }
+
+                CBill bill;
+                if (!fnGetBillUndo(nBillID, bill)) {
+                    error("DisconnectBlock(): Failed to load bill for house-held status undo!");
+                    return DISCONNECT_FAILED;
+                }
+                bill.status = BILL_STATUS_ACTIVE;
+                // The payload's owner id, which checks 28/29 pinned byte-exact
+                // to the pre-op record - so this restores a value, it does not
+                // reconstruct one.
+                bill.nOwnerHouseID = nOwnerHouseID;
+                mapBillUndo[bill.nBillID] = bill;
+            }
+        }
+
+        // Undo the HOUSE half of a v11 op, gated on the HouseDB marker
+        // INDEPENDENTLY of the bill undo above - the two side DBs disconnect on
+        // their own markers (the POOL_OP_RETIRE precedent below).
+        //
+        // The markers can legitimately disagree because the DBs are flushed in
+        // sequence and stepped back in sequence, never atomically WITH EACH
+        // OTHER: connect writes Bill then House, disconnect steps House back
+        // before Bill. A crash anywhere in either sequence leaves one marker on
+        // this block and the other on its parent. One shared gate would then
+        // either skip a revert that is owed - leaving nMintedUnits and
+        // nLoanBookFace inflated while that DB's marker still steps back - or
+        // repeat one that is not. (Repeating is harmless HERE only because the
+        // restore below is by value; it would not be for the shipped
+        // apply-inverse arms.)
+        //
+        // RECOURSE is absent on purpose: it mutates no house record at all.
+        if (fHouseUndo && tx.nVersion == TRANSACTION_BILL_VERSION &&
+                (tx.nBillOp == BILL_OP_DISCOUNT || tx.nBillOp == BILL_OP_HRETIRE ||
+                 tx.nBillOp == BILL_OP_HCLAIM)) {
+            uint32_t nHouseID = 0;
+            bool fHaveMinted = false;
+            uint64_t nPrevMinted = 0, nPrevFace = 0, nPrevWtHi = 0, nPrevWtLo = 0;
+            bool fDecoded = false;
+            if (tx.nBillOp == BILL_OP_DISCOUNT) {
+                BillDiscount d;
+                if (DecodeBillPayload(tx.vchBillPayload, d)) {
+                    nHouseID = d.nHouseID;
+                    fHaveMinted = true;
+                    nPrevMinted = d.nPrevMintedUnits;
+                    nPrevFace = d.nPrevLoanBookFace;
+                    nPrevWtHi = d.nPrevLoanWtMatHi;
+                    nPrevWtLo = d.nPrevLoanWtMatLo;
+                    fDecoded = true;
+                }
+            } else if (tx.nBillOp == BILL_OP_HRETIRE) {
+                BillHRetire h;
+                if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                    nHouseID = h.nOwnerHouseID;
+                    nPrevFace = h.nPrevLoanBookFace;
+                    nPrevWtHi = h.nPrevLoanWtMatHi;
+                    nPrevWtLo = h.nPrevLoanWtMatLo;
+                    fDecoded = true;
+                }
+            } else {
+                BillHClaim h;
+                if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                    nHouseID = h.nOwnerHouseID;
+                    nPrevFace = h.nPrevLoanBookFace;
+                    nPrevWtHi = h.nPrevLoanWtMatHi;
+                    nPrevWtLo = h.nPrevLoanWtMatLo;
+                    fDecoded = true;
+                }
+            }
+
+            CHouse house;
+            if (!fDecoded || !phousetree->GetHouse(nHouseID, house)) {
+                error("DisconnectBlock(): Failed to undo bill-op house effects!");
+                return DISCONNECT_FAILED;
+            }
+            // Restore-to-value, one prior per mutated field: idempotent under a
+            // repeated disconnect, which apply-inverse would not be. The
+            // one-op-per-house rule guarantees no other tx in this block touched
+            // this record, so a direct write cannot lose a sibling's effect.
+            if (fHaveMinted)
+                house.nMintedUnits = nPrevMinted;
+            house.nLoanBookFace = nPrevFace;
+            house.nLoanWtMatHi = nPrevWtHi;
+            house.nLoanWtMatLo = nPrevWtLo;
+            if (!phousetree->WriteHouse(house)) {
+                error("DisconnectBlock(): Failed to write bill-op house undo!");
+                return DISCONNECT_FAILED;
             }
         }
 
@@ -5449,11 +6591,15 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     return DISCONNECT_FAILED;
                 }
                 uint64_t U = 0;
+                uint32_t nMarkedBurned = 0;
                 if (i > 0) {
                     const CTxUndo& txundoNote = blockUndo.vtxundo[i - 1];
                     for (size_t j2 = 0; j2 < txundoNote.vprevout.size(); j2++) {
-                        if (txundoNote.vprevout[j2].fNote)
+                        if (txundoNote.vprevout[j2].fNote) {
                             U += txundoNote.vprevout[j2].nNoteUnits;
+                            if (txundoNote.vprevout[j2].nDemandHeight & NOTE_DEMAND_PROTESTED_BIT)
+                                nMarkedBurned++;
+                        }
                     }
                 }
                 if (U == 0 || house.nMintedUnits > (uint64_t)MAX_MONEY - U) {
@@ -5461,6 +6607,14 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     return DISCONNECT_FAILED;
                 }
                 house.nMintedUnits += U;
+                // B3 T-b5: re-add the protest marks this redeem retired -
+                // the exact inverse of the connect decrement (the undo coins
+                // carry the tag). The heights need no restore: the connect
+                // side never clears them (inert at zero, overwritten by the
+                // next fresh episode). If the connect-side defensive clamp
+                // ever fired this re-add would diverge - and the 2r/2v
+                // byte-compare gates are what catch that class.
+                house.nProtestOpen += nMarkedBurned;
                 // Drop the brassage outpoint this redeem added to the pot (3.5).
                 if (redeem.fBrassage) {
                     const COutPoint outBrassage(hash, 1);
@@ -5540,6 +6694,26 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write note claim undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nNoteOp == NOTE_OP_PROTEST) {
+                // B3 T-b5: priors restore from the payload alone (the ATTEST
+                // idiom) - connect verified all three against the DB record it
+                // overwrote, so this is byte-exact. The re-issued marked coins
+                // themselves revert via the generic CTxUndo machinery.
+                NoteProtest pro;
+                CHouse house;
+                if (!DecodeNotePayload(tx.vchNotePayload, pro) ||
+                        !phousetree->GetHouse(pro.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo note protest!");
+                    return DISCONNECT_FAILED;
+                }
+                house.nProtestOpen = pro.nPrevProtestOpen;
+                house.nProtestHeight = pro.nPrevProtestHeight;
+                house.nProtestDemandHeight = pro.nPrevProtestDemandHeight;
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write note protest undo!");
                     return DISCONNECT_FAILED;
                 }
             }
@@ -5756,6 +6930,12 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                         return DISCONNECT_FAILED;
                     }
                 }
+                else
+                if (fDepositUndo && obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
+                    // D-3: collect for the post-loop baseline revert + row erase
+                    const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
+                    vDepositUndo.push_back(deposit->GetID());
+                }
             }
 
             // If this output is a withdrawal bundle status update commit - undo the update
@@ -5816,6 +6996,24 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     // Revert the current withdrawal bundle hash
     psidechaintree->WriteLastWithdrawalBundleHash(pindex->pprev->hashWithdrawalBundle);
 
+    // D-3: revert the deposit-CTIP baseline. This block's deposits advanced
+    // DB_LAST_SIDECHAIN_DEPOSIT on connect and, unlike the bundle pointer one
+    // line up, had no revert - a reorged node kept a baseline pointing into
+    // the abandoned fork and split from every fresh sync (its own -reindex
+    // included) via invalid-deposit-input or a wrong payout delta. Restore
+    // pprev's cached baseline and erase this block's rows in one batch; the
+    // erase is what lets the template builder re-include these deposits on
+    // the new branch (miner.cpp HaveDepositNonAmount skips known rows).
+    // Only when the block actually carried deposits: a no-deposit disconnect
+    // never touched the pointer, so writing it would only propagate a null
+    // from a pre-D-3 index entry into a valid live baseline.
+    if (fDepositUndo && !vDepositUndo.empty()) {
+        if (!psidechaintree->WriteDepositDisconnect(vDepositUndo, pindex->pprev->hashLastDeposit)) {
+            error("DisconnectBlock(): Failed to revert deposit CTIP baseline!");
+            return DISCONNECT_FAILED;
+        }
+    }
+
     // Step the side-DB markers back with the undo (only where the undo ran)
     if (fPoolUndo) {
         uint256 hashPoolBest;
@@ -5833,12 +7031,29 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
             return DISCONNECT_FAILED;
         }
     }
+    // BillDB: the reverted records, the removals, the last-id rollback and the
+    // marker step-back all go down in ONE atomic batch (R-3 / F-B1b). Before
+    // this the records were written individually inside the loop and the marker
+    // moved afterwards, so a crash in between restarted with the marker still
+    // pointing at this block: the undo re-ran and applied every non-idempotent
+    // inverse twice - vEndorsement.pop_back() among them.
     if (fBillUndo) {
         uint256 hashBillBest;
-        if (pbilltree->GetBestBlock(hashBillBest) && !hashBillBest.IsNull() &&
-                !pbilltree->WriteBestBlock(pindex->pprev->GetBlockHash())) {
-            error("DisconnectBlock(): Failed to step BillDB best-block marker back!");
-            return DISCONNECT_FAILED;
+        const bool fHaveMarker = pbilltree->GetBestBlock(hashBillBest) && !hashBillBest.IsNull();
+        if (fHaveMarker || !mapBillUndo.empty() || !vBillUndoRemove.empty()) {
+            std::vector<CBill> vBillWrite;
+            for (const std::pair<const uint32_t, CBill>& p : mapBillUndo)
+                vBillWrite.push_back(p.second);
+            // A datadir with no marker at all (pre-3.4) keeps its old behaviour:
+            // records revert, and the marker stays absent rather than being
+            // created here as a null - which would look like a marker that had
+            // never applied any block.
+            const uint256 hashTarget = fHaveMarker ? pindex->pprev->GetBlockHash() : uint256();
+            if (!pbilltree->WriteBlockEffects(vBillWrite, vBillUndoRemove,
+                    fBillLastIDUndo ? &nBillLastIDUndo : nullptr, hashTarget)) {
+                error("DisconnectBlock(): Failed to write BillDB undo batch!");
+                return DISCONNECT_FAILED;
+            }
         }
     }
 
@@ -6308,7 +7523,20 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         //
         if (fCheckBMM && vDeposit.size()) {
             SidechainDeposit prev;
-            bool fHaveDeposits = psidechaintree->GetLastDeposit(prev);
+            bool fPointerSet = false;
+            bool fHaveDeposits = psidechaintree->GetLastDeposit(prev, &fPointerSet);
+
+            // Fail CLOSED on a dangling baseline (pointer set, row missing).
+            // The branch below treats !fHaveDeposits as "no deposits yet" and
+            // so skips the CTIP-input check with amountPrev = 0, which would
+            // size this payout at the whole cumulative CTIP. A dangling
+            // pointer means a corrupt deposit DB, never a valid chain state:
+            // halt and demand a rebuild instead of minting from the damage.
+            if (!fHaveDeposits && fPointerSet) {
+                return state.Error(strprintf("%s: deposit CTIP baseline is dangling (pointer set, "
+                                             "row missing) - deposit DB is corrupt; restart with "
+                                             "-reindex", __func__));
+            }
 
             CAmount amountPrev = CAmount(0);
             if (fHaveDeposits) {
@@ -6451,6 +7679,126 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 BillEndorse endorse;
                 if (DecodeBillPayload(tx.vchBillPayload, endorse))
                     nNewBillID = endorse.nBillID;
+            } else if (tx.nBillOp >= BILL_OP_DISCOUNT && tx.vchBillPayload.size() >= 4) {
+                // B1 ops 5-8 lead with nBillID (the same leading-4 read as
+                // RollforwardBlock's twin). Only a DISCOUNT creates a tagged
+                // output, but the arm is uniform so no future op can be omitted
+                // and silently drop a tag on the replay path.
+                memcpy(&nNewBillID, tx.vchBillPayload.data(), 4);
+            }
+
+            // THE DUAL-DB CRASH WINDOW. BillDB flushes before HouseDB in two
+            // non-atomic batches, so a crash between them leaves fBillDBReplay
+            // true and fHouseDBReplay false. The bill half of a v11 op is
+            // already applied; the HOUSE half is not, and the branch that would
+            // have applied it (CheckBillOperation) is skipped here. Without
+            // this arm the house effect is silently dropped, the HouseDB marker
+            // advances anyway, and the node diverges forever with an understated
+            // nMintedUnits - a supply divergence on the crashed node alone.
+            //
+            // Re-running CheckBillOperation is NOT an option: it would read the
+            // already-mutated bill and reject a canonical block. So the delta is
+            // re-derived from the PAYLOAD - priors give the pre-state, amountFace
+            // and nBillMaturityHeight give the change - and only the BASE record
+            // comes from the DB, which is legitimate precisely here because
+            // HouseDB is behind and therefore still holds the pre-block state.
+            // (Staging a default-constructed CHouse instead would flush a record
+            // with no partners, no escrow and no attestation snapshot.)
+            //
+            // DO NOT WIDEN THE !fHouseDBReplay GUARD. The GetHouse below is safe
+            // only while HouseDB is behind; drop that conjunct and the base
+            // record is the POST-state, so the delta gets applied twice.
+            if (!fHouseDBReplay &&
+                    (tx.nBillOp == BILL_OP_DISCOUNT || tx.nBillOp == BILL_OP_HRETIRE ||
+                     tx.nBillOp == BILL_OP_HCLAIM)) {
+                uint32_t nHouseID = 0;
+                bool fHaveMinted = false;
+                uint64_t nMinted = 0, nFace = 0;
+                uint64_t nPrevFace = 0, nPrevWtHi = 0, nPrevWtLo = 0;
+                uint32_t nBillMaturity = 0;
+                bool fAdd = false, fDecoded = false;
+                if (tx.nBillOp == BILL_OP_DISCOUNT) {
+                    BillDiscount d;
+                    if (DecodeBillPayload(tx.vchBillPayload, d)) {
+                        nHouseID = d.nHouseID;
+                        fHaveMinted = true;
+                        nMinted = d.nPrevMintedUnits + (uint64_t)d.amountPrice;
+                        nFace = (uint64_t)d.amountFace;
+                        nBillMaturity = d.nBillMaturityHeight;
+                        nPrevFace = d.nPrevLoanBookFace;
+                        nPrevWtHi = d.nPrevLoanWtMatHi;
+                        nPrevWtLo = d.nPrevLoanWtMatLo;
+                        fAdd = true;
+                        fDecoded = true;
+                    }
+                } else if (tx.nBillOp == BILL_OP_HRETIRE) {
+                    BillHRetire h;
+                    if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                        nHouseID = h.nOwnerHouseID;
+                        nFace = (uint64_t)h.amountFace;
+                        nBillMaturity = h.nBillMaturityHeight;
+                        nPrevFace = h.nPrevLoanBookFace;
+                        nPrevWtHi = h.nPrevLoanWtMatHi;
+                        nPrevWtLo = h.nPrevLoanWtMatLo;
+                        fDecoded = true;
+                    }
+                } else {
+                    BillHClaim h;
+                    if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                        nHouseID = h.nOwnerHouseID;
+                        nFace = (uint64_t)h.amountFace;
+                        nBillMaturity = h.nBillMaturityHeight;
+                        nPrevFace = h.nPrevLoanBookFace;
+                        nPrevWtHi = h.nPrevLoanWtMatHi;
+                        nPrevWtLo = h.nPrevLoanWtMatLo;
+                        fDecoded = true;
+                    }
+                }
+
+                // FAIL CLOSED on a decode failure. Doing nothing here would
+                // silently drop the house half while the HouseDB marker
+                // advances anyway - which is the exact supply divergence this
+                // arm exists to prevent. The disconnect twin fails closed too;
+                // the two must not diverge.
+                if (!fDecoded)
+                    return error("ConnectBlock(): replay could not decode bill op %s",
+                        tx.GetHash().ToString());
+                {
+                    CHouse house;
+                    if (!phousetree->GetHouse(nHouseID, house))
+                        return error("ConnectBlock(): replay could not load house %u for bill op %s",
+                            nHouseID, tx.GetHash().ToString());
+                    // The DB must be at the pre-state the payload claims, or we
+                    // are not in the window we think we are in. Fail closed
+                    // rather than write a delta onto an unknown base.
+                    if (house.nLoanBookFace != nPrevFace || house.nLoanWtMatHi != nPrevWtHi ||
+                            house.nLoanWtMatLo != nPrevWtLo)
+                        return error("ConnectBlock(): replay house priors mismatch for bill op %s",
+                            tx.GetHash().ToString());
+                    const unsigned __int128 nWeight =
+                            (unsigned __int128)nFace * (unsigned __int128)nBillMaturity;
+                    if (fAdd) {
+                        house.nLoanBookFace = nPrevFace + nFace;
+                        house.SetLoanWtMaturity(house.LoanWtMaturity() + nWeight);
+                    } else {
+                        if (nPrevFace < nFace || house.LoanWtMaturity() < nWeight)
+                            return error("ConnectBlock(): replay book underflow for bill op %s",
+                                tx.GetHash().ToString());
+                        house.nLoanBookFace = nPrevFace - nFace;
+                        house.SetLoanWtMaturity(house.LoanWtMaturity() - nWeight);
+                    }
+                    if (fHaveMinted)
+                        house.nMintedUnits = nMinted;
+
+                    for (const CHouse& h : vHouseNew)
+                        if (h.nHouseID == house.nHouseID)
+                            return state.DoS(100, error("ConnectBlock(): replay bill op on house %u registered this block",
+                                house.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
+                    if (mapHouseUpdate.count(house.nHouseID))
+                        return state.DoS(100, error("ConnectBlock(): replay second house-state change for house %u",
+                            house.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
+                    mapHouseUpdate[house.nHouseID] = house;
+                }
             }
         }
         else if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -6475,11 +7823,77 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 }
                 return pbilltree->HaveBillHash(hash);
             };
+            // Ops 5/7/8 mutate a CHouse, so the bill section reads houses
+            // through the SAME staged overlay the house / note / deposit
+            // sections use - the bill section runs first in this loop, so its
+            // staged update is what a later same-house op collides with.
+            auto fnGetHouseForBill = [&](uint32_t nID, CHouse& house) {
+                std::map<uint32_t, CHouse>::const_iterator it = mapHouseUpdate.find(nID);
+                if (it != mapHouseUpdate.end()) { house = it->second; return true; }
+                for (const CHouse& h : vHouseNew)
+                    if (h.nHouseID == nID) { house = h; return true; }
+                return phousetree->GetHouse(nID, house);
+            };
+            // The DISCOUNT reserve proof resolves against PARENT-CHAIN state,
+            // recovering a coin spent by an earlier tx in THIS block from that
+            // tx's undo entry - the HOUSE_OP_ATTEST / NOTE_OP_MINT resolver
+            // verbatim. This keeps discount validity order-independent within
+            // the block, so no feerate ordering can turn a valid template
+            // invalid (which would brick it - CreateNewBlock throws).
+            auto fnGetProofCoinForBill = [&](const COutPoint& out, Coin& coin) {
+                const Coin& c = view.AccessCoin(out);
+                if (!c.IsSpent()) {
+                    coin = c;
+                    return true;
+                }
+                for (size_t j = 1; j < i; j++) {
+                    const CTransaction& btx = *(block.vtx[j]);
+                    for (size_t k = 0; k < btx.vin.size(); k++) {
+                        if (btx.vin[k].prevout == out) {
+                            if (j - 1 < blockundo.vtxundo.size() &&
+                                    k < blockundo.vtxundo[j - 1].vprevout.size()) {
+                                coin = blockundo.vtxundo[j - 1].vprevout[k];
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+                return false;
+            };
+            auto fnGetBlockHashForBill = [&](uint32_t nH, uint256& hash) {
+                if ((int64_t)nH >= (int64_t)pindex->nHeight)
+                    return false;
+                const CBlockIndex* pAsOf = pindex->GetAncestor((int)nH);
+                if (!pAsOf)
+                    return false;
+                hash = pAsOf->GetBlockHash();
+                return true;
+            };
 
             CBill billResult;
-            if (!CheckBillOperation(tx, state, pindex->nHeight, nTxFeeBill, fnGetBill, fnHaveBillHash, billResult))
+            CHouse houseResultBill;
+            bool fHouseChangedBill = false;
+            if (!CheckBillOperation(tx, state, pindex->nHeight, nTxFeeBill, fnGetBill, fnHaveBillHash,
+                    fnGetHouseForBill, fnGetProofCoinForBill, fnGetBlockHashForBill,
+                    billResult, houseResultBill, fHouseChangedBill))
                 return error("ConnectBlock(): CheckBillOperation on %s failed with %s",
                     tx.GetHash().ToString(), FormatStateMessage(state));
+
+            // Ops 5/7/8 take the owning house's one-op-per-house-per-block slot,
+            // under the SAME collision rule as a governance op or a note MINT.
+            // RECOURSE takes no slot: it mutates no house record, so mempool
+            // slot accounting and consensus agree exactly.
+            if (fHouseChangedBill) {
+                for (const CHouse& h : vHouseNew)
+                    if (h.nHouseID == houseResultBill.nHouseID)
+                        return state.DoS(100, error("ConnectBlock(): bill op on house %u registered this block",
+                            houseResultBill.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
+                if (mapHouseUpdate.count(houseResultBill.nHouseID))
+                    return state.DoS(100, error("ConnectBlock(): second house-state change for house %u this block",
+                        houseResultBill.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
+                mapHouseUpdate[houseResultBill.nHouseID] = houseResultBill;
+            }
 
             if (tx.nBillOp == BILL_OP_ISSUE) {
                 if (nBillIDNext == 0) {
@@ -7170,6 +8584,9 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         // Collect & verify sidechain objects
         std::vector<std::pair<uint256, const SidechainObj *> > vSidechainObjects;
         bool fFoundWithdrawalBundle = false;
+        // D-3: the block's own last deposit (block order), for the pindex
+        // deposit-CTIP baseline set after the DB write below.
+        uint256 hashLastDepositInBlock;
         for (const CTransactionRef& tx : block.vtx) {
             for (const CTxOut& txout : tx->vout) {
                 const CScript& scriptPubKey = txout.scriptPubKey;
@@ -7245,6 +8662,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 if (obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
                     const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
                     id = deposit->GetID();
+                    hashLastDepositInBlock = id;
                 }
                 vSidechainObjects.push_back(std::make_pair(id, obj));
             }
@@ -7279,6 +8697,15 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             for (size_t i = 0; i < vSidechainObjects.size(); i++)
                 delete vSidechainObjects[i].second;
         }
+
+        // D-3: cache the deposit-CTIP baseline as of this block in the index -
+        // the block's own last deposit if it has any, else inherited from
+        // pprev. DisconnectBlock restores DB_LAST_SIDECHAIN_DEPOSIT from
+        // pprev's cached value, which is only correct if EVERY connected
+        // block carries the as-of value (a no-deposit block must inherit).
+        pindex->hashLastDeposit = !hashLastDepositInBlock.IsNull() ? hashLastDepositInBlock
+            : (pindex->pprev ? pindex->pprev->hashLastDeposit : uint256());
+        setDirtyBlockIndex.insert(pindex);
     }
 
     // Write asset objects to db
@@ -7297,7 +8724,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         for (const std::pair<const uint32_t, CBill>& p : mapBillUpdate)
             vBillWrite.push_back(p.second);
         const uint32_t nLastBillID = nBillIDNext - 1;
-        if (!pbilltree->WriteBlockEffects(vBillWrite, vBillNew.size() ? &nLastBillID : nullptr, pindex->GetBlockHash()))
+        if (!pbilltree->WriteBlockEffects(vBillWrite, std::vector<uint32_t>(),
+                vBillNew.size() ? &nLastBillID : nullptr, pindex->GetBlockHash()))
             return state.Error("Failed to write bill index!");
     }
 
@@ -9582,6 +11010,13 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
                 BillEndorse endorse;
                 if (DecodeBillPayload(tx->vchBillPayload, endorse))
                     nBillID = endorse.nBillID;
+            } else if (tx->nBillOp >= BILL_OP_DISCOUNT && tx->vchBillPayload.size() >= 4) {
+                // B1 ops 5-8 all LEAD with nBillID, so this is a payload read.
+                // Only a DISCOUNT actually creates a tagged output, but the arm
+                // is uniform: omit it and a rolled-forward discount puts an
+                // UNTAGGED title into the UTXO set - plain-spendable, and a
+                // coins-vs-BillDB split on the crashed node alone.
+                memcpy(&nBillID, tx->vchBillPayload.data(), 4);
             }
         }
 

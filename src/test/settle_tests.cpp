@@ -197,13 +197,15 @@ BOOST_AUTO_TEST_CASE(settle_house_ser_v6_migration)
         BOOST_CHECK_EQUAL(r.nMintedUnits, h.nMintedUnits);
     }
 
-    // Synthesize the SAME record at v6 layout: the v7 field is appended LAST,
-    // so v6 bytes = v7 bytes minus the trailing u32, with the version byte
-    // flipped to 6. Read must succeed with nLastSettleHeight defaulting to 0
-    // and every other field intact (read-by-stored-version, code-enforced).
-    BOOST_REQUIRE(v7bytes.size() > 4);
-    BOOST_REQUIRE_EQUAL(v7bytes[0], 7);
-    std::vector<unsigned char> v6bytes(v7bytes.begin(), v7bytes.end() - 4);
+    // Synthesize the SAME record at v6 layout: every later field is appended
+    // LAST, so v6 bytes = current bytes minus the v7 addendum (u32
+    // nLastSettleHeight) and the v8 addendum (three u64 loan-book fields, B1),
+    // with the version byte flipped to 6. Read must succeed with
+    // nLastSettleHeight defaulting to 0 and every other field intact
+    // (read-by-stored-version, code-enforced).
+    BOOST_REQUIRE(v7bytes.size() > 28);
+    BOOST_REQUIRE_EQUAL(v7bytes[0], HOUSE_SER_VERSION);
+    std::vector<unsigned char> v6bytes(v7bytes.begin(), v7bytes.end() - 28);
     v6bytes[0] = 6;
     {
         CDataStream rs(v6bytes, SER_DISK, PROTOCOL_VERSION);
@@ -217,10 +219,10 @@ BOOST_AUTO_TEST_CASE(settle_house_ser_v6_migration)
     }
 
     // A FUTURE version stays a hard read failure (never silently defaulted).
-    std::vector<unsigned char> v8bytes = v7bytes;
-    v8bytes[0] = 8;
+    std::vector<unsigned char> vFuture = v7bytes;
+    vFuture[0] = HOUSE_SER_VERSION + 1;
     {
-        CDataStream rs(v8bytes, SER_DISK, PROTOCOL_VERSION);
+        CDataStream rs(vFuture, SER_DISK, PROTOCOL_VERSION);
         CHouse r;
         BOOST_CHECK_THROW(rs >> r, std::ios_base::failure);
     }

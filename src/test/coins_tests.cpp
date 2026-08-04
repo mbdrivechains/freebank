@@ -904,9 +904,17 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
     const TxInUndoSerializer undoser(&c);
     BOOST_CHECK_EQUAL(::GetSerializeSize(undoser, SER_DISK, CLIENT_VERSION), (size_t)67);
 
+    // v2 evidence (D-3): the block-index entry grew hashLastDeposit. A
+    // default-constructed entry (all-zero VARINTs, no file positions) pins the
+    // fixed-field layout: 1 (stream version varint, 0) + 3 (height/status/tx)
+    // + 4 (header nVersion) + 32*2 (prev/merkle) + 4 (nTime) + 32*2
+    // (mainblock/bundle) + 32 (hashLastDeposit) = 172. It was 140 in v1.
+    CDiskBlockIndex di;
+    BOOST_CHECK_EQUAL(::GetSerializeSize(di, SER_DISK, 0), (size_t)172);
+
     // A bump without updating the pins above is also a mistake - the sizes are
     // the evidence for the version, so they move together.
-    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 1);
+    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

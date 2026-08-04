@@ -183,5 +183,10 @@ int main(int argc, char* argv[])
     // Connect freebankd signal handlers
     noui_connect();
 
-    return (AppInit(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE);
+    if (AppInit(argc, argv))
+        return EXIT_SUCCESS;
+    // A confirmed mainchain L1 identity mismatch exits with a distinct code so a
+    // wrong-chain node can be halted by systemd (RestartPreventExitStatus) and
+    // alarmed, instead of crash-looping; every other init failure stays EXIT_FAILURE.
+    return fMainchainIdentityMismatch ? EXIT_CODE_MAINCHAIN_IDENTITY : EXIT_FAILURE;
 }
