@@ -136,31 +136,33 @@ Run the unit tests:
 src/test/test_bitcoin
 ```
 
-## Run
+## Run (overview)
 
-FreeBank is a sidechain — it needs a BIP 300/301 mainchain to merge-mine against, reached
-through two companion pieces fetched separately: the CUSF
-[bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer) (validates the
-drivechain rules on the mainchain and holds the mainchain wallet) watching a
-[bitcoin-patched](https://github.com/LayerTwo-Labs/bitcoin-patched) signet bitcoind, plus
-[grpcurl](https://github.com/fullstorydev/grpcurl) on PATH. Point freebankd at the
-enforcer:
+FreeBank is a sidechain, so running it means running a small stack: a
+(drivechain-patched) signet `bitcoind` as the mainchain, the CUSF
+[bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer) watching it —
+it validates the drivechain rules and holds the mainchain wallet — and `freebankd`
+driving the enforcer over gRPC (via
+[grpcurl](https://github.com/fullstorydev/grpcurl)). The sidechain then advances by
+blind-merged-mining against the mainchain (`freebank-cli refreshbmm`). The mainchain
+node comes from LayerTwo Labs'
+[bitcoin-patched](https://github.com/LayerTwo-Labs/bitcoin-patched); FreeBank binaries
+from the [release page](https://github.com/mbdrivechains/freebank/releases).
 
-```sh
-# gRPC via grpcurl; deposits and withdrawal-status also need the
-# mainchain node's REST interface (bitcoind -rest -txindex).
-# The signet challenge IS the L1's identity — required outside regtest (v0.2.7+).
-freebankd -mainchainchallenge=<your-signet-challenge-hex> \
-          -mainchaintransport=enforcer \
-          -enforceraddr=127.0.0.1:50051 \
-          -mainchainrest=127.0.0.1:8332
-```
+Two things worth knowing before you start:
 
-Advance the chain with `freebank-cli refreshbmm`, once the slot is active on the mainchain.
-
-Full bring-up for someone starting from zero — every dependency with download links, which
-network/magic is which, joining the FreeBank signet, verification order:
-[`doc/signet.md`](doc/signet.md).
+- **The current network is a stopgap.** FreeBank presently runs against its own
+  project-operated signet — the chain behind [ecxfreebank.com](https://ecxfreebank.com),
+  reset daily. The intended home is the LayerTwo Labs drivechain signet: once FreeBank's
+  slot-130 activation (M1) lands there, the same stack simply points at that network
+  instead.
+- **The full walkthrough is a separate page**: [`doc/signet.md`](doc/signet.md) —
+  written for someone starting from zero, with every dependency linked, the
+  network/magic-bytes pitfalls explained, join parameters for the FreeBank signet, and a
+  step-by-step verification order. It is deliberately precise enough to hand to an AI
+  coding agent — if you'd rather not drive four pieces of software by hand, pointing
+  Claude Code (or another agentic assistant) at that page and asking it to do the
+  bring-up with you works well.
 
 ## Feedback
 

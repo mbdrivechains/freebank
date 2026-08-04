@@ -2,8 +2,13 @@
 
 How to bring FreeBank up as a sidechain (slot **130**) of a BIP 300/301 signet — the
 FreeBank signet behind <https://ecxfreebank.com>, or another drivechain signet such as
-LayerTwo Labs'. Written for someone starting from zero: every dependency is named with a
-download link. Experimental software: **test coins only**.
+LayerTwo Labs'. The README's *Run (overview)* section gives the general idea; this page
+is the full detail, written for someone starting from zero — every dependency is named
+with a download link, and it is meant to be precise enough to hand to an AI coding agent
+(Claude Code or similar) if you'd rather have the bring-up driven for you. The
+project-operated FreeBank signet is the current reference network, a stopgap until
+FreeBank activates on the LayerTwo Labs drivechain signet. Experimental software:
+**test coins only**.
 
 ## Topology
 
