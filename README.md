@@ -37,9 +37,25 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
   RPCs: `registerhouse`, `listhouses`, `attesthouse`, and friends.
 - **Credit notes** (the money): per-house redeemable credit claims. Issuance is
   **reserve-gated at mint** — a mint must prove live reserves against the cap; notes
-  transfer person-to-person; the issuing house redeems at par from reserves; a holder can
-  place a formal *demand*, which accrues interest from the date of demand. RPCs:
-  `mintnote`, `transfernote`, `redeemnote`, `demandnote`, `listmynotes`.
+  transfer person-to-person; the issuing house redeems at par from reserves.
+- **Bearer redemption** (the holder's teeth): a note holder places a formal *demand* for
+  par. Against an open house this **pre-authorises** the payout — the note coins move into
+  a consensus-enforced custody script and the house **discharges** them unilaterally,
+  paying par plus any in-window interest less a redemption spread, no holder signature
+  needed at payout. If the house lets a demand lapse, the holder **protests** it; a live
+  protest is a stress origin that turns off the house's par lamp and blocks minting, and
+  if the house cannot recover it ripens into insolvency where the bearer claims the custody
+  coin directly from reserves. A protest that rides through a lawful deferral re-arms at the
+  recovery height rather than being cleared by it. RPCs: `mintnote`, `transfernote`,
+  `redeemnote`, `demandnote`, `protestnote`, `dischargedemands`, `listmynotes`.
+- **Discounting** (credit creation, the point of the whole thing): a house buys a bill of
+  exchange from a holder, paying with its **own notes minted in the same operation** under
+  the full reserve/leverage discipline, and books the bill as a loan asset — the Scottish
+  discount-house mechanism, on-chain. Because the discount appends a real chain link,
+  recourse on a defaulted bill runs holder-passive: the paying party (drawer, acceptor, or
+  any prior endorser, the discount seller included) is subrogated in a fixed cascade, and a
+  match-funding rule caps the book a house may build against its free escrow. Ops:
+  discount, recourse, house-side retire/claim.
 - **Reserve attestation and a lazy solvency machine**: houses attest their liquid till on
   a consensus cadence, proven coin-by-coin against the UTXO set. A missed cadence derives
   *Stressed*; an expired recovery window derives *Insolvent* — both computed at read time
@@ -59,29 +75,33 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 
 ## Robustness
 
-Consensus code is only as trustworthy as what tries to break it. Recent work
-(v0.2.6) is mostly adversarial:
+Consensus code is only as trustworthy as what tries to break it. Much of the work is
+adversarial, and this release (v0.2.7) closes the two consensus issues that v0.2.6
+shipped as known-open:
 
-- **Adversarial deposit shapes.** The deposit path had no hostile coverage — the
-  happy path was all that was ever exercised. It now has a gate, and that gate
-  found two defects fixed in this release — a duplicate-deposit theft vector (one
-  coinbase output could satisfy two deposits) and a dust deposit that permanently
-  halted the peg.
-- **Two-node convergence.** Nothing previously ran *two* nodes against one chain, so
-  a rule written differently in the block producer than in the block validator was
-  invisible to the whole suite: one node agrees with itself by construction. A second
-  node now boots before the first block exists and independently validates every block
-  from genesis, and both must match on tip, the full UTXO set, and every side-database
-  (bills, houses, pools, oracle, the deposit accumulator) at each checkpoint.
-- **Recovery.** `-reindex` is verified to reproduce the chain exactly, including from a
-  datadir written by an earlier version.
-- **On-disk format guard.** Coin and undo records are versioned; a node reading records
-  it cannot parse refuses to start and names the remedy, rather than silently
-  misparsing them into wrong coin metadata.
-- **Reorg coverage** across every operation family, asserting that disconnect is an
-  exact inverse — not merely that state changed.
+- **Deposit reorg safety.** The deposit database's CTIP pointer is now rolled back when a
+  block is disconnected, so a node that reorgs across a deposit-bearing block computes the
+  same payouts as a freshly synced one. Before the fix, a reorg could strand or
+  mis-pay a depositor. (Closes the last known chain-split class; advances the on-disk
+  format, so an upgraded datadir re-reads once with `-reindex`.)
+- **Signature canonicality.** Every operation's payload signature is now verified
+  strict-DER and low-S at a single choke-point, so a keyless relayer can no longer
+  re-encode a payload signature to shift an unconfirmed transaction's id.
+- **Two-node convergence.** A second node boots before the first block exists and
+  independently validates every block from genesis; both must match on tip, the full UTXO
+  set, and every side-database (bills, houses, notes, deposits, pools, oracle) at each
+  checkpoint — catching any rule written differently in the producer than the validator.
+- **Reorg coverage** across every operation family, asserting disconnect is an exact
+  inverse — including a deep (200+ block) reorg replayed byte-for-byte against a
+  never-connected control node.
+- **Recovery + format guard.** `-reindex` reproduces the chain exactly, including from a
+  datadir written by an earlier version; a node reading records it cannot parse refuses to
+  start and names the remedy rather than silently misparsing them.
+- **Mempool-slot safety.** House-slot-taking wallet operations fail fast when another
+  state-changing op for the same house is already pooled, instead of building a
+  transaction the validator will reject.
 
-21 integration gates and 372 unit tests. All must pass to merge.
+28 integration gates and 446 unit tests. All must pass to merge.
 
 ## Wallet (preview)
 
@@ -149,26 +169,17 @@ MIT — see [`COPYING`](COPYING). Inherited from Bitcoin Core / the BitAssets ch
 
 ## Status
 
-Alpha. Consensus surfaces (bills, houses, notes, attestation/insolvency, redemption
-economics, term deposits, clearing pools, deposits/withdrawals, the transport layer) have
-unit + integration coverage and adversarial review; the full peg-out cycle is verified
-end-to-end against the CUSF enforcer (upstream ≥ `135115b`) on regtest. Reserve and
-solvency parameters are provisional pending simulation. Not yet audited; do not use with
+Alpha. Consensus surfaces (bills, houses, notes and bearer redemption, discounting,
+attestation/insolvency, redemption economics, term deposits, clearing pools,
+deposits/withdrawals, the transport layer) have unit + integration coverage and
+adversarial review; the full peg-out cycle is verified end-to-end against the CUSF
+enforcer (upstream ≥ `135115b`) on regtest. Reserve and solvency parameters are
+provisional pending simulation. Not yet audited; do not use with real value.
+
+**Closed since v0.2.6.** The two consensus issues the previous release listed as
+known-open are both fixed in v0.2.7: the deposit CTIP pointer is now rolled back on a
+reorg (deposit reorg safety), and payload signatures are now verified strict-DER and
+low-S at a single choke-point (signature canonicality). No consensus-level defect is
+currently outstanding on this list; the standing caveats are the ones above — provisional
+economic parameters and no third-party audit. Still test-coin software: do not use with
 real value.
-
-**Known open issues in this release.** Stated plainly because you should know them
-before running a node, not after:
-
-- **Deposit CTIP rollback (reorg).** The deposit database's pointer is not rolled back
-  when a block is disconnected, so a node that experienced a reorg across a
-  deposit-bearing block can compute deposit payouts differently from a freshly synced
-  node. Diagnosed and scoped; not yet fixed. It needs a reorg to trigger, and it
-  predates this release.
-- **Payload signature malleability.** FreeBank operation signatures are verified
-  outside the script interpreter and accept non-canonical (lax-DER, high-S) encodings.
-  Because the payloads are covered by the txid, a third party can alter a transaction's
-  id without invalidating it, which can break dependent operation chains and any
-  off-chain accounting keyed on txids.
-
-Neither is exploitable for value today — this is test-coin software — but both are
-consensus-level and both are on the list before any release that carries value.
