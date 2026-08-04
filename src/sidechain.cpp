@@ -122,21 +122,41 @@ SidechainObj* ParseSidechainObj(const std::vector<unsigned char>& vch)
     const char *vch0 = (const char *) &vch.begin()[0];
     CDataStream ds(vch0, vch0+vch.size(), SER_DISK, CLIENT_VERSION);
 
+    // Unserialize can throw on a malformed/truncated payload. These objects are
+    // heap-allocated before the throw, and this function is reached pre-cost from
+    // an unauthenticated peer's OP_RETURN at ATMP (validation.cpp), so an
+    // un-freed throw is a repeatable, unbanned memory leak. Fail closed instead:
+    // delete and return NULL, which every caller already treats as "reject".
     if (*vch0 == DB_SIDECHAIN_WITHDRAWAL_OP) {
         SidechainWithdrawal *obj = new SidechainWithdrawal;
-        obj->Unserialize(ds);
+        try {
+            obj->Unserialize(ds);
+        } catch (const std::exception&) {
+            delete obj;
+            return NULL;
+        }
         return obj;
     }
     else
     if (*vch0 == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
         SidechainWithdrawalBundle *obj = new SidechainWithdrawalBundle;
-        obj->Unserialize(ds);
+        try {
+            obj->Unserialize(ds);
+        } catch (const std::exception&) {
+            delete obj;
+            return NULL;
+        }
         return obj;
     }
     else
     if (*vch0 == DB_SIDECHAIN_DEPOSIT_OP) {
         SidechainDeposit *obj = new SidechainDeposit;
-        obj->Unserialize(ds);
+        try {
+            obj->Unserialize(ds);
+        } catch (const std::exception&) {
+            delete obj;
+            return NULL;
+        }
         return obj;
     }
 

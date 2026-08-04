@@ -21,10 +21,16 @@
 #include <pubkey.h>
 #include <blockencodings.h>
 
+#include <consensus/tx_verify.h>
+#include <consensus/validation.h>
+#include <crypto/common.h>
+#include <primitives/transaction.h>
+
 #include <stdint.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cassert>
 #include <vector>
 
 enum TEST_ID {
@@ -48,8 +54,81 @@ enum TEST_ID {
     CTXOUTCOMPRESSOR_DESERIALIZE,
     BLOCKTRANSACTIONS_DESERIALIZE,
     BLOCKTRANSACTIONSREQUEST_DESERIALIZE,
+    // FreeBank (C5). Appended, never inserted: a test id is the first four bytes
+    // of every corpus file, so renumbering an existing id silently repoints the
+    // whole accumulated corpus at the wrong target.
+    FREEBANK_BILL_TX_CHECK,
+    FREEBANK_HOUSE_TX_CHECK,
+    FREEBANK_NOTE_TX_CHECK,
+    FREEBANK_DEPOSIT_TX_CHECK,
+    FREEBANK_POOL_TX_CHECK,
+    FREEBANK_SETTLE_TX_CHECK,
+    FREEBANK_ORACLE_TX_CHECK,
     TEST_ID_END
 };
+
+/** Run the context-free FreeBank checks over an arbitrary transaction body.
+ *
+ * ECC: these checkers verify payload signatures, and CPubKey routes every one
+ * through the global secp256k1_context_verify, which is a NULL POINTER until an
+ * ECCVerifyHandle exists (pubkey.cpp:14) - so a signature-bearing input would
+ * fault inside secp256k1 on a harness defect indistinguishable from a consensus
+ * crash. This file's initialize() already builds that handle, and BOTH drivers
+ * call it (main() directly, libFuzzer via LLVMFuzzerInitialize), so there is
+ * nothing to add here - but any future driver that bypasses initialize() loses
+ * the guarantee silently.
+ *
+ * CheckTransaction (consensus/tx_verify.cpp:166) is the single door every
+ * FreeBank family comes through - it dispatches to CheckBill/House/Note/Deposit/
+ * Pool/Settle/OracleTransactionShape purely on tx.nVersion - and it is what an
+ * unauthenticated peer reaches before paying any cost. So this is the whole
+ * attacker-reachable context-free surface behind one entry point.
+ *
+ * The version is FORCED rather than taken from the input. nVersion is a magic
+ * gate: random bytes land on 11..17 about once in 2^29 mutations, so a target
+ * that let the fuzzer choose would spend its entire budget re-testing the stock
+ * Core paths and report coverage it never had. One test id per family also keeps
+ * the corpus separable, so a crash tells you which consensus object owns it.
+ *
+ * THE VERSION IS PATCHED INTO THE STREAM, NOT ASSIGNED AFTERWARDS, and that
+ * distinction is the whole target. UnserializeTransaction reads the op byte and
+ * the payload blob ONLY inside `if (tx.nVersion == TRANSACTION_*_VERSION)`
+ * (primitives/transaction.h:261-294), so a transaction deserialized under some
+ * other version and then relabelled arrives with nBillOp == 0 and an EMPTY
+ * payload. The checker would then run - and stay green forever - against a
+ * payload the fuzzer never controlled, exercising nothing but the "payload
+ * missing" rejection while reporting coverage of the decoder. Overwriting the
+ * leading four bytes puts the fuzzer's own bytes into the op and the payload,
+ * which is the surface we are actually trying to attack. */
+static int freebank_check_tx(CDataStream& ds, int32_t nForcedVersion)
+{
+    std::vector<unsigned char> body(ds.begin(), ds.end());
+    if (body.size() < sizeof(uint32_t)) return 0;
+    WriteLE32(body.data(), static_cast<uint32_t>(nForcedVersion));
+
+    CDataStream ds2(body, SER_NETWORK, ds.GetVersion());
+    CMutableTransaction mtx;
+    try {
+        ds2 >> mtx;
+    } catch (const std::ios_base::failure& e) {
+        return 0;
+    }
+
+    const CTransaction tx(mtx);
+    CValidationState state;
+    const bool ok = CheckTransaction(tx, state);
+
+    // A rejection MUST carry its reason. Several FreeBank checkers reject by
+    // propagating a bare `return false` out of a helper that was handed `state`
+    // (note.cpp CheckNoteOutputs, deposit.cpp CheckDepositReceiptOutputs,
+    // pool.cpp), so a helper with one un-flagged failure path would reject a
+    // peer's transaction while leaving the state valid - no reject reason, no
+    // DoS score, and a caller that reads IsInvalid() to decide what to do
+    // concludes nothing was wrong. That asymmetry is invisible to a no-crash
+    // fuzzer, which is exactly why it is asserted here rather than assumed.
+    assert(ok || state.IsInvalid());
+    return 0;
+}
 
 bool read_stdin(std::vector<uint8_t> &data) {
     uint8_t buffer[1024];
@@ -268,6 +347,20 @@ int test_one_input(std::vector<uint8_t> buffer) {
 
             break;
         }
+        case FREEBANK_BILL_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_BILL_VERSION);
+        case FREEBANK_HOUSE_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_HOUSE_VERSION);
+        case FREEBANK_NOTE_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_NOTE_VERSION);
+        case FREEBANK_DEPOSIT_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_DEPOSIT_VERSION);
+        case FREEBANK_POOL_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_POOL_VERSION);
+        case FREEBANK_SETTLE_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_SETTLE_VERSION);
+        case FREEBANK_ORACLE_TX_CHECK:
+            return freebank_check_tx(ds, TRANSACTION_ORACLE_VERSION);
         default:
             return 0;
     }

@@ -54,6 +54,7 @@ BOOST_AUTO_TEST_CASE(sidechain_obj)
 
     SidechainObj* parsed = ParseSidechainObj(vch);
     BOOST_CHECK(parsed);
+    delete parsed;
 }
 
 BOOST_AUTO_TEST_CASE(sidechain_bmm_cache)

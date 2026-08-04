@@ -76,9 +76,15 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 ## Robustness
 
 Consensus code is only as trustworthy as what tries to break it. Much of the work is
-adversarial, and this release (v0.2.7) closes the two consensus issues that v0.2.6
-shipped as known-open:
+adversarial. The v0.2.7 line closes the two consensus issues that v0.2.6 shipped as
+known-open, and v0.2.7.1 closes a memory leak that fuzzing turned up:
 
+- **Sidechain-object parser fails closed** (v0.2.7.1). The parser for sidechain-object
+  outputs allocated an object before deserializing into it, with no exception guard, so a
+  malformed payload leaked it. Because that parser runs during mempool acceptance ahead of
+  input and fee checks, and the resulting reject carried no misbehaviour score, any peer
+  could repeat it for free. It now frees the object and rejects cleanly. No accept/reject
+  decision changed, so a v0.2.7.1 node and a v0.2.7 node stay on the same chain.
 - **Deposit reorg safety.** The deposit database's CTIP pointer is now rolled back when a
   block is disconnected, so a node that reorgs across a deposit-bearing block computes the
   same payouts as a freshly synced one. Before the fix, a reorg could strand or

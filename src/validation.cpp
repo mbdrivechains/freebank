@@ -1236,6 +1236,9 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         SidechainObj *obj = ParseSidechainObj(vch);
         if (!obj)
             return state.Invalid(false, REJECT_INVALID, "invalid-sidechain-obj-script");
+        // Own the heap object for the rest of this scope: every path below
+        // (the DoS return, the loop continuation) otherwise leaks it.
+        std::unique_ptr<SidechainObj> objOwner(obj);
 
         if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
             SidechainWithdrawal *withdrawal = dynamic_cast<SidechainWithdrawal*>(obj);
@@ -6892,6 +6895,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     error("DisconnectBlock(): failure reading sidechain obj");
                     return DISCONNECT_FAILED;
                 }
+                std::unique_ptr<SidechainObj> objOwner(obj);
 
                 if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
                     const SidechainWithdrawalBundle *withdrawalBundle = (const SidechainWithdrawalBundle *) obj;
@@ -7496,6 +7500,9 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 if (!obj) {
                     return state.DoS(90, error("%s: invalid sidechain obj script", __func__), REJECT_INVALID, "invalid-sidechain-obj-script");
                 }
+                // Owns obj on every exit: the non-deposit `continue` below used to
+                // skip the delete and leak.
+                std::unique_ptr<SidechainObj> objOwner(obj);
 
                 if (obj->sidechainop != DB_SIDECHAIN_DEPOSIT_OP)
                     continue;
@@ -7505,8 +7512,6 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 nDepositPayout += deposit->amtUserPayout;
 
                 vDeposit.push_back(SidechainDeposit(deposit));
-
-                delete obj;
             }
         }
 
@@ -8595,6 +8600,13 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 if (!scriptPubKey.IsSidechainObj(vch))
                     continue;
 
+                // NOT scope-guarded, unlike the other ParseSidechainObj sites:
+                // here obj is handed to vSidechainObjects (line ~8667) and freed
+                // by the delete loop after WriteSidechainIndex, so a unique_ptr
+                // guard would double-free. The throw-path leak is already closed
+                // inside ParseSidechainObj. Residual: the error-return paths
+                // between here and that delete loop still leak (block-connection
+                // only, not unauthenticated) — see NEXT.md C7(e).
                 SidechainObj *obj = ParseSidechainObj(vch);
                 if (!obj)
                     return state.Error("Invalid sidechain obj script");
@@ -9747,6 +9759,9 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
             if (!obj) {
                 return state.DoS(90, error("%s: invalid sidechain deposit obj script", __func__), REJECT_INVALID, "invalid-sidechain-obj-script");
             }
+            // Owns obj on every exit: the non-deposit `continue` below used to
+            // skip both deletes and leak.
+            std::unique_ptr<SidechainObj> objOwner(obj);
 
             if (obj->sidechainop != DB_SIDECHAIN_DEPOSIT_OP)
                 continue;
@@ -9754,11 +9769,8 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
             const SidechainDeposit* deposit = (const SidechainDeposit *) obj;
 
             if (!VerifyDeposit(deposit->hashMainchainBlock, deposit->dtx.GetHash(), deposit->nTx)) {
-                delete obj;
                 return state.DoS(1, error("%s: invalid sidechain deposit", __func__), REJECT_INVALID, "invalid-sidechain-deposit");
             }
-
-            delete obj;
         }
     }
 
@@ -12279,6 +12291,9 @@ bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vecto
                 strFail = "Invalid sidechain obj!\n";
                 return false;
             }
+            // Owns obj on every exit: the `continue` and the `return false`
+            // paths below used to leak it.
+            std::unique_ptr<SidechainObj> objOwner(obj);
 
             if (obj->sidechainop != DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP)
                 continue;
