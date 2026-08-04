@@ -138,20 +138,29 @@ src/test/test_bitcoin
 
 ## Run
 
-FreeBank is a sidechain — it needs a BIP 300/301 mainchain to merge-mine against. Point it
-at the CUSF enforcer:
+FreeBank is a sidechain — it needs a BIP 300/301 mainchain to merge-mine against, reached
+through two companion pieces fetched separately: the CUSF
+[bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer) (validates the
+drivechain rules on the mainchain and holds the mainchain wallet) watching a
+[bitcoin-patched](https://github.com/LayerTwo-Labs/bitcoin-patched) signet bitcoind, plus
+[grpcurl](https://github.com/fullstorydev/grpcurl) on PATH. Point freebankd at the
+enforcer:
 
 ```sh
 # gRPC via grpcurl; deposits and withdrawal-status also need the
-# mainchain node's REST interface (bitcoind -rest -txindex)
-freebankd -mainchaintransport=enforcer \
+# mainchain node's REST interface (bitcoind -rest -txindex).
+# The signet challenge IS the L1's identity — required outside regtest (v0.2.7+).
+freebankd -mainchainchallenge=<your-signet-challenge-hex> \
+          -mainchaintransport=enforcer \
           -enforceraddr=127.0.0.1:50051 \
           -mainchainrest=127.0.0.1:8332
 ```
 
 Advance the chain with `freebank-cli refreshbmm`, once the slot is active on the mainchain.
 
-Full signet bring-up (topology, requirements, verification order): [`doc/signet.md`](doc/signet.md).
+Full bring-up for someone starting from zero — every dependency with download links, which
+network/magic is which, joining the FreeBank signet, verification order:
+[`doc/signet.md`](doc/signet.md).
 
 ## Feedback
 

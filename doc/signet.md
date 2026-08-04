@@ -1,7 +1,9 @@
 # Running FreeBank against a live signet
 
-How to bring FreeBank up as a sidechain (slot **130**) of a BIP 300/301 signet — e.g. the
-LayerTwo Labs drivechain signet. Experimental software: **test coins only**.
+How to bring FreeBank up as a sidechain (slot **130**) of a BIP 300/301 signet — the
+FreeBank signet behind <https://ecxfreebank.com>, or another drivechain signet such as
+LayerTwo Labs'. Written for someone starting from zero: every dependency is named with a
+download link. Experimental software: **test coins only**.
 
 ## Topology
 
@@ -18,11 +20,52 @@ surface plus the bitcoind REST interface — it does not join the signet P2P net
 FreeBank's own network params (magic `fb4b1845`, port 8455) govern the sidechain's own
 P2P, which is separate.
 
+## What you need (and where to get it)
+
+Four pieces, fetched separately — nothing bundles them for you yet:
+
+- **`freebankd` / `freebank-cli`** — the FreeBank sidechain node (this repo). Use the
+  static binaries from the
+  [release page](https://github.com/mbdrivechains/freebank/releases).
+- **`bip300301_enforcer`** — the CUSF BIP 300/301 enforcer. It validates the drivechain
+  rules on the mainchain, holds the mainchain wallet, and exposes the gRPC surface
+  freebankd drives. From
+  [LayerTwo-Labs/bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer)
+  (Rust; prebuilt releases, or `cargo build`). Version floor below.
+- **`bitcoind`** — a signet mainchain node. Use LayerTwo Labs'
+  [bitcoin-patched](https://github.com/LayerTwo-Labs/bitcoin-patched) fork of Bitcoin
+  Core — it is what the enforcer is developed against (it reports itself as an ordinary
+  Bitcoin Core version, e.g. `v29.x`).
+- **`grpcurl`** — a generic gRPC command-line client; freebankd shells out to it at
+  runtime to talk to the enforcer. From
+  [fullstorydev/grpcurl](https://github.com/fullstorydev/grpcurl) or your distro's
+  packages.
+
+## Which network? (magic bytes and the challenge)
+
+Two separate network identities are in play. Neither needs manual magic-byte
+configuration, but knowing how they work explains most connection confusion:
+
+- **Mainchain**: a signet derives its P2P network magic from its `signetchallenge`
+  (BIP 325), so the challenge you pass **is** the network selector. A bare
+  `bitcoind -signet` joins the public default signet — a different network entirely —
+  and a wrong challenge means your node syncs the wrong chain. Beware that **all
+  signets share the same hardcoded genesis hash** (Core's signet genesis is not derived
+  from the challenge), so a matching genesis proves nothing; the challenge is the only
+  real discriminator.
+- **FreeBank**: the sidechain's own P2P uses FreeBank's compiled-in magic `fb4b1845` on
+  port 8455 — distinct from Bitcoin's and every other chain's; nothing to configure.
+
+Because the challenge is the L1's identity, freebankd **requires
+`-mainchainchallenge=<hex>` outside regtest** (since v0.2.7) and refuses to start
+without it; at runtime it verifies, on both the REST and enforcer channels, that the
+mainchain it is talking to actually carries that challenge.
+
 ## Requirements
 
 - **Enforcer ≥ upstream `6fdb827`** (hard requirement: adds `BlindedM6::deserialize`;
-  anything older rejects FreeBank's blinded withdrawal bundles at parse time). v0.2.0 is
-  revalidated end-to-end against `135115b` (July 2026 master).
+  anything older rejects FreeBank's blinded withdrawal bundles at parse time). FreeBank
+  is revalidated end-to-end against upstream `135115b` (July 2026 master).
 - A **dedicated enforcer instance** for FreeBank is recommended (own wallet, own gRPC
   port, pointed at your signet bitcoind). FreeBank issues *write* ops — BMM requests and
   withdrawal broadcasts — so sharing an enforcer used by other software means sharing its
@@ -36,10 +79,29 @@ P2P, which is separate.
 
 ## Mainchain node
 
-Bring up a (drivechain-patched) signet bitcoind with the network's current challenge.
-For the LayerTwo Labs signet, **check <https://drivechain.info/dev.txt> for the current
-`signetchallenge` and seed nodes first** — they have rotated before; the values below are
-an example, not gospel:
+Bring up a (drivechain-patched) signet bitcoind with your target network's challenge.
+
+**For the FreeBank signet** — the chain this project operates, behind
+<https://ecxfreebank.com> (explorer included):
+
+```sh
+bitcoind -signet -daemon -rest -txindex \
+  -signetchallenge=00149048fe50778b4fee7156a5847d1d7dc1de789b3f \
+  -addnode=ecxfreebank.com:38333 \
+  -acceptnonstdtxn=1 -fallbackfee=0.00021 \
+  -zmqpubsequence=tcp://127.0.0.1:29332 \
+  -rpcuser=user -rpcpassword=pass
+```
+
+Slot 130 is already active there and the activation (M1) values are published on the
+homepage, so you can skip straight to the enforcer. Two honest caveats: the block
+signing key is held by the project, and this signet currently **resets daily at 09:00
+UTC** (it backs the public daily-reset demo) — expect the reset drill below to apply
+every day, so it is a connectivity/bring-up target, not a place to accumulate state.
+
+**For the LayerTwo Labs signet**, check <https://drivechain.info/dev.txt> for the
+current `signetchallenge` and seed nodes first — they have rotated before — and note
+that slot 130 must be proposed and activated there before FreeBank can advance:
 
 ```sh
 bitcoind -signet -daemon -rest -txindex \
@@ -50,8 +112,8 @@ bitcoind -signet -daemon -rest -txindex \
   -rpcuser=user -rpcpassword=pass
 ```
 
-Let it sync to tip, point your enforcer at it, and confirm slot 130 shows in the
-enforcer's `GetSidechains` once the FreeBank M1 proposal has activated.
+Either way: let it sync to tip, point your enforcer at it, and confirm slot 130 shows in
+the enforcer's `GetSidechains` once the FreeBank M1 proposal has activated.
 
 ## FreeBank node
 
@@ -60,17 +122,21 @@ Run on FreeBank's **main** network (not regtest) — the locked network params
 apply there:
 
 ```sh
-freebankd -mainchaintransport=enforcer \
+freebankd -mainchainchallenge=<your-signet-challenge-hex> \
+  -mainchaintransport=enforcer \
   -enforceraddr=127.0.0.1:<enforcer-grpc-port> \
   -mainchainrest=127.0.0.1:38332 \
   -rpcuser=user -rpcpassword=pass
 ```
 
-As of v0.2.1 the values above are the **defaults** — a bare `freebankd` does exactly
-this (`enforcer` transport, gRPC on `127.0.0.1:50051`, REST on `127.0.0.1:38332`),
-matching an orchestrated BitWindow-style stack. The flags remain for overriding; on
-regtest the transport default stays `jsonrpc` for the local-pair test harness.
-Startup now also probes the REST endpoint (with ~60s of retries for orchestrated
+The transport and endpoint values are the **defaults** since v0.2.1 (`enforcer`
+transport, gRPC on `127.0.0.1:50051`, REST on `127.0.0.1:38332`, matching an
+orchestrated BitWindow-style stack), so those flags are only needed to override. What
+is **not** optional is `-mainchainchallenge` — since v0.2.7 freebankd refuses to start
+outside regtest without it (see "Which network?" above); pass your target signet's
+challenge, e.g. the FreeBank signet value from the mainchain section. On regtest the
+transport default stays `jsonrpc` for the local-pair test harness.
+Startup also probes the REST endpoint (with ~60s of retries for orchestrated
 starts) and fails loud if it never answers, rather than letting a REST-less node
 reject its first deposit-bearing block later.
 
@@ -112,7 +178,7 @@ does. Plan for the wipe:
   reorg testing. A deep mainchain reorg is signet turbulence, not necessarily a FreeBank
   bug; check the signet operator's channels before filing one.
 
-## Known limitations (v0.2.0)
+## Known limitations (current as of v0.2.7)
 
 - Withdrawal mainchain destinations must be **legacy P2PKH** (an `m…`/`n…` signet
   address). Bech32/P2SH destinations are not yet decoded — a known chassis limitation,
