@@ -1,0 +1,135 @@
+name: linux-x86_64
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  # Fast build + unit tests on EVERY push. This is the gate whose absence let
+  # the 9-file unit-test exclusion sit invisible since 2026-07-07 (NEXT.md C1).
+  # System (apt) deps + --with-incompatible-bdb: a compile-and-test build, not a
+  # portable artifact - the portable static binary + ldd gate is the tag job
+  # below, matching docs-local/release-linux.sh. Integration gates (fb-test) are
+  # NOT here: they need the drivechain-patched mainchain binary, which no GitHub
+  # runner has - those run on the maintainer box (contrib/ci/local-ci.sh).
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libtool autotools-dev automake \
+            pkg-config bsdmainutils python3 libevent-dev libssl-dev \
+            libdb-dev libdb++-dev \
+            libboost-dev libboost-system-dev libboost-filesystem-dev \
+            libboost-test-dev libboost-thread-dev libboost-chrono-dev \
+            libboost-program-options-dev
+
+      - name: Configure
+        run: |
+          ./autogen.sh
+          ./configure --without-gui --disable-bench --with-incompatible-bdb
+
+      - name: Dump config.log on configure failure
+        if: failure()
+        run: tail -150 config.log
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Version smoke test
+        run: |
+          ./src/freebankd --version | head -3
+          ./src/freebank-cli --version | head -1
+
+      - name: Unit test suite
+        run: make check
+
+      - name: Dump test log on failure
+        if: failure()
+        run: tail -200 src/test-suite.log 2>/dev/null || true
+
+      - name: Regtest daemon smoke (no mainchain - boot + RPC + stop only)
+        run: |
+          mkdir -p /tmp/fbsmoke
+          ./src/freebankd -regtest -daemon -datadir=/tmp/fbsmoke -rpcuser=s -rpcpassword=s
+          for i in $(seq 1 30); do
+            ./src/freebank-cli -regtest -datadir=/tmp/fbsmoke -rpcuser=s -rpcpassword=s getblockchaininfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ./src/freebank-cli -regtest -datadir=/tmp/fbsmoke -rpcuser=s -rpcpassword=s getblockchaininfo | head -3
+          ./src/freebank-cli -regtest -datadir=/tmp/fbsmoke -rpcuser=s -rpcpassword=s stop
+          sleep 2
+
+  # PORTABILITY GATE, release tags only (vX.Y.Z). Builds the shipped static
+  # binary via the depends system and runs the same ldd gate + extracted-tarball
+  # acceptance as docs-local/release-linux.sh. Heavy (depends compiles boost/
+  # libevent/bdb from source), so it is tag-gated and depends-cached. The
+  # authoritative release build is still release-linux.sh run on the maintainer
+  # box; this is an independent enforcement of the portability contract.
+  portable-release-gate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (depends builds the libs themselves)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libtool autotools-dev automake \
+            pkg-config bsdmainutils curl python3 patch
+
+      - name: Cache depends
+        uses: actions/cache@v4
+        with:
+          path: depends/x86_64-pc-linux-gnu
+          key: depends-linux-${{ hashFiles('depends/packages/*.mk', 'depends/Makefile') }}
+
+      - name: Build depends (static, no qt/upnp)
+        run: make -C depends -j"$(nproc)" NO_QT=1 NO_UPNP=1
+
+      - name: Configure + build (static, forced relink)
+        run: |
+          D="$PWD/depends/x86_64-pc-linux-gnu"
+          ./autogen.sh
+          ./configure --prefix="$D" --without-gui --disable-bench --with-incompatible-bdb \
+            --with-boost="$D" CPPFLAGS="-I$D/include" \
+            LDFLAGS="-L$D/lib -static-libstdc++" \
+            PKG_CONFIG_PATH="$D/lib/pkgconfig"
+          rm -f src/freebankd src/freebank-cli src/freebank-tx
+          make -j"$(nproc)"
+
+      - name: Package + ldd gate + acceptance (extracted tarball)
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/freebank/bin
+          cp src/freebankd src/freebank-cli src/freebank-tx dist/freebank/bin/
+          strip dist/freebank/bin/*
+          cp COPYING README.md dist/freebank/
+          tar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2026-07-20 10:00' -czf "freebank-${VER}-x86_64-linux-gnu.tar.gz" freebank
+          sha256sum "freebank-${VER}-x86_64-linux-gnu.tar.gz"
+          mkdir -p /tmp/accept && tar -xzf "freebank-${VER}-x86_64-linux-gnu.tar.gz" -C /tmp/accept
+          BAD=$(ldd /tmp/accept/freebank/bin/freebankd \
+            | grep -vE "linux-vdso|ld-linux|libc\.so|libm\.so|libgcc" || true)
+          if [ -n "$BAD" ]; then echo "LDD GATE FAILED - non-base dependencies:"; echo "$BAD"; exit 1; fi
+          echo "ldd gate OK"
+          mkdir -p /tmp/accept/dd
+          /tmp/accept/freebank/bin/freebankd -regtest -daemon -datadir=/tmp/accept/dd -rpcuser=s -rpcpassword=s
+          for i in $(seq 1 30); do
+            /tmp/accept/freebank/bin/freebank-cli -regtest -datadir=/tmp/accept/dd -rpcuser=s -rpcpassword=s getblockchaininfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+          /tmp/accept/freebank/bin/freebank-cli -regtest -datadir=/tmp/accept/dd -rpcuser=s -rpcpassword=s getblockchaininfo | head -3
+          /tmp/accept/freebank/bin/freebank-cli -regtest -datadir=/tmp/accept/dd -rpcuser=s -rpcpassword=s stop
+          objdump -T /tmp/accept/freebank/bin/freebankd | grep -oE "GLIBC_[0-9.]+" | sort -uV | tail -1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebank-x86_64-linux-gnu
+          path: freebank-*-x86_64-linux-gnu.tar.gz

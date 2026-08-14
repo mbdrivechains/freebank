@@ -160,6 +160,7 @@ public:
     CSidechainTreeDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
     bool WriteSidechainIndex(const std::vector<std::pair<uint256, const SidechainObj *> > &list);
     bool WriteWithdrawalUpdate(const std::vector<SidechainWithdrawal>& vWithdrawal);
+    bool WriteWithdrawalDisconnect(const std::vector<uint256>& vEraseID);
     bool WriteWithdrawalBundleUpdate(const SidechainWithdrawalBundle& withdrawalBundle);
     bool WriteLastWithdrawalBundleHash(const uint256& hash);
 

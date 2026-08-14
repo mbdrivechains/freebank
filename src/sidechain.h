@@ -355,6 +355,21 @@ bool ClaimDepositPayoutOutput(const CTxOut& required,
                               const std::vector<CTxOut>& vout,
                               std::set<size_t>& setClaimed);
 
+/**
+ * C6-A: the withdrawal-side twin of ClaimDepositPayoutOutput. A withdrawal
+ * object must be backed by a DISTINCT burn OP_RETURN whose value equals its
+ * amount (with a valid amount/fee). The original check set a flag on ANY match
+ * and never consumed it, so one burn satisfied every withdrawal object of the
+ * same amount in a transaction (distinct destinations -> distinct GetID ->
+ * distinct rows), each later paid independently (N* escrow draw on the bundle
+ * path, N* mint on the refund path). Claim the lowest-indexed not-yet-claimed
+ * matching output and mark it used; `setClaimed` carries the indices already
+ * spoken for by earlier withdrawals in the same transaction.
+ */
+bool ClaimWithdrawalBurn(const SidechainWithdrawal& withdrawal,
+                         const std::vector<CTxOut>& vout,
+                         std::set<size_t>& setClaimed);
+
 std::string GenerateDepositAddress(const std::string& strDestIn);
 
 bool ParseDepositAddress(const std::string& strAddressIn, std::string& strAddressOut, unsigned int& nSidechainOut);

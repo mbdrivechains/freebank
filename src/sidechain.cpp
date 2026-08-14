@@ -167,7 +167,16 @@ struct CompareMainchainFee
 {
     bool operator()(const SidechainWithdrawal& a, const SidechainWithdrawal& b) const
     {
-        return a.mainchainFee > b.mainchainFee;
+        // C6-B: TOTAL ORDER. mainchainFee is user-chosen, so ties are the common
+        // case; an unstable std::sort left tied elements in libstdc++/libc++
+        // order, which differs between the Linux and macOS binaries -> the bundle
+        // payout order diverged -> the exact-tx replication check
+        // (validation.cpp) rejected across platforms = chain split. Tie-break on
+        // GetID() (a hash, platform-identical and unique per row) so the order is
+        // deterministic regardless of standard library or sort algorithm.
+        if (a.mainchainFee != b.mainchainFee)
+            return a.mainchainFee > b.mainchainFee;
+        return a.GetID() < b.GetID();
     }
 };
 
@@ -351,6 +360,32 @@ bool ClaimDepositPayoutOutput(const CTxOut& required,
         if (setClaimed.count(i))
             continue;
         if (vout[i] == required) {
+            setClaimed.insert(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ClaimWithdrawalBurn(const SidechainWithdrawal& withdrawal,
+                         const std::vector<CTxOut>& vout,
+                         std::set<size_t>& setClaimed)
+{
+    // The amount/fee validity is a property of the withdrawal, not of any
+    // particular output - if it fails, no output can back it.
+    if (!(withdrawal.amount > 0 && withdrawal.mainchainFee > 0
+            && withdrawal.amount > withdrawal.mainchainFee))
+        return false;
+
+    for (size_t i = 0; i < vout.size(); i++) {
+        // Skip a burn an earlier withdrawal in this tx already claimed. This is
+        // the C6-A fix: without it one OP_RETURN backs every identical-amount
+        // withdrawal row and each is paid, minting/draining the rest.
+        if (setClaimed.count(i))
+            continue;
+        const CTxOut& o = vout[i];
+        if (o.scriptPubKey.size() && o.scriptPubKey[0] == OP_RETURN
+                && o.nValue == withdrawal.amount) {
             setClaimed.insert(i);
             return true;
         }

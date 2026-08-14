@@ -435,6 +435,22 @@ bool CSidechainTreeDB::WriteDepositDisconnect(const std::vector<uint256>& vErase
     return WriteBatch(batch, true);
 }
 
+bool CSidechainTreeDB::WriteWithdrawalDisconnect(const std::vector<uint256>& vEraseID)
+{
+    // C6-A high rider: erase the withdrawal rows a disconnected block created.
+    // Rows are keyed (DB_SIDECHAIN_WITHDRAWAL_OP, GetID()) - the same key
+    // WriteSidechainIndex/WriteWithdrawalUpdate/GetWithdrawal use. Unlike the
+    // deposit disconnect there is no DB_LAST baseline pointer to revert, so this
+    // is a straight erase; leveldb makes an erase of an absent key a no-op, so a
+    // repeated disconnect is idempotent.
+    CDBBatch batch(*this);
+
+    for (const uint256& id : vEraseID)
+        batch.Erase(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_OP, id));
+
+    return WriteBatch(batch, true);
+}
+
 bool CSidechainTreeDB::WriteWithdrawalUpdate(const std::vector<SidechainWithdrawal>& vWithdrawal)
 {
     CDBBatch batch(*this);

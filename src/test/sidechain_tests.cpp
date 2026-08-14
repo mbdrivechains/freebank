@@ -57,6 +57,59 @@ BOOST_AUTO_TEST_CASE(sidechain_obj)
     delete parsed;
 }
 
+BOOST_AUTO_TEST_CASE(withdrawal_fee_sort_total_order)
+{
+    // C6-B: SortWithdrawalByFee must be a TOTAL order, deterministic even when
+    // mainchainFee ties (the common case - the fee is user-chosen). Before the
+    // fix an unstable std::sort left tied elements in libstdc++/libc++-specific
+    // order, so the Linux and macOS binaries built different bundle payout
+    // orders and split at the exact-tx replication check. The GetID() tie-break
+    // makes the order a pure function of the set, independent of platform/algo.
+    auto mk = [](const std::string& dest, CAmount amount, CAmount fee) {
+        SidechainWithdrawal wt;
+        wt.nSidechain = 0;
+        wt.strDestination = dest;
+        wt.strRefundDestination = dest;
+        wt.amount = amount;
+        wt.mainchainFee = fee;
+        wt.status = WITHDRAWAL_UNSPENT;
+        wt.hashBlindTx = uint256();
+        return wt;
+    };
+
+    // Two withdrawals share a fee (the tie); one has a higher fee.
+    SidechainWithdrawal a = mk("a", 100, 5);
+    SidechainWithdrawal b = mk("b", 200, 5); // ties with a on fee
+    SidechainWithdrawal c = mk("c", 300, 9); // higher fee -> sorts first
+
+    // Every permutation of the same set must produce the SAME order.
+    std::vector<std::vector<SidechainWithdrawal>> perms = {
+        {a, b, c}, {c, b, a}, {b, a, c}, {b, c, a}, {a, c, b}, {c, a, b},
+    };
+    std::vector<uint256> expected;
+    {
+        std::vector<SidechainWithdrawal> v = perms[0];
+        SortWithdrawalByFee(v);
+        for (const SidechainWithdrawal& w : v) expected.push_back(w.GetID());
+    }
+    BOOST_CHECK(expected.front() == c.GetID()); // highest fee first
+    for (const std::vector<SidechainWithdrawal>& p : perms) {
+        std::vector<SidechainWithdrawal> v = p;
+        SortWithdrawalByFee(v);
+        std::vector<uint256> got;
+        for (const SidechainWithdrawal& w : v) got.push_back(w.GetID());
+        BOOST_CHECK(got == expected);
+    }
+
+    // The two tied-fee elements are ordered by GetID() ascending (the tiebreak).
+    std::vector<SidechainWithdrawal> v = {a, b, c};
+    SortWithdrawalByFee(v);
+    BOOST_CHECK(v[0].GetID() == c.GetID());
+    const bool aFirst = a.GetID() < b.GetID();
+    BOOST_CHECK(v[1].GetID() == (aFirst ? a.GetID() : b.GetID()));
+    BOOST_CHECK(v[2].GetID() == (aFirst ? b.GetID() : a.GetID()));
+}
+
 BOOST_AUTO_TEST_CASE(sidechain_bmm_cache)
 {
     // Reject null block hash
@@ -644,6 +697,77 @@ BOOST_AUTO_TEST_CASE(deposit_payout_owed_nothing)
     junk.strDest = "s130_notavalidaddress";
     junk.amtUserPayout = CAmount(500000);
     BOOST_CHECK(!GetDepositPayoutOutput(junk, out));
+}
+
+// C6-A: the withdrawal burn must be CONSUMED - one OP_RETURN cannot back two
+// withdrawal rows. Before the fix one 100-burn satisfied every 100-amount
+// withdrawal object in a tx, each then paid (N* escrow draw on the bundle path,
+// N* coinbase mint on the refund path). The withdrawal twin of
+// deposit_payout_claim_is_consumed.
+BOOST_AUTO_TEST_CASE(withdrawal_burn_claim_is_consumed)
+{
+    auto mkwt = [](CAmount amount, CAmount fee) {
+        SidechainWithdrawal wt;
+        wt.nSidechain = 0;
+        wt.amount = amount;
+        wt.mainchainFee = fee;
+        wt.status = WITHDRAWAL_UNSPENT;
+        return wt;
+    };
+    const CAmount amount = 100;
+    const CTxOut burn(amount, CScript() << OP_RETURN);
+    const SidechainWithdrawal wt = mkwt(amount, 1);
+
+    // Two burns back two withdrawals: both claim, at distinct indices.
+    {
+        std::vector<CTxOut> vout{burn, burn};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(ClaimWithdrawalBurn(wt, vout, setClaimed));
+        BOOST_CHECK(ClaimWithdrawalBurn(wt, vout, setClaimed));
+        BOOST_CHECK_EQUAL(setClaimed.size(), 2u);
+    }
+
+    // THE DEFECT. One burn, two withdrawal rows: the second claim must FAIL.
+    {
+        std::vector<CTxOut> vout{burn};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(ClaimWithdrawalBurn(wt, vout, setClaimed));
+        BOOST_CHECK(!ClaimWithdrawalBurn(wt, vout, setClaimed));
+    }
+
+    // Unrelated outputs in between are skipped; the matching burn is consumed once.
+    {
+        const CTxOut other(CAmount(777), CScript() << OP_TRUE);
+        std::vector<CTxOut> vout{other, burn, other};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(ClaimWithdrawalBurn(wt, vout, setClaimed));
+        BOOST_CHECK_EQUAL(setClaimed.count(1), 1u);
+        BOOST_CHECK(!ClaimWithdrawalBurn(wt, vout, setClaimed));
+    }
+
+    // Value must match - a burn of a different value belongs to another withdrawal.
+    {
+        const CTxOut wrongValue(CAmount(99), CScript() << OP_RETURN);
+        std::vector<CTxOut> vout{wrongValue};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(!ClaimWithdrawalBurn(wt, vout, setClaimed));
+    }
+
+    // A non-OP_RETURN output of the right value is NOT a burn.
+    {
+        const CTxOut notBurn(amount, CScript() << OP_TRUE);
+        std::vector<CTxOut> vout{notBurn};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(!ClaimWithdrawalBurn(wt, vout, setClaimed));
+    }
+
+    // Invalid amount/fee (amount not greater than fee) never claims a burn.
+    {
+        const SidechainWithdrawal bad = mkwt(amount, amount);
+        std::vector<CTxOut> vout{burn};
+        std::set<size_t> setClaimed;
+        BOOST_CHECK(!ClaimWithdrawalBurn(bad, vout, setClaimed));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

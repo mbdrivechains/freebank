@@ -175,11 +175,17 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
         return state.DoS(100, false, REJECT_INVALID, "bad-txns-oversize");
 
 
-    bool fAssetGenesis = tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION;
-
-    // BitAsset genesis transactions must have at least 2 outputs
-    if (fAssetGenesis && tx.vout.size() < 2)
-        return state.DoS(10, false, REJECT_INVALID, "bad-txns-asset-gen-vout-size");
+    // C6-A (A1): the inherited BitAsset genesis version (v10) is RETIRED. It
+    // excluded vout[0..1] from BOTH halves of value conservation (the range
+    // loop below and GetValueOut) while coins.cpp still banked their nValue into
+    // the UTXO set -> unbounded money-in inflation from a raw tx. FreeBank's
+    // money layer never used BitAssets (gold = v17 oracle, notes = v13); this is
+    // inherited 46efa91 chassis surface. Reject the version outright rather than
+    // patch the carve-out. Unconditional: no persistent chain carries a v10 (the
+    // ev chain never ran createasset; the demo chain wipes daily), so a
+    // height-gate would be 0 on every network anyway.
+    if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION)
+        return state.DoS(100, false, REJECT_INVALID, "bad-txns-version-bitasset-retired");
 
     // Bill transactions: context-free shape + payload-signature checks
     if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -224,11 +230,10 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
     }
 
     // Check for negative or overflow output values
+    // C6-A (A1): the BitAsset-genesis skip is gone (v10 rejected above), so
+    // every output is range-checked and summed — no output escapes conservation.
     CAmount nValueOut = 0;
-    std::vector<CTxOut>::const_iterator it;
-    // Skip BitAsset genesis outputs
-    fAssetGenesis ? it = tx.vout.begin() + 2 : it = tx.vout.begin();
-    for (; it != tx.vout.end(); it++)
+    for (std::vector<CTxOut>::const_iterator it = tx.vout.begin(); it != tx.vout.end(); it++)
     {
         if (it->nValue < 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-vout-negative");

@@ -5938,6 +5938,15 @@ UniValue createasset(const JSONRPCRequest& request)
             + HelpExampleRpc("createasset", "")
         );
 
+    // C6-A (A1): the BitAsset subsystem (tx v10) is retired - a v10 tx is now
+    // rejected by consensus (bad-txns-version-bitasset-retired), so a created
+    // asset could never confirm. Refuse here, BEFORE building/committing, so we
+    // don't leave a funded-but-rejected wallet entry behind (the C7 phantom-tx
+    // class). FreeBank's money layer never used BitAssets (gold = v17 oracle,
+    // notes = v13).
+    throw JSONRPCError(RPC_MISC_ERROR,
+        "createasset is retired: the BitAsset subsystem (tx v10) was removed in C6-A.");
+
     ObserveSafeMode();
 
     // TODO check sizes
@@ -6086,6 +6095,11 @@ UniValue transferasset(const JSONRPCRequest& request)
             + HelpExampleRpc("transferasset", "")
         );
 
+    // C6-A (A1): BitAsset subsystem retired (see createasset). No new asset can
+    // be created, so there is nothing to transfer; refuse cleanly.
+    throw JSONRPCError(RPC_MISC_ERROR,
+        "transferasset is retired: the BitAsset subsystem (tx v10) was removed in C6-A.");
+
     ObserveSafeMode();
 
     // Txid
@@ -6155,6 +6169,10 @@ UniValue transferassetcontrol(const JSONRPCRequest& request)
             + HelpExampleCli("transferassetcontrol", "")
             + HelpExampleRpc("transferassetcontrol", "")
         );
+
+    // C6-A (A1): BitAsset subsystem retired (see createasset). Refuse cleanly.
+    throw JSONRPCError(RPC_MISC_ERROR,
+        "transferassetcontrol is retired: the BitAsset subsystem (tx v10) was removed in C6-A.");
 
     ObserveSafeMode();
 

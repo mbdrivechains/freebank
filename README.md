@@ -77,8 +77,30 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 
 Consensus code is only as trustworthy as what tries to break it. Much of the work is
 adversarial. The v0.2.7 line closes the two consensus issues that v0.2.6 shipped as
-known-open, and v0.2.7.1 closes a memory leak that fuzzing turned up:
+known-open, v0.2.7.1 closes a memory leak that fuzzing turned up, and v0.2.8 closes
+three consensus defects found by a line-by-line audit of the money paths inherited
+from the upstream sidechain chassis:
 
+- **Value conservation: the vestigial colored-coin subsystem is retired** (v0.2.8).
+  The chassis FreeBank was forked from shipped a generic asset-issuance feature
+  (transaction version 10, `createasset`/`transferasset`) that excluded its genesis
+  outputs from both halves of the value-conservation check while still crediting
+  their value to the UTXO set — a raw transaction could mint base coin from nothing.
+  No FreeBank instrument ever used it (bills, houses, notes, deposits, pools,
+  settlement and the oracle are transaction versions 11–17), so the subsystem is
+  removed outright: v10 transactions are now rejected at the transaction-check layer
+  and the RPCs are gone.
+- **Withdrawal burns are consumed exactly once** (v0.2.8). The burn output that
+  backs a withdrawal request was inspected but never marked spent, so one burn
+  could stand behind any number of withdrawal rows — and each row is a claim on the
+  mainchain payout. Each burn output is now claimed at most once per transaction,
+  mirroring the deposit-side fix this project shipped earlier; a withdrawal row is
+  also erased if the block that created it is disconnected.
+- **Withdrawal-bundle ordering is a total order** (v0.2.8). Bundle assembly sorted
+  withdrawals by fee with an unstable sort, so fee ties could order differently
+  between Linux (libstdc++) and macOS (libc++) — and payout order is compared
+  exactly at validation, which is a cross-platform chain split waiting for a tie.
+  Ties now break on the withdrawal id, which is platform-independent.
 - **Sidechain-object parser fails closed** (v0.2.7.1). The parser for sidechain-object
   outputs allocated an object before deserializing into it, with no exception guard, so a
   malformed payload leaked it. Because that parser runs during mempool acceptance ahead of
@@ -196,7 +218,13 @@ provisional pending simulation. Not yet audited; do not use with real value.
 **Closed since v0.2.6.** The two consensus issues the previous release listed as
 known-open are both fixed in v0.2.7: the deposit CTIP pointer is now rolled back on a
 reorg (deposit reorg safety), and payload signatures are now verified strict-DER and
-low-S at a single choke-point (signature canonicality). No consensus-level defect is
-currently outstanding on this list; the standing caveats are the ones above — provisional
-economic parameters and no third-party audit. Still test-coin software: do not use with
-real value.
+low-S at a single choke-point (signature canonicality). v0.2.8 closes the three
+consensus defects found by an internal audit of the inherited money paths (value
+conservation, withdrawal-burn consumption, withdrawal-bundle ordering — see
+Robustness above). v0.2.8 is a consensus change: a v0.2.8 node rejects transaction
+version 10 outright and enforces one-payout-per-burn, so upgrade before the chain
+you follow does. On chains that never carried a v10 transaction or a double-claimed
+burn — all known deployments — v0.2.8 revalidates the existing history unchanged.
+No consensus-level defect is currently outstanding on this list; the standing
+caveats are the ones above — provisional economic parameters and no third-party
+audit. Still test-coin software: do not use with real value.

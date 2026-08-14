@@ -82,17 +82,12 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : vin(std::move(tx.vin)), v
 
 CAmount CTransaction::GetValueOut() const
 {
-    bool fBitAsset = nVersion == TRANSACTION_BITASSET_CREATE_VERSION;
-
-    // Skip the controller and genesis output of a BitAsset creation
-    std::vector<CTxOut>::const_iterator it;
-    if (fBitAsset && vout.size() >= 2)
-        it = vout.begin() + 2;
-    else
-        it = vout.begin();
-
+    // C6-A (A1): the BitAsset genesis (v10) carve-out that skipped vout[0..1]
+    // is removed. v10 is now rejected in CheckTransaction, so every output of
+    // every valid transaction is counted against inputs here — the money-in
+    // conservation hole (skipped-but-banked genesis nValue) is closed.
     CAmount nValueOut = 0;
-    for (; it != vout.end(); it++) {
+    for (std::vector<CTxOut>::const_iterator it = vout.begin(); it != vout.end(); it++) {
         nValueOut += it->nValue;
         if (!MoneyRange(it->nValue) || !MoneyRange(nValueOut))
             throw std::runtime_error(std::string(__func__) + ": value out of range");

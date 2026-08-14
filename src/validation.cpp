@@ -5771,6 +5771,16 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     // VerifyDB throwaway pass).
     std::vector<uint256> vDepositUndo;
 
+    // C6-A high rider: withdrawal ROWS created in this block (by GetID),
+    // collected during the walk below and erased after the loop. Without this a
+    // reorg that drops a withdrawal-create block leaves a stale UNSPENT row that
+    // the new chain would pay. Status-reverts of PRE-EXISTING rows (the bundle-
+    // and refund-undo cases below) are already handled inline; this is only the
+    // create case, which had no disconnect handler at all. Erase by GetID is
+    // idempotent (no baseline pointer), so it needs no fDepositUndo-style guard -
+    // just fSideDB, like every other real-disconnect side-effect.
+    std::vector<uint256> vWithdrawalUndo;
+
     // B1/R-3: the bill undo STAGES its reverted records and flushes them with
     // the marker step-back in ONE atomic batch after the loop. Writing them
     // individually and stepping the marker afterwards (as this loop used to)
@@ -6940,6 +6950,15 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
                     vDepositUndo.push_back(deposit->GetID());
                 }
+                else
+                if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
+                    // C6-A high rider: this row was CREATED in this block. Collect
+                    // its GetID for the post-loop erase so the disconnect removes
+                    // it. (The other withdrawal cases above revert the status of
+                    // rows created in EARLIER blocks; only the create had no undo.)
+                    const SidechainWithdrawal *withdrawal = (const SidechainWithdrawal *) obj;
+                    vWithdrawalUndo.push_back(withdrawal->GetID());
+                }
             }
 
             // If this output is a withdrawal bundle status update commit - undo the update
@@ -7014,6 +7033,18 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     if (fDepositUndo && !vDepositUndo.empty()) {
         if (!psidechaintree->WriteDepositDisconnect(vDepositUndo, pindex->pprev->hashLastDeposit)) {
             error("DisconnectBlock(): Failed to revert deposit CTIP baseline!");
+            return DISCONNECT_FAILED;
+        }
+    }
+
+    // C6-A high rider: erase withdrawal rows created in this block. Real
+    // disconnects only (fSideDB) - the VerifyDB throwaway pass must not mutate
+    // the DB. Idempotent: erasing an already-erased GetID is a no-op, so a
+    // repeated disconnect is safe and no fDepositUndo-style pointer guard is
+    // needed (withdrawals carry no DB_LAST baseline to drag back).
+    if (fSideDB && !vWithdrawalUndo.empty()) {
+        if (!psidechaintree->WriteWithdrawalDisconnect(vWithdrawalUndo)) {
+            error("DisconnectBlock(): Failed to erase disconnected withdrawal rows!");
             return DISCONNECT_FAILED;
         }
     }
@@ -8593,6 +8624,13 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         // deposit-CTIP baseline set after the DB write below.
         uint256 hashLastDepositInBlock;
         for (const CTransactionRef& tx : block.vtx) {
+            // C6-A: OP_RETURN burn outputs (by index into tx->vout) already
+            // claimed by a withdrawal object in THIS transaction. Scoped per-tx
+            // because the burn scan below reads tx->vout, so a withdrawal can
+            // only be backed by a burn in its own transaction. A burn may back
+            // at most one withdrawal row — the setClaimed discipline D-1 applied
+            // to deposit payouts, here on the withdrawal-create path.
+            std::set<size_t> setClaimedBurns;
             for (const CTxOut& txout : tx->vout) {
                 const CScript& scriptPubKey = txout.scriptPubKey;
 
@@ -8618,22 +8656,15 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 // Check validity of withdrawals.
                 if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
                     const SidechainWithdrawal *withdrawal = (const SidechainWithdrawal *) obj;
-                    // Verify that burn output actually exists
-                    bool fBurnFound = false;
-                    // TODO refactor: looping through vout again during a loop
-                    // through vout... could be more efficient
-                    for (const CTxOut& o : tx->vout) {
-                        if (o.scriptPubKey.size()
-                                && o.scriptPubKey[0] == OP_RETURN
-                                && o.nValue == withdrawal->amount)
-                        {
-                            // Make sure that the burn amount & fee are valid
-                            if (withdrawal->amount > 0 && withdrawal->mainchainFee > 0
-                                    && withdrawal->amount > withdrawal->mainchainFee)
-                                fBurnFound = true;
-                        }
-                    }
-                    if (!fBurnFound) {
+                    // C6-A FIX: claim a DISTINCT burn per withdrawal. The original
+                    // check set a flag on ANY matching OP_RETURN and never consumed
+                    // it, so one burn satisfied EVERY withdrawal object of the same
+                    // amount in this tx (distinct dests -> distinct GetID -> distinct
+                    // rows), each later paid: N* escrow draw on the bundle path, N*
+                    // coinbase mint on the refund path. ClaimWithdrawalBurn marks the
+                    // output used (setClaimedBurns, per-tx) - the withdrawal twin of
+                    // ClaimDepositPayoutOutput (D-1).
+                    if (!ClaimWithdrawalBurn(*withdrawal, tx->vout, setClaimedBurns)) {
                         return state.Error("Invalid Withdrawal: invalid-withdrawal-missing-or-invalid-burn");
                     }
                 }
