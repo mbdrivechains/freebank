@@ -82,10 +82,25 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 
 Consensus code is only as trustworthy as what tries to break it. Much of the work is
 adversarial. The v0.2.7 line closes the two consensus issues that v0.2.6 shipped as
-known-open, v0.2.7.1 closes a memory leak that fuzzing turned up, and v0.2.8 closes
+known-open, v0.2.7.1 closes a memory leak that fuzzing turned up, v0.2.8 closes
 three consensus defects found by a line-by-line audit of the money paths inherited
-from the upstream sidechain chassis:
+from the upstream sidechain chassis, and v0.2.9 makes the node able to follow a
+mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran:
 
+- **Forknet L1 identity pin** (v0.2.9). A forknet such as alphanet has no signet
+  challenge and is byte-identical to Bitcoin below its fork height, so neither the
+  signet pin nor the chain name can identify it. `-mainchainblockpin=<height>:<hash>`
+  pins the fork block; a wrong hash refuses to start. Verified live on alphanet.
+- **Withdrawal destinations follow the L1's address family** (v0.2.9). The mainchain
+  address prefix used when withdrawal bundles are built and validated was fixed at the
+  signet/testnet value, so no mainnet-prefix destination could be expressed. It now
+  follows the L1 family the identity pin observes at startup — deterministic for every
+  node on the same L1, and unchanged on every signet-following chain.
+- **The enforcer identity probe verified nothing** (v0.2.9). It parsed the 80-byte
+  mainchain header as the sidechain's own header type, so it always failed, every start
+  warned "identity UNVERIFIED", and a wrong enforcer could never be refused. Found by
+  running the public guide's quick start on the release binaries. Fixed with a plain
+  SHA256d over the 80 bytes.
 - **Value conservation: the vestigial colored-coin subsystem is retired** (v0.2.8).
   The chassis FreeBank was forked from shipped a generic asset-issuance feature
   (transaction version 10, `createasset`/`transferasset`) that excluded its genesis
@@ -230,6 +245,10 @@ Robustness above). v0.2.8 is a consensus change: a v0.2.8 node rejects transacti
 version 10 outright and enforces one-payout-per-burn, so upgrade before the chain
 you follow does. On chains that never carried a v10 transaction or a double-claimed
 burn — all known deployments — v0.2.8 revalidates the existing history unchanged.
+v0.2.9 adds mainnet-family (forknet) L1 support — FreeBank is activated as slot 130 on
+the eCash alpha network, and a v0.2.9 node can follow it (see `FREEBANK_GUIDE.md`
+sections 2.3 and 5.2) — and fixes the enforcer identity probe, which had never
+verified. On chains following a signet L1 the withdrawal-address rule is unchanged.
 No consensus-level defect is currently outstanding on this list; the standing
 caveats are the ones above — provisional economic parameters and no third-party
 audit. Still test-coin software: do not use with real value.

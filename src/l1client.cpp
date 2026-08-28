@@ -12,6 +12,7 @@
 #include <univalue.h>
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
+#include <hash.h>
 #include <primitives/block.h>
 #include <streams.h>
 #include <txdb.h>
@@ -623,6 +624,14 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
         return false;
     }
 
+    // A9: record the L1 family for mainchain-address decoding. Read from the
+    // L1 itself, never from configuration, so every node following this L1
+    // derives the same withdrawal-destination prefix (bundle build/validate).
+    {
+        const UniValue& chainName = find_value(info, "chain");
+        g_fMainchainMainFamily = chainName.isStr() && chainName.get_str() == "main";
+    }
+
     const std::string strWantChain = gArgs.GetArg("-mainchainchain", "");
     if (!strWantChain.empty()) {
         const UniValue& chain = find_value(info, "chain");
@@ -650,6 +659,72 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
             return false;
         }
     }
+
+    // FORKNET / MAINNET-FAMILY PIN. A chain=main L1 (eCash alphanet, beta,
+    // mainnet, or real Bitcoin) carries no signet_challenge, so the challenge
+    // pin cannot exist there - and `chain` alone cannot tell alphanet from
+    // Bitcoin mainnet or from next month's beta forknet: they are byte-identical
+    // below the fork height. The block hash AT a height on the active chain is
+    // the discriminator (for alphanet, the fork block itself). A node still
+    // syncing below the pinned height is NOT a mismatch - report not-ready and
+    // let init's retry window run.
+    const std::string strWantPin = gArgs.GetArg("-mainchainblockpin", "");
+    if (!strWantPin.empty()) {
+        int nPinHeight = 0;
+        uint256 hashPin;
+        if (!ParseMainchainBlockPin(strWantPin, nPinHeight, hashPin)) {
+            strError = strprintf("-mainchainblockpin=%s is malformed (expected <height>:<64-hex blockhash>)",
+                                 strWantPin);
+            if (pfIdentityMismatch) *pfIdentityMismatch = true;
+            return false;
+        }
+        const UniValue& blocks = find_value(info, "blocks");
+        if (blocks.isNum() && blocks.get_int() < nPinHeight) {
+            strError = strprintf("mainchain %s is at height %d, below the pinned height %d - still syncing",
+                                 gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST),
+                                 blocks.get_int(), nPinHeight);
+            return false;
+        }
+        std::string strHashBody;
+        if (!client.RestGet("/rest/blockhashbyheight/" + std::to_string(nPinHeight) + ".json", strHashBody)
+                || strHashBody.empty()) {
+            strError = strprintf("mainchain REST endpoint %s did not answer /rest/blockhashbyheight/%d.json",
+                                 gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST), nPinHeight);
+            return false;
+        }
+        UniValue hashInfo;
+        const UniValue& got = (hashInfo.read(strHashBody) && hashInfo.isObject())
+                                  ? find_value(hashInfo, "blockhash") : NullUniValue;
+        if (!got.isStr() || uint256S(got.get_str()) != hashPin) {
+            strError = strprintf("mainchain identity mismatch: -mainchainblockpin pins block %s at height %d "
+                                 "but %s reports %s. This is a DIFFERENT chain (wrong forknet, or real "
+                                 "mainnet) - refusing to start against the wrong L1.",
+                                 hashPin.ToString(), nPinHeight,
+                                 gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST),
+                                 got.isStr() ? got.get_str() : "(absent)");
+            if (pfIdentityMismatch) *pfIdentityMismatch = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ParseMainchainBlockPin(const std::string& strPin, int& nHeight, uint256& hashBlock)
+{
+    const size_t nColon = strPin.find(':');
+    if (nColon == std::string::npos || nColon == 0 || nColon + 1 >= strPin.size())
+        return false;
+    const std::string strHeight = strPin.substr(0, nColon);
+    const std::string strHash = strPin.substr(nColon + 1);
+    for (char c : strHeight)
+        if (!std::isdigit(static_cast<unsigned char>(c)))
+            return false;
+    if (strHeight.size() > 9)
+        return false;                              // > 999,999,999 is not a real height
+    if (strHash.size() != 64 || !IsHex(strHash))
+        return false;
+    nHeight = std::atoi(strHeight.c_str());
+    hashBlock = uint256S(strHash);
     return true;
 }
 
@@ -742,13 +817,18 @@ EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale)
             } else if (IsHex(strHdr)) {
                 // Belt-and-braces: confirm the returned header really IS the
                 // enforcer tip (guards a misbehaving REST from a false MATCH).
-                try {
-                    CBlockHeader hdr;
-                    CDataStream ss(ParseHex(strHdr), SER_NETWORK, PROTOCOL_VERSION);
-                    ss >> hdr;
-                    fMember = (hdr.GetHash() == enfTip.hashBlock);
-                } catch (const std::exception&) {
-                    fMemberOK = false; // unparseable == couldn't check, not a mismatch
+                // This is a MAINCHAIN header: 80 bytes (version, prev, merkle,
+                // time, bits, nonce), hash = SHA256d over the 80 bytes. It must
+                // NOT be deserialized as the sidechain's CBlockHeader (which has
+                // a different layout and no nBits/nNonce) - that was the v0.2.8
+                // defect that made this probe report NOT-READY on every network,
+                // so the gRPC pin never verified and its refuse path was
+                // unreachable (found by the guide's stranger-run, 2026-08-28).
+                const std::vector<unsigned char> raw = ParseHex(strHdr);
+                if (raw.size() == 80) {
+                    fMember = (Hash(raw.begin(), raw.end()) == enfTip.hashBlock);
+                } else {
+                    fMemberOK = false; // not an 80-byte header == couldn't check, not a mismatch
                 }
             } else {
                 fMemberOK = false; // unexpected non-hex body == couldn't check

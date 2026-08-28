@@ -38,9 +38,9 @@ wallet holding its notes. Section 3 was run end-to-end as one script; the sectio
 recipes come from separate integration tests and are **not** one continuous script —
 each states the state it assumes. A returned txid is **not** acceptance — check chain
 state (`gethouse`, `getbill`, `getrawmempool`). Not in this file: the signet connection
-recipe (see `doc/signet.md`); running `freebankd` against the eCash alpha network is
-impossible with v0.2.8 (section 2.3 — watching the L1 side is 5.2). If this file and
-`freebank-cli help <rpc>` disagree, the binary is right; say so.
+recipe (see `doc/signet.md`). Running `freebankd` against the eCash alpha network needs
+v0.2.9 or later (2.3, recipe in 5.2). If this file and `freebank-cli help <rpc>`
+disagree, the binary is right; say so.
 
 ---
 
@@ -101,31 +101,32 @@ at 09:00 UTC**, so it is a playground, not a place to keep anything. The connect
 (signet challenge, seed node, enforcer and `freebankd` flags) is in
 [`doc/signet.md`](doc/signet.md) in this repository.
 
-### 2.3 The eCash alpha network (alphanet) — activated, not yet followable
+### 2.3 The eCash alpha network (alphanet) — activated; followable from v0.2.9
 
 On **2026-08-27** FreeBank was proposed and activated as **slot 130 on the eCash alpha
 network** (M1 in block 996,454, 30 of 30 acks, activated at block 996,485). Another
 sidechain, in slot 24, activated in the same window. The M1 declaration carries the
 v0.2.8 hash ids (section 2.4).
 
-Be precise about what that means today:
+Be precise about what that means:
 
-- **The slot is open. No FreeBank blocks are being produced on alpha yet.** Producing
-  them needs a `freebankd` following the alpha chain, and **v0.2.8 cannot do that**: its
-  startup identity pin assumes the mainchain is a *signet* and demands a signet challenge,
-  which a `chain=main` forknet like alphanet does not have. A second gap affects peg-out
-  only: withdrawal destinations are decoded with the signet/testnet address prefix, so an
-  alpha (mainnet-prefix) destination cannot be expressed. Both are planned for the next
-  release; when it ships, a new M1 with refreshed hash ids will be needed on whatever
-  eCash network is current.
-- **Do not deposit to slot 130 on alpha yet.** A deposit is a mainchain transaction into
-  the slot's escrow; with no `freebankd` following alpha there is nothing to credit it,
-  and it would be lost at the next reset regardless.
-- **What you *can* do on alpha now:** run the alphanet L1 node and an enforcer and watch
-  slot 130 in `GetSidechains`; scan coinbases for FreeBank's on-chain footprint (section
-  9.4); obtain alpha coins by mining or from other participants. The enforcer's
-  self-mining and self-acking are regtest/signet-only — on alpha, blocks come from real
-  hash.
+- **The slot is open.** A FreeBank node can follow the alpha chain from **v0.2.9**
+  (recipe in 5.2). v0.2.8 could not: its startup identity pin assumed the mainchain was a
+  *signet* and demanded a signet challenge, which a `chain=main` forknet does not have,
+  and it decoded withdrawal destinations with the signet/testnet address prefix. v0.2.9
+  adds `-mainchainblockpin` (pin the fork block) and derives the address prefix from the
+  L1 family.
+- **Blocks appear only when someone produces them.** A FreeBank block on alpha needs a
+  `freebankd` posting BMM requests through an enforcer whose wallet holds alpha coins (the
+  request is a paid mainchain transaction), and a miner running enforcer templates to
+  include it. To see whether slot 130 is being mined, scan recent coinbases for M7
+  commitments with the slot byte `0x82` (section 9.4).
+- **Deposit only once you can see FreeBank blocks being produced.** A deposit is a
+  mainchain transaction into the slot's escrow; it is credited by the sidechain, so with
+  no blocks there is nothing to credit it — and it would be lost at the next reset
+  regardless.
+- **The enforcer's self-mining and self-acking are regtest/signet-only** — on alpha,
+  blocks come from real hash. Obtain alpha coins by mining or from other participants.
 - **Alpha is disposable.** eCash has said alpha will be followed by a beta network and
   then mainnet, each a fresh fork (see eCash's own announcements for dates). Everything on
   alpha — the activation, deposits, any chain state — is expected to vanish at the next
@@ -140,8 +141,14 @@ coinbase scan).
 ### 2.4 Verifying what you download
 
 Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. The sidechain proposal (M1) that activated slot
-130 on alpha commits to this release:
+arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.9** (the first that can
+follow alpha): `freebank-0.2.9-x86_64-linux-gnu.tar.gz`, sha256
+`69ac41b74351d8374d3c7383faf69e0c27f5839459f4890ab25c204a8b452370`; its source is the
+commit the public tag `v0.2.9` points at (`git rev-parse 'v0.2.9^{commit}'`). The commands
+below are written for v0.2.8 because that is what the sidechain proposal on alpha
+commits to — substitute `0.2.9` to verify the current binaries the same way.
+
+The sidechain proposal (M1) that activated slot 130 on alpha commits to v0.2.8:
 
 | M1 field | value |
 |---|---|
@@ -711,8 +718,7 @@ after a reset, give the enforcer and `freebankd` fresh datadirs and delete `peer
 
 ### 5.2 The eCash alpha network
 
-Not yet followable by `freebankd` (section 2.3). What is documented for the L1 side, for
-anyone who wants to watch slot 130:
+Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the node:
 
 - **Node:** the alphanet build of the LayerTwo Labs L1 (`L1-ecash-bitcoin-alphanet-<triplet>.zip`
   from https://releases.drivechain.info/), run as `chain=main` with `drivechain=1`,
@@ -731,6 +737,26 @@ anyone who wants to watch slot 130:
   unless the full history is present. Then
   `grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechains`
   lists slot 130 once the validator is past 996,485.
+- **`freebankd` (v0.2.9 or later)** — on its `main` network (no `-regtest`), pinned to
+  the alphanet fork block. This is the exact command that followed the alphanet tip on
+  2026-08-28; substitute your node's RPC port and credentials:
+
+  ```bash
+  freebankd -daemon -server -rpcuser=user -rpcpassword=pass \
+    -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 -mainchainrest=127.0.0.1:18303 \
+    -mainchainchain=main \
+    -mainchainblockpin=963648:0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924
+  freebank-cli -rpcuser=user -rpcpassword=pass getmainchainblockcount   # the alpha tip
+  ```
+
+  A wrong pin hash is refused at startup with an identity-mismatch error; that is the
+  point of the pin — alphanet, real Bitcoin and the next forknet are byte-identical below
+  the fork height. Then run `refreshbmm 0.001` on a timer (every couple of minutes). The
+  BMM request is a mainchain transaction funded by the **enforcer's wallet**, so it must
+  hold alpha coins (`WalletService/CreateNewAddress` gives you an address to fund); with
+  `--wallet-sync-source=disabled` the wallet only learns of coins that arrive while it is
+  running. Whether your requests get mined depends on miners running enforcer templates
+  — the same pools that mine the other sidechains' BMM commitments.
 - **Coinbase scan:** the on-chain footprint needs no enforcer at all — see 9.4.
 
 ---
@@ -883,10 +909,10 @@ touches it.
 - Re-running `./configure` can leave stale archives (`undefined reference to
   boost::system::generic_category()`): remove `src/libbitcoin_util.a` and rebuild.
 - **`freebankd` has two chains of its own:** `regtest` (follows a regtest L1) and `main`
-  (follows any non-regtest L1 — with v0.2.8 that must be a signet, pinned by
-  `-mainchainchallenge`; forknet L1s such as alpha need the next release). There is no
-  separate testnet or signet mode. Address prefix `X…`; bech32 HRP `fbk` (`fbkrt` on
-  regtest).
+  (follows any non-regtest L1 — a signet pinned by `-mainchainchallenge`, or, from
+  v0.2.9, a mainnet-family forknet such as alpha pinned by `-mainchainblockpin`). There
+  is no separate testnet or signet mode. Address prefix `X…`; bech32 HRP `fbk` (`fbkrt`
+  on regtest).
 
 ---
 
@@ -912,7 +938,7 @@ touches it.
 | Chaumian bearer layer over notes | **Not built** (designed; op codes reserved) |
 | Cash-credit lines | **Not built** (designed) |
 | Strict-DER / low-S payload signatures; L1 identity pin | Built |
-| Forknet (alpha/mainnet-style L1) support in `freebankd` | **Not built** (planned next release) |
+| Forknet (alpha/mainnet-style L1) support in `freebankd` | Built (v0.2.9): `-mainchainblockpin` + address prefix from the L1 family; verified live on alphanet |
 | Third-party audit; mutation testing | **Not done** |
 
 Test posture: 28 end-to-end integration gates and 446 unit cases, including two-node

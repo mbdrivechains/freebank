@@ -311,6 +311,33 @@ BOOST_AUTO_TEST_CASE(l1client_blinded_m6id)
 // A7: the gRPC enforcer identity-pin decision logic. Kept pure (no gRPC/REST I/O)
 // precisely so its classification - the part that decides whether a node REFUSES
 // to start - is nailed down by vectors rather than by a live two-chain harness.
+BOOST_AUTO_TEST_CASE(l1client_mainchain_blockpin_parse)
+{
+    // The forknet/mainnet-family L1 identity pin: "<height>:<64-hex blockhash>".
+    int h = -1;
+    uint256 hash;
+    const std::string strFork = "00000000000000000001b4a6f9e8c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+    BOOST_CHECK(ParseMainchainBlockPin("963648:" + strFork, h, hash));
+    BOOST_CHECK_EQUAL(h, 963648);
+    BOOST_CHECK(hash == uint256S(strFork));
+
+    // Case-insensitive hex, height 0 allowed (genesis pin)
+    BOOST_CHECK(ParseMainchainBlockPin("0:" + std::string(64, 'A'), h, hash));
+    BOOST_CHECK_EQUAL(h, 0);
+
+    // Malformed: no colon, empty height, empty hash, non-numeric height,
+    // negative height, short hash, long hash, non-hex hash, absurd height.
+    BOOST_CHECK(!ParseMainchainBlockPin(strFork, h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin(":" + strFork, h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("963648:", h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("96x648:" + strFork, h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("-1:" + strFork, h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("963648:" + strFork.substr(0, 63), h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("963648:" + strFork + "0", h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("963648:" + std::string(64, 'z'), h, hash));
+    BOOST_CHECK(!ParseMainchainBlockPin("9999999999:" + strFork, h, hash));
+}
+
 BOOST_AUTO_TEST_CASE(l1client_enforcer_identity_classify)
 {
     const int K = 20; // stale-warn depth

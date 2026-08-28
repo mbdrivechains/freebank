@@ -23,6 +23,7 @@
 #include <httprpc.h>
 #include <key.h>
 #include <l1client.h>
+#include <sidechain.h>
 #include <validation.h>
 #include <miner.h>
 #include <netbase.h>
@@ -534,7 +535,9 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; probed at startup (default: 127.0.0.1:38332)"));
     strUsage += HelpMessageOpt("-mainchainchain=<name>", _("L1 IDENTITY PIN: refuse to start unless the mainchain reports this chain name (main/test/signet/regtest). Reachability is not identity - a second node taking the default -mainchainrest will happily follow SOMEONE ELSE'S mainchain."));
     strUsage += HelpMessageOpt("-mainchainchallenge=<hex>", _("L1 IDENTITY PIN for signet: refuse to start unless the mainchain reports this signet_challenge. Required to tell two custom signets apart - they share a chain name AND a genesis hash (Core's signet genesis is hardcoded, not derived from the challenge)."));
+    strUsage += HelpMessageOpt("-mainchainblockpin=<height>:<blockhash>", _("L1 IDENTITY PIN for a mainnet-family L1 (a forknet such as eCash alphanet, or mainnet): refuse to start unless the mainchain's active chain carries this block hash at this height. A forknet has no signet_challenge and is byte-identical to Bitcoin below its fork height, so pin the fork block. Outside regtest the enforcer transport requires -mainchainchallenge OR -mainchainblockpin."));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
+    strUsage += HelpMessageOpt("-minwithdrawal=<n>", strprintf(_("Minimum number of pending withdrawals before this node forms a withdrawal bundle (policy, not consensus; default: %u). Set 1 to bundle a lone withdrawal."), DEFAULT_MIN_WITHDRAWAL_CREATE_BUNDLE));
     strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
     strUsage += HelpMessageOpt("-housefailfast", _("Regtest only when disabled: set 0 to bypass the wallet's one-op-per-house fail-fast so ops reach ATMP (integration-gate knob; changes WHICH LAYER refuses, never whether it is refused - consensus is untouched; default: 1)"));
     strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
@@ -997,17 +1000,24 @@ bool AppInitParameterInteraction()
                                          "it this node would reject deposit-bearing blocks and fork off the "
                                          "network."), strProbeError));
 
-        // A7 #4: outside regtest the L1 is a signet, and the gRPC enforcer
-        // identity pin below is TRANSITIVE on the REST challenge pin. Without a
-        // challenge armed, both pins degrade to reachability-only - exactly the
-        // 2026-07-28 gap. Require it. (Regtest has no signet_challenge and runs
-        // the local drivechain-patched bench, so it is exempt.)
+        // A7 #4: outside regtest an L1 identity pin is MANDATORY, and the gRPC
+        // enforcer identity pin below is TRANSITIVE on it. Without one, both
+        // pins degrade to reachability-only - exactly the 2026-07-28 gap. Two
+        // pins exist because two L1 families exist: a signet is identified by
+        // its signet_challenge (two custom signets share chain name AND genesis);
+        // a mainnet-family L1 (eCash alphanet/beta/mainnet, real Bitcoin) has no
+        // challenge and is byte-identical to Bitcoin below its fork height, so it
+        // is identified by a pinned block hash at a height (the fork block).
+        // (Regtest runs the local bench and is exempt.)
         if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST &&
-                gArgs.GetArg("-mainchainchallenge", "").empty())
-            return InitError(_("-mainchaintransport=enforcer requires -mainchainchallenge=<hex> outside "
-                               "regtest: the L1 is a signet and, without its signet_challenge, this node "
-                               "cannot tell two custom signets apart - the 2026-07-28 wrong-L1 failure. "
-                               "The gRPC enforcer identity check is transitive on this pin."));
+                gArgs.GetArg("-mainchainchallenge", "").empty() &&
+                gArgs.GetArg("-mainchainblockpin", "").empty())
+            return InitError(_("-mainchaintransport=enforcer requires an L1 identity pin outside regtest: "
+                               "-mainchainchallenge=<hex> for a signet L1 (its signet_challenge), or "
+                               "-mainchainblockpin=<height>:<blockhash> for a mainnet-family L1 such as a "
+                               "forknet (pin the fork block). Without a pin this node cannot tell two L1s "
+                               "apart - the 2026-07-28 wrong-L1 failure. The gRPC enforcer identity check "
+                               "is transitive on this pin."));
 
         // A7: gRPC ENFORCER identity pin. The REST pin above proves the REST
         // node's identity; this proves the ENFORCER (a separate channel carrying

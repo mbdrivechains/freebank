@@ -22,7 +22,44 @@
 
 extern UniValue read_json(const std::string& jsondata);
 
+extern bool g_fMainchainMainFamily;   // defined in base58.cpp (A9); file scope, outside the suite namespace
+
 BOOST_FIXTURE_TEST_SUITE(base58_tests, BasicTestingSetup)
+
+// A9: mainchain (withdrawal-destination) P2PKH decoding follows the L1 family
+// observed at init - signet/testnet family -> prefix 111 (m.../n...), main
+// family (forknet / mainnet) -> prefix 0 (1...). This prefix feeds bundle
+// build/validate, so both directions are pinned here.
+BOOST_AUTO_TEST_CASE(base58_mainchain_prefix_follows_l1_family)
+{
+    std::vector<unsigned char> hash(20, 0x42);
+    std::vector<unsigned char> v111(1, 111); v111.insert(v111.end(), hash.begin(), hash.end());
+    std::vector<unsigned char> v0(1, 0);     v0.insert(v0.end(), hash.begin(), hash.end());
+    const std::string addr111 = EncodeBase58Check(v111);
+    const std::string addr0 = EncodeBase58Check(v0);
+
+    // The regtest branch (MAINCHAIN_REGTEST_PUBKEY_ADDRESS) must not mask the
+    // family switch: pin -regtest off for this case and restore it after.
+    const std::string strRegtestSaved = gArgs.GetArg("-regtest", "");
+    gArgs.ForceSetArg("-regtest", "0");
+    const bool fSaved = g_fMainchainMainFamily;
+
+    g_fMainchainMainFamily = false;   // signet / testnet family: today's behaviour
+    BOOST_CHECK(IsValidDestination(DecodeDestination(addr111, true)));
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(addr0, true)));
+
+    g_fMainchainMainFamily = true;    // main family: alphanet / mainnet
+    BOOST_CHECK(IsValidDestination(DecodeDestination(addr0, true)));
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(addr111, true)));
+
+    // Sidechain (non-mainchain) decoding is untouched by the family flag.
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(addr0, false)));
+
+    g_fMainchainMainFamily = fSaved;
+    // GetBoolArg("-regtest", false) reads an absent arg as false, so "0" restores
+    // the observable state exactly when it was unset before.
+    gArgs.ForceSetArg("-regtest", strRegtestSaved.empty() ? "0" : strRegtestSaved);
+}
 
 // Goal: test low-level base58 encoding functionality
 BOOST_AUTO_TEST_CASE(base58_EncodeBase58)

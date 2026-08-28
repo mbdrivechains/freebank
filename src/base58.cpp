@@ -18,6 +18,13 @@
 #include <assert.h>
 #include <string.h>
 
+// A9: the L1 family observed by the REST identity pin at init (set in
+// l1client.cpp). Defined HERE, in the common layer, because this file is linked
+// into every binary (freebank-tx has no server layer) and the decode below reads
+// it. False = signet/testnet family (prefix 111, today's default); true = the
+// mainchain reported chain=main (a forknet such as eCash alphanet, or mainnet).
+bool g_fMainchainMainFamily = false;
+
 
 /** All alphanumeric characters except for "0", "I", "O", and "l" */
 static const char* pszBase58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -277,8 +284,15 @@ CTxDestination DecodeDestination(const std::string& str, const CChainParams& par
         std::vector<unsigned char> pubkey_prefix;
         if (fMainchain && fRegtest)
             pubkey_prefix = params.Base58Prefix(CChainParams::MAINCHAIN_REGTEST_PUBKEY_ADDRESS);
-        else
-        if (fMainchain)
+        else if (fMainchain && g_fMainchainMainFamily)
+            // A9: the L1 reported chain=main (a forknet such as eCash alphanet,
+            // or mainnet) - its P2PKH addresses carry prefix 0, not the
+            // signet/testnet 111 that MAINCHAIN_PUBKEY_ADDRESS assumes. The
+            // family is observed from the L1 at init (l1client.cpp) and is not
+            // configurable: this prefix feeds withdrawal-bundle build/validate,
+            // so it must be identical for every node following the same L1.
+            pubkey_prefix = std::vector<unsigned char>(1, 0);
+        else if (fMainchain)
             pubkey_prefix = params.Base58Prefix(CChainParams::MAINCHAIN_PUBKEY_ADDRESS);
         else
             pubkey_prefix = params.Base58Prefix(CChainParams::PUBKEY_ADDRESS);

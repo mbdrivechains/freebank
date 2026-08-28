@@ -43,6 +43,18 @@ static const std::string DEFAULT_MAINCHAIN_REST = "127.0.0.1:38332";
  */
 bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch = nullptr);
 
+/** A9: the L1 family observed by the REST pin at init. True iff the mainchain reports
+ *  chain=main (a forknet such as eCash alphanet, or mainnet). Read by base58's mainchain
+ *  address decoding (withdrawal destinations, consumed at bundle build/validate), so it
+ *  is set once from the L1 itself and never configurable - identical for every node that
+ *  follows the same L1. False (signet/testnet family, prefix 111) until the probe runs.
+ *  Defined in base58.cpp (common layer) so freebank-tx links; SET here. */
+extern bool g_fMainchainMainFamily;
+
+/** Parse a -mainchainblockpin value "<height>:<blockhash>" (forknet / mainnet-family
+ *  L1 identity pin). Pure, no I/O, unit-tested. Returns false on any malformation. */
+bool ParseMainchainBlockPin(const std::string& strPin, int& nHeight, uint256& hashBlock);
+
 /** Result of the enforcer-side (gRPC) L1 identity probe. */
 enum EnforcerIdentity {
     ENFORCER_IDENTITY_MATCH,     // enforcer tip is a block on the REST node's active chain
