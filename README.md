@@ -15,6 +15,11 @@ new *monetary* arrangements settling against Bitcoin.
 FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT). It is **experimental,
 pre-audit software** — run it on regtest/testnet/signet with test coins only.
 
+> **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
+> knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
+> gotchas, parameters, glossary) written so you can hand it to an AI assistant and be walked
+> through running your own FreeBank.
+
 ## What works today
 
 - **BIP 300/301 sidechain**: activates into a slot, advances by blind-merged-mining (BMM),
