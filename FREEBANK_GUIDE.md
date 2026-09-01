@@ -760,7 +760,12 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   no patch), then `loadtxoutset` accepts it. After loading, sync forward and pin the tip
   with `-assumevalid=<known-good tip hash>`; snapshot-plus-sync-forward is ~4.5 h versus
   days for a full IBD. (The pre-fork UTXO set is real Bitcoin's, so a `dumptxoutset`
-  from any Bitcoin node at a supported height is an alternative.)
+  from any Bitcoin node at a supported height is an alternative.) One caveat if you take the
+  snapshot path: such a node runs two chainstates and its `txindex` only covers the
+  still-validating *background* (genesis-up) range until that finishes. The node follows the
+  chain fine meanwhile, but **peg-in deposits silently fail to credit until `txindex` passes
+  the deposit's block** (7.3) — run the mainchain node from a full `txindex` (no snapshot) if
+  you need deposits before the background sync completes.
 - **Enforcer:** a recent build with `--network-preset=alphanet` (v0.3.4 was the first to
   carry it), pointed at the node's RPC and ZMQ, default gRPC on `127.0.0.1:50051` (section
   3 used 50151 only to avoid collisions). Builds from mid-August 2026 on fetch only headers
@@ -1018,6 +1023,16 @@ touches it.
   `getdepositaddress`/`formatdepositaddress` exist for tools that expect the wrapper; the
   enforcer wants the plain address.
 - A deposit needs a mainchain block *and then* a sidechain block to credit.
+- **On a snapshot-bootstrapped mainchain node, deposits silently never credit until `txindex`
+  catches up.** `freebankd` fetches each deposit's raw transaction over REST
+  (`getrawtransaction`) to build the credit output; an assumeutxo node's `txindex` only covers
+  its still-validating *background* chainstate, so `getrawtransaction` for a recent deposit
+  returns *not found*, `freebankd` fails the whole deposit batch closed, and every block
+  credits `0 deposits`. The only clue is `REST raw-tx fetch failed for deposit <txid> (batch
+  failed closed)` in `debug.log` — the enforcer itself knows the deposit (`GetCtip` shows it);
+  only the raw-tx fetch is missing. Fix: wait for the node's background validation (and
+  `txindex`) to pass the deposit's block, or run the mainchain node from a full `txindex` (no
+  snapshot).
 - A lone withdrawal never bundles unless `-minwithdrawal=1` (default 10).
 - Withdrawal destinations: legacy P2PKH only; bech32 and P2SH are not decoded.
 - Payout timing is the enforcer's ack threshold (5 acks / 10 blocks on regtest), not
