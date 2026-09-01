@@ -6,7 +6,7 @@ This file is meant to be *complete enough on its own* that you can hand it to an
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
 you through running FreeBank, standing up a bank, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
-or from the source of the shipped release (v0.2.8, 2026-08-22), and the quick start in
+or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.10), and the quick start in
 section 3 was run verbatim against the release binaries. Where something is designed but
 not built, it says so.
 
@@ -725,16 +725,20 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   `txindex=1`, `rest=1`, a `zmqpubsequence` endpoint, and enough `dbcache` for your RAM.
   Fork height 963,648; network magic `eca5a104`. Sync: a full IBD from genesis takes
   days. An assumeutxo snapshot at height 935,000 is published at `data.drivechain.dev`,
-  but at the time of writing the file carries a *different network's* magic bytes and an
-  unmodified alphanet node refuses it — check whether a corrected file has been published
-  before relying on it. (The pre-fork UTXO set is real Bitcoin's, so a `dumptxoutset`
+  but as of Aug 2026 the file starts with the **drynet4** network magic and an
+  unmodified alphanet node refuses it. The fix is one byte: patch offset **9** to `0xa1`
+  (verify the offset against the current file first — a re-published corrected file needs
+  no patch), then `loadtxoutset` accepts it. After loading, sync forward and pin the tip
+  with `-assumevalid=<known-good tip hash>`; snapshot-plus-sync-forward is ~4.5 h versus
+  days for a full IBD. (The pre-fork UTXO set is real Bitcoin's, so a `dumptxoutset`
   from any Bitcoin node at a supported height is an alternative.)
 - **Enforcer:** a recent build with `--network-preset=alphanet` (v0.3.4 was the first to
   carry it), pointed at the node's RPC and ZMQ, default gRPC on `127.0.0.1:50051` (section
   3 used 50151 only to avoid collisions). Builds from mid-August 2026 on fetch only headers
   below the activation height, which lets an enforcer on an assumeutxo node reach the tip
-  in minutes; older builds scan every block from genesis and stall at the assumeutxo gap
-  unless the full history is present. Then
+  in minutes; older builds scan every block from genesis —
+  stalling at the assumeutxo gap unless the full history is present, and growing RSS with
+  the backlog until a low-memory box runs out of RAM. Then
   `grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechains`
   lists slot 130 once the validator is past 996,485.
 - **`freebankd` (v0.2.9 or later)** — on its `main` network (no `-regtest`), pinned to
@@ -812,7 +816,62 @@ end-to-end on an Apple-Silicon Mac against a BitWindow stack.)
    Success is a peer appearing on its own **plus** `getblockcount` reaching the network height — proof of
    download → seed discovery → P2P sync → L1 validation, on a machine that built none of it. If `freebankd`
    refuses to start with an identity-mismatch error, BitWindow's node is not on eCash alpha. This path only
-   *follows* the chain; producing blocks (the `refreshbmm` loop) is section 5.2.
+   *follows* the chain; to produce blocks yourself, bid via `refreshbmm` (5.2) or mine them (5.4).
+### 5.4 Producing blocks yourself
+
+§5.2 makes you a *follower* — you `refreshbmm` and bid for whoever is mining to include your
+request. This makes you a *producer*: you run the mining, your coinbase carries the M7 that connects
+the sidechain block, and there is no bidding war. On a network as small as alpha, a few hours of
+rented SHA-256 makes you the dominant producer — the most direct way to keep slot 130 advancing (or to
+watch your own `freebankd`'s blocks land).
+
+**Block-cost math.** Alpha's difficulty is pinned at the floor (`4,294,967,296` = 2³², bits
+`1900ffff`): honest hash on alpha is far below what that difficulty implies for 10-minute blocks, so
+blocks arrive *slower* than ten minutes and difficulty cannot retarget any lower. Work per block is
+`difficulty × 2³² = 2⁶⁴ ≈ 1.845×10¹⁹` hashes, so for a hashrate *H*:
+
+```
+expected_seconds_per_block  ≈  2^64 / H      (a Poisson mean — any single block can be much faster or slower)
+```
+
+Roughly: **~1.5 PH/s → ~3.4 h/block · ~10 PH/s → ~31 min · ~30 PH/s → ~10 min** (nominal block time,
+single-handed).
+
+**The pieces:**
+
+1. **An enforcer configured to mine** — §5.2's flags plus:
+   ```
+   --enable-mempool --enable-block-template-server \
+   --coinbase-recipient=<your bech32 payout address> \
+   --serve-rpc-addr=<ip>:<port>         # the getblocktemplate/submitblock endpoint the pool calls
+   --serve-grpc-addr=0.0.0.0:50051
+   ```
+   The enforcer builds the coinbase for you — your payout output **plus** the BIP300 M1/M2/M4/M7
+   commitments — inside the template's `coinbasetxn`; you never construct the drivechain commitments
+   yourself. (The enforcer's *self*-mine and *self*-ack are regtest/signet-only — `verify_can_mine`
+   errors on a `chain=main` forknet — so on alpha the blocks come from real hash even when you are the
+   producer.)
+
+2. **A solo pool** in front of `getblocktemplate` — **simplepool**
+   (`github.com/LayerTwo-Labs/simplepool`; build `master`, the Aug-2026 stratum fixes matter). Its GBT
+   client must request `capabilities:["coinbasetxn"]` so the enforcer supplies the ready-made coinbase.
+   Payout routing: the reward follows the **worker's stratum username** (the part before the first `.`)
+   — set that to your payout address.
+
+3. **Hashpower** pointed at the pool's stratum port. NiceHash's SHA-256 market is usually supply-starved
+   (orders sit unfilled); **MiningRigRentals** is the reliable source (whole rigs, per-rig minimum
+   length, priced BTC/PH/day). Two gotchas no AI's training will know: MRR shows **0 hashrate for a
+   custom/solo pool** (it infers the rate from a report a solo pool never sends — trust your own
+   `pool.log`, not the dashboard), and set the pool's `initial_diff` **inside the rig's advertised
+   optimal range**, because vardiff only retargets on an *accepted* share — set it too high and a miner
+   never lands one and appears to hang.
+
+> **The rule that makes or breaks solo mining:** the pool passes the enforcer's `coinbasetxn` through
+> **verbatim**, substituting only the reward key. **Do not strip or reorder the template's
+> transactions.** The coinbase carries a witness commitment computed over the template's exact tx set —
+> drop a tx and you break `bad-witness-merkle-match` *and* over-claim fees (`bad-cb-amount`); the
+> network silently rejects the block **after** you have paid for the hash. Mine the template as given.
+
 
 
 ---
@@ -951,6 +1010,20 @@ touches it.
 - On a signet, `-mainchainchallenge` is mandatory and an identity mismatch halts the node
   with exit status 66. After a signet reset, wipe all datadirs (enforcer included) and
   `peers.dat`.
+- **If you run an enforcer to *mine* (5.4)** and its `getblocktemplate` never leaves `still
+  syncing`, the enforcer's mempool init-sync has wedged on a dropped ZMQ sequence message
+  (the L1 node's `pubsequence` queue overran its high-water mark and the arming message was
+  lost). Set `zmqpubsequencehwm=100000` on the L1 node and restart the enforcer; run it
+  unattended only behind a watchdog that relaunches it when it fails to serve within a few
+  minutes — a *hang* (process alive, stuck) is not cleared by a plain restart-on-exit loop.
+- **Boot persistence:** if `@reboot` cron (or any `user@` systemd unit) keeps the stack up,
+  run `loginctl enable-linger <user>` once — without it systemd tears the user slice down a
+  few minutes after an unattended reboot and takes the node, enforcer and pool with it.
+  (Testing reboot-resilience over an *open* SSH session hides this: the session keeps the
+  slice alive. Test with nothing attached.)
+- **Power-cut durability:** bitcoind's LevelDB is fsync'd and comes back clean from a hard
+  power loss (no reindex); un-fsync'd files you write yourself (helper-script state) can
+  return NUL-zeroed. fsync anything you cannot afford to lose.
 
 ### 7.5 Build and upgrade
 
@@ -959,9 +1032,10 @@ touches it.
   format change — a binary swap. (v0.2.7 *did* change the disk format: a datadir written
   by ≤ v0.2.6 needs a one-time `-reindex`.)
 - Native builds are not portable; use the static release tarball or a `depends` static
-  build. **Build the static path from `master`**, not the `v0.2.8` tag: the tag is missing
-  `depends/Makefile` (a gitignore accident fixed on master right after the release; the tag
-  was left where it is so `hash_id_2` stays valid).
+  build. For **v0.2.8**, build the static path from `master`, not the `v0.2.8` tag: that tag is missing
+  `depends/Makefile` (a gitignore accident fixed right after the release; the tag was left as-is
+  so `hash_id_2` stays valid). **v0.2.9 and later tags carry the full `depends` tree** — build
+  those directly.
 - Re-running `./configure` can leave stale archives (`undefined reference to
   boost::system::generic_category()`): remove `src/libbitcoin_util.a` and rebuild.
 - **`freebankd` has two chains of its own:** `regtest` (follows a regtest L1) and `main`
@@ -972,7 +1046,7 @@ touches it.
 
 ---
 
-## 8. Built vs designed — as of v0.2.8
+## 8. Built vs designed — as of v0.2.10
 
 | Area | Status |
 |---|---|
@@ -1002,6 +1076,13 @@ byte-compare convergence against a never-connected control node, reorg coverage 
 every operation family, `-reindex` reproduction, and a property harness for bills. Three
 inherited consensus-critical defects (from the chassis) were found and fixed in v0.2.8;
 more inherited issues may exist.
+
+**Producer caveat (the enforcer, not FreeBank):** *self-mining* a busy alpha (5.4) currently
+needs a watchdog around the enforcer. Under sustained mempool churn and long uptime it can
+emit a topologically-invalid block template, and a block mined from it is rejected
+`bad-txns-inputs-missingorspent` — you pay for the hash and lose the block, silently. A fix
+is in progress upstream; until then, cross-check `getblocktemplate` against the node's
+mempool and restart the enforcer on a bad read. *Following* the chain (5.2/5.3) is unaffected.
 
 ---
 
