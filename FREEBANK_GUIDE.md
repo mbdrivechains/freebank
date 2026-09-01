@@ -85,13 +85,20 @@ redeemable for — that pegged coin.
 
 ## 2. Where FreeBank runs today
 
-There are three places you can meet a FreeBank chain. Pick by what you want.
+FreeBank runs on a **live network you can join today** — the eCash **alpha** chain (2.3), with a
+beta network and then mainnet to follow. That is the front door: a real BIP 300/301 chain in slot
+130, producing FreeBank blocks continuously. There is also a self-contained **regtest** you drive
+yourself (2.1) — the fast lane, where the whole instrument lifecycle runs in minutes because you
+mint blocks on demand. Start with the live network to join what is actually running; reach for
+regtest when you want the complete bank → loan → redeem loop instantly, offline, and repeatable.
+Three places, pick by what you want:
 
-### 2.1 Your own regtest (recommended first)
+### 2.1 Your own regtest (the fast lane — full lifecycle, instant, offline)
 
 A self-contained stack on your machine: a regtest Bitcoin node, the CUSF enforcer, and
-`freebankd`. Nothing external, resets whenever you like, every instrument available.
-**Section 3 is this.**
+`freebankd`. Nothing external, resets whenever you like, every instrument available. Because you
+produce blocks on demand, the whole section-4 lifecycle — register a house, issue and discount a
+bill, redeem a note — runs in minutes. **Section 3 is this.**
 
 ### 2.2 The public daily-reset signet
 
@@ -102,6 +109,8 @@ at 09:00 UTC**, so it is a playground, not a place to keep anything. The connect
 [`doc/signet.md`](doc/signet.md) in this repository.
 
 ### 2.3 The eCash alpha network (alphanet) — activated; followable from v0.2.9, self-syncing from v0.2.10
+
+**This is the front door: a live, public BIP 300/301 chain you can sync and take part in today.**
 
 On **2026-08-27** FreeBank was proposed and activated as **slot 130 on the eCash alpha
 network** (M1 in block 996,454, 30 of 30 acks, activated at block 996,485). Another
@@ -177,6 +186,11 @@ not a browser, so Gatekeeper's quarantine flag never attaches to the unsigned bi
 ---
 
 ## 3. Quick start on regtest (the reproducible path)
+
+> **This is the fast lane (2.1), not the destination.** You drive block production yourself, so the
+> whole instrument lifecycle in section 4 runs in minutes and repeats exactly. To do the same things
+> on the **live** network, see section 5 — the commands are identical, but each operation advances
+> only as your BMM blocks land, and live state is wiped at each network reset.
 
 Three processes, all local: a regtest **Bitcoin node** (the Core build bundled with
 BitWindow — currently a v31 "eCash drynet4" build; any recent Core with `-rest -txindex
@@ -706,6 +720,21 @@ limitation.
 ---
 
 ## 5. Running against a live network
+
+This is where you **join what is actually running** — the front door of section 2. The stack is the
+same shape as section 3; what changes is that you no longer own the block clock. Two consequences
+to internalise before you start:
+
+- **Operating, not just watching.** Everything in the section-4 cookbook works here — you point the
+  same `freebank-cli` RPCs at a `freebankd` on the live network. But a FreeBank block only appears
+  when a BMM request wins inclusion in a mainchain block, so an operation that needs *N* sidechain
+  blocks takes *N* block intervals (minutes to hours), not seconds. To *write* at all you need the
+  **write path**: your own `freebankd` plus an enforcer whose wallet holds live coins, posting
+  `refreshbmm` on a timer (5.2). A BitWindow-only setup (5.3) *follows* the chain — it does not by
+  itself fund and post your BMM requests.
+- **It is disposable.** Alpha — and the beta and mainnet forks after it — reset to fresh chains; any
+  house you register or bill you issue on a live *test* network is expected to vanish at the next
+  reset (2.3). Keep nothing there you are not willing to lose.
 
 ### 5.1 The public daily-reset signet
 
