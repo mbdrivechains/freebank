@@ -101,7 +101,7 @@ at 09:00 UTC**, so it is a playground, not a place to keep anything. The connect
 (signet challenge, seed node, enforcer and `freebankd` flags) is in
 [`doc/signet.md`](doc/signet.md) in this repository.
 
-### 2.3 The eCash alpha network (alphanet) — activated; followable from v0.2.9
+### 2.3 The eCash alpha network (alphanet) — activated; followable from v0.2.9, self-syncing from v0.2.10
 
 On **2026-08-27** FreeBank was proposed and activated as **slot 130 on the eCash alpha
 network** (M1 in block 996,454, 30 of 30 acks, activated at block 996,485). Another
@@ -120,7 +120,7 @@ Be precise about what that means:
   `freebankd` posting BMM requests through an enforcer whose wallet holds alpha coins (the
   request is a paid mainchain transaction), and a miner running enforcer templates to
   include it. To see whether slot 130 is being mined, scan recent coinbases for M7
-  commitments with the slot byte `0x82` (section 9.4).
+  commitments with the slot byte `0x82` (section 9.4). **As of September 2026 the network is producing FreeBank blocks continuously** — a followed node syncs a live chain; 5.3 is the fastest way to watch it happen.
 - **Deposit only once you can see FreeBank blocks being produced.** A deposit is a
   mainchain transaction into the slot's escrow; it is credited by the sidechain, so with
   no blocks there is nothing to credit it — and it would be lost at the next reset
@@ -141,12 +141,12 @@ coinbase scan).
 ### 2.4 Verifying what you download
 
 Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.9** (the first that can
-follow alpha): `freebank-0.2.9-x86_64-linux-gnu.tar.gz`, sha256
-`69ac41b74351d8374d3c7383faf69e0c27f5839459f4890ab25c204a8b452370`; its source is the
-commit the public tag `v0.2.9` points at (`git rev-parse 'v0.2.9^{commit}'`). The commands
+arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.10** (adds a baked DNS seed for zero-config peer discovery, §5.3; can
+follow alpha): `freebank-0.2.10-x86_64-linux-gnu.tar.gz`, sha256
+`2cbba2e68552c455a134d73f72eb748ac4c44d9c411b157c7076dbaf22f397d5`; its source is the
+commit the public tag `v0.2.10` points at (`git rev-parse 'v0.2.10^{commit}'`). The commands
 below are written for v0.2.8 because that is what the sidechain proposal on alpha
-commits to — substitute `0.2.9` to verify the current binaries the same way.
+commits to — substitute `0.2.10` to verify the current binaries the same way.
 
 The sidechain proposal (M1) that activated slot 130 on alpha commits to v0.2.8:
 
@@ -758,6 +758,62 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   running. Whether your requests get mined depends on miners running enforcer templates
   — the same pools that mine the other sidechains' BMM commitments.
 - **Coinbase scan:** the on-chain footprint needs no enforcer at all — see 9.4.
+
+### 5.3 The fast path: download a release and watch it sync (via BitWindow)
+
+Sections 5.1–5.2 build the L1 and enforcer yourself. If you already run **BitWindow** — which
+bundles an eCash-alpha L1 node and an enforcer — the quickest way to see FreeBank live is to drop a
+downloaded `freebankd` on top of it and let it find the network on its own. As of **September 2026 the
+alpha network is producing FreeBank blocks continuously**, so there is a live chain to sync.
+
+From **v0.2.10**, `freebankd` ships a DNS seed (`seed.ecxfreebank.com`) baked into its `main` chain
+params, so it discovers a peer with **no `-addnode`** — that is the whole point of this test. (Verified
+end-to-end on an Apple-Silicon Mac against a BitWindow stack.)
+
+1. **Download and verify.** On macOS use `curl`, not a browser, so Gatekeeper's quarantine flag never
+   attaches to the unsigned binary:
+   ```bash
+   # Linux:
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.10/freebank-0.2.10-x86_64-linux-gnu.tar.gz
+   # macOS (Apple Silicon):
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.10/freebank-0.2.10-arm64-apple-darwin.tar.gz
+
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.10/SHA256SUMS
+   sha256sum -c SHA256SUMS --ignore-missing        # macOS: shasum -a 256 -c  -> OK
+   tar -xzf freebank-0.2.10-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
+   xattr -dr com.apple.quarantine freebank 2>/dev/null   # macOS only: clear quarantine if present
+   ```
+   `freebankd` shells out to `grpcurl` for the enforcer transport — install it (`brew install grpcurl`,
+   or your package manager).
+
+2. **Point it at BitWindow's alpha stack.** Find BitWindow's enforcer gRPC (usually `127.0.0.1:50051`)
+   and its mainchain bitcoind's **REST** port. The node must have been started with `-rest` (BitWindow's
+   default config includes `rest=1`) and must be on eCash alpha (`chain=main`, tip near the current alpha
+   height). A **pruned** node is fine for a sync test — only deposit crediting needs `txindex`.
+
+3. **Run `freebankd` with no `-addnode`** (create the datadir first — it refuses a missing one; replace
+   `<REST_PORT>`):
+   ```bash
+   mkdir -p $HOME/freebank-alpha/data
+   freebank/bin/freebankd -datadir=$HOME/freebank-alpha/data -server -rpcuser=fb -rpcpassword=test \
+     -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 \
+     -mainchainrest=127.0.0.1:<REST_PORT> -mainchainchain=main \
+     -mainchainblockpin=963648:0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924 \
+     -grpcurlbin=$(which grpcurl) -daemon
+   ```
+
+4. **Confirm it synced:**
+   ```bash
+   CLI="freebank/bin/freebank-cli -datadir=$HOME/freebank-alpha/data -rpcuser=fb -rpcpassword=test"
+   $CLI getpeerinfo | grep addr     # a peer at 68.183.235.153:8455 (= seed.ecxfreebank.com), found with zero config
+   $CLI getblockcount               # climbs to the live FreeBank tip
+   $CLI getmainchainblockcount      # matches BitWindow's alpha tip
+   ```
+   Success is a peer appearing on its own **plus** `getblockcount` reaching the network height — proof of
+   download → seed discovery → P2P sync → L1 validation, on a machine that built none of it. If `freebankd`
+   refuses to start with an identity-mismatch error, BitWindow's node is not on eCash alpha. This path only
+   *follows* the chain; producing blocks (the `refreshbmm` loop) is section 5.2.
+
 
 ---
 
