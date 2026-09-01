@@ -1273,6 +1273,27 @@ for v in cb["vout"]:
   https://github.com/mbdrivechains/freebank-gui
 - Drivechain stack: https://github.com/LayerTwo-Labs/bip300301_enforcer,
   https://github.com/LayerTwo-Labs/bitcoin-patched, https://layertwolabs.com/download
-- Problems → GitHub issues; ideas → GitHub discussions; security vulnerabilities → privately
-  (see `SECURITY.md`).
 - MIT licensed — see `COPYING`.
+
+### 10.1 Reporting a problem or giving feedback
+
+Pick the channel by what you have:
+
+- **A concrete bug → a GitHub issue** (https://github.com/mbdrivechains/freebank/issues). A
+  useful report — and enough for an AI assistant to file a complete one unaided — carries all of:
+  - **Version + platform:** the full `freebankd --version` string (`vX.Y.Z-<commit>`) and
+    OS/arch (Linux x86-64 or macOS arm64).
+  - **Network:** regtest, the public signet, or eCash alpha — and for alpha, the L1 you
+    follow and the exact `-mainchainblockpin` you started with.
+  - **Repro:** the smallest ordered sequence of `freebank-cli` / `grpcurl` commands that
+    triggers it, copied verbatim.
+  - **Expected vs actual:** the exact error text or wrong output — copied, not paraphrased.
+  - **Logs:** the relevant tail of `<datadir>/debug.log` around the failure (and the
+    enforcer's stderr if it is in the path). **Redact `rpcpassword` and any keys first.**
+  - **If it is a transaction:** the txid and the height it landed at (or that it never confirmed).
+- **A question, an idea, or "is the network up?" → the community.** The wider BIP 300/301
+  discussion — FreeBank included — happens in the **Drivechain Talk** group on Telegram: the
+  fastest place for network status, design questions, and informal reports that are not yet a
+  formal bug. Ideas can also go to GitHub Discussions.
+- **A security vulnerability → privately, never a public issue.** Follow `SECURITY.md`, and
+  describe the *class* of problem rather than a working exploit.
