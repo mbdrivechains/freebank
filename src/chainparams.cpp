@@ -135,6 +135,10 @@ public:
         assert(genesis.hashMerkleRoot == uint256S("0x8eb1364f43885edf1322b2d32095e57abb03c32a61a80ac25c8db3de58e16b8a"));
 
         vSeeds.clear();
+        // Public DNS seed (added 2026-09-01, first FreeBank blocks live on eCash alpha). A dedicated (seed.ecxfreebank.com — freebank.com DNS is delegated+wildcarded)
+        // subdomain resolving to the seed node, so the seed IP is repointable via DNS without a recompile.
+        // Fresh nodes discover peers here on nDefaultPort (8455) with zero config.
+        vSeeds.emplace_back("seed.ecxfreebank.com");
 
         // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11).
         // Sidechain addresses: PUBKEY 75 / SCRIPT 125 (X... addresses).
