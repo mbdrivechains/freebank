@@ -765,7 +765,15 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   still-validating *background* (genesis-up) range until that finishes. The node follows the
   chain fine meanwhile, but **peg-in deposits silently fail to credit until `txindex` passes
   the deposit's block** (7.3) — run the mainchain node from a full `txindex` (no snapshot) if
-  you need deposits before the background sync completes.
+  you need deposits before the background sync completes. How long that background sync
+  takes is set by **RAM, not CPU**: the 2024-era UTXO set overflows a small `dbcache`, so
+  validation stalls on chainstate reads and periodic multi-minute UTXO flushes — on an 8 GB
+  box with `dbcache=2800` it crawls at ~2,000 blocks/h through the 860k–935k range, with
+  idle CPU and network (the disk is the bottleneck, so that is *normal* there, not a stall).
+  Budget **16 GB+ RAM and `dbcache=8000` or more** (and NVMe over SATA SSD) if you take the
+  snapshot path and want the background validation done in hours rather than days. Check
+  progress with `getchainstates` (the background chainstate's `blocks`), not the log: Core
+  logs `[background validation] UpdateTip` only every 2,000 blocks.
 - **Enforcer:** a recent build with `--network-preset=alphanet` (v0.3.4 was the first to
   carry it), pointed at the node's RPC and ZMQ, default gRPC on `127.0.0.1:50051` (section
   3 used 50151 only to avoid collisions). Builds from mid-August 2026 on fetch only headers
