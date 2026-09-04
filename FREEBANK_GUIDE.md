@@ -774,6 +774,18 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   snapshot path and want the background validation done in hours rather than days. Check
   progress with `getchainstates` (the background chainstate's `blocks`), not the log: Core
   logs `[background validation] UpdateTip` only every 2,000 blocks.
+  Which node *configuration* you run is your choice, within one constraint as of v0.2.10: deposit
+  crediting looks the deposit transaction up by txid, hence `txindex=1`, and Core refuses `txindex`
+  on a **pruned** node. So today a **full node from scratch** (unpruned, txindex) works and is the
+  maximum-assurance path; an **assumeutxo start, unpruned + txindex** works and is the practical one —
+  it follows the chain within hours, but deposits credit only once the background validation has
+  passed the deposit's block (caveat above); a **pruned** node, from scratch or from a snapshot,
+  follows the chain and can produce blocks but **cannot credit deposits**. A planned change (fetch
+  the deposit transaction from its block, which needs no txindex) lifts that last restriction and makes
+  a pruned assumeutxo node (~20 GB) the sensible default; until it ships, plan for txindex. And
+  "validated" has a precise meaning: an assumeutxo node trusts the snapshot's UTXO hash until its
+  background sync from genesis completes — `getchainstates` then shows a single chainstate. For
+  anything you would call real money, run your own node and wait for that state.
 - **Enforcer:** a recent build with `--network-preset=alphanet` (v0.3.4 was the first to
   carry it), pointed at the node's RPC and ZMQ, default gRPC on `127.0.0.1:50051` (section
   3 used 50151 only to avoid collisions). Builds from mid-August 2026 on fetch only headers
@@ -803,6 +815,14 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   `--wallet-sync-source=disabled` the wallet only learns of coins that arrive while it is
   running. Whether your requests get mined depends on miners running enforcer templates
   — the same pools that mine the other sidechains' BMM commitments.
+  Two first-run costs to expect. On its very first start `freebankd` builds a **mainchain block-hash
+  cache** from the fork height to the tip with one enforcer call per L1 block — tens of thousands of
+  calls, i.e. hours, during which it logs `Updating mainchain block cache...` and has not yet opened
+  its P2P port. A `mainblockhash.dat` copied from a node you trust (or from your own earlier run) into
+  the datadir before the first start cuts that to seconds; the node only extends it to the tip. And the
+  initial sidechain sync verifies every block's BMM commitment through the enforcer — roughly 7 s per
+  header plus ~15 s per block with the enforcer reached across a network, faster on localhost — so a
+  few hundred blocks is minutes, and RPC calls block while it runs. Both are on the list to fix.
 - **Coinbase scan:** the on-chain footprint needs no enforcer at all — see 9.4.
 
 ### 5.3 The fast path: download a release and watch it sync (via BitWindow)
@@ -827,6 +847,15 @@ the fallback working, not a failure. Two more things the fresh-box run confirmed
 verifies against `SHA256SUMS`, and **`freebankd` will not run without an L1** — with no enforcer/REST
 reachable it exits after 60 s with an explicit `mainchain REST endpoint … did not answer` error. There
 is no light or follower mode; section 5.2's node and enforcer are required.
+
+The same fresh cloud box, given a private network route to a *remote* L1 (an enforcer and REST endpoint
+on another machine) and a pre-built `mainblockhash.dat`, then did the whole thing: `1 addresses found
+from DNS seeds` → outbound connection to the seed → 58 blocks synced in about 20 minutes, with every
+checked block hash matching the seed's, including the block that credited a live peg-in. That is the
+strongest statement we can make about the seed path today. It also shows the L1 can be remote — read
+that with care. A node that takes its view of eCash from someone else's enforcer is trusting that
+provider with consensus input; a dishonest L1 could invent a deposit. Acceptable for alpha and beta
+testing, nothing more. For real money, run your own validated stack (5.2).
 
 1. **Download and verify.** On macOS use `curl`, not a browser, so Gatekeeper's quarantine flag never
    attaches to the unsigned binary:
