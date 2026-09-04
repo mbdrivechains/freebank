@@ -814,7 +814,19 @@ alpha network is producing FreeBank blocks continuously**, so there is a live ch
 
 From **v0.2.10**, `freebankd` ships a DNS seed (`seed.ecxfreebank.com`) baked into its `main` chain
 params, so it discovers a peer with **no `-addnode`** — that is the whole point of this test. (Verified
-end-to-end on an Apple-Silicon Mac against a BitWindow stack.)
+end-to-end on an Apple-Silicon Mac against a BitWindow stack, and from a fresh US cloud box on
+2026-09-04.)
+
+How that discovery works — worth knowing if you run your own seed or are reading the log: a node does
+not look up the bare seed name. It asks for the name with a service-bit prefix, **`x9.seed.ecxfreebank.com`**
+(`x9` = NETWORK|WITNESS), so a DNS seed must answer the `x9.` name — a wildcard `*.seed…` record covers it.
+If that lookup returns nothing the node logs `0 addresses found from DNS seeds`, then falls back to a
+**one-shot connection to the bare seed name**; because the seed advertises its own address, the node
+still comes away with a persistent peer. So that log line followed by `New outbound peer connected` is
+the fallback working, not a failure. Two more things the fresh-box run confirmed: the release tarball
+verifies against `SHA256SUMS`, and **`freebankd` will not run without an L1** — with no enforcer/REST
+reachable it exits after 60 s with an explicit `mainchain REST endpoint … did not answer` error. There
+is no light or follower mode; section 5.2's node and enforcer are required.
 
 1. **Download and verify.** On macOS use `curl`, not a browser, so Gatekeeper's quarantine flag never
    attaches to the unsigned binary:
