@@ -381,4 +381,17 @@ BOOST_AUTO_TEST_CASE(l1client_enforcer_identity_classify)
                       (int)ENFORCER_IDENTITY_NOTREADY);
 }
 
+BOOST_AUTO_TEST_CASE(l1client_grpcurl_command_quotes_binary_path)
+{
+    // BitWindow's macOS binaries dir contains a space; the shell must see one word.
+    const std::string cmd = BuildGrpcurlCommand("/Users/me/Library/Application Support/bitwindow/assets/bin/grpcurl",
+        "{}", "127.0.0.1:50051", "cusf.mainchain.v1.ValidatorService", "GetChainTip");
+    BOOST_CHECK_EQUAL(cmd.find("\"/Users/me/Library/Application Support/bitwindow/assets/bin/grpcurl\" -plaintext"), 0U);
+    BOOST_CHECK(cmd.find(" -plaintext -max-time 15 -d '{}' 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetChainTip 2>/dev/null") != std::string::npos);
+    // The plain default keeps working
+    BOOST_CHECK_EQUAL(BuildGrpcurlCommand("grpcurl", "{}", "127.0.0.1:50051", "s", "m").find("\"grpcurl\" -plaintext"), 0U);
+    // A path that cannot be quoted safely is refused
+    BOOST_CHECK(BuildGrpcurlCommand("/tmp/a\"b/grpcurl", "{}", "127.0.0.1:50051", "s", "m").empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -9711,6 +9711,7 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
 
     // Check for mainchain connection
     if (!fGenesis && fCheckBMM && !CheckMainchainConnection()) {
+        g_fNetworkDisabledByMainchain = true;
         SetNetworkActive(false, "Failed to connect to mainchain when checking block!");
         return false;
     }
@@ -10265,6 +10266,7 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
 
     // Check for mainchain connection
     if (!fGenesis && !CheckMainchainConnection()) {
+        g_fNetworkDisabledByMainchain = true;
         SetNetworkActive(false, "Failed to connect to mainchain when checking block header!");
         return false;
     }
@@ -10330,6 +10332,8 @@ bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidatio
     std::vector<uint256> vOrphan;
     if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
         LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
+        g_fNetworkDisabledByMainchain = true;
+        SetNetworkActive(false, "Failed to update the mainchain block cache when processing headers (mainchain unreachable)");
         return false;
     }
     if (fReorg)
@@ -12594,10 +12598,23 @@ bool CheckMainchainConnection()
     return true;
 }
 
+std::atomic<bool> g_fNetworkDisabledByMainchain{false};
+
+void MaybeRestoreMainchainConnection()
+{
+    if (!g_fNetworkDisabledByMainchain)
+        return;
+    if (!CheckMainchainConnection())
+        return;
+    SetNetworkActive(true, "mainchain connection restored (periodic re-check)");
+}
+
 void SetNetworkActive(bool fActive, const std::string& strReason)
 {
     if (!g_connman)
         return;
+    if (fActive)
+        g_fNetworkDisabledByMainchain = false;
 
     bool fCurrentState = g_connman->GetNetworkActive();
     if (fActive == fCurrentState)

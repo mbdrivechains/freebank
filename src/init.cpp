@@ -2105,6 +2105,10 @@ bool AppInitMain()
     // ********************************************************* Step 12: finished
 
     SetRPCWarmupFinished();
+    // A failed mainchain check turns network activity off; look every 30 s for the
+    // mainchain to answer again and turn it back on (v0.2.11).
+    scheduler.scheduleEvery(&MaybeRestoreMainchainConnection, 30 * 1000);
+
     uiInterface.InitMessage(_("Done loading"));
 
 #ifdef ENABLE_WALLET

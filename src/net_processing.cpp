@@ -1382,6 +1382,12 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
             }
             return false;
         }
+        // Not invalid, just not processed: the mainchain block cache could not be
+        // updated (mainchain unreachable). Nothing to punish - the peer will
+        // re-announce and we re-request once the mainchain answers again. Falling
+        // through would dereference a null pindexLast (v0.2.10 aborted here).
+        LogPrint(BCLog::NET, "peer=%d: headers not processed (mainchain unavailable), will retry\n", pfrom->GetId());
+        return true;
     }
 
     {
@@ -2311,6 +2317,9 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                 }
                 return true;
             }
+            // Mainchain unreachable (see the headers path): nothing processed, retry later
+            LogPrint(BCLog::NET, "peer=%d: cmpctblock header not processed (mainchain unavailable), will retry\n", pfrom->GetId());
+            return true;
         }
 
         // When we succeed in decoding a block's txids from a cmpctblock

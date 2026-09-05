@@ -590,6 +590,12 @@ bool SortDeposits(const std::vector<SidechainDeposit>& vDeposit, std::vector<Sid
 
 /** Check for RPC connection to mainchain node */
 bool CheckMainchainConnection();
+/** True while network activity is off because a mainchain connection check failed; cleared
+ *  when the network is re-enabled. Read by the periodic restore below. */
+extern std::atomic<bool> g_fNetworkDisabledByMainchain;
+/** Scheduler job: if the network was disabled by a failed mainchain check and the mainchain
+ *  answers again, re-enable it (before v0.2.11 only the refreshbmm RPC could). */
+void MaybeRestoreMainchainConnection();
 
 /** Enable or disable networking and print log message */
 void SetNetworkActive(bool fActive, const std::string& strReason = "");

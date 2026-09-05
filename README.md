@@ -84,9 +84,19 @@ Consensus code is only as trustworthy as what tries to break it. Much of the wor
 adversarial. The v0.2.7 line closes the two consensus issues that v0.2.6 shipped as
 known-open, v0.2.7.1 closes a memory leak that fuzzing turned up, v0.2.8 closes
 three consensus defects found by a line-by-line audit of the money paths inherited
-from the upstream sidechain chassis, and v0.2.9 makes the node able to follow a
-mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran:
+from the upstream sidechain chassis, v0.2.9 makes the node able to follow a
+mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran,
+and v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves:
 
+- **Enforcer transport survives a host that is not quite ready** (v0.2.11). Found by
+  booting freebankd under BitWindow's orchestrator on eCash alphanet. The `grpcurl`
+  path is now quoted (BitWindow's macOS install dir contains a space, which split the
+  command and silently disabled the transport); a failed mainchain connection check no
+  longer leaves P2P network activity off until an operator runs `refreshbmm` — a
+  30-second job restores it once the mainchain answers; and headers arriving while the
+  mainchain is unreachable are retried rather than tripping an assertion that aborted
+  the node and put a supervisor into a restart loop. No consensus change; a new
+  integration gate (`enforcer_reconnect`) proves the disable → restore → resync cycle.
 - **Forknet L1 identity pin** (v0.2.9). A forknet such as alphanet has no signet
   challenge and is byte-identical to Bitcoin below its fork height, so neither the
   signet pin nor the chain name can identify it. `-mainchainblockpin=<height>:<hash>`

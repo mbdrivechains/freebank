@@ -389,8 +389,12 @@ bool EnforcerL1Client::CallEnforcer(const std::string& strService, const std::st
     std::string strBin = gArgs.GetArg("-grpcurlbin", "grpcurl");
     std::string strAddr = gArgs.GetArg("-enforceraddr", "127.0.0.1:50051");
 
-    std::string strCommand = strBin + " -plaintext -max-time 15 -d '" + strRequest + "' " +
-        strAddr + " " + strService + "/" + strMethod + " 2>/dev/null";
+    std::string strCommand = BuildGrpcurlCommand(strBin, strRequest, strAddr, strService, strMethod);
+    if (strCommand.empty()) {
+        LogOnce("grpcurl-badpath", "ERROR Enforcer client: -grpcurlbin path '" + strBin +
+            "' contains a double quote and cannot be run; set -grpcurlbin to a plain path\n");
+        return false;
+    }
 
     FILE* pipe = popen(strCommand.c_str(), "r");
     if (!pipe) {
@@ -1427,6 +1431,14 @@ bool EnforcerL1Client::HaveFailedWithdrawalBundle(const uint256& hash)
 bool IsValidL1Transport(const std::string& strTransport)
 {
     return strTransport == "jsonrpc" || strTransport == "enforcer";
+}
+
+std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod)
+{
+    if (strBin.find('"') != std::string::npos)
+        return "";
+    return "\"" + strBin + "\" -plaintext -max-time 15 -d '" + strRequest + "' " +
+        strAddr + " " + strService + "/" + strMethod + " 2>/dev/null";
 }
 
 const std::string& DefaultMainchainTransport()

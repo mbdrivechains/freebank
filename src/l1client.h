@@ -144,6 +144,11 @@ L1Client& GetL1Client();
 /** True if strTransport names a valid -mainchaintransport value. */
 bool IsValidL1Transport(const std::string& strTransport);
 
+/** The shell command the enforcer transport runs for one grpcurl call. The binary path is
+ *  double-quoted (BitWindow's macOS path contains a space); a path containing a double quote
+ *  cannot be quoted safely and yields "". Pure, unit-tested. */
+std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod);
+
 //
 // Enforcer wire helpers - exposed for unit tests (l1client_tests.cpp).
 //
