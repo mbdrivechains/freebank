@@ -6,7 +6,7 @@ This file is meant to be *complete enough on its own* that you can hand it to an
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
 you through running FreeBank, standing up a bank, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
-or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.10), and the quick start in
+or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.11), and the quick start in
 section 3 was run verbatim against the release binaries. Where something is designed but
 not built, it says so.
 
@@ -150,12 +150,13 @@ coinbase scan).
 ### 2.4 Verifying what you download
 
 Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.10** (adds a baked DNS seed for zero-config peer discovery, §5.3; can
-follow alpha): `freebank-0.2.10-x86_64-linux-gnu.tar.gz`, sha256
-`2cbba2e68552c455a134d73f72eb748ac4c44d9c411b157c7076dbaf22f397d5`; its source is the
-commit the public tag `v0.2.10` points at (`git rev-parse 'v0.2.10^{commit}'`). The commands
+arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.11** (enforcer-transport robustness — quoted `grpcurl` path, self-restoring
+network activity, no abort on headers while the mainchain is unreachable; v0.2.10 added the baked DNS
+seed for zero-config peer discovery, §5.3): `freebank-0.2.11-x86_64-linux-gnu.tar.gz`, sha256
+`78e841e078466240c89a4e377e64cdbf5d6f19f8606e22dad6ef7aa73eab86c8`; its source is the
+commit the public tag `v0.2.11` points at (`git rev-parse 'v0.2.11^{commit}'`). The commands
 below are written for v0.2.8 because that is what the sidechain proposal on alpha
-commits to — substitute `0.2.10` to verify the current binaries the same way.
+commits to — substitute `0.2.11` to verify the current binaries the same way.
 
 The sidechain proposal (M1) that activated slot 130 on alpha commits to v0.2.8:
 
@@ -860,13 +861,13 @@ testing, nothing more. For real money, run your own validated stack (5.2).
    attaches to the unsigned binary:
    ```bash
    # Linux:
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.10/freebank-0.2.10-x86_64-linux-gnu.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/freebank-0.2.11-x86_64-linux-gnu.tar.gz
    # macOS (Apple Silicon):
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.10/freebank-0.2.10-arm64-apple-darwin.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/freebank-0.2.11-arm64-apple-darwin.tar.gz
 
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.10/SHA256SUMS
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing        # macOS: shasum -a 256 -c  -> OK
-   tar -xzf freebank-0.2.10-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
+   tar -xzf freebank-0.2.11-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
    xattr -dr com.apple.quarantine freebank 2>/dev/null   # macOS only: clear quarantine if present
    ```
    `freebankd` shells out to `grpcurl` for the enforcer transport — install it (`brew install grpcurl`,
@@ -1139,7 +1140,7 @@ touches it.
 
 ---
 
-## 8. Built vs designed — as of v0.2.10
+## 8. Built vs designed — as of v0.2.11
 
 | Area | Status |
 |---|---|
