@@ -27,6 +27,8 @@ Give the assistant this whole file, then ask things like:
   reserves, mint notes and redeem them."*
 - *"Set up two wallets and two houses (section 4.0), then discount a bill and settle."*
 - *"My house shows `effective_status: stressed`. Why, and what do I do?"*
+- *"Rent a cloud box and bring up the full alpha stack on it — provision it through the
+  DigitalOcean or Linode API, then follow section 5.5."*
 - *"What is built and what is only designed?"*
 
 **For the assistant.** Sections 3–4 are the command ground truth; section 7 is the
@@ -751,17 +753,39 @@ after a reset, give the enforcer and `freebankd` fresh datadirs and delete `peer
 Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the node:
 
 - **Node:** the alphanet build of the LayerTwo Labs L1 (`L1-ecash-bitcoin-alphanet-<triplet>.zip`
-  from https://releases.drivechain.info/), run as `chain=main` with `drivechain=1`,
-  `txindex=1`, `rest=1`, a `zmqpubsequence` endpoint, and enough `dbcache` for your RAM.
+  from https://releases.drivechain.info/), run as `chain=main` with
+  `txindex=1`, `rest=1`, a `zmqpubsequence` endpoint, and enough `dbcache` for your RAM
+  (the build reports itself as *Bitcoin Core (eCash alphanet) v31.1.0*; its defaults are P2P
+  8533, RPC 8532, config file **`ecash.conf`** and datadir `~/.ecash` — a `bitcoin.conf` is
+  silently ignored and the node starts on defaults, so name the file `ecash.conf` or pass
+  `-conf=`; there is no `drivechain=` option — the fork parameters are compiled in).
   Fork height 963,648; network magic `eca5a104`. Sync: a full IBD from genesis takes
-  days. An assumeutxo snapshot at height 935,000 is published at `data.drivechain.dev`,
-  but as of Aug 2026 the file starts with the **drynet4** network magic and an
-  unmodified alphanet node refuses it. The fix is one byte: patch offset **9** to `0xa1`
-  (verify the offset against the current file first — a re-published corrected file needs
-  no patch), then `loadtxoutset` accepts it. After loading, sync forward and pin the tip
-  with `-assumevalid=<known-good tip hash>`; snapshot-plus-sync-forward is ~4.5 h versus
-  days for a full IBD. (The pre-fork UTXO set is real Bitcoin's, so a `dumptxoutset`
-  from any Bitcoin node at a supported height is an alternative.) One caveat if you take the
+  days. Two assumeutxo snapshots are published under `https://data.drivechain.dev/alphanet/`:
+  `utxo-935000.dat` (base = Bitcoin block 935,000, 9.4 GB) and `utxo-963648.dat` (base = the
+  fork block itself). **Use the 935,000 file.** A node bootstrapped from the fork-height file has
+  no body for block 963,648, and the current enforcer (2026-09-04 master, assumeutxo-aware)
+  fetches its first block body *at* the activation height and decides purely from
+  `getchainstates` — so it sits at 963,647 "waiting for the node's background sync" until the
+  genesis-up validation reaches the fork, i.e. days; fetching the block by hand does not unstick
+  it. Any base below the fork never waits. The 935,000 file has a wrinkle of its own: as of
+  September 2026 it carries the **drynet4** network magic (`ec a5 d4 04` at bytes 7–10 of the
+  snapshot header) and an alphanet node refuses it as an "unrecognized network". The two magics
+  differ in exactly one byte, so the fix is one byte — offset **9**, `d4` → `a1`:
+  ```bash
+  xxd -s 7 -l 4 utxo-935000.dat                                   # eca5 d404 before
+  printf '\241' | dd of=utxo-935000.dat bs=1 seek=9 count=1 conv=notrunc   # octal 241 = 0xa1; POSIX-safe
+  xxd -s 7 -l 4 utxo-935000.dat                                   # eca5 a104 after
+  ```
+  (verify the bytes against the current file first — a re-published corrected file needs no
+  patch), then `loadtxoutset` accepts it: ~25 min, one load at a time, and only once the headers
+  chain contains the base (it refuses until then — let headers pass 935,000 first). After
+  loading, sync forward and pin the tip with `-assumevalid=<known-good tip hash>` — the alphanet
+  build's stock `assumevalid` is a Bitcoin block at height 938,343 (February 2026), so without
+  your own pin every script from there to the tip is verified; snapshot-plus-sync-forward is ~4.5 h versus days for a full IBD
+  (measured 2026-09-05 on a 4-core cloud box: 25 min load, 3 h 50 to the fork, 20 min to the
+  tip — 5.5). (The pre-fork UTXO set is real Bitcoin's, so a `dumptxoutset` from a Bitcoin node at
+  a height the alphanet build lists is an alternative — but it carries Bitcoin's magic `f9beb4d9`,
+  so patch all four bytes 7–10 to `eca5a104`, not just offset 9.) One caveat if you take the
   snapshot path: such a node runs two chainstates and its `txindex` only covers the
   still-validating *background* (genesis-up) range until that finishes. The node follows the
   chain fine meanwhile, but **peg-in deposits silently fail to credit until `txindex` passes
@@ -772,7 +796,8 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   box with `dbcache=2800` it crawls at ~2,000 blocks/h through the 860k–935k range, with
   idle CPU and network (the disk is the bottleneck, so that is *normal* there, not a stall).
   Budget **16 GB+ RAM and `dbcache=8000` or more** (and NVMe over SATA SSD) if you take the
-  snapshot path and want the background validation done in hours rather than days. Check
+  snapshot path and want the background validation to finish sooner — it took about four days on
+  our 8 GB box, and no 16 GB run has been timed yet (5.5). Check
   progress with `getchainstates` (the background chainstate's `blocks`), not the log: Core
   logs `[background validation] UpdateTip` only every 2,000 blocks.
   Which node *configuration* you run comes down to one rule: **a full node — unpruned, `txindex=1` —
@@ -784,13 +809,17 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   `txindex` to credit deposits, Core refuses `txindex` on a pruned node, and the enforcer itself now
   refuses a pruned bitcoind at startup (its 2026-09-04 master: *"Bitcoin Core node has pruning
   enabled"*). And "validated" has a precise meaning: an assumeutxo node trusts the snapshot's UTXO hash until its
-  background sync from genesis completes — `getchainstates` then shows a single chainstate. For
+  background sync from genesis completes — `getchainstates` then drops to a single chainstate (the
+  snapshot one, still showing `snapshot_blockhash`, now `validated: true`); the next restart only
+  cleans the background chainstate off the disk. For
   anything you would call real money, run your own node and wait for that state.
-- **Enforcer:** a recent build with `--network-preset=alphanet` (v0.3.4 was the first to
-  carry it), pointed at the node's RPC and ZMQ, default gRPC on `127.0.0.1:50051` (section
-  3 used 50151 only to avoid collisions). Builds from mid-August 2026 on fetch only headers
+- **Enforcer:** a recent build with `--network-preset=alphanet` (the preset landed on
+  2026-08-17; every build reports version `0.3.4`, so go by the commit `--version` prints),
+  pointed at the node's RPC and ZMQ, default gRPC on `127.0.0.1:50051` (section
+  3 used 50151 only to avoid collisions). Builds from 2026-08-26 on fetch only headers
   below the activation height, which lets an enforcer on an assumeutxo node reach the tip
-  in minutes; older builds scan every block from genesis —
+  in minutes, and from 2026-09-04 they understand an assumeutxo node's block-data gap (and
+  refuse a pruned one); older builds scan every block from genesis —
   stalling at the assumeutxo gap unless the full history is present, and growing RSS with
   the backlog until a low-memory box runs out of RAM. Then
   `grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechains`
@@ -813,11 +842,13 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   BMM request is a mainchain transaction funded by the **enforcer's wallet**, so it must
   hold alpha coins (`WalletService/CreateNewAddress` gives you an address to fund); with
   `--wallet-sync-source=disabled` the wallet only learns of coins that arrive while it is
-  running. Whether your requests get mined depends on miners running enforcer templates
+  running. Alpha has no faucet: coins come from mining (5.4) or from another participant (2.3) —
+  settle that before enabling the wallet. Whether your requests get mined depends on miners running enforcer templates
   — the same pools that mine the other sidechains' BMM commitments.
   Two first-run costs to expect. On its very first start `freebankd` builds a **mainchain block-hash
   cache** from the fork height to the tip with one enforcer call per L1 block — tens of thousands of
-  calls, i.e. hours, during which it logs `Updating mainchain block cache...` and has not yet opened
+  calls: hours with the enforcer reached across a network, about 4 minutes on localhost (5.5) —
+  during which it logs `Updating mainchain block cache...` and has not yet opened
   its P2P port. A `mainblockhash.dat` copied from a node you trust (or from your own earlier run) into
   the datadir before the first start cuts that to seconds; the node only extends it to the tip. And the
   initial sidechain sync verifies every block's BMM commitment through the enforcer — roughly 7 s per
@@ -955,6 +986,212 @@ single-handed).
 > transactions.** The coinbase carries a witness commitment computed over the template's exact tx set —
 > drop a tx and you break `bad-witness-merkle-match` *and* over-claim fees (`bad-cb-amount`); the
 > network silently rejects the block **after** you have paid for the hash. Mine the template as given.
+
+### 5.5 Renting the stack: the same thing on a VPS
+
+Everything in 5.2 runs on a rented Linux box, and that is the quickest way to have a full alpha stack
+without touching your own hardware: nothing to download to your desk, no disk to buy, gone when you
+delete it. Any AI assistant already knows the DigitalOcean and Linode APIs from training; what it does
+not know is this chain — so hand it this section together with 5.2 and 5.3 and let it drive the
+provider's API and the bring-up below. The honest part first: below the fork the alpha chain **is**
+Bitcoin's history, a full node is ~900 GB today, and the enforcer refuses pruned nodes (5.2) — so the
+**disk, not the CPU, sets the price**, and it is a real monthly cost, not pocket change.
+
+**What it costs.** List prices fetched 2026-09-05 (USD; both providers bill hourly against a monthly cap,
+bill a powered-off box, and charge nothing for inbound transfer). Disk today at height 996,840: blocks
+811 GB + `txindex` 69 GB + chainstate 11 GB, plus the 9.4 GB snapshot file — budget a **1–1.2 TB
+volume** ($0.10 per GB-month on both providers; pre-fork history is fixed and post-fork alpha blocks are
+small, so it lasts). Plans with 1.2 TB+ of *local* disk exist (DigitalOcean `so-8vcpu-64gb` $524,
+Linode 64GB $384) but cost 2–3× plan-plus-volume; only worth it for a short validation burst.
+
+| Configuration | DigitalOcean | Linode (Akamai) |
+|---|---|---|
+| **Follow within a day** — snapshot path, 4 vCPU / 8 GB, + 1.2 TB volume | `s-4vcpu-8gb-240gb-intel` $64 + $120 = **$184/mo** (~$6.6/day) — the box we measured on | Linode 8GB $48 + $120 = **$168/mo** (~$6.0/day) |
+| **Validate the history faster** — 16 GB RAM, `dbcache=8000`+, same volume (not yet measured on a rented box; see below) | `s-4vcpu-16gb-amd` $84 + $120 = **$204/mo** (~$7.3/day) | Linode 16GB $96 + $120 = **$216/mo** (~$7.8/day) |
+| **`freebankd` only** — L1 and enforcer elsewhere (read 5.3's trust caveat); follow-only, and the first start is hours without a pre-seeded `mainblockhash.dat` (5.2) | `s-2vcpu-2gb` $18/mo (`-intel`/`-amd` $21); datadir is ~50 MB | Linode 4GB (2 vCPU) $24/mo, Linode 2GB (1 vCPU) $12/mo |
+| The ~5 h bring-up below, by itself | ~$0.50 (plan) to ~$1.40 (plan + volume) | ~$0.40 to ~$1.30 |
+| Parking the just-bootstrapped stack (~110 GB used) | volume snapshot at $0.06/GB-month ≈ **$6.60/mo** (droplet snapshots exclude volumes — take both) | no cheap form: a clone is a full-size volume ($120/mo); or stop the daemons and tar the datadir to object storage ($0.02/GB) |
+| Parking a validated node (~900 GB used) | volume snapshot ≈ **$54–72/mo** depending on whether it bills used or allocated space | clone = $120/mo, the same as keeping the volume |
+
+So: the sync itself is almost free; keeping a full node is **$150–220 a month**, $100–120 of it the
+volume (once the data is on the volume, DigitalOcean's `s-4vcpu-8gb` — $48 with a 160 GB SSD — does
+the same job as the $64 box for $168/mo; the 240 GB plan disk only matters if you skip the volume). A
+box without the volume can still do the snapshot path (the measured run used ~110 GB of a 240 GB plan
+disk), but as soon as it reaches the tip the background validation starts pulling the ~750 GB history,
+and `bitcoind` shuts itself down when the disk fills (*"Disk space is too low!"*) — within a day on a
+240 GB disk. Use that only for a short look, never for anything you would deposit to.
+
+**The bring-up, in order.** Timings are from a DigitalOcean 4 vCPU / 8 GB / 240 GB NVMe box on
+2026-09-05, enforcer on the same machine.
+
+1. **Provision.** Ubuntu 24.04, SSH key only (no root password), the volume attached, formatted ext4
+   and mounted with `nofail` — say `/mnt/vol`. DigitalOcean does the formatting and mounting for you
+   when the volume is created with `filesystem_type: "ext4"`: Ubuntu mounts it at `/mnt/<volume-name>`
+   with `defaults,nofail,discard,noatime`, so name the volume `vol`. Linode hands you a raw device at
+   `/dev/disk/by-id/scsi-0Linode_Volume_<label>` — `mkfs.ext4` it, `mkdir /mnt/vol`, mount it, and add
+   an `fstab` line with `nofail` yourself. Firewall: allow 22, the L1 P2P port (8533 below) and
+   `freebankd`'s **8455**; **never** expose RPC, REST, gRPC or ZMQ — keep them on `127.0.0.1`. (The one
+   exception is a private-network route to your own second box for the `freebankd`-only row: bind the
+   L1's `rpcbind`/`rpcallowip` *and* the enforcer's `--serve-grpc-addr` to that private address, keep
+   that enforcer walletless — its gRPC port carries an unauthenticated wallet service — and still put
+   nothing on a public interface.) Then
+   `apt update && apt install -y curl unzip xxd jq`, put `grpcurl` on `PATH` (its GitHub release), and **switch
+   unattended upgrades off for the load and the sync** — an apt-triggered restart killed a snapshot load
+   half-way on our box (`apt upgrade` by hand first, then re-enable them once the node is synced):
+   ```bash
+   systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer
+   ```
+   Every datadir goes on the volume, so one volume snapshot captures the whole stack.
+2. **Binaries** (2.4 for the FreeBank checksum; the L2L server publishes no checksums — record the
+   `sha256sum` of what you got):
+   ```bash
+   curl -LO https://releases.drivechain.info/L1-ecash-bitcoin-alphanet-x86_64-unknown-linux-gnu.zip   # ~278 MB
+   curl -LO https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip  # 'latest' moves; you want 2026-09-04 or newer
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/freebank-0.2.11-x86_64-linux-gnu.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/SHA256SUMS
+   sha256sum -c SHA256SUMS --ignore-missing && tar -xzf freebank-0.2.11-*.tar.gz
+   unzip -qj L1-ecash-*.zip -d l1 -x '*/qt/*'       # -> l1/bitcoind, l1/bitcoin-cli (skip the 388 MB Qt build)
+   unzip -qj bip300301-enforcer-*.zip -d enf && mv enf/bip300301-enforcer-* enf/bip300301-enforcer
+   chmod +x l1/* enf/*
+   nohup curl -C - -LO https://data.drivechain.dev/alphanet/utxo-935000.dat > snapshot-dl.log 2>&1 &   # 9.4 GB, overlaps the header sync; -C - resumes a dropped transfer
+   ```
+   Both zips wrap their files in a directory named like the zip, mode 0644 — the enforcer's single file
+   even *is* named like the zip — hence `-j`, the rename and the `chmod`. What we got on 2026-09-05: L1
+   zip sha256 `d415a7dd…b039f4a` (bitcoind *v31.1.0*-based), enforcer zip `3babbc19…f729866`
+   (commit `c188a38`, 2026-09-04). The steps below assume you stay in this directory.
+3. **`ecash.conf`** — 5.2's flags, on the volume, RPC on the loopback with cookie auth. The file is
+   `ecash.conf`, not `bitcoin.conf`: the alphanet build is eCash-branded (default config `ecash.conf`,
+   default datadir `~/.ecash`), and a missing default config is not an error — the node would silently
+   start on defaults, without `txindex`, `rest` or ZMQ — which is why step 4 also passes `-conf=`
+   explicitly: a wrong path is then a hard error instead of a silent default start. Create the
+   datadir (`mkdir -p /mnt/vol/ecash`), then write:
+   ```ini
+   # /mnt/vol/ecash/ecash.conf
+   server=1
+   listen=1
+   chain=main
+   txindex=1
+   rest=1
+   zmqpubsequence=tcp://127.0.0.1:29000
+   zmqpubsequencehwm=100000
+   dbcache=2000                       # 8 GB box; 8000 or more on 16 GB
+   [main]
+   port=8533                          # P2P (the build's default) — open this one in the firewall
+   rpcport=18302                      # RPC and REST share it; loopback only
+   rpcbind=127.0.0.1
+   rpcallowip=127.0.0.1
+   addnode=seed.alpha.ecash.ninja:8533
+   assumevalid=<a recent alpha block hash you trust>   # the build's stock pin is at height 938,343: without yours, every script after it is verified
+   ```
+   Take the `assumevalid` hash from a node you already trust (`getbestblockhash`) or, if you accept
+   that trust, from the alpha explorer: `curl -s https://explorer.alpha.ecash.ninja/api/blocks/tip/hash`
+   (2.3). A hash that is not in the chain simply disables the shortcut; a non-hex placeholder stops
+   `bitcoind` at startup — if you have no hash yet, leave the line out.
+4. **Start the node, check the config took, and let the headers pass the snapshot base** —
+   `loadtxoutset` refuses until the base header is in the headers chain (not timed on a fresh datadir;
+   expect minutes, not hours):
+   ```bash
+   l1/bitcoind -datadir=/mnt/vol/ecash -conf=/mnt/vol/ecash/ecash.conf -daemon
+   BC="l1/bitcoin-cli -datadir=/mnt/vol/ecash -conf=/mnt/vol/ecash/ecash.conf"
+   until $BC getblockcount >/dev/null 2>&1; do sleep 2; done      # not done within a minute? bitcoind refused to start: read /mnt/vol/ecash/debug.log
+   $BC getzmqnotifications | grep -q pubsequence && $BC getindexinfo | grep -q txindex && echo "config OK"   # else the conf was not read
+   until [ "$($BC getblockchaininfo 2>/dev/null | jq .headers)" -ge 935000 ] 2>/dev/null; do sleep 15; done
+   ```
+5. **Snapshot: download, patch one byte, load** (5.2 explains the patch; ~25 min to load; run exactly
+   one `loadtxoutset` — a second one racing it kills both on `chainstate_snapshot/LOCK`; and if a load
+   was killed hard and `chainstate_snapshot/` is still there, the next start boots "@ height -1" and
+   never answers RPC — kill `bitcoind`, `rm -rf /mnt/vol/ecash/chainstate_snapshot`, restart, retry):
+   ```bash
+   wait; ls -l utxo-935000.dat                                         # step 2's download: 9,387,990,306 bytes (NOT utxo-963648.dat, 5.2)
+   xxd -s 7 -l 4 utxo-935000.dat                                       # eca5 d404 = drynet4 magic
+   printf '\241' | dd of=utxo-935000.dat bs=1 seek=9 count=1 conv=notrunc   # offset 9: d4 -> a1 (octal is POSIX; count=1 caps it at one byte)
+   xxd -s 7 -l 4 utxo-935000.dat                                       # must read eca5 a104
+   sha256sum utxo-935000.dat                                           # patched file: 4c569766d896a8f10fb74c579bd7cca596c1ae1570207a3dc7948a6862f9bfb4
+   nohup $BC -rpcclienttimeout=0 loadtxoutset "$PWD/utxo-935000.dat" > load.log 2>&1 &   # ~25 min; detached so a dropped session cannot hurt it
+   until [ "$($BC getchainstates 2>/dev/null | jq '.chainstates | length')" = 2 ] 2>/dev/null; do sleep 60; done   # progress: grep 'coins loaded' /mnt/vol/ecash/debug.log
+   ```
+   If the client side dies, the load carries on inside `bitcoind` — do not run it again; watch
+   `debug.log` and the loop above.
+6. **Sync forward to the tip** — 935,000 → 963,648 in ~3 h 50 on this box (≈125 blocks a minute on
+   average, slower through the last few thousand pre-fork blocks: those are full Bitcoin blocks), then
+   the post-fork alpha blocks to the tip in ~20 min. Watch the active chainstate's `blocks` in
+   `getchainstates`.
+7. **Enforcer — start it only once the node is at the tip.** It does not wait out a node's IBD: in our
+   run an enforcer started alongside the node sat at a reported height of 96,295 for 3.5 h and then
+   exited with status 1; restarted against the idle, synced node it reached the tip in ~7 min (a cold
+   start was not timed — allow half an hour). Run it as a transient systemd unit so it survives a
+   dropped session and restarts on failure, and restart it (then `freebankd`) after any `bitcoind`
+   restart — the RPC cookie is read once at enforcer start:
+   ```bash
+   systemd-run --unit=enforcer --same-dir -p Restart=on-failure \
+     enf/bip300301-enforcer --data-dir /mnt/vol/enforcer --network-preset=alphanet \
+     --node-rpc-addr=127.0.0.1:18302 --node-rpc-cookie-path=/mnt/vol/ecash/.cookie \
+     --node-zmq-addr-sequence=tcp://127.0.0.1:29000 --serve-grpc-addr=127.0.0.1:50051
+     # add 3.2's wallet flags (--enable-wallet --wallet-sync-source=disabled --wallet-auto-create) only if this
+     # enforcer will fund BMM bids (5.2: alpha has no faucet); with a wallet it waits at startup for txindex to report synced
+   journalctl -u enforcer -f                                                              # its log
+   grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechains   # slot 130, once synced
+   ```
+8. **`freebankd`** — 5.3's command with the datadir on the volume (it refuses a missing one). Drop a
+   trusted `mainblockhash.dat` into the datadir first if you have one (5.2); without it the first start
+   spends ~4 min building the cache against the local enforcer, then syncs the sidechain (71 blocks
+   on our run) in a minute or two:
+   ```bash
+   mkdir -p /mnt/vol/freebank
+   freebank/bin/freebankd -datadir=/mnt/vol/freebank -server -rpcuser=fb -rpcpassword=<choose one> \
+     -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 \
+     -mainchainrest=127.0.0.1:18302 -mainchainchain=main \
+     -mainchainblockpin=963648:0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924 \
+     -grpcurlbin=$(which grpcurl) -daemon
+   ```
+   Then 5.3's three checks: a peer at the seed, `getblockcount` at the network height,
+   `getmainchainblockcount` equal to the L1 tip.
+
+From `bitcoind` start to `freebankd` at the network tip the measured total was **4 h 37 min** — with
+the enforcer already running alongside, the snapshot file already downloaded and headers cached. In
+the order above, add the 9.4 GB download and step 7: call it 5 h, which is what the cost row uses.
+
+What you have at that point is a node at the tip that is not yet *validated*: the background
+validation from genesis is now running on its own, pulling roughly 750 GB of pre-snapshot blocks
+(most of today's 811 GB) onto the volume. That took about four days on our 8 GB reference box
+(chainstate on a local SATA SSD, `dbcache=2800`, ~2,000 blocks an hour, I/O-bound); 16 GB with
+`dbcache=8000`+ should be much faster but has not been measured on a rented box, and a network
+volume's IOPS ceiling is exactly the resource that bounded our run. `getchainstates` drops to a
+single chainstate with `validated: true` when it finishes; the next restart cleans the background
+chainstate off the disk. Until then `txindex` covers only the validated range, so **deposits do not
+credit** (7.3) — which is why the guide's one rule stands here too: fully synced first, then FreeBank.
+Snapshot the volume once it is validated (~$54–72 a month on DigitalOcean, see the table) and you
+never pay for the sync again.
+
+**Driving it from the API** (what an assistant needs; both APIs are `Authorization: Bearer <token>`,
+JSON, with an action or event object to poll):
+
+- *DigitalOcean* (`https://api.digitalocean.com/v2`). Token scopes: `droplet:create/read/update/delete`,
+  `block_storage:create/read/delete`, `block_storage_action:create`, `block_storage_snapshot:create`,
+  `image:create` + `image:read` (a droplet snapshot needs `image:create` — a token without it gets the
+  call refused, as ours did), `snapshot:read`, `ssh_key:read`, `sizes:read`, `regions:read`,
+  `actions:read`. Calls: `POST /v2/volumes` `{name: "vol", size_gigabytes, region, filesystem_type:
+  "ext4"}` (Ubuntu then auto-mounts it at `/mnt/vol`); `POST /v2/droplets` `{name, region, size, image:
+  "ubuntu-24-04-x64", ssh_keys: [id], volumes: [volume_id]}`; `GET /v2/droplets/{id}` until `status:
+  active` (public IP in `networks.v4`); `POST /v2/droplets/{id}/actions` `{"type": "shutdown"}`, then
+  `{"type": "snapshot", "name": …}`; `POST /v2/volumes/{id}/snapshots` `{name}`; `DELETE
+  /v2/droplets/{id}` — which leaves the volume behind, so `DELETE /v2/volumes/{id}` too.
+- *Linode* (`https://api.linode.com/v4`). Token scopes: `linodes:read_write volumes:read_write
+  events:read_only` (add `firewall:read_write` only for a Cloud Firewall), with an expiry. Calls:
+  `POST /v4/linode/instances` `{type: "g6-standard-4", region, image: "linode/ubuntu24.04", label,
+  authorized_keys: [...]}` (omit `root_pass`); `POST /v4/volumes` `{label, size, linode_id}` — created
+  attached, device `/dev/disk/by-id/scsi-0Linode_Volume_<label>`, then `mkfs.ext4`, mount, `fstab` with
+  `nofail`; `GET /v4/linode/instances/{id}` until `status: running`; images are capped at 6 GB and
+  backups skip volumes, so the copy of a node is `POST /v4/volumes/{id}/clone` `{label}` with the
+  daemons stopped; `DELETE /v4/linode/instances/{id}` detaches but does not delete the volume —
+  `DELETE /v4/volumes/{id}`.
+
+Two closing cautions. A rented box is still *your* node — everything 5.3 says about trusting someone
+else's L1 applies the moment you point `freebankd` at an enforcer you did not run. And mind what each
+snapshot holds: the volume snapshot carries the wallets (`freebankd`'s `wallet.dat` in its datadir,
+and the enforcer's seed under `/mnt/vol/enforcer/wallet/` if you enabled its wallet) — fine while it
+stays in your own account, never something to hand to anyone; and keep the provider token off the box
+altogether.
 
 
 
