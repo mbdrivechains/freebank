@@ -774,16 +774,15 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   snapshot path and want the background validation done in hours rather than days. Check
   progress with `getchainstates` (the background chainstate's `blocks`), not the log: Core
   logs `[background validation] UpdateTip` only every 2,000 blocks.
-  Which node *configuration* you run is your choice, within one constraint as of v0.2.10: deposit
-  crediting looks the deposit transaction up by txid, hence `txindex=1`, and Core refuses `txindex`
-  on a **pruned** node. So today a **full node from scratch** (unpruned, txindex) works and is the
-  maximum-assurance path; an **assumeutxo start, unpruned + txindex** works and is the practical one —
-  it follows the chain within hours, but deposits credit only once the background validation has
-  passed the deposit's block (caveat above); a **pruned** node, from scratch or from a snapshot,
-  follows the chain and can produce blocks but **cannot credit deposits**. A planned change (fetch
-  the deposit transaction from its block, which needs no txindex) lifts that last restriction and makes
-  a pruned assumeutxo node (~20 GB) the sensible default; until it ships, plan for txindex. And
-  "validated" has a precise meaning: an assumeutxo node trusts the snapshot's UTXO hash until its
+  Which node *configuration* you run comes down to one rule: **a full node — unpruned, `txindex=1` —
+  fully synced before you rely on FreeBank for anything.** A **full node from scratch** is the
+  maximum-assurance path. An **assumeutxo start** (unpruned, `txindex=1`) is the practical one: it
+  follows the chain within hours, but deposits credit only once the background validation — and with
+  it `txindex` — has passed the deposit's block (caveat above); treat it as *synced* only when
+  `getchainstates` shows a single chainstate. A **pruned** node is not an option: `freebankd` needs
+  `txindex` to credit deposits, Core refuses `txindex` on a pruned node, and the enforcer itself now
+  refuses a pruned bitcoind at startup (its 2026-09-04 master: *"Bitcoin Core node has pruning
+  enabled"*). And "validated" has a precise meaning: an assumeutxo node trusts the snapshot's UTXO hash until its
   background sync from genesis completes — `getchainstates` then shows a single chainstate. For
   anything you would call real money, run your own node and wait for that state.
 - **Enforcer:** a recent build with `--network-preset=alphanet` (v0.3.4 was the first to
@@ -876,7 +875,8 @@ testing, nothing more. For real money, run your own validated stack (5.2).
 2. **Point it at BitWindow's alpha stack.** Find BitWindow's enforcer gRPC (usually `127.0.0.1:50051`)
    and its mainchain bitcoind's **REST** port. The node must have been started with `-rest` (BitWindow's
    default config includes `rest=1`) and must be on eCash alpha (`chain=main`, tip near the current alpha
-   height). A **pruned** node is fine for a sync test — only deposit crediting needs `txindex`.
+   height). The node must be unpruned (the enforcer refuses pruned nodes); a sync test alone never
+   exercises `txindex`, but run the full configuration anyway — every later step needs it.
 
 3. **Run `freebankd` with no `-addnode`** (create the datadir first — it refuses a missing one; replace
    `<REST_PORT>`):
