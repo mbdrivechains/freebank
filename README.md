@@ -86,8 +86,15 @@ known-open, v0.2.7.1 closes a memory leak that fuzzing turned up, v0.2.8 closes
 three consensus defects found by a line-by-line audit of the money paths inherited
 from the upstream sidechain chassis, v0.2.9 makes the node able to follow a
 mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran,
-and v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves:
+v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves, and
+v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed:
 
+- **Provision a wallet from a seed** (v0.2.12). `sethdseed` sets the wallet's HD seed from
+  a WIF key, so every address the wallet derives is reproducible from that seed — which lets
+  FreeBank be folded into a single-recovery-phrase backup the way BitWindow does its other
+  sidechains (FreeBank is a legacy-wallet Core fork with no `importdescriptors`). The main
+  network also now ships the live seed (`seed.ecxfreebank.com`, 68.183.235.153:8455) as a
+  hardcoded bootstrap fallback beside the DNS seed. No consensus change.
 - **Enforcer transport survives a host that is not quite ready** (v0.2.11). Found by
   booting freebankd under BitWindow's orchestrator on eCash alphanet. The `grpcurl`
   path is now quoted (BitWindow's macOS install dir contains a space, which split the

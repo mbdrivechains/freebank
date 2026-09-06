@@ -1329,6 +1329,11 @@ public:
     /* Generates a new HD master key (will not be activated) */
     CPubKey GenerateNewHDMasterKey();
 
+    /* Derives a new HD master key from a supplied key, storing it in the wallet
+       (will not be activated). Used by GenerateNewHDMasterKey and by sethdseed to
+       adopt an externally-supplied seed. */
+    CPubKey DeriveNewSeed(const CKey& key);
+
     /* Set the current HD master key (will reset the chain child index counters)
        Sets the master key's version based on the current wallet version (so the
        caller must ensure the current wallet version is correct before calling

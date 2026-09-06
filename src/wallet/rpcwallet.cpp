@@ -2343,6 +2343,78 @@ UniValue keypoolrefill(const JSONRPCRequest& request)
     return NullUniValue;
 }
 
+UniValue sethdseed(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() > 2) {
+        throw std::runtime_error(
+            "sethdseed ( \"newkeypool\" \"seed\" )\n"
+            "\nSet or generate a new HD wallet seed. Non-HD wallets will not be upgraded to being a HD wallet.\n"
+            "Wallets that are already HD will have a new HD seed set so that new keys added to the keypool will be\n"
+            "derived from this new seed.\n"
+            "\nThis lets an external manager (for example the BitWindow orchestrator) provision this wallet from a\n"
+            "master mnemonic: derive a key from the mnemonic and pass it here, and every address the wallet then\n"
+            "generates is recoverable from that same seed.\n"
+            "\nNote that you will need to MAKE A NEW BACKUP of your wallet after setting the HD wallet seed.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nArguments:\n"
+            "1. \"newkeypool\"         (boolean, optional, default=true) Whether to flush old unused addresses, including change\n"
+            "                             addresses, from the keypool and regenerate it. If true, the next address from\n"
+            "                             getnewaddress and the next change address will be derived from this new seed. If false,\n"
+            "                             addresses from the existing keypool will be used until it has been depleted.\n"
+            "2. \"seed\"               (string, optional) The WIF private key to use as the new HD seed; if not provided a random\n"
+            "                             seed will be used. The value can be retrieved from another wallet with dumpwallet (the\n"
+            "                             private key marked hdmaster=1).\n"
+            "\nExamples:\n"
+            + HelpExampleCli("sethdseed", "")
+            + HelpExampleCli("sethdseed", "false")
+            + HelpExampleCli("sethdseed", "true \"wifkey\"")
+            + HelpExampleRpc("sethdseed", "true, \"wifkey\"")
+            );
+    }
+
+    // Do not do anything to non-HD wallets
+    if (!pwallet->IsHDEnabled()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot set an HD seed on a non-HD wallet. Start with -upgradewallet in order to upgrade a non-HD wallet to HD");
+    }
+
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    EnsureWalletIsUnlocked(pwallet);
+
+    bool flush_key_pool = true;
+    if (!request.params[0].isNull()) {
+        flush_key_pool = request.params[0].get_bool();
+    }
+
+    CPubKey master_pub_key;
+    if (request.params[1].isNull()) {
+        master_pub_key = pwallet->GenerateNewHDMasterKey();
+    } else {
+        CBitcoinSecret vchSecret;
+        if (!vchSecret.SetString(request.params[1].get_str())) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key encoding");
+        }
+        CKey key = vchSecret.GetKey();
+        if (!key.IsValid()) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Private key outside allowed range");
+        }
+        if (pwallet->HaveKey(key.GetPubKey().GetID())) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Already have this key (either as an HD seed or as a loose private key)");
+        }
+        master_pub_key = pwallet->DeriveNewSeed(key);
+    }
+
+    pwallet->SetHDMasterKey(master_pub_key);
+    if (flush_key_pool) pwallet->NewKeyPool();
+
+    return NullUniValue;
+}
+
 
 static void LockWallet(CWallet* pWallet)
 {
@@ -6564,6 +6636,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "sendmany",                         &sendmany,                      {"fromaccount","amounts","minconf","comment","subtractfeefrom","replaceable","conf_target","estimate_mode"} },
     { "wallet",             "sendtoaddress",                    &sendtoaddress,                 {"address","amount","comment","comment_to","subtractfeefromamount","replaceable","conf_target","estimate_mode"} },
     { "wallet",             "setaccount",                       &setaccount,                    {"address","account"} },
+    { "wallet",             "sethdseed",                        &sethdseed,                     {"newkeypool","seed"} },
     { "wallet",             "settxfee",                         &settxfee,                      {"amount"} },
     { "wallet",             "signmessage",                      &signmessage,                   {"address","message"} },
     { "wallet",             "signrawtransactionwithwallet",     &signrawtransactionwithwallet,  {"hexstring","prevtxs","sighashtype"} },

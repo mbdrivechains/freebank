@@ -720,4 +720,71 @@ BOOST_FIXTURE_TEST_CASE(ListCoins, ListCoinsTestingSetup)
 }
 */
 
+// --- sethdseed / DeriveNewSeed ---
+// A wallet's HD addresses must be reproducible from its seed. This is the property the BitWindow
+// orchestrator relies on to fold FreeBank into its one-mnemonic backup: derive a key from the
+// master mnemonic, set it as this wallet's HD seed (what the sethdseed RPC does with DeriveNewSeed
+// + SetHDMasterKey), and every address the wallet then hands out can be recovered by setting the
+// same seed again on a fresh wallet.
+
+static CKey FixedSeedKey(unsigned char b)
+{
+    std::vector<unsigned char> bytes(32, b);
+    CKey key;
+    key.Set(bytes.begin(), bytes.end(), true /* compressed */);
+    return key;
+}
+
+static std::vector<CKeyID> ExternalAddressesFromSeed(const CKey& seed, unsigned int count)
+{
+    // Dummy (in-memory) wallet DB; keep a raw handle so we can derive keys directly, which is the
+    // same external-chain path (m/0'/0'/n') the keypool and getnewaddress use, without the DB
+    // round-trip the keypool would otherwise require.
+    CWalletDBWrapper* rawdb = new CWalletDBWrapper();
+    CWallet wallet{std::unique_ptr<CWalletDBWrapper>(rawdb)};
+    bool firstRun;
+    wallet.LoadWallet(firstRun);
+    LOCK(wallet.cs_wallet);
+    wallet.SetMinVersion(FEATURE_HD);
+
+    // This mirrors sethdseed's seed-provided path exactly.
+    CPubKey master = wallet.DeriveNewSeed(seed);
+    BOOST_CHECK(wallet.SetHDMasterKey(master));
+
+    CWalletDB walletdb(*rawdb);
+    std::vector<CKeyID> ids;
+    for (unsigned int i = 0; i < count; ++i) {
+        CPubKey pubkey = wallet.GenerateNewKey(walletdb, false /* external chain */);
+        ids.push_back(pubkey.GetID());
+    }
+    return ids;
+}
+
+BOOST_AUTO_TEST_CASE(sethdseed_reproducible_from_seed)
+{
+    CKey seed = FixedSeedKey(0x11);
+    BOOST_CHECK(seed.IsValid());
+
+    // Two independent wallets fed the same seed must derive the same addresses, in the same
+    // order — a fresh wallet restored from the same mnemonic reproduces the funds.
+    std::vector<CKeyID> a = ExternalAddressesFromSeed(seed, 8);
+    std::vector<CKeyID> b = ExternalAddressesFromSeed(seed, 8);
+    BOOST_CHECK_EQUAL(a.size(), 8U);
+    BOOST_CHECK(a == b);
+}
+
+BOOST_AUTO_TEST_CASE(sethdseed_distinct_seeds_distinct_addresses)
+{
+    std::vector<CKeyID> a = ExternalAddressesFromSeed(FixedSeedKey(0x11), 8);
+    std::vector<CKeyID> c = ExternalAddressesFromSeed(FixedSeedKey(0x22), 8);
+    BOOST_CHECK_EQUAL(a.size(), 8U);
+    BOOST_CHECK_EQUAL(c.size(), 8U);
+    // Different seeds must not produce a shared address.
+    for (const CKeyID& id : a) {
+        for (const CKeyID& id2 : c) {
+            BOOST_CHECK(id != id2);
+        }
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

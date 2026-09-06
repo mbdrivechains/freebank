@@ -185,4 +185,20 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK(pnode2->fFeeler == false);
 }
 
+// The main network ships exactly one hardcoded fixed seed: the live FreeBank seed
+// seed.ecxfreebank.com (68.183.235.153:8455). Guards against pnSeed6_main being cleared
+// again, and against a wrong IPv4-mapped byte or port.
+BOOST_AUTO_TEST_CASE(mainnet_fixed_seed_is_the_live_seed)
+{
+    const auto params = CreateChainParams("main");
+    const std::vector<SeedSpec6>& seeds = params->FixedSeeds();
+    BOOST_CHECK_EQUAL(seeds.size(), 1U);
+    // 68.183.235.153:8455 as an IPv4-mapped IPv6 address
+    const uint8_t expected[16] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff,0x44,0xb7,0xeb,0x99};
+    for (int i = 0; i < 16; ++i) {
+        BOOST_CHECK_EQUAL(seeds.at(0).addr[i], expected[i]);
+    }
+    BOOST_CHECK_EQUAL(seeds.at(0).port, 8455);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

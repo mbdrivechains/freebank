@@ -158,8 +158,11 @@ public:
         // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         bech32_hrp = "fbk";
 
-        // TODO more seed nodes
-        vFixedSeeds.clear(); // v0.1.0 ships no fixed seeds (upstream pnSeed6_main pointed at LayerTwo Labs nodes); seed nodes added when a public network exists
+        // A public network (eCash alpha) now exists, so ship the live seed as a hardcoded
+        // fixed-seed fallback alongside the DNS seed above (pnSeed6_main = seed.ecxfreebank.com,
+        // 68.183.235.153:8455). v0.1.0 cleared this because upstream pnSeed6_main pointed at dead
+        // LayerTwo Labs nodes.
+        vFixedSeeds = std::vector<SeedSpec6>(pnSeed6_main, pnSeed6_main + ARRAYLEN(pnSeed6_main));
 
         fDefaultConsistencyChecks = false;
         fRequireStandard = false;

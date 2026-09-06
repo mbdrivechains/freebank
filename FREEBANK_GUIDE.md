@@ -6,7 +6,7 @@ This file is meant to be *complete enough on its own* that you can hand it to an
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
 you through running FreeBank, standing up a bank, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
-or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.11), and the quick start in
+or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.12), and the quick start in
 section 3 was run verbatim against the release binaries. Where something is designed but
 not built, it says so.
 
@@ -152,13 +152,14 @@ coinbase scan).
 ### 2.4 Verifying what you download
 
 Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.11** (enforcer-transport robustness — quoted `grpcurl` path, self-restoring
-network activity, no abort on headers while the mainchain is unreachable; v0.2.10 added the baked DNS
-seed for zero-config peer discovery, §5.3): `freebank-0.2.11-x86_64-linux-gnu.tar.gz`, sha256
-`78e841e078466240c89a4e377e64cdbf5d6f19f8606e22dad6ef7aa73eab86c8`; its source is the
-commit the public tag `v0.2.11` points at (`git rev-parse 'v0.2.11^{commit}'`). The commands
+arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.12** (`sethdseed` to provision a
+wallet from a seed, and the live fixed seed shipped as a bootstrap fallback; v0.2.11 hardened the
+enforcer transport, v0.2.10 added the baked DNS seed for zero-config peer discovery, §5.3):
+`freebank-0.2.12-x86_64-linux-gnu.tar.gz`, sha256
+`d3c59222fb31eb7036097ad643c24c1efd3cf5b0eec504f3c19e027180c52ad6`; its source is the
+commit the public tag `v0.2.12` points at (`git rev-parse 'v0.2.12^{commit}'`). The commands
 below are written for v0.2.8 because that is what the sidechain proposal on alpha
-commits to — substitute `0.2.11` to verify the current binaries the same way.
+commits to — substitute `0.2.12` to verify the current binaries the same way.
 
 The sidechain proposal (M1) that activated slot 130 on alpha commits to v0.2.8:
 
@@ -892,13 +893,13 @@ testing, nothing more. For real money, run your own validated stack (5.2).
    attaches to the unsigned binary:
    ```bash
    # Linux:
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/freebank-0.2.11-x86_64-linux-gnu.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/freebank-0.2.12-x86_64-linux-gnu.tar.gz
    # macOS (Apple Silicon):
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/freebank-0.2.11-arm64-apple-darwin.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/freebank-0.2.12-arm64-apple-darwin.tar.gz
 
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/SHA256SUMS
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing        # macOS: shasum -a 256 -c  -> OK
-   tar -xzf freebank-0.2.11-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
+   tar -xzf freebank-0.2.12-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
    xattr -dr com.apple.quarantine freebank 2>/dev/null   # macOS only: clear quarantine if present
    ```
    `freebankd` shells out to `grpcurl` for the enforcer transport — install it (`brew install grpcurl`,
@@ -1047,9 +1048,9 @@ and `bitcoind` shuts itself down when the disk fills (*"Disk space is too low!"*
    ```bash
    curl -LO https://releases.drivechain.info/L1-ecash-bitcoin-alphanet-x86_64-unknown-linux-gnu.zip   # ~278 MB
    curl -LO https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip  # 'latest' moves; you want 2026-09-04 or newer
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/freebank-0.2.11-x86_64-linux-gnu.tar.gz
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.11/SHA256SUMS
-   sha256sum -c SHA256SUMS --ignore-missing && tar -xzf freebank-0.2.11-*.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/freebank-0.2.12-x86_64-linux-gnu.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/SHA256SUMS
+   sha256sum -c SHA256SUMS --ignore-missing && tar -xzf freebank-0.2.12-*.tar.gz
    unzip -qj L1-ecash-*.zip -d l1 -x '*/qt/*'       # -> l1/bitcoind, l1/bitcoin-cli (skip the 388 MB Qt build)
    unzip -qj bip300301-enforcer-*.zip -d enf && mv enf/bip300301-enforcer-* enf/bip300301-enforcer
    chmod +x l1/* enf/*
@@ -1479,7 +1480,7 @@ touches it.
 
 ---
 
-## 8. Built vs designed — as of v0.2.11
+## 8. Built vs designed — as of v0.2.12
 
 | Area | Status |
 |---|---|
