@@ -131,7 +131,7 @@ Be precise about what that means:
   `freebankd` posting BMM requests through an enforcer whose wallet holds alpha coins (the
   request is a paid mainchain transaction), and a miner running enforcer templates to
   include it. To see whether slot 130 is being mined, scan recent coinbases for M7
-  commitments with the slot byte `0x82` (section 9.4). **As of September 2026 the network is producing FreeBank blocks continuously** — a followed node syncs a live chain; 5.3 is the fastest way to watch it happen.
+  commitments with the slot byte `0x82` (section 9.4). **As of September 2026 the network is producing FreeBank blocks continuously** — a followed node syncs a live chain; 5.3 is the fastest way to watch it happen, and 5.6 is the first bank and loan on it, step by step as it happened.
 - **Deposit only once you can see FreeBank blocks being produced.** A deposit is a
   mainchain transaction into the slot's escrow; it is credited by the sidechain, so with
   no blocks there is nothing to credit it — and it would be lost at the next reset
@@ -1193,7 +1193,96 @@ and the enforcer's seed under `/mnt/vol/enforcer/wallet/` if you enabled its wal
 stays in your own account, never something to hand to anyone; and keep the provider token off the box
 altogether.
 
+### 5.6 The first bank and loan on alpha, as it happened (2026-09-05)
 
+Sections 3.7 and 4.3 are the regtest recipes. This is the same sequence run once on the live alpha
+chain, by a script in one day with one manual intervention (below) — every transaction is in the
+public FreeBank chain, so a node synced by 5.3 can check the end state with `gethouse 1`, `getbill 1`
+and `listloanbook 1`, and the txids listed after the table. `listhouses` at block 68 returned exactly
+one house and ids are sequential, so house 1 and bill 1 are the first on the alpha FreeBank chain,
+which has run unbroken since its first block on 2026-08-29. It is here because it is the one *timed*
+transcript of the live path: what each step costs in blocks and hours when you do not own the block
+clock.
+
+**Setup.** The public seed's `freebankd` (v0.2.10, swapped to v0.2.11 at 07:48 UTC between steps 3
+and 4 — a robustness-only release, no consensus change; 5.2's stack, enforcer on another machine)
+with two wallets — `wallet=wallet.dat` and `wallet=w2.dat` lines in `freebank.conf` and a restart
+(4.0's `-wallet=` flags, as conf lines). `$W1` (the treasury: 2.95 alpha coins from a peg-in made the
+4.0 way — the enforcer's `CreateDepositTransaction` to a plain `getnewaddress` address, 7.3 — credited
+in FreeBank block 55 and spendable at 56) plays the house; `$W2` the merchant. Every house and bill
+operation passed `0.001` as its fee (the funding sends used the wallet's default rate). The seed's
+BMM ticker bids 0.00002 alpha coins **once per alpha block**, from the enforcer's own wallet, never
+from `$W1`/`$W2` — a different regime from 5.2's every-couple-of-minutes timer, and it matters below.
+
+| # | Command (wallet) | Sent (UTC) | Confirmed in FreeBank block (alpha) | What it established |
+|---|---|---|---|---|
+| 1 | `$W1 sendtoaddress <new legacy> 0.15` × 6 and `$W1 sendtoaddress <W2 legacy> 0.5` | 01:21 | 66 (996,831) | the merchant's float. The six self-sends were meant to leave several coins for `signdiscount` (which pays its fee from a coin outside the proof set) but, sent back to back, each spent the previous one's change: the house wallet ended with two confirmed coins, 2.3498 and 0.0997 — enough. Send one, wait a block, send the next if you want distinct floats |
+| 2 | `$W1 registerhouse 0 1 e7bank 1000 "[1.0]" 0.001` | 03:27 | 68 (996,833) | house **id 1**, pledge 1.0 ⇒ capital cap 100,000,000 units |
+| 3 | `$W1 attesthouse 1 0.001` | refused at 68; sent at 69 (07:00) | 70 (996,836) | till 1.4485 coins ⇒ reserve cap 14.5 coins; `mintcapunits` 100,000,000 |
+| 4 | `$W1 mintnote 1 40000000 0.001` | 10:22 | 72 (996,838) | 40,000,000 units of e7bank notes |
+| 5 | `$W1 transfernote 1 10000000 0.001 <W1 legacy>` | 12:05 | 74 (996,840) | bearer transfer (to itself) |
+| 6 | `$W1 redeemnote 1 10000000 0.001` | 13:01 | 76 (996,842) | redeemed at par; `mintedunits` 30,000,000 |
+| 7 | `$W2 issuebill <64-byte hex body> 0.5 0.4 476 5 0.001` | 13:47 | 78 (996,844) | **bill id 1**: face 0.5, bond 0.4 locked, maturity 476 (= 76 + 400), grace 5; the body is 64 random bytes as hex, made as in 4.3 |
+| 8 | `$W2 proposediscount 1 1 0.475 200` → `$W1 signdiscount <proposal> 0.001` → `$W2 completediscount <hex>` | 14:50 (all three within five seconds; only the last is a transaction) | **80** (996,846) | the loan: house 1 buys the bill at a 5% discount with newly minted notes |
+
+Txids, rows 2–8 (row 1 was seven funding sends):
+
+```
+5127ea686285d2465bb751a7ee9b6c2ae0cf1c163436a977359f72d3aa5eb815   registerhouse   block 68
+d9dec345147e55befcf8f5ae81faedbb3a4bf17d477e542c5d08524e76e69e1e   attesthouse     block 70
+aada9d627ab8e8552d72ac730624c25abab27ed09fad3843d7c22c85d08c6856   mintnote        block 72
+baad83553ae2dd1a180dbd5298f0bb50537c6e425fc8927b12b04f3c2ba44992   transfernote    block 74
+fc8699f3acdb873ce8bdc43a3caaeb03835b1aaa91ed22cbc32ab9421e9d7aa9   redeemnote      block 76
+384eca13d570d1b0161b01d613731b1f9f713d6105f643a2b477c7d6fb84a01c   issuebill       block 78
+90a8fbf67b64388cde4a4109e78b0b001afe6cee6761b178683767afef64e2f3   completediscount block 80
+```
+
+**End state at block 80.** `gethouse 1`: `effective_status: open`, `mintedunits` 77,500,000 of
+`mintcapunits` 100,000,000, `loanbookface` 50,000,000, `lastattestheight` 70, `attest_deadline` 358.
+`listloanbook 1`: one bill, `face_matches: true`, weighted maturity 476. `getbill 1`: `owner_house_id`
+1, one endorsement from the merchant's key to the house's with `at_height` 78 (the tip when the
+discount was signed; inclusion was block 80), title outpoint in the discount transaction. `$W2
+listmynotes`: 47,500,000 units of e7bank; `$W1 listmynotes`: 30,000,000. Balances: `$W1` 1.45009 (the
+1.0 pledge sits in house escrow), `$W2` 0.09891 (the 0.4 bond sits in bill escrow until the bill is
+retired — or, unpaid, until the house claims it after maturity plus grace).
+
+**What the clock did.** Fifteen FreeBank blocks (66–80) across seventeen alpha blocks
+(996,830–996,846) in 22 h 38 min from the first send to the last confirmation, with gaps from under
+half an hour to about eight hours — alpha is mined when someone mines it (5.4). Two of those alpha
+blocks (996,830 and 996,835) carried no FreeBank block at all. And **every step took two alpha
+blocks**, never one: six of the eight also took two FreeBank blocks, and the mechanism is the ticker.
+It bids once per alpha block, the moment the new alpha block appears — which is exactly when the
+previous FreeBank block (and your confirmation) landed. A transaction sent seconds later is not in
+that bid's template; the next FreeBank block carries the stale template, and yours rides the one after
+(66→68, 70→72, 72→74, 74→76, 76→78, 78→80). The other two steps — the split (65→66) and the attest
+(69→70) — confirmed in the very next FreeBank block because the intervening alpha block carried no
+FreeBank block at all (the first of them right after a `freebankd` restart, 7.4's own case). Budget
+two alpha blocks per step, or roughly a day for this whole sequence at alpha's cadence. A ticker that
+re-bids every couple of minutes — 5.2's recipe — re-templates in time and would not show this; on a
+bid-per-block ticker, sending and then calling `refreshbmm` yourself is the equivalent shortcut (a
+second bid; not tried here).
+
+**What differed from the regtest recipes.**
+
+- **Attest one block after registering.** Registration counts as the house's attestation at its own
+  height, so `attesthouse` in the block that confirmed `registerhouse` is refused with *"Already
+  attested at this chain height - wait for the next block!"*. The regtest recipe's `bmm 6` hides this;
+  here it stopped the script at block 68 (the one manual intervention: resume once block 69 existed).
+- **The attestation clocks are the same as regtest's, but alpha's blocks are hours apart.**
+  `attest_deadline` in `gethouse` (last attestation + 288, 7.1) is the last height at which the house
+  is still Open without a new attestation; it derives Stressed from the block after. `signdiscount`
+  wants an attestation at most 144 blocks old. Only ten blocks separated the attest at 70 from the
+  discount's block at 80, so 4.3's re-attest was not needed — but a house left alone for 288 FreeBank
+  blocks is Stressed, and at the cadence seen here (~80 min per alpha block, and not every alpha block
+  carries a FreeBank block) that is one to two weeks, not the two days of 7.1's ten-minute arithmetic.
+- **Fees:** 0.001 per operation was plenty. Gross fees were about 0.0075 alpha coins — seven house and
+  bill operations at 0.001 plus roughly 0.0005 on the seven funding sends. The two wallets nonetheless
+  moved by only about 0.001 net (`$W1` +0.00009, `$W2` −0.00109), because `wallet.dat` is also the
+  seed's block-producer key: this chain has no subsidy, a block's coinbase is its fees, and with a
+  one-block maturity every fee paid into blocks 66–78 was back in `$W1` a block later. A participant
+  who is not producing the blocks pays the gross figure. The ticker's bids — one 0.00002 per alpha
+  block, about 17 for the run, 15 of which bought a FreeBank block — came to roughly 0.0003 from the
+  enforcer wallet.
 
 ---
 
@@ -1292,6 +1381,10 @@ touches it.
 - **Budget in blocks, not seconds.** A house needs ~5 block-slots to stand up (register,
   attest, mint, seed a pool, create the pool); on a 10-minute chain that is a multi-hour
   job.
+- **Attest one block *after* registering.** Registration counts as the house's attestation
+  at its own height, so `attesthouse` in the block that confirmed `registerhouse` is refused:
+  *"Already attested at this chain height - wait for the next block!"*. Regtest recipes with
+  a `bmm` between the two never see it; on a live chain (5.6) you will.
 
 ### 7.2 Notes and redemption
 
@@ -1333,6 +1426,15 @@ touches it.
   commitment.
 - After a daemon restart the first BMM request may miss the first mainchain block; the tip
   rides the second.
+- **If your ticker bids once per mainchain block (as the public seed's does), budget *two*
+  mainchain blocks per operation.** The ticker bids the moment a new mainchain block appears
+  — which is when your previous confirmation landed — so anything you send after that is not
+  in the template the next block carries; it rides the block after. All eight steps in 5.6
+  confirmed exactly two alpha blocks after they were sent; six of them took two FreeBank
+  blocks, and the other two took one only because the intervening alpha block carried no
+  FreeBank block at all. 5.2's every-couple-of-minutes `refreshbmm` timer re-templates in
+  time and does not show this; on a bid-per-block ticker, sending and then calling
+  `refreshbmm` yourself is the equivalent (a second bid; untested).
 - If `$FB` answers with a chain you do not recognise, another `freebankd` owns the RPC
   port: `freebankd -daemon` still returns 0, but `debug.log` says `Unable to bind any
   endpoint for RPC server`. Pick other ports (3.1).
