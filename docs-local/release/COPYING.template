@@ -1,0 +1,25 @@
+All rights reserved unless otherwise noted.
+
+This software makes use of the Unicode Data Files and/or Software under the Unicode License Agreement.
+
+================================================================================
+FreeBank NOTICE
+================================================================================
+
+FreeBank is a drivechain sidechain built on LayerTwo Labs' plain-bitassets
+chassis.
+
+- FreeBank's OWN additions and modifications (the FreeBank-specific source in
+  this repository authored by the FreeBank project) are licensed under the MIT
+  License.
+
+- The underlying plain-bitassets chassis (from LayerTwo Labs) is used under a
+  WRITTEN grant of MIT terms from LayerTwo Labs (Bjorn Olav, 6 September 2026:
+  "It's changed to MIT"), pending the update of the upstream LICENSE.txt file. The license text reproduced above is the upstream
+  LICENSE.txt as it stands in the plain-bitassets repository. FreeBank makes NO
+  claim that the plain-bitassets chassis is MIT-licensed; consult LayerTwo Labs
+  for the authoritative terms of the chassis.
+
+This COPYING file is bundled with FreeBank release tarballs. For the current,
+authoritative license of any component, consult the respective source
+repository.

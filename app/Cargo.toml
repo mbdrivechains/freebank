@@ -1,0 +1,65 @@
+[package]
+name = "plain_bitassets_app"
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+bitcoin = { workspace = true, features = ["serde"] }
+blake3 = { workspace = true }
+borsh = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+dirs = { workspace = true }
+eframe = { workspace = true }
+either = { workspace = true }
+fallible-iterator = { workspace = true }
+fraction = { workspace = true, features = ["with-serde-support"] }
+futures = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+human-size = { workspace = true }
+itertools = { workspace = true }
+include_path = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server"] }
+mimalloc = { workspace = true, features = ["v3"] }
+parking_lot = { workspace = true }
+plain_bitassets = { path = "../lib", features = ["clap"] }
+plain_bitassets_app_cli = { path = "../cli" }
+plain_bitassets_app_rpc_api = { path = "../rpc-api" }
+poll-promise = { workspace = true, features = ["tokio"] }
+serde = { workspace = true, features = ["derive"] }
+shlex = { workspace = true }
+strum = {  workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tiny-bip39 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "request-id", "trace"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+url = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dependencies.libes]
+workspace = true
+features = ["AES256-GCM", "ECIES-MAC", "HMAC-SHA256", "x25519"]
+
+[features]
+default = ["zmq"]
+zmq = ["plain_bitassets/zmq"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "freebankd"
+path = "main.rs"

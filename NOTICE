@@ -1,0 +1,16 @@
+FreeBank NOTICE
+===============
+
+FreeBank is a Bitcoin drivechain sidechain built on LayerTwo Labs'
+plain-bitassets chassis.
+
+* FreeBank's OWN additions and modifications (the FreeBank-specific source in
+  this repository authored by the FreeBank project) are licensed under the MIT
+  License.
+
+* The underlying plain-bitassets chassis (LayerTwo Labs) is used under a written
+  grant of MIT terms given by LayerTwo Labs to the FreeBank project. As of this
+  release the upstream LICENSE.txt in the plain-bitassets repository still reads
+  "all rights reserved"; FreeBank makes NO claim that that file says MIT.
+  Consult LayerTwo Labs for the authoritative terms of the chassis, and see
+  LICENSE.txt in this repository (reproduced upstream, unchanged).

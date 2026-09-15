@@ -1,0 +1,164 @@
+# FreeBank fork — release build + reproducibility gate. NO PUBLISH STEP.
+#
+# Triggered on tag push `v*`. Builds the three bins on the pinned nightly and
+# packages them EXACTLY as docs-local/release-linux.sh does (same
+# `freebank/bin/{freebankd,freebank-cli,freebank-tx}` + COPYING + README.md
+# layout, strip, deterministic tar), then uploads the tarball as a workflow
+# ARTIFACT only. It deliberately does NOT create a GitHub Release / upload a
+# release asset: a PUBLIC tarball is gated on MIT actually landing in
+# plain-bitassets/LICENSE.txt (still all-rights-reserved), and the CANONICAL
+# linux asset is the one built + accepted locally (C++ precedent — acceptance
+# runs on the extracted, locally-built tarball). No secrets are used.
+#
+# Version comes from Cargo.toml major.minor.patch (digits only) — NEVER the
+# tag's pre-release suffix — so BitWindow's `freebank-[\d.]+-<arch>.tar.gz`
+# fetch regex matches (CHASSIS_MAP §8, BITWINDOW_LAUNCH_CONTRACT §6.8).
+on:
+  push:
+    tags:
+      - 'v*'
+
+name: Release (build + gate, no publish)
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-arm64:
+    name: macOS arm64 release tarball (artifact only)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install pinned nightly (rust-toolchain.toml is the source of truth)
+        run: |
+          rustup show
+          rustup target add aarch64-apple-darwin
+
+      - name: Install GNU tar (deterministic tarball; macOS bsdtar lacks --sort/--mtime)
+        run: brew install gnu-tar
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          cache-all-crates: "true"
+          prefix-key: "v0-rust-nightly"
+          shared-key: release-aarch64-apple-darwin
+
+      - name: Build (release, --locked, three bins)
+        run: >-
+          cargo build --release --locked --target aarch64-apple-darwin
+          --bin freebankd --bin freebank-cli --bin freebank-tx
+
+      - name: Package (same layout as docs-local/release-linux.sh)
+        run: |
+          set -euo pipefail
+          # Version = Cargo.toml major.minor.patch (digits only), NOT the tag suffix.
+          VER="$(sed -n 's/^version *= *"\([0-9][0-9.]*\).*/\1/p' Cargo.toml | head -1)"
+          [[ "$VER" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "bad version '$VER'"; exit 1; }
+          ARCH="arm64-apple-darwin"
+          NAME="freebank-${VER}-${ARCH}.tar.gz"
+          BIN="target/aarch64-apple-darwin/release"
+          STAGE="stage"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/freebank/bin"
+          cp "$BIN/freebankd" "$BIN/freebank-cli" "$BIN/freebank-tx" "$STAGE/freebank/bin/"
+          strip "$STAGE/freebank/bin/freebankd" "$STAGE/freebank/bin/freebank-cli" "$STAGE/freebank/bin/freebank-tx"
+          cp docs-local/release/COPYING.template "$STAGE/freebank/COPYING"
+          cp docs-local/release/README.tarball.md "$STAGE/freebank/README.md"
+          MTIME="$(date -u +%Y-%m-%d) 10:00"
+          gtar -C "$STAGE" --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="$MTIME" -cf "${NAME%.gz}" freebank
+          gzip -nf "${NAME%.gz}"
+          [ -f "$NAME" ] || { echo "tarball not produced: $NAME"; exit 1; }
+          shasum -a 256 "$NAME" > SHA256SUMS
+          cat SHA256SUMS
+          echo "ASSET=$NAME" >> "$GITHUB_ENV"
+
+      - name: Upload artifact (NOT a release — licence gate; publish nothing)
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebank-arm64-apple-darwin
+          if-no-files-found: error
+          path: |
+            ${{ env.ASSET }}
+            SHA256SUMS
+
+  linux-gate:
+    # The CANONICAL linux asset is the one built + accepted LOCALLY by
+    # docs-local/release-linux.sh (+ release-acceptance.sh) — C++ precedent:
+    # acceptance runs on the extracted, locally-built tarball. This job is a
+    # REPRODUCIBILITY GATE only: it proves the fork builds, unit-tests, packages
+    # and passes the base-only ldd gate on a clean runner. It publishes nothing.
+    name: Linux build + package gate (artifact only)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install pinned nightly (rust-toolchain.toml is the source of truth)
+        run: rustup show
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          cache-all-crates: "true"
+          prefix-key: "v0-rust-nightly"
+          shared-key: release-x86_64-unknown-linux-gnu
+
+      - name: Build (release, --locked, three bins) — fresh clone
+        run: >-
+          cargo build --release --locked
+          --bin freebankd --bin freebank-cli --bin freebank-tx
+
+      - name: Unit tests
+        run: cargo test --tests
+
+      - name: Package + ldd gate (same layout/discipline as docs-local/release-linux.sh)
+        run: |
+          set -euo pipefail
+          VER="$(sed -n 's/^version *= *"\([0-9][0-9.]*\).*/\1/p' Cargo.toml | head -1)"
+          [[ "$VER" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "bad version '$VER'"; exit 1; }
+          ARCH="x86_64-linux-gnu"
+          NAME="freebank-${VER}-${ARCH}.tar.gz"
+          BIN="target/release"
+          STAGE="stage"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/freebank/bin"
+          cp "$BIN/freebankd" "$BIN/freebank-cli" "$BIN/freebank-tx" "$STAGE/freebank/bin/"
+          strip "$STAGE/freebank/bin/freebankd" "$STAGE/freebank/bin/freebank-cli" "$STAGE/freebank/bin/freebank-tx"
+          cp docs-local/release/COPYING.template "$STAGE/freebank/COPYING"
+          cp docs-local/release/README.tarball.md "$STAGE/freebank/README.md"
+          # base-system shared libs only (portable Linux binary) — mirrors release-linux.sh
+          LDD_ALLOW='linux-vdso|ld-linux|libc\.so|libm\.so|libgcc_s'
+          for b in freebankd freebank-cli freebank-tx; do
+            BAD="$(ldd "$STAGE/freebank/bin/$b" 2>/dev/null | grep -vE "$LDD_ALLOW" \
+              | grep -vE 'not a dynamic executable|statically linked' || true)"
+            if [ -n "$(echo "$BAD" | tr -d '[:space:]')" ]; then
+              echo "LDD GATE FAILED for $b — non-base dependencies:"; echo "$BAD"; exit 1
+            fi
+            echo "$b: base-only OK"
+          done
+          MTIME="$(date -u +%Y-%m-%d) 10:00"
+          tar -C "$STAGE" --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="$MTIME" -cf "${NAME%.gz}" freebank
+          gzip -nf "${NAME%.gz}"
+          [ -f "$NAME" ] || { echo "tarball not produced: $NAME"; exit 1; }
+          sha256sum "$NAME" > SHA256SUMS
+          cat SHA256SUMS
+          echo "ASSET=$NAME" >> "$GITHUB_ENV"
+
+      - name: Upload artifact (gate only; publish nothing)
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebank-linux-gate
+          if-no-files-found: error
+          path: |
+            ${{ env.ASSET }}
+            SHA256SUMS
