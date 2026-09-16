@@ -22,14 +22,14 @@ Rust FreeBank daemon and its command-line tools.
 ## Identity (fixed at genesis)
 
 - **Sidechain slot:** 130
-- **Version:** 0.3.0
+- **Version:** 0.3.1
 
 ## Default ports and paths
 
 | Purpose | Default |
 |---------|---------|
 | P2P (net-addr) | `0.0.0.0:4130` |
-| RPC | `127.0.0.1:8454` |
+| RPC | `127.0.0.1:6130` |
 | ZMQ | `127.0.0.1:28130` |
 | Mainchain enforcer gRPC | `127.0.0.1:50051` |
 | Data directory (Linux) | `~/.local/share/freebank` |
@@ -51,7 +51,7 @@ BitWindow / the sidechain orchestrator launches it):
 Then talk to it with the CLI:
 
 ```
-./freebank-cli --rpc-port 8454 getblockcount
+./freebank-cli --rpc-port 6130 getblockcount
 ```
 
 Run `./freebankd --help` and `./freebank-cli --help` for the full flag list.

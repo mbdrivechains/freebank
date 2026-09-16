@@ -27,6 +27,8 @@ mod dutch_auction;
 pub mod error;
 mod rollback;
 mod two_way_peg_data;
+#[cfg(test)]
+mod zero_input_replay_tests;
 
 pub use amm::{AmmPair, PoolState as AmmPoolState};
 pub use bitassets::SeqId as BitAssetSeqId;
@@ -677,12 +679,48 @@ impl State {
         Ok(())
     }
 
+    /// FreeBank consensus rule R2 (BIP30-style): an outpoint key that is
+    /// about to be created must not already exist in `utxos` (unspent) OR in
+    /// `stxos` (spent). `connect_prevalidated` writes created outputs with an
+    /// unchecked `put` and `disconnect_tip` deletes them by key / restores
+    /// spent ones from `stxos`, so a re-created key would make undo inexact
+    /// (the UTXO set would depend on reorg history) or impossible (`NoUtxo` /
+    /// `NoStxo`). Keys of different `OutPoint` variants never collide (the
+    /// borsh variant tag is the first key byte).
+    pub(crate) fn ensure_outpoint_is_new(
+        &self,
+        rotxn: &RoTxn,
+        outpoint: &OutPoint,
+    ) -> Result<(), Error> {
+        let key = OutPointKey::from_outpoint(outpoint);
+        if self.utxos.contains_key(rotxn, &key)?
+            || self.stxos.contains_key(rotxn, &key)?
+        {
+            return Err(Error::OutPointAlreadyExists {
+                outpoint: *outpoint,
+            });
+        }
+        Ok(())
+    }
+
     /// Validates a filled transaction, and returns the fee
     pub fn validate_filled_transaction(
         &self,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
     ) -> Result<bitcoin::Amount, Error> {
+        // FreeBank consensus rule R1: a transaction must spend at least one
+        // input. The coinbase is not a `Transaction` and does not pass here.
+        // Without this, a zero-input tx has a txid that is a pure function of
+        // its outputs/memo, so the identical tx can be mined again after it
+        // leaves the mempool, re-creating `Regular{txid,vout}` keys. With it,
+        // every txid commits to at least one outpoint that can be spent only
+        // once, so `Regular` output keys are unique by construction (R2 below
+        // is then defence in depth for them, and load-bearing for coinbase
+        // keys, see `block::prevalidate`).
+        if tx.transaction.inputs.is_empty() {
+            return Err(Error::NoInputs { txid: tx.txid() });
+        }
         // FreeBank: reject disabled chassis token/market families first, in
         // both the mempool and block-connect paths (this fn is the shared
         // choke point). Money-path txs (Bitcoin transfers, deposits,
@@ -699,6 +737,17 @@ impl State {
                     outpoint: *outpoint,
                 });
             }
+        }
+        // FreeBank consensus rule R2 for transaction outputs (see
+        // `ensure_outpoint_is_new`). Runs on the mempool path and, via
+        // `block::prevalidate`, against the pre-block state on connect.
+        let txid = tx.txid();
+        for vout in 0..tx.transaction.outputs.len() {
+            let outpoint = OutPoint::Regular {
+                txid,
+                vout: vout as u32,
+            };
+            let () = self.ensure_outpoint_is_new(rotxn, &outpoint)?;
         }
         Ok(fee)
     }

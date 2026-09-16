@@ -359,6 +359,22 @@ pub enum Error {
     DisabledAmm,
     #[error("freebank: dutch auction transactions are disabled on this chain")]
     DisabledDutchAuction,
+    // FreeBank consensus rules R1/R2 (sec/zero-input-replay, 2026-09-16):
+    // outpoint keys are never re-created, so `disconnect_tip` (which deletes
+    // created outputs by key and restores spent ones from `stxos`) is an exact
+    // inverse of connect and the UTXO set is a pure function of the chain.
+    #[error(
+        "freebank: transaction {txid} has no inputs \
+         (a non-coinbase transaction must spend at least one input)"
+    )]
+    NoInputs { txid: Txid },
+    #[error(
+        "freebank: output {outpoint} already exists (unspent or spent); \
+         an outpoint may not be re-created"
+    )]
+    OutPointAlreadyExists { outpoint: OutPoint },
+    #[error("freebank: block body contains transaction {txid} more than once")]
+    DuplicateTransaction { txid: Txid },
     #[error(transparent)]
     BitAsset(#[from] BitAsset),
     #[error("bitasset {name_hash:?} already registered")]

@@ -8,7 +8,10 @@ use http::HeaderMap;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder};
 use plain_bitassets::{
     authorization::{Dst, Signature},
-    types::{Address, BlockHash, EncryptionPubKey, Txid, VerifyingKey},
+    types::{
+        Address, BlockHash, EncryptionPubKey, THIS_SIDECHAIN, Txid,
+        VerifyingKey,
+    },
 };
 use plain_bitassets_app_rpc_api::RpcClient;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -176,8 +179,9 @@ pub enum Command {
 
 const DEFAULT_RPC_HOST: Host = Host::Ipv4(Ipv4Addr::LOCALHOST);
 
-// Fixed on every network to match the daemon's fixed 8454 RPC default (BitWindow contract).
-const DEFAULT_RPC_PORT: u16 = 8454;
+// Matches the daemon's slot-derived RPC default (6000 + THIS_SIDECHAIN = 6130),
+// the 6000 + slot convention of the other Rust sidechains / BitWindow's BasePort.
+const DEFAULT_RPC_PORT: u16 = 6000 + THIS_SIDECHAIN as u16;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 

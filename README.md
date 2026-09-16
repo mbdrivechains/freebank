@@ -23,10 +23,22 @@ chassis. The C++ FreeBank lives on the `master` branch and on the `v0.2.x` relea
 - **Fresh genesis:** the Rust node cannot continue the C++ FreeBank chain. It starts a new chain on a
   new (beta) network. Do not point it at anything of real value.
 
+## What's new in 0.3.1
+
+This release adds consensus rules rejecting transactions with no inputs and re-created outputs: a
+transaction must spend at least one input, an output that already exists cannot be created again, and
+a block may not contain the same transaction twice. Without them a transaction could be mined twice
+and a later reorg could leave nodes with different UTXO sets. The same fix is offered upstream as
+[LayerTwo-Labs/plain-bitassets#61](https://github.com/LayerTwo-Labs/plain-bitassets/pull/61).
+
+These are consensus changes: **0.3.1 cannot sync a chain started by 0.3.0** — it needs a fresh
+genesis. The RPC port default also moved to `6130` (was `8454`), matching the 6000 + slot convention
+of the other Rust sidechains.
+
 ## Identity (fixed at genesis)
 
 - **Sidechain slot:** 130
-- **Version:** 0.3.0
+- **Version:** 0.3.1
 - Same daemon and asset names as the C++ FreeBank (a BitWindow / release-channel drop-in).
 
 ## Contents of the tarball
@@ -44,7 +56,7 @@ chassis. The C++ FreeBank lives on the `master` branch and on the `v0.2.x` relea
 | Purpose | Default |
 |---------|---------|
 | P2P (`--net-addr`) | `0.0.0.0:4130` |
-| RPC | `127.0.0.1:8454` |
+| RPC | `127.0.0.1:6130` |
 | ZMQ | `127.0.0.1:28130` |
 | Mainchain enforcer gRPC | `127.0.0.1:50051` |
 | Data directory (Linux) | `~/.local/share/freebank` |
@@ -66,7 +78,7 @@ the sidechain orchestrator launch it):
 Then talk to it with the CLI:
 
 ```
-./freebank-cli --rpc-port 8454 getblockcount
+./freebank-cli --rpc-port 6130 getblockcount
 ```
 
 Run `./freebankd --help` and `./freebank-cli --help` for the full flag list.
@@ -82,10 +94,10 @@ sha256sum -c SHA256SUMS --ignore-missing      # macOS: shasum -a 256 -c SHA256SU
 ## BitWindow
 
 FreeBank is distributed through the same channel as the C++ build (`freebank-<digits>-<arch>.tar.gz`,
-no `v` prefix). This Rust `0.3.0` is a **pre-release**: BitWindow follows `releases/latest`, which
+no `v` prefix). This Rust `0.3.1` is a **pre-release**: BitWindow follows `releases/latest`, which
 excludes pre-releases, so the released BitWindow keeps fetching the C++ FreeBank. Running the Rust MVP
 under BitWindow requires either the beta BitWindow that treats FreeBank as a native Rust sidechain, or
-pinning `0.3.0` in the chains_config — see the project's integration notes. Until then, run the daemon
+pinning `0.3.1` in the chains_config — see the project's integration notes. Until then, run the daemon
 directly as shown above.
 
 ## Licence

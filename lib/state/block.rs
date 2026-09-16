@@ -8,14 +8,53 @@ use crate::{
     types::{
         AmountOverflowError, Authorization, BitAssetId, Body, FilledOutput,
         FilledOutputContent, GetAddress as _, GetBitcoinValue as _, Header,
-        InPoint, OutPoint, OutPointKey, OutputContent, SpentOutput, TxData,
-        Verify as _,
+        InPoint, MerkleRoot, OutPoint, OutPointKey, OutputContent, SpentOutput,
+        TxData, Txid, Verify as _,
     },
 };
 
 /// Calculate total number of inputs across all transactions in a block body
 fn calculate_total_inputs(body: &Body) -> usize {
     body.transactions.iter().map(|t| t.inputs.len()).sum()
+}
+
+/// FreeBank consensus rule R2, body level (sec/zero-input-replay). Must run
+/// after the merkle-root check, against the pre-block state:
+///
+/// (a) a body may not contain the same txid twice. With unique txids every
+///     `Regular{txid,vout}` key created by the body is distinct, coinbase keys
+///     differ by `vout`, and keys of different `OutPoint` variants never
+///     collide, so no body creates the same key twice. (A duplicated
+///     input-bearing tx would also trip `UtxoDoubleSpent`; a duplicated
+///     zero-input tx would also trip R1 — this check reports the real cause
+///     first and does not depend on either.)
+/// (b) coinbase outpoint keys (`Coinbase{merkle_root,vout}`) must not already
+///     exist in `utxos`/`stxos`. `merkle_root` commits only to
+///     `(coinbase, transactions)`, not to the parent, so two blocks with an
+///     identical body — e.g. no transactions and the same zero-value coinbase
+///     output (allowed: coinbase value 0 <= fees 0) — would otherwise re-create
+///     the same coinbase keys. Transaction output keys are checked per tx in
+///     `State::validate_filled_transaction`.
+fn validate_outpoint_uniqueness(
+    state: &State,
+    rotxn: &RoTxn,
+    merkle_root: MerkleRoot,
+    body: &Body,
+) -> Result<(), Error> {
+    let mut txids: Vec<Txid> =
+        body.transactions.iter().map(|tx| tx.txid()).collect();
+    txids.par_sort_unstable();
+    if let Some(dup) = txids.windows(2).find(|w| w[0] == w[1]) {
+        return Err(Error::DuplicateTransaction { txid: dup[0] });
+    }
+    for vout in 0..body.coinbase.len() {
+        let outpoint = OutPoint::Coinbase {
+            merkle_root,
+            vout: vout as u32,
+        };
+        let () = state.ensure_outpoint_is_new(rotxn, &outpoint)?;
+    }
+    Ok(())
 }
 
 /// Validate a block, returning fees
@@ -48,6 +87,7 @@ pub fn validate(
         };
         return Err(err);
     }
+    let () = validate_outpoint_uniqueness(state, rotxn, merkle_root, body)?;
     let mut coinbase_value = bitcoin::Amount::ZERO;
     for output in &body.coinbase {
         coinbase_value = coinbase_value
@@ -127,6 +167,9 @@ pub fn prevalidate(
         };
         return Err(err);
     }
+
+    let () =
+        validate_outpoint_uniqueness(state, rotxn, computed_merkle_root, body)?;
 
     let mut coinbase_value = bitcoin::Amount::ZERO;
     for output in &body.coinbase {

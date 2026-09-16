@@ -35,9 +35,11 @@ const DEFAULT_NET_ADDR: SocketAddr =
 
 const DEFAULT_RPC_HOST: Host = Host::Ipv4(Ipv4Addr::LOCALHOST);
 
-// Fixed on every network (NOT derived from THIS_SIDECHAIN): BitWindow's health check
-// dials a network-independent 127.0.0.1:8454, so the RPC port must not shift per network.
-const DEFAULT_RPC_PORT: u16 = 8454;
+// Derived from the slot, following the 6000 + slot convention of the other Rust
+// sidechains (BitAssets 6004, BitNames 6002, Thunder 6009, Truthcoin 6013).
+// BitWindow's spec BasePort for FreeBank is 6130, so its health check dials
+// 127.0.0.1:6130 and the launch line withholds `--rpc-port`.
+const DEFAULT_RPC_PORT: u16 = 6000 + THIS_SIDECHAIN as u16;
 
 #[cfg(feature = "zmq")]
 const DEFAULT_ZMQ_ADDR: SocketAddr =
