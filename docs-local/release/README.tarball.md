@@ -22,7 +22,7 @@ Rust FreeBank daemon and its command-line tools.
 ## Identity (fixed at genesis)
 
 - **Sidechain slot:** 130
-- **Version:** 0.3.1
+- **Version:** 0.3.2
 
 ## Default ports and paths
 
@@ -47,6 +47,22 @@ BitWindow / the sidechain orchestrator launches it):
   --mainchain-grpc-host 127.0.0.1 --mainchain-grpc-port 50051 \
   --network signet
 ```
+
+## Networks
+
+`--network` accepts one of:
+
+| Value | Purpose |
+|-------|---------|
+| `signet` | default; a signet-backed mainchain |
+| `regtest` | local regtest |
+| `forknet` | forknet |
+| `alphanet` | the eCash **alphanet** generation (BitWindow `--network alphanet`) |
+| `betanet` | the eCash **betanet** generation (BitWindow `--network betanet`) |
+
+Each network carries its own P2P magic (`FB 42 94 C0…C4`), so nodes on
+different networks — alphanet and betanet included — can never handshake with
+each other.
 
 Then talk to it with the CLI:
 

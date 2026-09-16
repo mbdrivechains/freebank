@@ -642,6 +642,9 @@ pub enum Network {
     Forknet,
     /// eCash alphanet — the FreeBank MVP launch network (BitWindow `--network alphanet`).
     Alphanet,
+    /// eCash betanet — the eCash beta generation (BitWindow `--network betanet`).
+    /// Carries its own P2P magic so a beta node can never handshake with an alpha node.
+    Betanet,
 }
 
 /// Semver-compatible version

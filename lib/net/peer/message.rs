@@ -29,6 +29,9 @@ pub const fn magic_bytes(network: Network) -> MagicBytes {
         Network::Forknet => b3 |= 0b0000_0010,
         // Alphanet gets its own distinct magic (…C3), extending the FB 42 94 Cx scheme.
         Network::Alphanet => b3 |= 0b0000_0011,
+        // Betanet continues the scheme at …C4, so beta nodes cannot handshake
+        // with alpha (…C3) nodes.
+        Network::Betanet => b3 |= 0b0000_0100,
     }
     [b0, b1, b2, b3]
 }
@@ -327,6 +330,7 @@ mod network_magic_tests {
             Network::Signet,
             Network::Forknet,
             Network::Alphanet,
+            Network::Betanet,
         ];
         for (i, a) in nets.iter().enumerate() {
             for b in &nets[i + 1..] {
@@ -339,5 +343,43 @@ mod network_magic_tests {
         }
         // Pin Alphanet's magic to the extended FB 42 94 C3 value.
         assert_eq!(magic_bytes(Network::Alphanet), [0xFB, 0x42, 0x94, 0xC3]);
+    }
+
+    // Network::Betanet must parse from the lowercase "betanet" token (the
+    // BitWindow `--network betanet` launch value for the eCash beta generation).
+    #[test]
+    fn betanet_parses_from_lowercase_token() {
+        assert_eq!(Network::from_str("betanet"), Ok(Network::Betanet));
+        // Sanity: the token is exactly what Display round-trips to.
+        assert_eq!(Network::Betanet.to_string(), "betanet");
+    }
+
+    // Betanet must carry its OWN distinct P2P magic, pinned to FB 42 94 C4, so
+    // a beta node can never handshake with an alpha node (…C3) or any other.
+    #[test]
+    fn betanet_magic_is_distinct() {
+        let nets = [
+            Network::Regtest,
+            Network::Signet,
+            Network::Forknet,
+            Network::Alphanet,
+            Network::Betanet,
+        ];
+        for (i, a) in nets.iter().enumerate() {
+            for b in &nets[i + 1..] {
+                assert_ne!(
+                    magic_bytes(*a),
+                    magic_bytes(*b),
+                    "magic collision between {a} and {b}"
+                );
+            }
+        }
+        // Pin Betanet's magic to the extended FB 42 94 C4 value.
+        assert_eq!(magic_bytes(Network::Betanet), [0xFB, 0x42, 0x94, 0xC4]);
+        // And explicitly: beta must not share alpha's magic.
+        assert_ne!(
+            magic_bytes(Network::Betanet),
+            magic_bytes(Network::Alphanet)
+        );
     }
 }

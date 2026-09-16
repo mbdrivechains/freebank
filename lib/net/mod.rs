@@ -148,12 +148,15 @@ const FORKNET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
 
 const ALPHANET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
 
+const BETANET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
+
 const fn seed_node_addrs(network: Network) -> &'static [SocketAddr] {
     match network {
         Network::Signet => SIGNET_SEED_NODE_ADDRS,
         Network::Regtest => &[],
         Network::Forknet => FORKNET_SEED_NODE_ADDRS,
         Network::Alphanet => ALPHANET_SEED_NODE_ADDRS,
+        Network::Betanet => BETANET_SEED_NODE_ADDRS,
     }
 }
 
