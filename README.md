@@ -23,17 +23,33 @@ chassis. The C++ FreeBank lives on the `master` branch and on the `v0.2.x` relea
 - **Fresh genesis:** the Rust node cannot continue the C++ FreeBank chain. It starts a new chain on a
   new (beta) network. Do not point it at anything of real value.
 
-## What's new in 0.3.2 — the eCash beta network
+## What's new in 0.3.3 — a beta node finds peers by itself
 
-0.3.2 adds the **`betanet`** network for the eCash **beta**: run `freebankd --network betanet`. Betanet has its
+FreeBank has **no DNS seeding**: a node's first peer comes either from a seed list compiled into the
+binary or from an address you give it by hand. Through 0.3.2 every list shipped empty, so a fresh node
+sat there with no peers until someone handed it one.
+
+0.3.3 bakes in the **beta seed node `163.47.9.132:4130`**, so `freebankd --network betanet` now finds
+the network on its own from an empty data directory. Every other network still ships no seeds and needs
+a peer by hand:
+
+```
+./freebank-cli --rpc-port 6130 connect-peer <host>:4130
+```
+
+(`4130` is the P2P port; the RPC port `6130` is a different thing and is not a peer address.)
+
+No consensus rules change in 0.3.3, and it is wire-compatible with 0.3.2 — a 0.3.2 node and a 0.3.3
+node on betanet are the same network and peer with each other normally.
+
+## 0.3.2 — the eCash beta network
+
+0.3.2 added the **`betanet`** network for the eCash **beta**: run `freebankd --network betanet`. Betanet has its
 own P2P magic (`FB 42 94 C4`, continuing the `FB 42 94 Cx` scheme after alphanet's `C3`), so a beta node can never
-handshake with an alphanet node or any other network. There are no built-in seed nodes; a fresh node needs a
-manual or BitWindow-supplied peer.
+handshake with an alphanet node or any other network.
 
 The FreeBank chain on the eCash beta is a **fresh genesis**: start with an empty data directory
 (`~/.local/share/freebank` on Linux). Default ports: RPC **6130**, P2P **4130**, ZMQ **28130**.
-
-No consensus rules change in 0.3.2; everything below from 0.3.1 still applies.
 
 ## Consensus rules since 0.3.1
 
@@ -50,7 +66,7 @@ of the other Rust sidechains.
 ## Identity (fixed at genesis)
 
 - **Sidechain slot:** 130
-- **Version:** 0.3.2
+- **Version:** 0.3.3
 - Same daemon and asset names as the C++ FreeBank (a BitWindow / release-channel drop-in).
 
 ## Contents of the tarball
@@ -99,6 +115,15 @@ the sidechain orchestrator launch it):
 
 Each network carries its own P2P magic (`FB 42 94 C0…C4`), so nodes on different networks — alphanet and
 betanet included — can never handshake with each other.
+
+### Peers
+
+| Network | First peer |
+|---------|-----------|
+| `betanet` | automatic — the built-in beta seed node `163.47.9.132:4130` |
+| every other network | none built in; supply one with `freebank-cli connect-peer <host>:4130` |
+
+Peers are remembered across restarts once connected.
 
 Then talk to it with the CLI:
 

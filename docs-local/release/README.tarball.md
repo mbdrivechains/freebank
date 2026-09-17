@@ -22,7 +22,7 @@ Rust FreeBank daemon and its command-line tools.
 ## Identity (fixed at genesis)
 
 - **Sidechain slot:** 130
-- **Version:** 0.3.2
+- **Version:** 0.3.3
 
 ## Default ports and paths
 
@@ -63,6 +63,25 @@ BitWindow / the sidechain orchestrator launches it):
 Each network carries its own P2P magic (`FB 42 94 C0…C4`), so nodes on
 different networks — alphanet and betanet included — can never handshake with
 each other.
+
+### Peers (no DNS seeding)
+
+FreeBank has no DNS seeds: a node finds its first peer either from a
+compiled-in seed list or from one you give it by hand.
+
+| Network | First peer |
+|---------|-----------|
+| `betanet` | automatic — the baked-in beta seed node `163.47.9.132:4130` |
+| every other network | none baked in; supply one by hand |
+
+To add a peer by hand (any network):
+
+```
+./freebank-cli --rpc-port 6130 connect-peer <host>:4130
+```
+
+Once connected, peers are remembered across restarts. `4130` is the FreeBank
+P2P port; the RPC port `6130` is separate and should not be dialled as a peer.
 
 Then talk to it with the CLI:
 

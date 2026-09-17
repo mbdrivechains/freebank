@@ -16,7 +16,7 @@ use tracing::instrument;
 use crate::{
     archive::Archive,
     state::State,
-    types::{AuthorizedTransaction, Network, VERSION, Version},
+    types::{AuthorizedTransaction, Network, THIS_SIDECHAIN, VERSION, Version},
 };
 
 pub mod error;
@@ -140,15 +140,24 @@ pub fn make_server_endpoint(
 pub type PeerInfoRx =
     mpsc::UnboundedReceiver<(SocketAddr, Option<PeerConnectionInfo>)>;
 
-// FreeBank ships with no L2L seed nodes; an operator seed is added later.
-// Fresh nodes need a manual peer (--connect / BitWindow-supplied) on first run.
+// The Rust chassis has no DNS seeding: these compiled-in lists are the ONLY way a
+// fresh node finds its first peer. FreeBank ships one seed, on the eCash beta
+// network (the operator's Singapore node). Nodes on every other network still need
+// a peer given by hand (`freebank-cli connect-peer <host>:4130`).
 const SIGNET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
 
 const FORKNET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
 
 const ALPHANET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
 
-const BETANET_SEED_NODE_ADDRS: &[SocketAddr] = &[];
+const BETANET_SEED_NODE_ADDRS: &[SocketAddr] = {
+    // FreeBank beta seed node (Singapore), reserved IP 163.47.9.132
+    const FREEBANK_BETA_SEED: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(163, 47, 9, 132)),
+        4000 + THIS_SIDECHAIN as u16,
+    );
+    &[FREEBANK_BETA_SEED]
+};
 
 const fn seed_node_addrs(network: Network) -> &'static [SocketAddr] {
     match network {
@@ -507,5 +516,39 @@ impl Net {
                     tracing::warn!("Failed to push tx {txid} to peer at {addr}")
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod seed_node_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::seed_node_addrs;
+    use crate::types::Network;
+
+    /// The beta network carries exactly one compiled-in seed: the operator's
+    /// Singapore node at 163.47.9.132, on the FreeBank P2P port 4130.
+    #[test]
+    fn betanet_seed_is_the_singapore_node() {
+        let expected =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(163, 47, 9, 132)), 4130);
+        assert_eq!(seed_node_addrs(Network::Betanet), &[expected]);
+    }
+
+    /// Every other network still ships empty (no DNS seeding in the chassis:
+    /// those nodes need a peer given by hand).
+    #[test]
+    fn other_networks_have_no_seeds() {
+        for network in [
+            Network::Signet,
+            Network::Regtest,
+            Network::Forknet,
+            Network::Alphanet,
+        ] {
+            assert!(
+                seed_node_addrs(network).is_empty(),
+                "expected no seed nodes for {network}"
+            );
+        }
     }
 }
