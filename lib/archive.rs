@@ -154,6 +154,26 @@ pub struct Archive {
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
+/// The oldest database this build can open.
+///
+/// The chassis stamps a database with the daemon's own version and refuses one
+/// written before `deposits` and `main_bmm_commitments` were removed and
+/// `main_block_infos` added — a change the chassis made in ITS 0.12.0. FreeBank
+/// forked after that change but renumbered from scratch, so every FreeBank
+/// database is "older than 0.12.0" by a plain version comparison: a node could
+/// not reopen a data directory it had written itself, and refused to start
+/// after any restart or upgrade with "Incompatible DB version. Please clear the
+/// DB and re-sync" (found 2026-09-22 upgrading the beta seed node 0.3.3 ->
+/// 0.3.4). FreeBank's own databases start at 0.3.0 and all carry the post-0.12
+/// layout, so that is the floor here.
+///
+/// A database written by a NEWER build than this one is accepted, as before.
+const MIN_COMPATIBLE_DB_VERSION: Version = Version {
+    major: 0,
+    minor: 3,
+    patch: 0,
+};
+
 impl Archive {
     pub const NUM_DBS: u32 = 14;
 
@@ -162,16 +182,7 @@ impl Archive {
         let version =
             DatabaseUnique::create(env, &mut rwtxn, "archive_version")?;
         match version.try_get(&rwtxn, &())? {
-            Some(db_version)
-                if db_version
-                    < Version {
-                        major: 0,
-                        minor: 12,
-                        patch: 0,
-                    } =>
-            {
-                // `deposits` and `main_bmm_commitments` were removed in
-                // 0.12.0, and `main_block_infos` was added
+            Some(db_version) if db_version < MIN_COMPATIBLE_DB_VERSION => {
                 return Err(Error::IncompatibleVersion {
                     version: db_version,
                     db_path: env.path().to_path_buf(),
@@ -1596,5 +1607,50 @@ impl FallibleIterator for AncestorsRev<'_, '_> {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod db_version_tests {
+    use super::*;
+
+    fn temp_env(test_name: &str) -> (temp_dir::TempDir, sneed::Env) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = temp_dir::TempDir::with_prefix(format!(
+            "freebank-archive-{test_name}-{}-{nanos}",
+            std::process::id()
+        ))
+        .unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        (dir, env)
+    }
+
+    /// The regression: a node must be able to reopen the database it wrote.
+    /// Before the floor was corrected, the second open failed with
+    /// "Incompatible DB version", so a node could not be restarted at all.
+    #[test]
+    fn a_node_can_reopen_its_own_archive() {
+        let (_dir, env) = temp_env("reopen");
+        let _archive = Archive::new(&env).expect("first open writes the version");
+        drop(_archive);
+        let _reopened = Archive::new(&env)
+            .expect("a node must be able to reopen its own database");
+    }
+
+    /// The floor must never sit above the version this build stamps, or every
+    /// database this build writes is unreadable by it.
+    #[test]
+    fn the_floor_is_not_above_this_build() {
+        assert!(
+            *VERSION >= MIN_COMPATIBLE_DB_VERSION,
+            "this build stamps {} but refuses anything below {}",
+            *VERSION,
+            MIN_COMPATIBLE_DB_VERSION
+        );
     }
 }

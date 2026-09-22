@@ -23,7 +23,19 @@ chassis. The C++ FreeBank lives on the `master` branch and on the `v0.2.x` relea
 - **Fresh genesis:** the Rust node cannot continue the C++ FreeBank chain. It starts a new chain on a
   new (beta) network. Do not point it at anything of real value.
 
-## What's new in 0.3.4 — a node refuses the wrong mainchain, and the window says FreeBank
+## What's new in 0.3.5 — a node can restart
+
+**Upgrade from 0.3.4 or earlier.** Until 0.3.5, `freebankd` could not reopen the data directory it had written
+itself: any restart or upgrade stopped with *"Incompatible DB version. Please clear the DB and re-sync"*. The
+chassis stamps its database with the daemon's version and rejects anything written before the chassis' own
+0.12.0; FreeBank forked after that change but renumbered its versions to 0.3.x, so every FreeBank database
+compared as older than the floor. 0.3.5 sets the floor to FreeBank's own first version.
+
+Upgrading from **0.3.4** is a binary swap and keeps your data. Coming from **0.3.3 or earlier**, delete the node
+database once (`~/.local/share/freebank/data.mdb` on Linux, or the `data.mdb` in your `--datadir`) and let the
+node re-sync; your wallet file beside it is untouched.
+
+## 0.3.4 — a node refuses the wrong mainchain, and the window says FreeBank
 
 Two changes. Neither is a consensus rule, so 0.3.4 is wire-compatible with 0.3.3: no re-sync, and a
 0.3.3 node and a 0.3.4 node are on the same network.
