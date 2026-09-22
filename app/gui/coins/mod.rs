@@ -25,6 +25,30 @@ enum Tab {
     MyBitAssets,
 }
 
+/// The coin sub-tabs a user can reach. "My BitAssets" is not one of them: the
+/// FreeBank chain rejects BitAssets at validation, so the pane can only ever
+/// list nothing and offer actions that fail. The variant and pane are kept so
+/// the diff against the upstream chassis stays small.
+fn visible_tabs() -> impl Iterator<Item = Tab> {
+    Tab::iter().filter(|tab| *tab != Tab::MyBitAssets)
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn no_bitassets_sub_tab_is_offered() {
+        let names: Vec<String> =
+            visible_tabs().map(|tab| tab.to_string()).collect();
+        assert!(
+            !names.iter().any(|name| name.to_lowercase().contains("bitasset")),
+            "a disabled chassis feature is still reachable: {names:?}"
+        );
+        assert!(names.contains(&"Transfer & Receive".to_owned()), "{names:?}");
+    }
+}
+
 pub struct Coins {
     my_bitassets: MyBitAssets,
     tab: Tab,
@@ -49,7 +73,7 @@ impl Coins {
     ) -> anyhow::Result<()> {
         egui::Panel::top("coins_tabs").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                Tab::iter().for_each(|tab_variant| {
+                visible_tabs().for_each(|tab_variant| {
                     let tab_name = tab_variant.to_string();
                     ui.selectable_value(&mut self.tab, tab_variant, tab_name);
                 })

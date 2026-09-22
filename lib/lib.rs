@@ -5,6 +5,7 @@
 
 pub mod archive;
 pub mod authorization;
+pub mod mainchain_identity;
 pub mod mempool;
 pub mod miner;
 pub mod net;

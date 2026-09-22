@@ -4,6 +4,7 @@ use fallible_iterator::FallibleIterator as _;
 use futures::{StreamExt as _, TryFutureExt as _};
 use parking_lot::RwLock;
 use plain_bitassets::{
+    mainchain_identity,
     miner::{self, Miner},
     node::{self, Node},
     types::{
@@ -33,6 +34,10 @@ pub enum Error {
     CusfMainchain(#[from] plain_bitassets::types::proto::Error),
     #[error("io error")]
     Io(#[from] std::io::Error),
+    /// The enforcer is following a chain this network does not expect. Refuse
+    /// to start rather than build a sidechain on a foreign mainchain.
+    #[error(transparent)]
+    MainchainIdentity(#[from] mainchain_identity::IdentityError),
     #[error("miner error: {0}")]
     Miner(#[from] miner::Error),
     #[error("node error")]
@@ -244,6 +249,15 @@ impl App {
         } else {
             (mainchain::ValidatorClient::new(transport), None)
         };
+        // Refuse to run against the wrong mainchain before anything is built:
+        // the P2P magic alone does not stop a node from following a foreign
+        // chain's deposits, withdrawals and BMM.
+        {
+            let mut identity_client = cusf_mainchain.clone();
+            let _outcome: mainchain_identity::Outcome = runtime.block_on(
+                mainchain_identity::verify(&mut identity_client, config.network),
+            )?;
+        }
         let miner = cusf_mainchain_wallet
             .clone()
             .map(|wallet| Miner::new(cusf_mainchain.clone(), wallet))

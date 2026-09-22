@@ -183,7 +183,7 @@ fn run_egui_app(
         ..Default::default()
     };
     eframe::run_native(
-        "Plain Bitassets",
+        WINDOW_TITLE,
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(gui::EguiApp::new(
@@ -195,6 +195,26 @@ fn run_egui_app(
             )))
         }),
     )
+}
+
+/// Title of the desktop window. It is the first thing a user sees, so it names
+/// FreeBank, not the chassis this daemon is built on.
+const WINDOW_TITLE: &str = "FreeBank";
+
+#[cfg(test)]
+mod branding_tests {
+    /// The window carried the chassis name "Plain Bitassets" until 0.3.4, which
+    /// beta users reported on sight.
+    #[test]
+    fn the_window_is_named_freebank() {
+        assert_eq!(super::WINDOW_TITLE, "FreeBank");
+        let lowercase = super::WINDOW_TITLE.to_lowercase();
+        assert!(
+            !lowercase.contains("bitassets"),
+            "the window title must not carry chassis branding: {}",
+            super::WINDOW_TITLE
+        );
+    }
 }
 
 fn main() -> anyhow::Result<()> {

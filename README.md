@@ -23,7 +23,26 @@ chassis. The C++ FreeBank lives on the `master` branch and on the `v0.2.x` relea
 - **Fresh genesis:** the Rust node cannot continue the C++ FreeBank chain. It starts a new chain on a
   new (beta) network. Do not point it at anything of real value.
 
-## What's new in 0.3.3 — a beta node finds peers by itself
+## What's new in 0.3.4 — a node refuses the wrong mainchain, and the window says FreeBank
+
+Two changes. Neither is a consensus rule, so 0.3.4 is wire-compatible with 0.3.3: no re-sync, and a
+0.3.3 node and a 0.3.4 node are on the same network.
+
+**freebankd now checks which chain it is attached to.** It trusts whichever enforcer you point it at,
+and until now nothing noticed if that enforcer followed a different chain — the node would build its
+blocks, deposits and withdrawals on a mainchain nobody else is on. At startup it asks the enforcer two
+questions: which Bitcoin network it is on, and whether it carries the block FreeBank expects. For
+`betanet` that block is height **968,000**, hash
+`00000000000000042ab4b327b828ae7bcfc6c88147d24d2c38e517ead4f56234`, which exists only on the eCash beta
+chain — the network answer alone cannot tell two forks of mainnet apart. If either answer is wrong the
+daemon refuses to start and says why. If the enforcer is still catching up, or is not answering yet,
+the node starts as it always did: only a chain that is provably wrong stops it.
+
+**The window is named FreeBank.** It used to say "Plain Bitassets", the name of the chassis FreeBank is
+built on. The "My BitAssets" pane is gone too, joining the BitAssets tab hidden earlier: FreeBank
+rejects those transactions at validation, so the pane could only ever produce errors.
+
+## 0.3.3 — a beta node finds peers by itself
 
 FreeBank has **no DNS seeding**: a node's first peer comes either from a seed list compiled into the
 binary or from an address you give it by hand. Through 0.3.2 every list shipped empty, so a fresh node

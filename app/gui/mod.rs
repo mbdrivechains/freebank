@@ -185,6 +185,35 @@ enum Tab {
     ConsoleLogs,
 }
 
+/// The tabs a user can reach.
+///
+/// FreeBank (operator decision 2026-09-15): the chassis token/market features
+/// (BitAssets, AMM, Dutch auctions) are rejected at validation on this chain,
+/// so the BitAssets tab — its reserve/register, AMM and Dutch-auction panes —
+/// could only produce errors and is not offered. The variant, panes and match
+/// arm are retained: they keep the wallet builders referenced, and keep the
+/// diff against the upstream chassis small.
+fn visible_tabs() -> impl Iterator<Item = Tab> {
+    Tab::iter().filter(|tab| *tab != Tab::BitAssets)
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn no_chassis_token_tab_is_offered() {
+        let names: Vec<String> =
+            visible_tabs().map(|tab| tab.to_string()).collect();
+        assert!(
+            !names.iter().any(|name| name.to_lowercase().contains("bitasset")),
+            "a disabled chassis feature is still reachable: {names:?}"
+        );
+        assert!(names.contains(&"Coins".to_owned()), "{names:?}");
+        assert_eq!(names.len(), Tab::iter().count() - 1, "{names:?}");
+    }
+}
+
 impl EguiApp {
     pub fn new(
         app: Option<App>,
@@ -248,16 +277,7 @@ impl eframe::App for EguiApp {
         } else {
             egui::Panel::top("tabs").show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    Tab::iter()
-                        // FreeBank (operator decision 2026-09-15): the chassis
-                        // token/market features (BitAssets, AMM, Dutch
-                        // auctions) are disabled at validation. Hide the
-                        // BitAssets tab (its reserve/register, AMM and
-                        // Dutch-auction panes) so the surface is unreachable.
-                        // The variant, panes and match arm are retained (they
-                        // keep the wallet builders referenced and the daemon
-                        // runs --headless under BitWindow anyway).
-                        .filter(|tab_variant| *tab_variant != Tab::BitAssets)
+                    visible_tabs()
                         .for_each(|tab_variant| {
                             let tab_name = tab_variant.to_string();
                             ui.selectable_value(
