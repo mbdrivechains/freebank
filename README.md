@@ -87,9 +87,21 @@ three consensus defects found by a line-by-line audit of the money paths inherit
 from the upstream sidechain chassis, v0.2.9 makes the node able to follow a
 mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran,
 v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves,
-v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed, and
-v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers:
+v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed,
+v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers, and
+v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send:
 
+- **Block producers can name their blocks** (v0.2.14). One config line, `coinbasetag=<name>` in
+  `freebank.conf` (or `-coinbasetag=`), writes the producer's name into the coinbase of every block
+  the node produces, after the height and the extra nonce, so explorers can credit the block to
+  whoever won the BMM. 1 to 64 printable ASCII characters; the same downloaded binary for everyone.
+  Without it, the FreeBank explorer shows the block as "unknown producer". See
+  `FREEBANK_GUIDE.md` section 5.2. No consensus change: older nodes accept tagged blocks.
+- **The mempool refuses deposit and withdrawal-bundle objects outside the coinbase** (v0.2.14).
+  A loose transaction that carries a deposit object or a withdrawal-bundle object is refused, as
+  is a withdrawal whose burn another withdrawal in the same transaction already claims (block
+  validation already refuses that second claim). Honest wallets never build either. Mempool
+  policy only; no consensus change.
 - **Unpayable withdrawals are refused by consensus** (v0.2.13). A withdrawal whose L1 payout
   can never be paid (below the L1 dust limit, or a destination that does not decode) used to
   be accepted, and then blocked every future withdrawal bundle until its owner refunded it.
@@ -295,6 +307,7 @@ verified. On chains following a signet L1 the withdrawal-address rule is unchang
 v0.2.13 is a consensus change (a soft fork from height 0): it refuses withdrawals that can
 never be paid on L1. Chains that never carried such a withdrawal, including the eCash beta at
 the time of release, revalidate unchanged; upgrade every node that validates.
-No consensus-level defect is currently outstanding on this list; the standing
-caveats are the ones above — provisional economic parameters and no third-party
-audit. Still test-coin software: do not use with real value.
+v0.2.14 has no consensus change; it is a binary swap.
+The standing caveats are the ones above — provisional economic parameters and no
+third-party audit. Report security issues privately (see [`SECURITY.md`](SECURITY.md)).
+Still test-coin software: do not use with real value.

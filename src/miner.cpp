@@ -846,6 +846,43 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
     }
 }
 
+// The worst case of the coinbase scriptSig IncrementExtraNonce builds: the height
+// and the extra nonce are unsigned ints, each at most a 5-byte CScriptNum behind a
+// 1-byte push; the tag is one direct push (a length byte, then the bytes).
+static_assert(MAX_COINBASE_TAG_BYTES < OP_PUSHDATA1, "the coinbase tag must fit one direct push");
+static_assert((1 + 5) + (1 + 5) + (1 + MAX_COINBASE_TAG_BYTES) <= 100,
+              "a tagged coinbase scriptSig must stay within the 100 bytes consensus allows");
+
+bool ParseCoinbaseTag(const std::string& strIn, std::string& strTag, CScript& scriptTag, std::string& strError)
+{
+    const std::string strWhitespace = " \t\r\n";
+    const size_t nBegin = strIn.find_first_not_of(strWhitespace);
+    if (nBegin == std::string::npos) {
+        strError = strprintf("-coinbasetag is empty. Set a name of 1 to %u printable ASCII characters, "
+                             "or remove the setting to produce blocks without a tag.", MAX_COINBASE_TAG_BYTES);
+        return false;
+    }
+    const size_t nEnd = strIn.find_last_not_of(strWhitespace);
+    const std::string str = strIn.substr(nBegin, nEnd - nBegin + 1);
+
+    if (str.size() > MAX_COINBASE_TAG_BYTES) {
+        strError = strprintf("-coinbasetag is %u bytes long; the limit is %u bytes.", str.size(), MAX_COINBASE_TAG_BYTES);
+        return false;
+    }
+    for (size_t i = 0; i < str.size(); i++) {
+        const unsigned char c = str[i];
+        if (c < 0x20 || c > 0x7e) {
+            strError = strprintf("-coinbasetag has a byte outside printable ASCII (0x%02x at position %u). "
+                                 "Use letters, digits, punctuation and spaces only.", c, i + 1);
+            return false;
+        }
+    }
+
+    strTag = str;
+    scriptTag = CScript() << std::vector<unsigned char>(str.begin(), str.end());
+    return true;
+}
+
 void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned int& nExtraNonce)
 {
     // Update nExtraNonce

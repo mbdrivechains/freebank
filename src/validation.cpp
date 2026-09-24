@@ -314,7 +314,8 @@ CAmount maxTxFee = DEFAULT_TRANSACTION_MAXFEE;
 CBlockPolicyEstimator feeEstimator;
 CTxMemPool mempool(&feeEstimator);
 
-/** Constant stuff for coinbase transactions we create: */
+/** Constant stuff for coinbase transactions we create: the -coinbasetag push
+ *  (set once at startup in AppInitParameterInteraction), or empty. */
 CScript COINBASE_FLAGS;
 
 const std::string strMessageMagic = "Bitcoin Signed Message:\n";
@@ -1274,7 +1275,18 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         return state.Invalid(false, REJECT_DUPLICATE, "txn-already-in-mempool");
     }
 
-    // If this is a withdrawal check that it is valid
+    // Sidechain objects in a loose transaction. A template can pass
+    // TestBlockValidity (ConnectBlock returns under fJustCheck before its
+    // sidechain-object checks) and still be a block ConnectBlock rejects, so
+    // the pool must hold nothing those checks refuse. Several of them fail
+    // with state.Error, which never marks the block invalid: every template
+    // and every retry would carry the tx again and block production would
+    // stall. The coinbase-only and burn-claim rules below depend on the tx
+    // alone, so a tx that passes them here passes them in any later block, and
+    // every path into the pool (relay, RPC, wallet, reorg, mempool.dat) comes
+    // through here. The height-dependent poison-row guard has its own sweep
+    // and template skip. Node policy only (v0.2.13); consensus is unchanged.
+    std::set<size_t> setClaimedBurns; // C6-A: burns already claimed in this tx
     for (const CTxOut& txout : tx.vout) {
         const CScript& scriptPubKey = txout.scriptPubKey;
         std::vector<unsigned char> vch;
@@ -1288,32 +1300,56 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // (the DoS return, the loop continuation) otherwise leaks it.
         std::unique_ptr<SidechainObj> objOwner(obj);
 
-        if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
-            SidechainWithdrawal *withdrawal = dynamic_cast<SidechainWithdrawal*>(obj);
-            // Verify that burn output actually exists
-            bool fBurnFound = false;
-            for (const CTxOut& o : tx.vout) {
-                if (o.scriptPubKey.size()
-                        && o.scriptPubKey[0] == OP_RETURN
-                        && o.nValue == withdrawal->amount)
-                {
-                    // Make sure that the burn amount & fee are valid
-                    if (withdrawal->amount > 0 && withdrawal->mainchainFee > 0 && withdrawal->amount > withdrawal->mainchainFee)
-                        fBurnFound = true;
-                }
+        // Only a withdrawal belongs in a loose tx. Deposit and withdrawal-bundle
+        // objects are written by a block producer into its own coinbase
+        // (CreateNewBlock), never into a mempool tx. ConnectBlock still takes
+        // them from any tx: a user tx carrying a deposit object would move the
+        // deposit CTIP baseline (DB_LAST_SIDECHAIN_DEPOSIT) to a fake dtx, so
+        // CreateNewBlock would fail at the next real deposit on every node, and
+        // a bundle object reaches ConnectBlock's state.Error paths. Rejecting
+        // them here closes the mempool route; the block rule is a separate,
+        // operator-gated soft fork. DoS 0: consensus allows them, and a
+        // v0.2.12 peer still relays them.
+        if (obj->sidechainop != DB_SIDECHAIN_WITHDRAWAL_OP)
+            return state.DoS(0, false, REJECT_NONSTANDARD, "sidechain-obj-coinbase-only", false,
+                             "deposit and withdrawal-bundle objects belong only in a block producer's coinbase");
+
+        SidechainWithdrawal *withdrawal = dynamic_cast<SidechainWithdrawal*>(obj);
+        // Verify that burn output actually exists
+        bool fBurnFound = false;
+        for (const CTxOut& o : tx.vout) {
+            if (o.scriptPubKey.size()
+                    && o.scriptPubKey[0] == OP_RETURN
+                    && o.nValue == withdrawal->amount)
+            {
+                // Make sure that the burn amount & fee are valid
+                if (withdrawal->amount > 0 && withdrawal->mainchainFee > 0 && withdrawal->amount > withdrawal->mainchainFee)
+                    fBurnFound = true;
             }
-            if (!fBurnFound) {
-                return state.DoS(100, false, REJECT_INVALID, "invalid-withdrawal-missing-or-invalid-burn");
-            }
-            // Poison-row guard (v0.2.13): no withdrawal the mainchain
-            // could never pay. Checked for the next block's height, like the
-            // block rule in ConnectBlock. DoS 0: a not-yet-upgraded node may
-            // still relay one around the flag day.
-            std::string strPayable;
-            if (WithdrawalGuardActive(chainActive.Height() + 1, chainparams.GetConsensus().nWithdrawalGuardHeight)
-                    && !CheckWithdrawalPayable(*withdrawal, strPayable)) {
-                return state.DoS(0, false, REJECT_INVALID, "invalid-withdrawal-unpayable", false, strPayable);
-            }
+        }
+        if (!fBurnFound) {
+            return state.DoS(100, false, REJECT_INVALID, "invalid-withdrawal-missing-or-invalid-burn");
+        }
+        // C6-A parity: ConnectBlock claims a DISTINCT burn per withdrawal
+        // object (ClaimWithdrawalBurn), so one burn cannot back two same-amount
+        // withdrawals. The check above only asks that SOME matching burn exist,
+        // so without this one tx with two such objects on one burn was pooled,
+        // and its block failed ConnectBlock with state.Error on every template.
+        // With a matching burn found above, the claim can fail only because an
+        // earlier object in this tx already took every matching burn. DoS 0:
+        // v0.2.12 accepts and relays such a tx.
+        if (!ClaimWithdrawalBurn(*withdrawal, tx.vout, setClaimedBurns)) {
+            return state.DoS(0, false, REJECT_INVALID, "invalid-withdrawal-burn-already-claimed", false,
+                             "every matching burn is already claimed by an earlier withdrawal in this tx");
+        }
+        // Poison-row guard (v0.2.13): no withdrawal the mainchain
+        // could never pay. Checked for the next block's height, like the
+        // block rule in ConnectBlock. DoS 0: a not-yet-upgraded node may
+        // still relay one around the flag day.
+        std::string strPayable;
+        if (WithdrawalGuardActive(chainActive.Height() + 1, chainparams.GetConsensus().nWithdrawalGuardHeight)
+                && !CheckWithdrawalPayable(*withdrawal, strPayable)) {
+            return state.DoS(0, false, REJECT_INVALID, "invalid-withdrawal-unpayable", false, strPayable);
         }
     }
 

@@ -1380,4 +1380,170 @@ BOOST_AUTO_TEST_CASE(withdrawal_guard_connectblock)
     }
 }
 
+namespace {
+/** ATMP, returning the reject reason and the DoS score. */
+bool AcceptForTestDoS(const CTransactionRef& tx, std::string& strReject, int& nDoS)
+{
+    LOCK(cs_main);
+    CValidationState state;
+    const bool fOk = AcceptToMemoryPool(mempool, state, tx, nullptr /* pfMissingInputs */,
+                                        nullptr /* plTxnReplaced */, true /* bypass_limits */, 0 /* nAbsurdFee */);
+    strReject = state.GetRejectReason();
+    nDoS = 0;
+    state.IsInvalid(nDoS);
+    return fOk;
+}
+
+/** A transaction whose only sidechain object is `obj`: change + the object. */
+CTransactionRef MakeObjectTx(const COutPoint& in, CAmount nIn, const SidechainObj& obj)
+{
+    CMutableTransaction mtx;
+    mtx.vin.push_back(CTxIn(in));
+    mtx.vout.push_back(CTxOut(nIn - 20000, CScript() << OP_TRUE));
+    mtx.vout.push_back(CTxOut(0, obj.GetScript()));
+    return MakeTransactionRef(std::move(mtx));
+}
+
+/** Two payable, same-amount withdrawal objects to distinct destinations (so
+ *  distinct rows), backed by nBurns matching burns. */
+CTransactionRef MakeTwoWithdrawalTx(const COutPoint& in, CAmount nIn, int nBurns)
+{
+    const CAmount nPayout = COIN / 10, nMainchainFee = 5000;
+    CMutableTransaction mtx;
+    mtx.vin.push_back(CTxIn(in));
+    mtx.vout.push_back(CTxOut(nIn - nBurns * (nPayout + nMainchainFee) - 20000, CScript() << OP_TRUE));
+    for (int i = 0; i < nBurns; i++)
+        mtx.vout.push_back(CTxOut(nPayout + nMainchainFee, CScript() << OP_RETURN));
+    const uint256 hashBlind = CTransaction(mtx).GetHash();
+    for (const std::string& strDest : {L1_P2PKH_REGTEST, std::string("16L5yRNPTuciSgXGHqYwn9N6NeoKqopAu")}) {
+        SidechainWithdrawal wt;
+        wt.nSidechain = THIS_SIDECHAIN;
+        wt.strDestination = strDest;
+        wt.strRefundDestination = "";
+        wt.amount = nPayout + nMainchainFee;
+        wt.mainchainFee = nMainchainFee;
+        wt.hashBlindTx = hashBlind;
+        mtx.vout.push_back(CTxOut(0, wt.GetScript()));
+    }
+    return MakeTransactionRef(std::move(mtx));
+}
+
+/** ConnectBlock's per-tx burn rule (C6-A), restated: every withdrawal object
+ *  claims a distinct matching burn, in output order. */
+bool ConnectBlockClaimsEveryBurn(const CTransaction& tx)
+{
+    std::set<size_t> setClaimed;
+    for (const CTxOut& txout : tx.vout) {
+        std::vector<unsigned char> vch;
+        if (!txout.scriptPubKey.IsSidechainObj(vch))
+            continue;
+        std::unique_ptr<SidechainObj> obj(ParseSidechainObj(vch));
+        if (obj && obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP
+                && !ClaimWithdrawalBurn(*static_cast<const SidechainWithdrawal*>(obj.get()), tx.vout, setClaimed))
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+// v0.2.13 final review, two inherited majors (node policy; consensus is
+// unchanged). ATMP must refuse what ConnectBlock's sidechain-object checks
+// refuse: a template passes TestBlockValidity (ConnectBlock returns under
+// fJustCheck before those checks), and several of them fail with state.Error,
+// which never marks the block invalid, so a pooled offender rides every
+// template and block production stalls.
+//  1. Two same-amount withdrawal objects on ONE burn: ATMP only asked that
+//     some matching burn exist, ConnectBlock claims a distinct burn per object
+//     (C6-A). Now refused, DoS 0 (v0.2.12 relays it). With two burns it is
+//     valid and still accepted.
+//  2. A deposit object in a user tx: ConnectBlock would take it as the last
+//     deposit (the CTIP baseline) and CreateNewBlock would fail at the next
+//     real deposit. A withdrawal-bundle object in a user tx reaches
+//     ConnectBlock's state.Error paths. Honest producers write both only into
+//     their coinbase, so a loose tx carrying one is refused, DoS 0.
+BOOST_AUTO_TEST_CASE(loose_tx_sidechain_obj_policy)
+{
+    MempoolClearScope mempoolClear;
+    RegtestFamilyScope family;
+    NodeStandardnessScope standardness;
+    std::string strReject;
+    int nDoS = -1;
+
+    // 1. One burn, two withdrawal objects: refused, not pooled, and exactly
+    //    the tx ConnectBlock's burn rule refuses
+    const CTransactionRef txShared = MakeTwoWithdrawalTx(FundCoinForTest(11, COIN), COIN, 1);
+    BOOST_CHECK(!ConnectBlockClaimsEveryBurn(*txShared));
+    BOOST_CHECK(!AcceptForTestDoS(txShared, strReject, nDoS));
+    BOOST_CHECK_EQUAL(strReject, "invalid-withdrawal-burn-already-claimed");
+    BOOST_CHECK_EQUAL(nDoS, 0);
+    BOOST_CHECK(!InMempool(txShared));
+
+    // Two burns back two withdrawals: valid in a block, so still accepted
+    const CTransactionRef txTwoBurns = MakeTwoWithdrawalTx(FundCoinForTest(12, COIN), COIN, 2);
+    BOOST_CHECK(ConnectBlockClaimsEveryBurn(*txTwoBurns));
+    BOOST_CHECK_MESSAGE(AcceptForTestDoS(txTwoBurns, strReject, nDoS), "two burns refused: " << strReject);
+    BOOST_CHECK(InMempool(txTwoBurns));
+
+    // The wallet's own shape (one burn, one withdrawal) is unaffected
+    const CTransactionRef txWallet = MakeWithdrawalTx(FundCoinForTest(13, COIN), COIN, L1_P2PKH_REGTEST, COIN / 10, 5000);
+    BOOST_CHECK(ConnectBlockClaimsEveryBurn(*txWallet));
+    BOOST_CHECK_MESSAGE(AcceptForTestDoS(txWallet, strReject, nDoS), "wallet withdrawal refused: " << strReject);
+
+    // No matching burn at all is still the old DoS-100 reject
+    {
+        CMutableTransaction mtx(*txWallet);
+        mtx.vin[0] = CTxIn(FundCoinForTest(14, COIN));
+        mtx.vout[1].nValue += 1; // the burn no longer matches the object's amount
+        BOOST_CHECK(!AcceptForTestDoS(MakeTransactionRef(std::move(mtx)), strReject, nDoS));
+        BOOST_CHECK_EQUAL(strReject, "invalid-withdrawal-missing-or-invalid-burn");
+        BOOST_CHECK_EQUAL(nDoS, 100);
+    }
+
+    // 2. A deposit object in a loose tx (a fake dtx): refused, DoS 0
+    SidechainDeposit deposit;
+    deposit.nSidechain = THIS_SIDECHAIN;
+    deposit.strDest = "";
+    deposit.amtUserPayout = 0;
+    {
+        // An input, as every real dtx has one: an empty vin does not
+        // round-trip through the witness serializer, so the object would not
+        // even parse
+        CMutableTransaction dtx;
+        dtx.vin.push_back(CTxIn(COutPoint(ArithToUint256(arith_uint256(0xdead)), 0)));
+        dtx.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+        deposit.dtx = dtx;
+    }
+    deposit.nBurnIndex = 0;
+    deposit.nTx = 0;
+    deposit.hashMainchainBlock = uint256();
+    const CTransactionRef txDeposit = MakeObjectTx(FundCoinForTest(15, COIN), COIN, deposit);
+    BOOST_CHECK(!AcceptForTestDoS(txDeposit, strReject, nDoS));
+    BOOST_CHECK_EQUAL(strReject, "sidechain-obj-coinbase-only");
+    BOOST_CHECK_EQUAL(nDoS, 0);
+    BOOST_CHECK(!InMempool(txDeposit));
+
+    // A withdrawal-bundle object in a loose tx: refused, DoS 0
+    SidechainWithdrawalBundle bundle;
+    bundle.nSidechain = THIS_SIDECHAIN;
+    bundle.nFailHeight = 0;
+    bundle.tx.vin.push_back(CTxIn(COutPoint(ArithToUint256(arith_uint256(0xbeef)), 0)));
+    bundle.tx.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    const CTransactionRef txBundle = MakeObjectTx(FundCoinForTest(16, COIN), COIN, bundle);
+    BOOST_CHECK(!AcceptForTestDoS(txBundle, strReject, nDoS));
+    BOOST_CHECK_EQUAL(strReject, "sidechain-obj-coinbase-only");
+    BOOST_CHECK_EQUAL(nDoS, 0);
+    BOOST_CHECK(!InMempool(txBundle));
+
+    // The template draws only from the pool: it carries the valid withdrawals
+    // and none of the refused txs
+    CBlock block;
+    std::string strError;
+    BOOST_REQUIRE(BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
+        std::vector<CMutableTransaction>(), uint256(), GetCoinbaseScript()));
+    BOOST_CHECK(BlockHasTx(block, txTwoBurns));
+    BOOST_CHECK(BlockHasTx(block, txWallet));
+    for (const CTransactionRef& tx : {txShared, txDeposit, txBundle})
+        BOOST_CHECK(!BlockHasTx(block, tx));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

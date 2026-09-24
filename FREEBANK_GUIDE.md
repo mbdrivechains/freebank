@@ -855,6 +855,28 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   initial sidechain sync verifies every block's BMM commitment through the enforcer — roughly 7 s per
   header plus ~15 s per block with the enforcer reached across a network, faster on localhost — so a
   few hundred blocks is minutes, and RPC calls block while it runs. Both are on the list to fix.
+- **Name your blocks (`coinbasetag=`, v0.2.14 or later).** When your `refreshbmm` bid wins, the
+  FreeBank block is yours: your `freebankd` built it and earns its fees. Add one line to
+  `freebank.conf` (or pass `-coinbasetag=` on the command line) and restart, so explorers can credit
+  your FreeBank blocks to you:
+  ```
+  coinbasetag=YourPoolName
+  ```
+  Put your own name in place of `YourPoolName`; the public seed's tag is `ecxfreebank.com`, and
+  another node that copies it has its blocks credited to the seed. The node writes the name into the
+  coinbase of every block it produces, after the height and the extra nonce, where eCash pools put
+  theirs. It is a config line, not a build option: everyone runs the same downloaded binary. Use 1 to
+  64 printable ASCII characters (letters, digits, punctuation, spaces); anything else stops
+  `freebankd` at startup with a message saying why. Write the name bare, without quotes (quotes
+  become part of the tag). No slashes are needed, and keep `#` out of it (in `freebank.conf` a `#`
+  starts a comment). To stop tagging, delete the line; do not use `nocoinbasetag`, which tags every
+  block `0`. Without a tag, the FreeBank explorer shows your blocks as "unknown producer"; v0.2.13
+  and earlier cannot set one. An eCash pool can reuse the tag it already has on eCash, and the
+  FreeBank explorer recognises it with its existing logo; anyone else gets a name and a logo through
+  a PR to the eCash pool list,
+  [github.com/LayerTwo-Labs/mining-pools](https://github.com/LayerTwo-Labs/mining-pools), and until
+  then the FreeBank explorer shows the tag as written. The tag is self-declared (anyone can claim any
+  name) and is not consensus: nodes without it, older ones included, accept tagged blocks.
 - **Coinbase scan:** the on-chain footprint needs no enforcer at all — see 9.4.
 
 ### 5.3 The fast path: download a release and watch it sync (via BitWindow)
@@ -987,6 +1009,10 @@ single-handed).
 > transactions.** The coinbase carries a witness commitment computed over the template's exact tx set —
 > drop a tx and you break `bad-witness-merkle-match` *and* over-claim fees (`bad-cb-amount`); the
 > network silently rejects the block **after** you have paid for the hash. Mine the template as given.
+
+**Two tags, two chains.** Your pool's coinbase tag names the eCash block. The FreeBank block that it
+commits to is named by `coinbasetag=` in the `freebank.conf` of the `freebankd` whose bid won (5.2),
+which is yours only if you also bid. Use the same text for both and explorers credit both blocks to you.
 
 ### 5.5 Renting the stack: the same thing on a VPS
 
@@ -1425,6 +1451,9 @@ touches it.
   a mainchain block. `refreshbmm` returns non-zero on an empty tick — normal.
 - Poll to a target height; a bid can be spent on a mainchain block that carries no
   commitment.
+- **The FreeBank explorer shows your blocks as "unknown producer":** set `coinbasetag=<name>` in
+  `freebank.conf` (5.2) and restart `freebankd`. It is read at startup and names the blocks
+  templated after that; blocks already made keep no tag.
 - After a daemon restart the first BMM request may miss the first mainchain block; the tip
   rides the second.
 - **If your ticker bids once per mainchain block (as the public seed's does), budget *two*

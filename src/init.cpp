@@ -510,6 +510,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-blockmintxfee=<amt>", strprintf(_("Set lowest fee rate (in %s/kB) for transactions to be included in block creation. (default: %s)"), CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)));
     if (showDebug)
         strUsage += HelpMessageOpt("-blockversion=<n>", "Override block version to test forking scenarios");
+    strUsage += HelpMessageOpt("-coinbasetag=<name>", strprintf(_("Write this name into the coinbase of every block this node produces, after the height and the extra nonce, so block explorers can credit the block to you. 1 to %u printable ASCII characters. Not a consensus setting: nodes without it accept tagged blocks (default: none)"), MAX_COINBASE_TAG_BYTES));
 
     strUsage += HelpMessageGroup(_("RPC server options:"));
     strUsage += HelpMessageOpt("-rest", strprintf(_("Accept public REST requests (default: %u)"), DEFAULT_REST_ENABLE));
@@ -964,6 +965,22 @@ bool AppInitParameterInteraction()
 
     if (nMaxConnections < nUserMaxConnections)
         InitWarning(strprintf(_("Reducing -maxconnections from %d to %d, because of system limitations."), nUserMaxConnections, nMaxConnections));
+
+    // The block producer's name, pushed after the height and the extra nonce in
+    // the coinbase of every block this node produces (IncrementExtraNonce). Not
+    // consensus: validation reads only the BIP34 height prefix and the 2..100-byte
+    // length of a coinbase scriptSig. Unset = no tag, the coinbase is unchanged.
+    // Checked before the mainchain probe below, so a bad tag fails at once.
+    if (gArgs.IsArgSet("-coinbasetag"))
+    {
+        std::string strTag;
+        CScript scriptTag;
+        std::string strTagError;
+        if (!ParseCoinbaseTag(gArgs.GetArg("-coinbasetag", ""), strTag, scriptTag, strTagError))
+            return InitError(strTagError);
+        COINBASE_FLAGS = scriptTag;
+        LogPrintf("Coinbase tag: \"%s\" (written into the coinbase of every block this node produces)\n", strTag);
+    }
 
     // Sidechain: validate the mainchain transport selection
     const std::string strMainchainTransport = gArgs.GetArg("-mainchaintransport", DefaultMainchainTransport());

@@ -208,8 +208,27 @@ private:
     int UpdatePackagesForAdded(const CTxMemPool::setEntries& alreadyAdded, indexed_modified_transaction_set &mapModifiedTx);
 };
 
-/** Modify the extranonce in a block */
+/** Modify the extranonce in a block. The coinbase scriptSig becomes
+ *  <height> <extranonce> + COINBASE_FLAGS (the -coinbasetag push, or nothing). */
 void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned int& nExtraNonce);
+
+/** Longest -coinbasetag, in bytes. A produced coinbase scriptSig is then at most
+ *  (1+5) + (1+5) + (1+64) = 77 bytes, inside the 100 that consensus allows a
+ *  coinbase scriptSig (CheckTransaction, "bad-cb-length") and that
+ *  IncrementExtraNonce asserts. */
+static const unsigned int MAX_COINBASE_TAG_BYTES = 64;
+
+/** -coinbasetag: the block producer's self-declared name. It is written after the
+ *  height and the extra nonce in the coinbase scriptSig of every block this node
+ *  produces (through COINBASE_FLAGS), so an explorer can show who produced a block.
+ *  Policy, not consensus: validation reads nothing in a coinbase scriptSig past the
+ *  BIP34 height prefix, and checks only its 2..100-byte length.
+ *
+ *  Trims surrounding whitespace, then requires 1..MAX_COINBASE_TAG_BYTES bytes of
+ *  printable ASCII (0x20-0x7e). On success strTag is the trimmed tag and scriptTag
+ *  one push of its bytes (the value for COINBASE_FLAGS). On failure strError says
+ *  why, and strTag and scriptTag are left untouched. */
+bool ParseCoinbaseTag(const std::string& strIn, std::string& strTag, CScript& scriptTag, std::string& strError);
 int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev);
 
 bool CreateDepositTx(CMutableTransaction& depositTx);
