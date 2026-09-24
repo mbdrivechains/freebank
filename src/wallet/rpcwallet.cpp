@@ -16,6 +16,7 @@
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <httpserver.h>
+#include <mainchainaddress.h>
 #include <validation.h>
 #include <net.h>
 #include <policy/feerate.h>
@@ -3582,27 +3583,43 @@ UniValue createwithdrawal(const JSONRPCRequest& request)
 
     if (request.fHelp || request.params.size() != 5)
         throw std::runtime_error(
-            "createwithdrawal amount \"address\"\n"
+            "createwithdrawal \"address\" \"refundaddress\" amount fee mainchainfee\n"
             "\nCreate a withdrawal so that it can be included in a bundle.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nArguments:\n"
-            "1. \"address\"            (string, required) The bitcoin address to send to.\n"
-            "2. \"refundaddress\"      (string, required) Destination for refunds.\n"
-            "3. \"amount\"             (numeric or string, required) The amount in " + CURRENCY_UNIT + " to send. eg 0.1\n"
+            "1. \"address\"            (string, required) The MAINCHAIN address to pay: P2PKH, P2SH, P2WPKH, P2WSH\n"
+            "                           or P2TR of the L1 this node follows (e.g. 1.. 3.. bc1q.. bc1p.. on a\n"
+            "                           main-family L1; m../n.. 2.. tb1q.. tb1p.. on a test family; bcrt1.. on\n"
+            "                           regtest). A FreeBank (sidechain) address is refused.\n"
+            "2. \"refundaddress\"      (string, required) Legacy (P2PKH) FreeBank address of THIS wallet for refunds\n"
+            "                           (the refund is signed with its key): getnewaddress \"\" legacy\n"
+            "3. \"amount\"             (numeric or string, required) The amount in " + CURRENCY_UNIT + " the mainchain address receives. eg 0.1\n"
+            "                           Must be above the mainchain dust threshold for the address type.\n"
             "4. \"fee\"                (numeric or string, required) The amount in " + CURRENCY_UNIT + " to be subtracted for fees. eg 0.1\n"
             "5. \"mainchainfee\"       (numeric or string, required) The amount in " + CURRENCY_UNIT + " to be subtracted for fees on the mainchain. eg 0.1\n"
             "\nResult:\n"
-            "\"txid\"                  (string) The transaction id.\n"
+            "{\n"
+            "  \"txid\" : \"hex\",          (string) The transaction id.\n"
+            "  \"destination\" : \"str\",   (string) The mainchain address, normalized\n"
+            "  \"scriptpubkey\" : \"hex\",  (string) The mainchain payout script\n"
+            "}\n"
             "\nExamples:\n"
-            + HelpExampleCli("createwithdrawal", "\"1M72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\", \"1M72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\", 0.3, 0.1, 0.1")
-            + HelpExampleRpc("createwithdrawal", "\"1M72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\", \"1M72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\", 0.3, 0.1, 0.1")
+            + HelpExampleCli("createwithdrawal", "\"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\" \"XrefundLegacyAddress\" 0.3 0.1 0.1")
+            + HelpExampleRpc("createwithdrawal", "\"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\", \"XrefundLegacyAddress\", 0.3, 0.1, 0.1")
         );
 
     ObserveSafeMode();
 
-    CTxDestination dest = DecodeDestination(request.params[0].get_str(), true /*fMainchainAddress */);
-    if (!IsValidDestination(dest)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    // The user gives the real L1 address; store the carrier string the frozen
+    // consensus decoder maps to the same L1 script (mainchainaddress.h).
+    CScript scriptL1;
+    std::string strParseError;
+    if (!ParseMainchainAddress(request.params[0].get_str(), scriptL1, strParseError)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid mainchain address: " + strParseError);
+    }
+    const std::string strCarrier = EncodeMainchainCarrier(scriptL1);
+    if (strCarrier.empty()) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Mainchain address type not supported for withdrawal");
     }
 
     CTxDestination refundDest = DecodeDestination(request.params[1].get_str(), false /*fMainchainAddress */);
@@ -3636,7 +3653,7 @@ UniValue createwithdrawal(const JSONRPCRequest& request)
     std::string strFail = "";
     uint256 txid;
     uint256 wtid;
-    if (!pwallet->CreateWithdrawal(nAmount, nFee, nMainchainFee, request.params[0].get_str(), request.params[1].get_str(), strFail, txid, wtid)) {
+    if (!pwallet->CreateWithdrawal(nAmount, nFee, nMainchainFee, strCarrier, request.params[1].get_str(), strFail, txid, wtid)) {
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
 
@@ -3645,6 +3662,8 @@ UniValue createwithdrawal(const JSONRPCRequest& request)
 
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
+    response.pushKV("destination", EncodeMainchainAddress(scriptL1));
+    response.pushKV("scriptpubkey", HexStr(scriptL1.begin(), scriptL1.end()));
     return response;
 }
 

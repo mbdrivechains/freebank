@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -135,6 +136,13 @@ private:
 
     std::mutex mutexLogged;
     std::set<std::string> setLogged;
+
+    /* Located M6s by (L1 block hash, m6id) -> (index in block, tx). UpdateDeposits
+     * re-reads every Succeeded event of the full L1 history on each template;
+     * without this cache each one re-fetches every non-deposit tx of its block
+     * over REST. Entries are immutable facts about a block hash. */
+    std::mutex mutexM6Cache;
+    std::map<std::pair<uint256, uint256>, std::pair<int, CMutableTransaction>> mapM6Cache;
 };
 
 //
@@ -371,6 +379,90 @@ bool ParseEnforcerWithdrawalEvents(const UniValue& response, std::vector<L1Withd
         }
     }
     return true;
+}
+
+std::vector<uint256> PendingM6idsFromEvents(const std::vector<L1WithdrawalEvent>& vEvents)
+{
+    std::vector<uint256> vPending;
+    for (const L1WithdrawalEvent& e : vEvents) {
+        std::vector<uint256>::iterator it = std::find(vPending.begin(), vPending.end(), e.m6id);
+        if (e.status == 'U') {
+            if (it == vPending.end())
+                vPending.push_back(e.m6id);
+        } else if (e.status == 'S' || e.status == 'F') {
+            if (it != vPending.end())
+                vPending.erase(it);
+        }
+    }
+    return vPending;
+}
+
+bool L1StillTracksWithdrawalBundle(const std::vector<L1WithdrawalEvent>& vEvents, std::vector<uint256>& vHashWithdrawalBundle)
+{
+    const std::vector<uint256> vPending = PendingM6idsFromEvents(vEvents);
+    vHashWithdrawalBundle.insert(vHashWithdrawalBundle.end(), vPending.begin(), vPending.end());
+    return !vPending.empty();
+}
+
+unsigned char TreasuryScriptOpcode(const CScript& script, unsigned int nSidechain)
+{
+    if (nSidechain > 0xff || script.size() != 4)
+        return 0;
+    const unsigned char op = script[0];
+    const bool fUpgradableNop = op == OP_NOP1 || (op >= OP_NOP4 && op <= OP_NOP10);
+    if (!fUpgradableNop)
+        return 0;
+    if (script[1] != 0x01 || script[2] != (unsigned char)nSidechain || script[3] != OP_TRUE)
+        return 0;
+    return op;
+}
+
+bool ComputeM6id(const CMutableTransaction& mtx, CAmount nPrevTreasury, unsigned int nSidechain, uint256& m6id)
+{
+    if (mtx.vin.size() != 1 || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, nSidechain))
+        return false;
+    if (!MoneyRange(nPrevTreasury))
+        return false;
+    const CAmount nTreasuryNew = mtx.vout[0].nValue;
+    if (!MoneyRange(nTreasuryNew))
+        return false;
+    CAmount nPayout = 0;
+    for (size_t i = 1; i < mtx.vout.size(); i++) {
+        if (!MoneyRange(mtx.vout[i].nValue))
+            return false;
+        nPayout += mtx.vout[i].nValue;
+        if (!MoneyRange(nPayout))
+            return false;
+    }
+    const CAmount nFee = nPrevTreasury - nTreasuryNew - nPayout;
+    if (nFee < 0 || !MoneyRange(nFee))
+        return false;
+
+    CMutableTransaction mtxBlind(mtx);
+    mtxBlind.vin.clear();
+    mtxBlind.vout[0] = CTxOut(0, EncodeWithdrawalFeesCUSF(nFee));
+    m6id = CTransaction(mtxBlind).GetHash();
+    return true;
+}
+
+int LocateM6(const std::vector<M6Candidate>& vCandidate, const uint256& m6id, unsigned int nSidechain, int& nMatches)
+{
+    nMatches = 0;
+    int nIndex = -1;
+    for (size_t i = 0; i < vCandidate.size(); i++) {
+        const M6Candidate& c = vCandidate[i];
+        // The M6 spends the CTIP: a treasury output under the same script
+        if (c.mtx.vout.empty() || !IsTreasuryScript(c.scriptPrev, nSidechain) || c.scriptPrev != c.mtx.vout[0].scriptPubKey)
+            continue;
+        uint256 m6idCandidate;
+        if (!ComputeM6id(c.mtx, c.nPrevValue, nSidechain, m6idCandidate) || m6idCandidate != m6id)
+            continue;
+        nMatches++;
+        nIndex = (int)i;
+    }
+    if (nMatches > 1)
+        return -2;
+    return nIndex;
 }
 
 //
@@ -1057,11 +1149,14 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     for (const EnfDep& d : vDep)
         setDepositTxid.insert(d.txid);
 
-    // An M6 pays the sidechain treasury script at vout[0]:
-    // OP_DRIVECHAIN(OP_NOP5) PUSH1(<sidechain#>) OP_TRUE
-    const CScript scriptTreasury = CScript() << OP_NOP5
-        << std::vector<unsigned char>{(unsigned char)THIS_SIDECHAIN} << OP_TRUE;
-
+    // An M6 pays the sidechain treasury script `OP_DRIVECHAIN 0x01 <slot> OP_TRUE`
+    // at vout[0], and OP_DRIVECHAIN is per-L1 (OP_NOP5 alphanet/regtest, OP_NOP8
+    // betanet). v0.2.12 matched OP_NOP5 only, so the first beta M6 halted
+    // deposit crediting for good (item 1). The M6 is now identified by the
+    // event's m6id, recomputed from the L1 tx exactly as the enforcer does
+    // (ComputeM6id), so no opcode has to be known: a treasury-shaped lookalike
+    // cannot match, and a second (e.g. foreign) M6 in the same block has its
+    // own m6id and its own event.
     for (const L1WithdrawalEvent& ev : vEvent) {
         if (ev.status != 'S')
             continue;
@@ -1071,38 +1166,68 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
             return std::vector<SidechainDeposit>();
         }
 
-        std::vector<uint256> vBlockTxid;
-        if (!RestGetBlockTxids(ev.hashMainBlock, vBlockTxid)) {
-            LogPrintf("ERROR Enforcer client: REST block fetch failed for %s (batch failed closed)\n", ev.hashMainBlock.ToString());
-            return std::vector<SidechainDeposit>();
-        }
-
-        // Locate the M6: the single non-coinbase, non-deposit tx in the event
-        // block paying the treasury script at vout[0]. Anything other than
-        // exactly one match fails closed.
-        int nFound = 0;
         int nTxM6 = -1;
         CMutableTransaction mtxM6;
-        for (size_t j = 1; j < vBlockTxid.size(); j++) {
-            if (setDepositTxid.count(vBlockTxid[j]))
-                continue;
+        bool fCached = false;
+        {
+            std::lock_guard<std::mutex> lock(mutexM6Cache);
+            const auto it = mapM6Cache.find(std::make_pair(ev.hashMainBlock, ev.m6id));
+            if (it != mapM6Cache.end()) {
+                nTxM6 = it->second.first;
+                mtxM6 = it->second.second;
+                fCached = true;
+            }
+        }
 
-            CMutableTransaction mtx;
-            if (!RestGetRawTx(vBlockTxid[j], mtx)) {
-                LogPrintf("ERROR Enforcer client: REST raw-tx fetch failed for %s (batch failed closed)\n", vBlockTxid[j].ToString());
+        if (!fCached) {
+            std::vector<uint256> vBlockTxid;
+            if (!RestGetBlockTxids(ev.hashMainBlock, vBlockTxid)) {
+                LogPrintf("ERROR Enforcer client: REST block fetch failed for %s (batch failed closed)\n", ev.hashMainBlock.ToString());
                 return std::vector<SidechainDeposit>();
             }
 
-            if (mtx.vout.empty() || mtx.vout[0].scriptPubKey != scriptTreasury)
-                continue;
+            // Candidates: non-coinbase, non-deposit txs with one input and a
+            // treasury-shaped vout[0] (any upgradable NOP), plus the output
+            // their input spends.
+            std::vector<M6Candidate> vCandidate;
+            for (size_t j = 1; j < vBlockTxid.size(); j++) {
+                if (setDepositTxid.count(vBlockTxid[j]))
+                    continue;
 
-            nFound++;
-            nTxM6 = (int)j;
-            mtxM6 = mtx;
-        }
-        if (nFound != 1) {
-            LogPrintf("ERROR Enforcer client: expected exactly 1 M6 in block %s, found %d (batch failed closed)\n", ev.hashMainBlock.ToString(), nFound);
-            return std::vector<SidechainDeposit>();
+                CMutableTransaction mtx;
+                if (!RestGetRawTx(vBlockTxid[j], mtx)) {
+                    LogPrintf("ERROR Enforcer client: REST raw-tx fetch failed for %s (batch failed closed)\n", vBlockTxid[j].ToString());
+                    return std::vector<SidechainDeposit>();
+                }
+                if (mtx.vin.size() != 1 || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, THIS_SIDECHAIN))
+                    continue;
+
+                CMutableTransaction mtxPrev;
+                if (!RestGetRawTx(mtx.vin[0].prevout.hash, mtxPrev) || mtx.vin[0].prevout.n >= mtxPrev.vout.size()) {
+                    LogPrintf("ERROR Enforcer client: REST fetch of the output spent by %s failed (batch failed closed)\n", vBlockTxid[j].ToString());
+                    return std::vector<SidechainDeposit>();
+                }
+                M6Candidate c;
+                c.nTx = (int)j;
+                c.mtx = mtx;
+                c.nPrevValue = mtxPrev.vout[mtx.vin[0].prevout.n].nValue;
+                c.scriptPrev = mtxPrev.vout[mtx.vin[0].prevout.n].scriptPubKey;
+                vCandidate.push_back(c);
+            }
+
+            int nMatches = 0;
+            const int nIndex = LocateM6(vCandidate, ev.m6id, THIS_SIDECHAIN, nMatches);
+            if (nIndex < 0) {
+                LogPrintf("ERROR Enforcer client: expected exactly 1 M6 with m6id %s in block %s, found %d "
+                          "(%u treasury-shaped candidates: OP_NOPx 0x01 <slot> OP_TRUE at vout[0]) (batch failed closed)\n",
+                          ev.m6id.ToString(), ev.hashMainBlock.ToString(), nMatches, vCandidate.size());
+                return std::vector<SidechainDeposit>();
+            }
+            nTxM6 = vCandidate[nIndex].nTx;
+            mtxM6 = vCandidate[nIndex].mtx;
+
+            std::lock_guard<std::mutex> lock(mutexM6Cache);
+            mapM6Cache[std::make_pair(ev.hashMainBlock, ev.m6id)] = std::make_pair(nTxM6, mtxM6);
         }
 
         SidechainDeposit deposit;
@@ -1264,19 +1389,29 @@ bool EnforcerL1Client::GetWorkScore(const uint256& hash, int& nWorkScore)
 
 bool EnforcerL1Client::ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle)
 {
-    // Used by CreateWithdrawalBundleTx as a double-propose guard (don't create a
-    // new bundle if one is already tracked on L1) - the caller only tests for
-    // presence. NB the returned hashes are enforcer m6ids (blinded txids), not
-    // chassis bundle hashes; do not match them against chassis hashes.
+    // Double-propose guard for CreateWithdrawalBundleTx (block-template path
+    // only; replication never calls it): true iff L1 is STILL tracking
+    // (proposed, not yet paid or expired) a bundle on this slot - the legacy
+    // listwithdrawalstatus semantics. v0.2.12 kept every Submitted/Succeeded
+    // event in the full L1 history (FetchWithdrawalEvents has no start block),
+    // so once the first bundle was ever proposed this returned true forever and
+    // no second bundle could be created (v0.2.13 item 2). Any pending bundle
+    // blocks, ours or foreign: an m6id cannot tell a foreign bundle from one of
+    // ours broadcast from an orphaned branch carrying the same withdrawals.
+    // NB the returned hashes are enforcer m6ids (blinded txids), not chassis
+    // bundle hashes; do not match them against chassis hashes.
     std::vector<L1WithdrawalEvent> vEvents;
-    if (!FetchWithdrawalEvents(vEvents))
-        return false;
-
-    for (const L1WithdrawalEvent& e : vEvents) {
-        if (e.status == 'U' || e.status == 'S')
-            vHashWithdrawalBundle.push_back(e.m6id);
+    if (!FetchWithdrawalEvents(vEvents)) {
+        // Fail CLOSED: an unreachable or timed-out enforcer must not read as
+        // "nothing pending" (v0.2.12 failed open). It only delays a proposal to
+        // a later block; with the events unreadable HaveSpent/HaveFailed fail
+        // too, so the chassis would keep the previous bundle CREATED anyway.
+        LogOnce("bundle-guard-fetch", "Enforcer client: could not fetch L1 withdrawal events; "
+            "not proposing a withdrawal bundle until L1 state is readable\n");
+        return true;
     }
-    return vHashWithdrawalBundle.size() > 0;
+
+    return L1StillTracksWithdrawalBundle(vEvents, vHashWithdrawalBundle);
 }
 
 bool EnforcerL1Client::GetBlockHash(int nHeight, uint256& hashBlock)
@@ -1456,13 +1591,18 @@ L1Transport GetL1Transport()
     return transport;
 }
 
+L1Client& GetEnforcerL1Client()
+{
+    static EnforcerL1Client clientEnforcer;
+    return clientEnforcer;
+}
+
 L1Client& GetL1Client()
 {
     static JsonRpcL1Client clientJsonRpc;
-    static EnforcerL1Client clientEnforcer;
 
     if (GetL1Transport() == L1Transport::ENFORCER)
-        return clientEnforcer;
+        return GetEnforcerL1Client();
 
     return clientJsonRpc;
 }

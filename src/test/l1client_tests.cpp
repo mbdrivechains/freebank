@@ -4,6 +4,7 @@
 
 #include <l1client.h>
 
+#include <fs.h>
 #include <primitives/transaction.h>
 #include <test/test_bitcoin.h>
 #include <uint256.h>
@@ -12,6 +13,8 @@
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <sys/stat.h>
 
 // The canned JSON in this suite is captured from a live bip300301_enforcer
 // v0.3.4 ValidatorService via grpcurl (bench, 2026-07-08). If the enforcer
@@ -244,6 +247,162 @@ BOOST_AUTO_TEST_CASE(l1client_parse_withdrawal_events)
     BOOST_CHECK(vEvents.empty());
 }
 
+// v0.2.13 item 2: the bundle double-propose guard must count only bundles L1
+// is STILL tracking. The events come from the full L1 history (oldest first).
+static L1WithdrawalEvent MakeEvent(const uint256& m6id, char status)
+{
+    L1WithdrawalEvent e;
+    e.m6id = m6id;
+    e.status = status;
+    return e;
+}
+
+BOOST_AUTO_TEST_CASE(l1client_pending_m6ids_fold)
+{
+    const uint256 X = uint256S("1111111111111111111111111111111111111111111111111111111111111111");
+    const uint256 Y = uint256S("2222222222222222222222222222222222222222222222222222222222222222");
+    const uint256 Z = uint256S("3333333333333333333333333333333333333333333333333333333333333333");
+    typedef std::vector<L1WithdrawalEvent> Ev;
+    typedef std::vector<uint256> Ids;
+
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{}) == Ids{});
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U')}) == Ids{X});
+    // The item-2 regression: a paid or expired bundle is no longer pending
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'S')}) == Ids{});
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'F')}) == Ids{});
+    // Paid, then a new (ours or foreign) bundle proposed
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'S'), MakeEvent(Y, 'U')}) == Ids{Y});
+    // Re-proposal of the same m6id after expiry
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'F'), MakeEvent(X, 'U')}) == Ids{X});
+    // M6 removes only the paid m6id
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(Y, 'U'), MakeEvent(X, 'S')}) == Ids{Y});
+    // First-submission order is kept
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(Y, 'U')}) == (Ids{X, Y}));
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(Y, 'U'), MakeEvent(X, 'U')}) == (Ids{Y, X}));
+    // A terminal event with no Submitted in view (truncated history) is ignored
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(Z, 'S')}) == Ids{});
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(Z, 'F'), MakeEvent(X, 'U')}) == Ids{X});
+    // A duplicate Submitted is counted once
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'U')}) == Ids{X});
+    // Unknown status bytes are ignored
+    BOOST_CHECK(PendingM6idsFromEvents(Ev{MakeEvent(X, 'U'), MakeEvent(X, '?')}) == Ids{X});
+
+    // The guard wrapper appends and reports presence
+    Ids vOut{Z};
+    BOOST_CHECK(!L1StillTracksWithdrawalBundle(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'S')}, vOut));
+    BOOST_CHECK(vOut == Ids{Z});
+    BOOST_CHECK(L1StillTracksWithdrawalBundle(Ev{MakeEvent(X, 'U'), MakeEvent(X, 'S'), MakeEvent(Y, 'U')}, vOut));
+    BOOST_CHECK(vOut == (Ids{Z, Y}));
+}
+
+BOOST_AUTO_TEST_CASE(l1client_bundle_guard_after_payout)
+{
+    // A GetTwoWayPegData history in the wire shape of l1client_parse_withdrawal_events
+    // (captured): block 1 = Submitted X, block 2 = Succeeded X.
+    const std::string strX = "1111111111111111111111111111111111111111111111111111111111111111";
+    const std::string strY = "2222222222222222222222222222222222222222222222222222222222222222";
+    auto block = [](const std::string& strHash, const std::string& strM6, const std::string& strEvent) {
+        return "{\"blockHeaderInfo\": {\"blockHash\": {\"hex\": \"" + strHash + "\"}},"
+               "\"blockInfo\": {\"events\": [{\"withdrawalBundle\": {\"m6id\": {\"hex\": \"" + strM6 + "\"},"
+               "\"event\": {\"" + strEvent + "\": {}}}}]}}";
+    };
+    const std::string h1(64, 'a'), h2(64, 'b'), h3(64, 'c');
+
+    for (const std::string strTerminal : {"succeeded", "failed"}) {
+        UniValue response(UniValue::VOBJ);
+        BOOST_REQUIRE(response.read("{\"blocks\": [" + block(h1, strX, "submitted") + "," +
+                                    block(h2, strX, strTerminal) + "]}"));
+        std::vector<L1WithdrawalEvent> vEvents;
+        BOOST_REQUIRE(ParseEnforcerWithdrawalEvents(response, vEvents));
+        BOOST_REQUIRE_EQUAL(vEvents.size(), 2U);
+
+        // The v0.2.12 predicate (every Submitted or Succeeded ever seen) still
+        // reports "tracked" after the payout: it blocked every later bundle.
+        size_t nOld = 0;
+        for (const L1WithdrawalEvent& e : vEvents)
+            if (e.status == 'U' || e.status == 'S') nOld++;
+        BOOST_CHECK_EQUAL(nOld, strTerminal == std::string("succeeded") ? 2U : 1U);
+
+        std::vector<uint256> vHash;
+        BOOST_CHECK(!L1StillTracksWithdrawalBundle(vEvents, vHash));
+        BOOST_CHECK(vHash.empty());
+
+        // A third block proposes bundle Y: now exactly Y is pending
+        BOOST_REQUIRE(response.read("{\"blocks\": [" + block(h1, strX, "submitted") + "," +
+                                    block(h2, strX, strTerminal) + "," + block(h3, strY, "submitted") + "]}"));
+        BOOST_REQUIRE(ParseEnforcerWithdrawalEvents(response, vEvents));
+        vHash.clear();
+        BOOST_CHECK(L1StillTracksWithdrawalBundle(vEvents, vHash));
+        BOOST_REQUIRE_EQUAL(vHash.size(), 1U);
+        BOOST_CHECK(vHash[0] == Uint256FromConsensusHex(strY));
+    }
+}
+
+// Drive the REAL EnforcerL1Client::ListWithdrawalBundleStatus (what
+// CreateWithdrawalBundleTx calls through SidechainClient) through a fake
+// grpcurl that serves a canned GetChainTip + GetTwoWayPegData history.
+BOOST_AUTO_TEST_CASE(l1client_bundle_guard_through_enforcer_client)
+{
+    const fs::path dir = fs::temp_directory_path() / fs::unique_path("fb_fake_grpcurl_%%%%%%%%");
+    BOOST_REQUIRE(fs::create_directories(dir));
+    const fs::path script = dir / "grpcurl";
+    const fs::path peg = dir / "peg.json";
+    const fs::path failflag = dir / "fail";
+    {
+        fs::ofstream f(script);
+        f << "#!/bin/sh\n"
+             "# Fake grpcurl for l1client_tests: last arg = <service>/<method>\n"
+             "for last; do :; done\n"
+             "D=$(dirname \"$0\")\n"
+             "[ -e \"$D/fail\" ] && exit 1\n"
+             "case \"$last\" in\n"
+             "  */GetChainTip) echo '{\"blockHeaderInfo\": {\"blockHash\": {\"hex\": \"00000000000000000000000000000000000000000000000000000000000000ff\"}, \"height\": 100}}' ;;\n"
+             "  */GetTwoWayPegData) cat \"$D/peg.json\" ;;\n"
+             "  *) exit 1 ;;\n"
+             "esac\n";
+    }
+    BOOST_REQUIRE_EQUAL(chmod(script.string().c_str(), 0700), 0);
+    gArgs.ForceSetArg("-grpcurlbin", script.string());
+
+    const std::string X(64, '1'), Y(64, '2');
+    auto blk = [](const std::string& strM6, const std::string& strEvent) {
+        return "{\"blockInfo\": {\"events\": [{\"withdrawalBundle\": {\"m6id\": {\"hex\": \"" + strM6 +
+               "\"}, \"event\": {\"" + strEvent + "\": {}}}}]}}";
+    };
+    struct Scenario { const char* name; std::string json; bool fBlocks; size_t nPending; };
+    const std::vector<Scenario> vScenario = {
+        {"empty", "{\"blocks\": []}", false, 0},
+        {"pending", "{\"blocks\": [" + blk(X, "submitted") + "]}", true, 1},
+        {"succeeded", "{\"blocks\": [" + blk(X, "submitted") + "," + blk(X, "succeeded") + "]}", false, 0},
+        {"failed", "{\"blocks\": [" + blk(X, "submitted") + "," + blk(X, "failed") + "]}", false, 0},
+        {"paid_then_foreign_pending", "{\"blocks\": [" + blk(X, "submitted") + "," + blk(X, "succeeded") + "," + blk(Y, "submitted") + "]}", true, 1},
+        {"failed_then_reproposed", "{\"blocks\": [" + blk(X, "submitted") + "," + blk(X, "failed") + "," + blk(X, "submitted") + "]}", true, 1},
+    };
+    L1Client& client = GetEnforcerL1Client();
+    for (const Scenario& sc : vScenario) {
+        {
+            fs::ofstream f(peg);
+            f << sc.json;
+        }
+        std::vector<uint256> vHash;
+        const bool fBlocks = client.ListWithdrawalBundleStatus(vHash);
+        BOOST_CHECK_MESSAGE(fBlocks == sc.fBlocks, "scenario " << sc.name);
+        BOOST_CHECK_MESSAGE(vHash.size() == sc.nPending, "scenario " << sc.name << " pending " << vHash.size());
+    }
+
+    // Unreadable L1 (grpcurl fails): fail CLOSED - block the proposal (v0.2.12
+    // reported "nothing tracked" and let the miner propose blind)
+    {
+        fs::ofstream f(failflag);
+    }
+    std::vector<uint256> vHash;
+    BOOST_CHECK(client.ListWithdrawalBundleStatus(vHash));
+    BOOST_CHECK(vHash.empty());
+
+    gArgs.ForceSetArg("-grpcurlbin", "grpcurl");
+    fs::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(l1client_cusf_fee_codec)
 {
     // The enforcer's BlindedM6 fee output is exactly OP_RETURN PUSH8(fee) in
@@ -306,6 +465,186 @@ BOOST_AUTO_TEST_CASE(l1client_blinded_m6id)
     BOOST_CHECK(!m6id.IsNull());
     // Deterministic: stripping again yields the same m6id
     BOOST_CHECK(CTransaction(mtxBlind).GetHash() == m6id);
+}
+
+// v0.2.13 item 1: locating a Succeeded M6 whatever this L1's OP_DRIVECHAIN is.
+// Golden treasury bytes = bip300301_enforcer OpDrivechain::script(130):
+// push_opcode(op) + push_slice([0x82]) + OP_TRUE.
+static CScript ScriptHex(const std::string& h)
+{
+    const std::vector<unsigned char> v = ParseHex(h);
+    return CScript(v.begin(), v.end());
+}
+
+BOOST_AUTO_TEST_CASE(l1client_treasury_script_shape)
+{
+    const unsigned int S = 130; // THIS_SIDECHAIN
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b4018251"), S), 0xb4); // OP_NOP5: BIP300, alphanet, regtest bench
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b7018251"), S), 0xb7); // OP_NOP8: betanet
+    // Every upgradable NOP passes the shape prefilter (an unknown mainnet preset still works)
+    for (const unsigned char op : {0xb0, 0xb3, 0xb5, 0xb6, 0xb8, 0xb9}) {
+        CScript sc = ScriptHex("b7018251");
+        sc[0] = op;
+        BOOST_CHECK_EQUAL(TreasuryScriptOpcode(sc, S), op);
+    }
+    // Never CLTV / CSV, never anything else
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b1018251"), S), 0);
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b2018251"), S), 0);
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("6a018251"), S), 0);
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("61018251"), S), 0); // OP_NOP (0x61)
+    // Slot mismatch
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b7018151"), S), 0);
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b7018251"), 129), 0);
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b7018251"), 2), 0);
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b7018251"), 256), 0);
+    // Other encodings of "the same thing" are not the treasury script
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b701825151"), S), 0);   // trailing byte
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b70182"), S), 0);       // truncated
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b402820051"), S), 0);   // CScriptNum slot form
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(ScriptHex("b44c018251"), S), 0);   // OP_PUSHDATA1 form
+    BOOST_CHECK_EQUAL(TreasuryScriptOpcode(CScript(), S), 0);
+
+    // NOP5 no-regress: v0.2.12's exact scriptTreasury is still recognised...
+    const CScript scriptV0212 = CScript() << OP_NOP5 << std::vector<unsigned char>{(unsigned char)S} << OP_TRUE;
+    BOOST_CHECK_EQUAL(HexStr(scriptV0212.begin(), scriptV0212.end()), "b4018251");
+    BOOST_CHECK(IsTreasuryScript(scriptV0212, S));
+    BOOST_CHECK(IsTreasuryScript(CScript() << OP_NOP8 << std::vector<unsigned char>{(unsigned char)S} << OP_TRUE, S));
+    // ...and the betanet treasury script is NOT the one v0.2.12 compared against (the bug)
+    BOOST_CHECK(ScriptHex("b7018251") != scriptV0212);
+}
+
+// A chassis bundle in the CUSF (BlindedM6) format and the L1 M6 the enforcer
+// builds from it (BlindedM6::into_m6: vout[0] := treasury change under the
+// preset opcode, vin := [CTIP]).
+static CMutableTransaction MakeBlindedBundle(CAmount nFee, const std::vector<CTxOut>& vPayout)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion = 2;
+    mtx.vout.push_back(CTxOut(0, EncodeWithdrawalFeesCUSF(nFee)));
+    for (const CTxOut& out : vPayout)
+        mtx.vout.push_back(out);
+    return mtx; // vin empty: exactly what the enforcer hashes as the m6id
+}
+
+static CMutableTransaction IntoM6(const CMutableTransaction& blinded, unsigned char op, const COutPoint& ctip, CAmount nTreasury, CAmount nFee)
+{
+    CMutableTransaction m6(blinded);
+    CAmount nPayout = 0;
+    for (size_t i = 1; i < m6.vout.size(); i++)
+        nPayout += m6.vout[i].nValue;
+    CScript scriptTreasury;
+    scriptTreasury << (opcodetype)op << std::vector<unsigned char>{130} << OP_TRUE;
+    m6.vout[0] = CTxOut(nTreasury - nPayout - nFee, scriptTreasury);
+    m6.vin.clear();
+    m6.vin.push_back(CTxIn(ctip));
+    return m6;
+}
+
+static std::vector<CTxOut> Payouts(unsigned char tag)
+{
+    return {CTxOut(COIN, CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, tag) << OP_EQUALVERIFY << OP_CHECKSIG),
+            CTxOut(COIN / 2, CScript() << OP_0 << std::vector<unsigned char>(20, tag + 1))};
+}
+
+BOOST_AUTO_TEST_CASE(l1client_m6id_roundtrip)
+{
+    const CAmount nTreasury = 10 * COIN, nFee = 5000;
+    const CMutableTransaction blinded = MakeBlindedBundle(nFee, Payouts(0x11));
+    const uint256 m6idChassis = CTransaction(blinded).GetHash(); // == BlindedM6IdForBundle
+    const COutPoint ctip(uint256S("aa00000000000000000000000000000000000000000000000000000000000001"), 0);
+
+    // Recomputed from the L1 M6 under either opcode: the blinded form carries no opcode
+    for (const unsigned char op : {0xb4, 0xb7}) {
+        const CMutableTransaction m6 = IntoM6(blinded, op, ctip, nTreasury, nFee);
+        uint256 m6id;
+        BOOST_REQUIRE(ComputeM6id(m6, nTreasury, 130, m6id));
+        BOOST_CHECK(m6id == m6idChassis);
+        // T_{n-1} is part of the identity: a wrong previous treasury gives another fee
+        BOOST_REQUIRE(ComputeM6id(m6, nTreasury + 1, 130, m6id));
+        BOOST_CHECK(m6id != m6idChassis);
+        // Negative fee (T_{n-1} < T_n + P_total), wrong slot: not an M6
+        BOOST_CHECK(!ComputeM6id(m6, m6.vout[0].nValue, 130, m6id));
+        BOOST_CHECK(!ComputeM6id(m6, nTreasury - nFee - 1, 130, m6id));
+        BOOST_CHECK(!ComputeM6id(m6, nTreasury, 129, m6id));
+        // Input count must be exactly one
+        CMutableTransaction two(m6);
+        two.vin.push_back(CTxIn(COutPoint(uint256S("bb"), 1)));
+        BOOST_CHECK(!ComputeM6id(two, nTreasury, 130, m6id));
+        CMutableTransaction none(m6);
+        none.vin.clear();
+        BOOST_CHECK(!ComputeM6id(none, nTreasury, 130, m6id));
+    }
+    // Zero fee is a valid M6 (enforcer compute_m6id_valid_inputs)
+    const CMutableTransaction blinded0 = MakeBlindedBundle(0, Payouts(0x21));
+    uint256 m6id0;
+    BOOST_REQUIRE(ComputeM6id(IntoM6(blinded0, 0xb7, ctip, nTreasury, 0), nTreasury, 130, m6id0));
+    BOOST_CHECK(m6id0 == CTransaction(blinded0).GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(l1client_locate_m6)
+{
+    const CAmount nTreasury = 10 * COIN, nFee = 5000;
+    const CScript scriptNop5 = ScriptHex("b4018251"), scriptNop8 = ScriptHex("b7018251");
+    const COutPoint ctip(uint256S("aa00000000000000000000000000000000000000000000000000000000000001"), 0);
+
+    const CMutableTransaction blindedOurs = MakeBlindedBundle(nFee, Payouts(0x11));
+    const CMutableTransaction blindedForeign = MakeBlindedBundle(nFee, Payouts(0x33));
+    const uint256 m6idOurs = CTransaction(blindedOurs).GetHash();
+    const uint256 m6idForeign = CTransaction(blindedForeign).GetHash();
+
+    auto candidate = [](int nTx, const CMutableTransaction& mtx, CAmount nPrev, const CScript& scriptPrev) {
+        M6Candidate c;
+        c.nTx = nTx;
+        c.mtx = mtx;
+        c.nPrevValue = nPrev;
+        c.scriptPrev = scriptPrev;
+        return c;
+    };
+    const CMutableTransaction m6Beta = IntoM6(blindedOurs, 0xb7, ctip, nTreasury, nFee);
+    int nMatches = -1;
+
+    // A betanet (NOP8) M6 alone: found
+    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury, scriptNop8)}, m6idOurs, 130, nMatches), 0);
+    BOOST_CHECK_EQUAL(nMatches, 1);
+    // v0.2.12's exact-NOP5 comparison finds nothing in the same block: the halt
+    const CScript scriptV0212 = CScript() << OP_NOP5 << std::vector<unsigned char>{130} << OP_TRUE;
+    BOOST_CHECK(m6Beta.vout[0].scriptPubKey != scriptV0212);
+
+    // A NOP5 lookalike in the same block (on beta OP_NOP5 is a plain NOP anyone
+    // can mint) does not match; "accept both opcodes" would have counted 2.
+    CMutableTransaction lookalike = IntoM6(MakeBlindedBundle(0, Payouts(0x55)), 0xb4, COutPoint(uint256S("cc"), 0), COIN * 2, 0);
+    std::vector<M6Candidate> v = {candidate(1, lookalike, COIN * 2, CScript() << OP_TRUE),
+                                  candidate(2, m6Beta, nTreasury, scriptNop8)};
+    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), 1);
+    BOOST_CHECK_EQUAL(nMatches, 1);
+    // ...even if it spends a NOP5 "treasury" of its own
+    v[0].scriptPrev = scriptNop5;
+    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), 1);
+    BOOST_CHECK_EQUAL(nMatches, 1);
+
+    // Two real M6s in one L1 block (ours + a foreign bundle on the shared slot):
+    // each event finds its own
+    const CMutableTransaction m6Foreign = IntoM6(blindedForeign, 0xb7, COutPoint(uint256S("dd"), 0), nTreasury, nFee);
+    v = {candidate(4, m6Foreign, nTreasury, scriptNop8), candidate(7, m6Beta, nTreasury, scriptNop8)};
+    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), 1);
+    BOOST_CHECK_EQUAL(LocateM6(v, m6idForeign, 130, nMatches), 0);
+
+    // The M6 must spend a treasury output under its own script (the CTIP)
+    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury, CScript() << OP_TRUE)}, m6idOurs, 130, nMatches), -1);
+    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury, scriptNop5)}, m6idOurs, 130, nMatches), -1);
+    // Wrong previous treasury value -> different m6id -> not found
+    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury + 1, scriptNop8)}, m6idOurs, 130, nMatches), -1);
+    BOOST_CHECK_EQUAL(nMatches, 0);
+    // Nothing at all
+    BOOST_CHECK_EQUAL(LocateM6({}, m6idOurs, 130, nMatches), -1);
+
+    // Residual, fails closed: a duplicate with identical outputs spending another
+    // treasury-shaped output of the same value (the attacker pays every payout
+    // again) is ambiguous
+    const CMutableTransaction dup = IntoM6(blindedOurs, 0xb7, COutPoint(uint256S("ee"), 0), nTreasury, nFee);
+    v = {candidate(3, m6Beta, nTreasury, scriptNop8), candidate(5, dup, nTreasury, scriptNop8)};
+    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), -2);
+    BOOST_CHECK_EQUAL(nMatches, 2);
 }
 
 // A7: the gRPC enforcer identity-pin decision logic. Kept pure (no gRPC/REST I/O)

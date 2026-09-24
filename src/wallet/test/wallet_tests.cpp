@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include <base58.h>
+#include <chainparams.h>
 #include <consensus/validation.h>
 #include <rpc/server.h>
 #include <test/test_bitcoin.h>
@@ -22,6 +24,8 @@
 extern UniValue importmulti(const JSONRPCRequest& request);
 extern UniValue dumpwallet(const JSONRPCRequest& request);
 extern UniValue importwallet(const JSONRPCRequest& request);
+extern UniValue createwithdrawal(const JSONRPCRequest& request);
+extern bool g_fMainchainMainFamily; // base58.cpp (A9)
 
 // how many times to run all the tests to have a chance to catch errors that only show up with particular random shuffles
 #define RUN_TESTS 100
@@ -785,6 +789,104 @@ BOOST_AUTO_TEST_CASE(sethdseed_distinct_seeds_distinct_addresses)
             BOOST_CHECK(id != id2);
         }
     }
+}
+
+// v0.2.13 item 5: createwithdrawal takes real L1 addresses of every standard
+// type (stored as consensus carriers), and refuses destinations that would
+// block every bundle (dust / non-standard) or withdrawals that could never be
+// refunded. The wallet has no coins here (a FreeBank unit test cannot mine), so
+// "passes every guard" shows up as the coin-selection failure.
+BOOST_AUTO_TEST_CASE(createwithdrawal_l1_destinations_and_guards)
+{
+    const std::string strRegtestSaved = gArgs.GetArg("-regtest", "0");
+    const bool fFamilySaved = g_fMainchainMainFamily;
+    gArgs.ForceSetArg("-regtest", "0");
+    g_fMainchainMainFamily = true; // a main-family L1 (eCash beta / mainnet)
+
+    CPubKey pub;
+    {
+        LOCK(pwalletMain->cs_wallet);
+        pwalletMain->TopUpKeyPool();
+        BOOST_REQUIRE(pwalletMain->GetKeyFromPool(pub));
+        pwalletMain->LearnRelatedScripts(pub, OUTPUT_TYPE_P2SH_SEGWIT);
+    }
+    const std::string strRefund = EncodeDestination(pub.GetID());
+    const std::string strRefundP2SH = EncodeDestination(GetDestinationForKey(pub, OUTPUT_TYPE_P2SH_SEGWIT));
+    CKey keyStranger;
+    keyStranger.MakeNewKey(true);
+    const std::string strRefundStranger = EncodeDestination(keyStranger.GetPubKey().GetID());
+
+    const std::string NOCOINS = "Could not collect enough coins";
+    auto create = [&](const std::string& strDest, CAmount nAmount, const std::string& strRefundDest) {
+        std::string strFail;
+        uint256 txid, wtid;
+        BOOST_CHECK(!pwalletMain->CreateWithdrawal(nAmount, 100, 1000, strDest, strRefundDest, strFail, txid, wtid));
+        return strFail;
+    };
+    auto isDust = [](const std::string& s) { return s.find("dust threshold") != std::string::npos; };
+    auto noCoins = [&](const std::string& s) { return s.compare(0, NOCOINS.size(), NOCOINS) == 0; };
+
+    // Stored forms: the L1 P2PKH string itself, and carriers (mainchainaddress.h)
+    const std::string P2PKH = "16L5yRNPTuciSgXGHqYwn9N6NeoKqopAu";
+    const std::string cP2SH = "sJLjAYgP91q8wd7MKjUPZTAhmRri9baprg";
+    const std::string cP2WPKH = "fbk1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5a6737n";
+    const std::string cP2TR = "fbk1pqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5z5tpwxqergd3c8g7rusqf5s3v2";
+
+    // L1 dust thresholds at DUST_RELAY_TX_FEE (3000 sat/kvB): P2PKH 546, P2SH 540, P2WPKH 294, P2TR 330
+    BOOST_CHECK(isDust(create(P2PKH, 545, strRefund)));
+    BOOST_CHECK(noCoins(create(P2PKH, 546, strRefund)));
+    BOOST_CHECK(isDust(create(cP2SH, 539, strRefund)));
+    BOOST_CHECK(noCoins(create(cP2SH, 540, strRefund)));
+    BOOST_CHECK(isDust(create(cP2WPKH, 293, strRefund)));
+    BOOST_CHECK(noCoins(create(cP2WPKH, 294, strRefund)));
+    BOOST_CHECK(isDust(create(cP2TR, 329, strRefund)));
+    BOOST_CHECK(noCoins(create(cP2TR, 330, strRefund)));
+    // A destination the bundle code cannot decode
+    BOOST_CHECK_EQUAL(create("garbage", COIN, strRefund), "Invalid destination");
+    // Refund guards: consensus only accepts a P2PKH refund key, and it signs with this wallet's key
+    BOOST_CHECK(create(P2PKH, COIN, strRefundP2SH).find("legacy (P2PKH)") != std::string::npos);
+    BOOST_CHECK(create(P2PKH, COIN, strRefundStranger).find("belong to this wallet") != std::string::npos);
+
+    // The RPC: every L1 type is parsed and reaches coin selection; FreeBank-format
+    // and other-network destinations are refused before anything is stored.
+    {
+        // createwithdrawal waits for the wallet to catch up with the tip first
+        LOCK(cs_main);
+        pwalletMain->BlockConnected({}, std::make_shared<const CBlock>(Params().GenesisBlock()), chainActive.Tip(), {});
+    }
+    vpwallets.insert(vpwallets.begin(), pwalletMain.get());
+    auto rpc = [&](const std::string& strDest, const std::string& strAmount, const std::string& strRefundDest) -> std::string {
+        JSONRPCRequest request;
+        request.params.setArray();
+        request.params.push_back(strDest);
+        request.params.push_back(strRefundDest);
+        request.params.push_back(strAmount);
+        request.params.push_back("0.000001");
+        request.params.push_back("0.00001");
+        try {
+            ::createwithdrawal(request);
+        } catch (const UniValue& e) {
+            return find_value(e, "message").get_str();
+        }
+        return "";
+    };
+    for (const std::string strL1 : {"16L5yRNPTuciSgXGHqYwn9N6NeoKqopAu",
+                                    "31nM1WuowNDzocNxPPW9NQWJEtwWpjfcLj",
+                                    "bc1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5fcj4z3",
+                                    "bc1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5z5tpwxqergd3c8g7rusqyp0mu0",
+                                    "bc1pqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5z5tpwxqergd3c8g7rusqwk0jyn"}) {
+        const std::string strErr = rpc(strL1, "0.01", strRefund);
+        BOOST_CHECK_MESSAGE(noCoins(strErr), strL1 << ": " << strErr);
+    }
+    BOOST_CHECK(rpc(cP2WPKH, "0.01", strRefund).find("FreeBank (sidechain) address") != std::string::npos);
+    BOOST_CHECK(rpc(cP2SH, "0.01", strRefund).find("FreeBank (sidechain) address") != std::string::npos);
+    BOOST_CHECK(rpc("tb1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5r7fxez", "0.01", strRefund).find("another network") != std::string::npos);
+    BOOST_CHECK(isDust(rpc("bc1pqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5z5tpwxqergd3c8g7rusqwk0jyn", "0.00000329", strRefund)));
+    BOOST_CHECK(rpc(P2PKH, "0.01", strRefundP2SH).find("legacy (P2PKH)") != std::string::npos);
+    vpwallets.erase(vpwallets.begin());
+
+    gArgs.ForceSetArg("-regtest", strRegtestSaved);
+    g_fMainchainMainFamily = fFamilySaved;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

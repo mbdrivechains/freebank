@@ -93,6 +93,18 @@ public:
         consensus.nOracleOpWindow = 6;            // ~1h at 144 blk/day: a price older than the
                                                   // row-1 hourly cadence promise can never enter a
                                                   // fix; 6 << the 144 brake cap; 2.1% of G3's ~2d
+        // Withdrawal poison-row guard from genesis (operator sign-off 2026-09-24, H = 0).
+        // CMainParams serves BOTH the eCash beta and eCash mainnet, so one H covers both.
+        // 0 is safe on beta only while no block of its FreeBank chain holds a withdrawal
+        // object: only such a block can break the rule. Check that directly at the swap,
+        // with v0.2.12 stopped so it cannot connect a block in between: no output in blocks
+        // 1..tip has a scriptPubKey starting 6aacdcf66f57 (the withdrawal object header).
+        // gettxoutsetinfo total_amount 0 (measured at height 10) is only a proxy: it leaves
+        // out OP_RETURN outputs, and every withdrawal burn is one. And an upgraded node
+        // re-connects only its last few blocks at startup, so a deeper violating block
+        // would show up only as a fork on a fresh v0.2.13 sync.
+        // Mainnet has the rule from its first block, so it never needs a flag day.
+        consensus.nWithdrawalGuardHeight = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 1199145601; // January 1, 2008
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = 1230767999; // December 31, 2008
@@ -150,6 +162,8 @@ public:
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,75);
         base58Prefixes[MAINCHAIN_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[MAINCHAIN_REGTEST_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
+        // CONSENSUS-FROZEN: SCRIPT_ADDRESS and bech32_hrp are part of the L1 withdrawal
+        // carrier encoding (mainchainaddress.h); changing them splits the chain.
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,125);
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,128);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
@@ -158,9 +172,10 @@ public:
         // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         bech32_hrp = "fbk";
 
-        // A public network (eCash alpha) now exists, so ship the live seed as a hardcoded
+        // A public network (eCash beta) exists, so ship the live seed as a hardcoded
         // fixed-seed fallback alongside the DNS seed above (pnSeed6_main = seed.ecxfreebank.com,
-        // 68.183.235.153:8455). v0.1.0 cleared this because upstream pnSeed6_main pointed at dead
+        // 163.47.9.132:8455, the seed droplet's reserved IP; v0.2.12 shipped its primary IP
+        // 68.183.235.153). v0.1.0 cleared this because upstream pnSeed6_main pointed at dead
         // LayerTwo Labs nodes.
         vFixedSeeds = std::vector<SeedSpec6>(pnSeed6_main, pnSeed6_main + ARRAYLEN(pnSeed6_main));
 
@@ -213,6 +228,7 @@ public:
         consensus.nOracleUnbondDelay = 16;
         consensus.nOracleOpWindow = 3;            // mechanical floor 2 + 1 margin; small enough
                                                   // that the gate proves expiry in 3 blocks
+        consensus.nWithdrawalGuardHeight = 0;     // poison-row guard active from genesis on regtest
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -265,6 +281,7 @@ public:
         base58Prefixes[MAINCHAIN_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
         base58Prefixes[MAINCHAIN_REGTEST_PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,75);
+        // CONSENSUS-FROZEN (carrier encoding, mainchainaddress.h)
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,125);
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};

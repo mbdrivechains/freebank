@@ -25,8 +25,10 @@
 #include <wallet/init.h>
 #include <key.h>
 #include <keystore.h>
+#include <mainchainaddress.h>
 #include <validation.h>
 #include <net.h>
+#include <policy/corepolicy.h>
 #include <policy/fees.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
@@ -11175,10 +11177,35 @@ bool CWallet::CreateWithdrawal(const CAmount& nAmount, const CAmount& nFee, cons
         return false;
     }
 
+    // strDestination is the STORED form (the RPC and Qt translate the user's L1
+    // address into a carrier string first, mainchainaddress.h). Check it the way
+    // the bundle code will read it.
     CTxDestination dest = DecodeDestination(strDestination, true /*fMainchain */);
     if (!IsValidDestination(dest)) {
         strFail = "Invalid destination";
         return false;
+    }
+
+    // A payout the mainchain will not relay (non-standard script, or dust) makes
+    // CreateWithdrawalBundleTx fail CoreIsStandardTx on EVERY attempt, and a
+    // bundle that leaves the row out fails replication: one such row blocks all
+    // withdrawals until its owner refunds it. Refuse to create one. (Consensus
+    // does not check this yet - see the v0.2.13 poison-row proposal.)
+    {
+        const CScript scriptPayout = MainchainPayoutScript(strDestination);
+        txnouttype whichType;
+        std::string strReason;
+        if (!CoreIsStandard(scriptPayout, whichType, strReason)) {
+            strFail = "Mainchain destination script is not standard (" + strReason + ")";
+            return false;
+        }
+        const CTxOut payout(nAmount, scriptPayout);
+        if (CoreIsDust(payout, CFeeRate(DUST_RELAY_TX_FEE))) {
+            strFail = strprintf("Withdrawal amount is below the mainchain dust threshold for this address type "
+                "(%d sats); it could never be paid and would block every withdrawal bundle",
+                CoreGetDustThreshold(payout, CFeeRate(DUST_RELAY_TX_FEE)));
+            return false;
+        }
     }
 
     CTxDestination refundDest = DecodeDestination(strRefundDestination, false /*fMainchain */);
@@ -11186,10 +11213,23 @@ bool CWallet::CreateWithdrawal(const CAmount& nAmount, const CAmount& nFee, cons
         strFail = "Invalid refund destination";
         return false;
     }
+    // A refund is claimed with a signature that consensus checks against a
+    // P2PKH key id (VerifyWithdrawalRefundRequest), so any other refund address
+    // makes the withdrawal unrefundable. The default address type is
+    // p2sh-segwit, so this is an easy mistake.
+    if (!boost::get<CKeyID>(&refundDest)) {
+        strFail = "Refund address must be a legacy (P2PKH) address, e.g. getnewaddress \"\" legacy";
+        return false;
+    }
 
     CAmount nTotal = nAmount + nFee + nMainchainFee;
 
     LOCK2(cs_main, cs_wallet);
+
+    if (!(::IsMine(*this, refundDest) & ISMINE_SPENDABLE)) {
+        strFail = "Refund address must belong to this wallet (the refund is signed with its key)";
+        return false;
+    }
 
     // Select coins to cover withdrawal
     std::vector<COutput> vCoins;

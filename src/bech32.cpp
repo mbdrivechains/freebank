@@ -138,6 +138,22 @@ data CreateChecksum(const std::string& hrp, const data& values)
     return ret;
 }
 
+/** BIP350 (bech32m) checksum constant. */
+const uint32_t BECH32M_CONST = 0x2bc830a3;
+
+/** Create a checksum with an explicit constant (1 = bech32, BECH32M_CONST = bech32m). */
+data CreateChecksumConst(const std::string& hrp, const data& values, uint32_t nConst)
+{
+    data enc = Cat(ExpandHRP(hrp), values);
+    enc.resize(enc.size() + 6);
+    uint32_t mod = PolyMod(enc) ^ nConst;
+    data ret(6);
+    for (size_t i = 0; i < 6; ++i) {
+        ret[i] = (mod >> (5 * (5 - i))) & 31;
+    }
+    return ret;
+}
+
 } // namespace
 
 namespace bech32
@@ -186,6 +202,61 @@ std::pair<std::string, data> Decode(const std::string& str) {
         return {};
     }
     return {hrp, data(values.begin(), values.end() - 6)};
+}
+
+std::string EncodeM(const std::string& hrp, const data& values) {
+    for (const unsigned char c : hrp) {
+        if (c >= 'A' && c <= 'Z') return {}; // the HRP must be lower case (Core asserts this)
+    }
+    data checksum = CreateChecksumConst(hrp, values, BECH32M_CONST);
+    data combined = Cat(values, checksum);
+    std::string ret = hrp + '1';
+    ret.reserve(ret.size() + combined.size());
+    for (auto c : combined) {
+        if (c > 31) return {};
+        ret += CHARSET[c];
+    }
+    return ret;
+}
+
+DecodeResult DecodeEx(const std::string& str) {
+    DecodeResult result;
+    bool lower = false, upper = false;
+    for (size_t i = 0; i < str.size(); ++i) {
+        unsigned char c = str[i];
+        if (c < 33 || c > 126) return result;
+        if (c >= 'a' && c <= 'z') lower = true;
+        if (c >= 'A' && c <= 'Z') upper = true;
+    }
+    if (lower && upper) return result;
+    size_t pos = str.rfind('1');
+    if (str.size() > 90 || pos == str.npos || pos == 0 || pos + 7 > str.size()) {
+        return result;
+    }
+    data values(str.size() - 1 - pos);
+    for (size_t i = 0; i < str.size() - 1 - pos; ++i) {
+        unsigned char c = str[i + pos + 1];
+        int8_t rev = (c < 33 || c > 126) ? -1 : CHARSET_REV[c];
+        if (rev == -1) {
+            return result;
+        }
+        values[i] = rev;
+    }
+    std::string hrp;
+    for (size_t i = 0; i < pos; ++i) {
+        hrp += LowerCase(str[i]);
+    }
+    const uint32_t check = PolyMod(Cat(ExpandHRP(hrp), values));
+    if (check == 1) {
+        result.encoding = Encoding::BECH32;
+    } else if (check == BECH32M_CONST) {
+        result.encoding = Encoding::BECH32M;
+    } else {
+        return result;
+    }
+    result.hrp = hrp;
+    result.data = data(values.begin(), values.end() - 6);
+    return result;
 }
 
 } // namespace bech32

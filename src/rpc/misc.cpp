@@ -16,6 +16,7 @@
 #include <core_io.h>
 #include <crypto/ripemd160.h>
 #include <init.h>
+#include <mainchainaddress.h>
 #include <validation.h>
 #include <httpserver.h>
 #include <net.h>
@@ -756,10 +757,22 @@ UniValue getwithdrawal(const JSONRPCRequest& request)
 {
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
-            "getwithdrawal\n"
-            "\nArguments:\n"
-            "1. \"id (string, required) the withdrawal ID\"\n"
+            "getwithdrawal \"id\"\n"
             "\nGet withdrawal information\n"
+            "\nArguments:\n"
+            "1. \"id\"   (string, required) the withdrawal ID\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"destination\" : \"str\",      (string) the mainchain address paid, in its mainchain form\n"
+            "  \"destination_raw\" : \"str\",  (string) the stored destination string (bech32/P2SH destinations are\n"
+            "                                stored in a sidechain-looking carrier form; never send FreeBank coins to it)\n"
+            "  \"scriptpubkey\" : \"hex\",     (string) the mainchain payout script (empty if the stored string does not decode)\n"
+            "  \"refunddestination\" : \"str\",(string)\n"
+            "  \"amount\" : n,                (numeric) sats, payout + mainchain fee\n"
+            "  \"amountmainchainfee\" : n,    (numeric) sats\n"
+            "  \"status\" : \"str\",           (string)\n"
+            "  \"hashblindtx\" : \"hex\"       (string)\n"
+            "}\n"
         );
 
     uint256 id = uint256S(request.params[0].get_str());
@@ -771,7 +784,10 @@ UniValue getwithdrawal(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_MISC_ERROR, "Withdrawal does not exist!");
 
     UniValue result(UniValue::VOBJ);
-    result.pushKV("destination", wt.strDestination);
+    const CScript scriptPayout = MainchainPayoutScript(wt.strDestination);
+    result.pushKV("destination", MainchainDisplayAddress(wt.strDestination));
+    result.pushKV("destination_raw", wt.strDestination);
+    result.pushKV("scriptpubkey", HexStr(scriptPayout.begin(), scriptPayout.end()));
     result.pushKV("refunddestination", wt.strRefundDestination);
     result.pushKV("amount", wt.amount);
     result.pushKV("amountmainchainfee",wt.mainchainFee );

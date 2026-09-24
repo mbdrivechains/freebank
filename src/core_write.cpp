@@ -5,6 +5,13 @@
 #include <core_io.h>
 
 #include <base58.h>
+#include <bill.h>
+#include <deposit.h>
+#include <house.h>
+#include <note.h>
+#include <oracle.h>
+#include <pool.h>
+#include <settle.h>
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <script/script.h>
@@ -154,6 +161,94 @@ void ScriptPubKeyToUniv(const CScript& scriptPubKey,
     out.pushKV("addresses", a);
 }
 
+const char* CreditFamilyName(int nVersion)
+{
+    switch (nVersion) {
+    case TRANSACTION_BILL_VERSION:    return "bill";
+    case TRANSACTION_HOUSE_VERSION:   return "house";
+    case TRANSACTION_NOTE_VERSION:    return "note";
+    case TRANSACTION_DEPOSIT_VERSION: return "deposit";
+    case TRANSACTION_POOL_VERSION:    return "pool";
+    case TRANSACTION_SETTLE_VERSION:  return "settle";
+    case TRANSACTION_ORACLE_VERSION:  return "oracle";
+    }
+    return nullptr;
+}
+
+std::string CreditOpName(int nVersion, uint8_t nOp)
+{
+    // The header constants with the family prefix dropped, lower-cased: the
+    // same names the explorer's own parser uses (freebank-tx-parser.ts).
+    static const std::map<std::pair<int, uint8_t>, const char*> mapNames = {
+        {{TRANSACTION_BILL_VERSION, BILL_OP_ISSUE}, "issue"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_ENDORSE}, "endorse"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_RETIRE}, "retire"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_CLAIM}, "claim"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_DISCOUNT}, "discount"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_RECOURSE}, "recourse"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE}, "hretire"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM}, "hclaim"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_REGISTER}, "register"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_TOPUP}, "topup"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_ADMIT}, "admit"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_EXIT}, "exit"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_WINDDOWN}, "winddown"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_RECLAIM}, "reclaim"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_ATTEST}, "attest"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_DEFER}, "defer"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_RENEW}, "renew"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_RELEASE}, "release"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_MINT}, "mint"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_TRANSFER}, "transfer"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_REDEEM}, "redeem"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_LOCK}, "lock"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_UNLOCK}, "unlock"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_CLAIM}, "claim"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND}, "demand"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST}, "protest"},
+        {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE}, "originate"},
+        {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_TRANSFER}, "transfer"},
+        {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_WITHDRAW}, "withdraw"},
+        {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_CLAIM}, "claim"},
+        {{TRANSACTION_POOL_VERSION, POOL_OP_CREATE}, "create"},
+        {{TRANSACTION_POOL_VERSION, POOL_OP_ADD_LIQ}, "add_liq"},
+        {{TRANSACTION_POOL_VERSION, POOL_OP_REMOVE_LIQ}, "remove_liq"},
+        {{TRANSACTION_POOL_VERSION, POOL_OP_SWAP}, "swap"},
+        {{TRANSACTION_POOL_VERSION, POOL_OP_RETIRE}, "retire"},
+        {{TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE}, "exchange"},
+        {{TRANSACTION_ORACLE_VERSION, ORACLE_OP_BOND}, "bond"},
+        {{TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT}, "submit"},
+    };
+    const auto it = mapNames.find(std::make_pair(nVersion, nOp));
+    return it != mapNames.end() ? std::string(it->second) : strprintf("op_%u", (unsigned int)nOp);
+}
+
+/** The credit trailer (op byte + payload after nLockTime) of a v11-v17 tx, or
+ *  nothing for any other version. Display only: consensus never reads this. */
+static void CreditToUniv(const CTransaction& tx, UniValue& entry)
+{
+    const char* family = CreditFamilyName(tx.nVersion);
+    if (!family) return;
+    uint8_t nOp = 0;
+    const std::vector<unsigned char>* payload = nullptr;
+    switch (tx.nVersion) {
+    case TRANSACTION_BILL_VERSION:    nOp = tx.nBillOp;    payload = &tx.vchBillPayload;    break;
+    case TRANSACTION_HOUSE_VERSION:   nOp = tx.nHouseOp;   payload = &tx.vchHousePayload;   break;
+    case TRANSACTION_NOTE_VERSION:    nOp = tx.nNoteOp;    payload = &tx.vchNotePayload;    break;
+    case TRANSACTION_DEPOSIT_VERSION: nOp = tx.nDepositOp; payload = &tx.vchDepositPayload; break;
+    case TRANSACTION_POOL_VERSION:    nOp = tx.nPoolOp;    payload = &tx.vchPoolPayload;    break;
+    case TRANSACTION_SETTLE_VERSION:  nOp = tx.nSettleOp;  payload = &tx.vchSettlePayload;  break;
+    case TRANSACTION_ORACLE_VERSION:  nOp = tx.nOracleOp;  payload = &tx.vchOraclePayload;  break;
+    default: return;
+    }
+    UniValue credit(UniValue::VOBJ);
+    credit.pushKV("family", family);
+    credit.pushKV("op", (int)nOp);
+    credit.pushKV("op_name", CreditOpName(tx.nVersion, nOp));
+    credit.pushKV("payload_hex", HexStr(payload->begin(), payload->end()));
+    entry.pushKV("credit", credit);
+}
+
 void TxToUniv(const CTransaction& tx, const uint256& hashBlock, UniValue& entry, bool include_hex, int serialize_flags)
 {
     entry.pushKV("txid", tx.GetHash().GetHex());
@@ -161,6 +256,7 @@ void TxToUniv(const CTransaction& tx, const uint256& hashBlock, UniValue& entry,
     entry.pushKV("version", tx.nVersion);
     entry.pushKV("size", (int)::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));
     entry.pushKV("vsize", (GetTransactionWeight(tx) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR);
+    entry.pushKV("weight", GetTransactionWeight(tx));
     entry.pushKV("locktime", (int64_t)tx.nLockTime);
 
     UniValue vin(UniValue::VARR);
@@ -204,6 +300,8 @@ void TxToUniv(const CTransaction& tx, const uint256& hashBlock, UniValue& entry,
         vout.push_back(out);
     }
     entry.pushKV("vout", vout);
+
+    CreditToUniv(tx, entry);
 
     if (!hashBlock.IsNull())
         entry.pushKV("blockhash", hashBlock.GetHex());

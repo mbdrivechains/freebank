@@ -1106,6 +1106,52 @@ static void EvictStaleHouseNoteOps()
     }
 }
 
+/** Withdrawal poison-row guard (v0.2.13): evict pooled withdrawals the guard
+ * makes invalid for the next block.
+ *
+ * ATMP applies CheckWithdrawalPayable only when the NEXT block is at or past
+ * nWithdrawalGuardHeight, so an unpayable withdrawal admitted while it was
+ * below can still be pooled when the tip reaches H-1 (or when a reorg carries
+ * the chain back across H). A block holding it would be rejected at connect
+ * (bad-withdrawal-unpayable) - TestBlockValidity does not catch it, since
+ * ConnectBlock returns under fJustCheck before its sidechain-object checks -
+ * so every template would yield an invalid BMM block. The block assembler
+ * skips it (BlockAssembler::TestPackageTransactions), so templates stay
+ * valid; this sweep keeps the pool itself consistent with the rule, so the tx
+ * does not sit there until -mempoolexpiry and its owner's wallet sees it leave.
+ *
+ * Runs on every tip change while the guard is active for the next block, not
+ * only at the crossing: a reorg or a pre-H admission between ActivateBestChain
+ * steps can put such a tx back in the pool, and the scan is one script-prefix
+ * test per output. Node policy only - consensus is untouched. External
+ * linkage so the unit suite can drive it (the IsAttestDisplaceable idiom): no
+ * unit fixture can connect a block, so none can reach it through ConnectTip. */
+void EvictUnpayableWithdrawals()
+{
+    AssertLockHeld(cs_main);
+    if (!chainActive.Tip())
+        return;
+    if (!WithdrawalGuardActive(chainActive.Height() + 1, Params().GetConsensus().nWithdrawalGuardHeight))
+        return;
+
+    std::vector<std::pair<CTransactionRef, std::string>> vEvict;
+    {
+        LOCK(mempool.cs);
+        for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
+            std::string strReason;
+            if (TxHasUnpayableWithdrawal(mi->GetTx(), strReason))
+                vEvict.push_back(std::make_pair(mi->GetSharedTx(), strReason));
+        }
+    }
+    for (const std::pair<CTransactionRef, std::string>& e : vEvict) {
+        LogPrintf("%s: evicting unpayable withdrawal %s from mempool (%s)\n",
+                  __func__, e.first->GetHash().ToString(), e.second);
+        // EXPIRY for the same wallet-notification reason as EvictStaleHouseNoteOps.
+        // removeRecursive takes the descendants too: they cannot be mined without it.
+        mempool.removeRecursive(*e.first, MemPoolRemovalReason::EXPIRY);
+    }
+}
+
 void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool fAddToMempool)
 {
     AssertLockHeld(cs_main);
@@ -1145,6 +1191,8 @@ void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool f
     // approver sets, attestation priors) - re-validate against the post-reorg
     // branch and drop whatever no longer connects.
     EvictStaleHouseNoteOps();
+    // The reorg may have carried the chain back across nWithdrawalGuardHeight.
+    EvictUnpayableWithdrawals();
     // Re-limit mempool size, in case we added any transactions
     LimitMempoolSize(mempool, gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000, gArgs.GetArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY) * 60 * 60);
 }
@@ -1256,6 +1304,15 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
             if (!fBurnFound) {
                 return state.DoS(100, false, REJECT_INVALID, "invalid-withdrawal-missing-or-invalid-burn");
+            }
+            // Poison-row guard (v0.2.13): no withdrawal the mainchain
+            // could never pay. Checked for the next block's height, like the
+            // block rule in ConnectBlock. DoS 0: a not-yet-upgraded node may
+            // still relay one around the flag day.
+            std::string strPayable;
+            if (WithdrawalGuardActive(chainActive.Height() + 1, chainparams.GetConsensus().nWithdrawalGuardHeight)
+                    && !CheckWithdrawalPayable(*withdrawal, strPayable)) {
+                return state.DoS(0, false, REJECT_INVALID, "invalid-withdrawal-unpayable", false, strPayable);
             }
         }
     }
@@ -5629,7 +5686,11 @@ bool UndoWriteToDisk(const CBlockUndo& blockundo, CDiskBlockPos& pos, const uint
     return true;
 }
 
-static bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex *pindex)
+} // namespace
+
+// Exported (linkage only) for the read-only RPCs getblockstats and getblock
+// verbosity 2 (per-tx fee), as Core did in #14802. Reads, never writes.
+bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex *pindex)
 {
     CDiskBlockPos pos = pindex->GetUndoPos();
     if (pos.IsNull()) {
@@ -5659,6 +5720,8 @@ static bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex *pindex)
 
     return true;
 }
+
+namespace {
 
 /** Abort with a message */
 bool AbortNode(const std::string& strMessage, const std::string& userMessage="")
@@ -8667,6 +8730,16 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     if (!ClaimWithdrawalBurn(*withdrawal, tx->vout, setClaimedBurns)) {
                         return state.Error("Invalid Withdrawal: invalid-withdrawal-missing-or-invalid-burn");
                     }
+                    // Poison-row guard (v0.2.13, soft fork from
+                    // nWithdrawalGuardHeight): a withdrawal the mainchain can never
+                    // pay is invalid. Family-independent, so every node agrees
+                    // whatever L1 it probed.
+                    std::string strPayable;
+                    if (WithdrawalGuardActive(pindex->nHeight, chainparams.GetConsensus().nWithdrawalGuardHeight)
+                            && !CheckWithdrawalPayable(*withdrawal, strPayable)) {
+                        delete obj;
+                        return state.DoS(100, error("ConnectBlock(): %s", strPayable), REJECT_INVALID, "bad-withdrawal-unpayable");
+                    }
                 }
 
                 // If the object is a withdrawal we do not want the ID to change when
@@ -9140,6 +9213,9 @@ bool CChainState::ConnectTip(CValidationState& state, const CChainParams& chainp
     // slack at a boundary is a PERMANENT brick (a failed template means no
     // block, so no later sweep would ever run).
     EvictStaleHouseNoteOps();
+    // The same height-only staleness for withdrawals at nWithdrawalGuardHeight:
+    // a pre-H admission the guard now rejects.
+    EvictUnpayableWithdrawals();
 
     int64_t nTime6 = GetTimeMicros(); nTimePostConnect += nTime6 - nTime5; nTimeTotal += nTime6 - nTime1;
     LogPrint(BCLog::BENCH, "  - Connect postprocess: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime6 - nTime5) * MILLI, nTimePostConnect * MICRO, nTimePostConnect * MILLI / nBlocksTotal);
@@ -12199,6 +12275,33 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
     // Select only Withdrawals with Withdrawal_UNSPENT status
     SelectUnspentWithdrawal(vWithdrawal);
 
+    // Poison-row guard (v0.2.13, from nWithdrawalGuardHeight): leave out
+    // any row whose payout the mainchain would refuse (undecodable destination,
+    // non-standard script, dust). Before the guard such a row made this function
+    // fail on every attempt - it sorts in, and a bundle without it fails
+    // replication - so one row blocked every peg-out until refunded. The same
+    // skip runs in replication (fReplicationCheck=true), so builders and
+    // validators agree; a node without it (v0.2.12) would reject such a bundle,
+    // hence the flag day. Decode = the bundle's own (MainchainPayoutScript).
+    if (WithdrawalGuardActive(nHeight, Params().GetConsensus().nWithdrawalGuardHeight)) {
+        const CFeeRate dustGuard(DUST_RELAY_TX_FEE);
+        vWithdrawal.erase(std::remove_if(vWithdrawal.begin(), vWithdrawal.end(),
+            [&dustGuard](const SidechainWithdrawal& w) {
+                if (!(w.amount > w.mainchainFee && w.mainchainFee > 0))
+                    return true;
+                const CScript scriptPayout = GetScriptForDestination(DecodeDestination(w.strDestination, true /* fMainchain */));
+                txnouttype whichType;
+                std::string strReasonSkip;
+                if (scriptPayout.empty() || !CoreIsStandard(scriptPayout, whichType, strReasonSkip) || whichType == TX_NULL_DATA)
+                    return true;
+                return CoreIsDust(CTxOut(w.amount - w.mainchainFee, scriptPayout), dustGuard);
+            }), vWithdrawal.end());
+        if (vWithdrawal.empty()) {
+            LogPrintf("%s: No payable withdrawal(s) to create bundle!\n", __func__);
+            return false;
+        }
+    }
+
     // Sort Withdrawals by mainchain fee amount
     SortWithdrawalByFee(vWithdrawal);
 
@@ -12240,6 +12343,8 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
 
         // TODO check IsValidDestination
         // Output to mainchain keyID
+        // CONSENSUS-FROZEN: stored destinations include v0.2.13 carrier strings
+        // (mainchainaddress.h) that rely on this exact decode; do not change it.
         CTxDestination dest = DecodeDestination(withdrawal.strDestination, true /* fMainchain */);
         wjtx.vout.push_back(CTxOut(amountWithdrawal, GetScriptForDestination(dest)));
 
@@ -12397,6 +12502,7 @@ bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vecto
             // Check that every Withdrawal listed in the Withdrawal Bundle is included
             for (const SidechainWithdrawal& w : vWithdrawal) {
                 bool fFound = false;
+                // CONSENSUS-FROZEN decode (see mainchainaddress.h: carrier strings)
                 for (const CTxOut& out : withdrawalBundle->tx.vout) {
                     if (out.nValue == w.amount - w.mainchainFee &&
                             GetScriptForDestination(DecodeDestination(w.strDestination, true)) == out.scriptPubKey) {

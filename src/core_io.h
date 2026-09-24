@@ -7,6 +7,7 @@
 
 #include <amount.h>
 
+#include <stdint.h>
 #include <string>
 #include <vector>
 
@@ -32,5 +33,9 @@ std::string FormatScript(const CScript& script);
 std::string EncodeHexTx(const CTransaction& tx, const int serializeFlags = 0);
 void ScriptPubKeyToUniv(const CScript& scriptPubKey, UniValue& out, bool fIncludeHex);
 void TxToUniv(const CTransaction& tx, const uint256& hashBlock, UniValue& entry, bool include_hex = true, int serialize_flags = 0);
+/** Credit family of a v11-v17 tx ("bill" ... "oracle"), nullptr for any other version. */
+const char* CreditFamilyName(int nVersion);
+/** Op name for a credit family's op byte, "op_<n>" when the headers define none. */
+std::string CreditOpName(int nVersion, uint8_t nOp);
 
 #endif // BITCOIN_CORE_IO_H

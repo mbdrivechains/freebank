@@ -97,6 +97,20 @@ struct Params {
      * 2026-07-28). Every STORED height stays a connect height; only this
      * validity predicate widened. */
     uint32_t nOracleOpWindow;
+    /** Withdrawal poison-row guard (v0.2.13, operator sign-off 2026-09-24:
+     *  0 on main and regtest).
+     *  From this sidechain height: (a) a withdrawal object is valid only if its
+     *  destination yields a standard, non-dust L1 payout under a decode that does
+     *  not depend on the L1 family (CheckWithdrawalPayable) - mempool and block
+     *  rule, a soft fork; (b) the bundle builder, and so replication, SKIPS an
+     *  unspent row whose payout cannot be paid instead of failing - this changes
+     *  what a valid bundle is for chains that already hold such a row, so every
+     *  node must upgrade before this height (flag day). A withdrawal pooled
+     *  before this height is evicted at it (EvictUnpayableWithdrawals) and never
+     *  enters a template (BlockAssembler::TestPackageTransactions). Same
+     *  never-a-CLI-knob rule as nSettleCadence; unit tests move it through a
+     *  const_cast on Params().GetConsensus(). */
+    int nWithdrawalGuardHeight;
     BIP9Deployment vDeployments[MAX_VERSION_BITS_DEPLOYMENTS];
     /** Proof of work parameters */
     uint256 powLimit;

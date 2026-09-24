@@ -86,8 +86,34 @@ known-open, v0.2.7.1 closes a memory leak that fuzzing turned up, v0.2.8 closes
 three consensus defects found by a line-by-line audit of the money paths inherited
 from the upstream sidechain chassis, v0.2.9 makes the node able to follow a
 mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran,
-v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves, and
-v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed:
+v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves,
+v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed, and
+v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers:
+
+- **Unpayable withdrawals are refused by consensus** (v0.2.13). A withdrawal whose L1 payout
+  can never be paid (below the L1 dust limit, or a destination that does not decode) used to
+  be accepted, and then blocked every future withdrawal bundle until its owner refunded it.
+  Such withdrawals are now rejected at the mempool and in blocks, and the bundle builder skips
+  any that already exist. **This is a consensus change, a soft fork active from height 0:**
+  every node that validates the chain should run v0.2.13.
+- **A second withdrawal bundle is possible** (v0.2.13). On the enforcer transport, the guard
+  against proposing a bundle while one is pending counted every bundle the slot had ever seen,
+  so after the first bundle no other could ever be proposed. It now counts only bundles L1 is
+  still tracking, and refuses to propose while L1's withdrawal events cannot be read.
+- **Withdrawal payouts are found by their ID, whatever the L1's opcode** (v0.2.13). eCash beta
+  moved the drivechain opcode from `OP_NOP5` to `OP_NOP8`. After the first payout on such a
+  network, v0.2.12 would have stopped crediting deposits. The node now identifies a paid bundle
+  by recomputing the enforcer's own bundle ID from the L1 transaction, so no opcode is assumed.
+- **Withdrawals to modern L1 addresses** (v0.2.13). `createwithdrawal` now accepts P2SH,
+  P2WPKH, P2WSH and P2TR (taproot) L1 destinations, not only legacy P2PKH. It refuses payouts
+  below the dust limit and refund addresses that are not this wallet's own legacy addresses.
+  `getwithdrawal` shows the L1 form. No consensus change.
+- **Explorer RPCs** (v0.2.13). `getblockstats`, `getindexinfo`, transaction `weight`, per-transaction
+  `fee` in `getblock <hash> 2`, mempool `fees`, `nTx`, and a `credit` object that says what a
+  FreeBank transaction did. An unmodified mempool-style explorer now runs against the node with no
+  translation proxy. No consensus change.
+- **The fixed seed moved to the seed's permanent address** (v0.2.13): `163.47.9.132:8455`, a
+  reserved IP that survives the seed host being replaced. `seed.ecxfreebank.com` points there too.
 
 - **Provision a wallet from a seed** (v0.2.12). `sethdseed` sets the wallet's HD seed from
   a WIF key, so every address the wallet derives is reproducible from that seed — which lets
@@ -216,11 +242,11 @@ from the [release page](https://github.com/mbdrivechains/freebank/releases).
 
 Two things worth knowing before you start:
 
-- **The current network is a stopgap.** FreeBank presently runs against its own
-  project-operated signet — the chain behind [ecxfreebank.com](https://ecxfreebank.com),
-  reset daily. The intended home is the LayerTwo Labs drivechain signet: once FreeBank's
-  slot-130 activation (M1) lands there, the same stack simply points at that network
-  instead.
+- **The live network is the eCash beta.** FreeBank runs as sidechain slot 130 on the eCash
+  beta network, with a public seed at `seed.ecxfreebank.com` (port 8455). The beta L1 comes
+  from eCash's own releases and the enforcer runs with `--network-preset=betanet`. Pin the
+  fork block with `-mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
+  The signet walkthrough below still describes the stack's shape.
 - **The full walkthrough is a separate page**: [`doc/signet.md`](doc/signet.md) —
   written for someone starting from zero, with every dependency linked, the
   network/magic-bytes pitfalls explained, join parameters for the FreeBank signet, and a
@@ -266,6 +292,9 @@ v0.2.9 adds mainnet-family (forknet) L1 support — FreeBank is activated as slo
 the eCash alpha network, and a v0.2.9 node can follow it (see `FREEBANK_GUIDE.md`
 sections 2.3 and 5.2) — and fixes the enforcer identity probe, which had never
 verified. On chains following a signet L1 the withdrawal-address rule is unchanged.
+v0.2.13 is a consensus change (a soft fork from height 0): it refuses withdrawals that can
+never be paid on L1. Chains that never carried such a withdrawal, including the eCash beta at
+the time of release, revalidate unchanged; upgrade every node that validates.
 No consensus-level defect is currently outstanding on this list; the standing
 caveats are the ones above — provisional economic parameters and no third-party
 audit. Still test-coin software: do not use with real value.

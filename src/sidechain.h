@@ -370,6 +370,27 @@ bool ClaimWithdrawalBurn(const SidechainWithdrawal& withdrawal,
                          const std::vector<CTxOut>& vout,
                          std::set<size_t>& setClaimed);
 
+/** Withdrawal poison-row guard (v0.2.13): true iff the withdrawal's
+ *  payout (amount - mainchainFee > 0) goes to a standard, non-dust L1 script
+ *  under a family-independent decode (MainchainPayoutScriptAnyFamily). A row
+ *  failing this could never be paid, and the bundle builder used to fail on it
+ *  forever, blocking every peg-out. Pure. */
+bool CheckWithdrawalPayable(const SidechainWithdrawal& withdrawal, std::string& strReason);
+
+/** Is the withdrawal poison-row guard active at sidechain height nHeight? */
+bool WithdrawalGuardActive(int nHeight, int nGuardHeight);
+
+/** Withdrawal poison-row guard, transaction level: true iff `tx` carries a
+ *  withdrawal object that fails CheckWithdrawalPayable (the first failure's
+ *  reason goes to strReason). Exactly the objects the ConnectBlock guard
+ *  checks. Used where a POOLED transaction meets the guard: ATMP applies it
+ *  only from nWithdrawalGuardHeight, so a withdrawal admitted while the next
+ *  block was below that height can still be pooled when the chain reaches it -
+ *  the mempool sweep evicts it and the block assembler skips it (a block
+ *  holding it would be rejected at connect, on every try). An object that
+ *  does not parse is not reported: ATMP refuses those outright. Pure. */
+bool TxHasUnpayableWithdrawal(const CTransaction& tx, std::string& strReason);
+
 std::string GenerateDepositAddress(const std::string& strDestIn);
 
 bool ParseDepositAddress(const std::string& strAddressIn, std::string& strAddressOut, unsigned int& nSidechainOut);

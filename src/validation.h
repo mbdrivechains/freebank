@@ -50,6 +50,7 @@ class CScriptCheck;
 class CBlockPolicyEstimator;
 class CTxMemPool;
 class CTxUndo;
+class CBlockUndo;
 class CValidationState;
 struct ChainTxData;
 
@@ -424,6 +425,8 @@ void InitScriptExecutionCache();
 /** Functions for disk access for blocks */
 bool ReadBlockFromDisk(CBlock& block, const CDiskBlockPos& pos, const Consensus::Params& consensusParams);
 bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams);
+/** Read a connected block's undo data (rev*.dat); false if absent or corrupt. RPC read path only. */
+bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
 
 /** Functions for validating blocks and updating the block tree */
 

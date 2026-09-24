@@ -109,6 +109,7 @@ BITCOIN_CORE_H = \
   keystore.h \
   dbwrapper.h \
   limitedmap.h \
+  mainchainaddress.h \
   memusage.h \
   merkleblock.h \
   miner.h \
@@ -353,6 +354,7 @@ libbitcoin_common_a_SOURCES = \
   core_write.cpp \
   key.cpp \
   keystore.cpp \
+  mainchainaddress.cpp \
   netaddress.cpp \
   netbase.cpp \
   policy/feerate.cpp \

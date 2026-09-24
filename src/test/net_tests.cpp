@@ -13,6 +13,8 @@
 #include <chainparams.h>
 #include <util.h>
 
+#include <cstring>
+
 class CAddrManSerializationMock : public CAddrMan
 {
 public:
@@ -186,19 +188,34 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
 }
 
 // The main network ships exactly one hardcoded fixed seed: the live FreeBank seed
-// seed.ecxfreebank.com (68.183.235.153:8455). Guards against pnSeed6_main being cleared
-// again, and against a wrong IPv4-mapped byte or port.
+// seed.ecxfreebank.com (163.47.9.132:8455, the seed droplet's reserved IP). Guards against
+// pnSeed6_main being cleared again, against a wrong IPv4-mapped byte or port, and against a
+// silent revert to the v0.2.12 primary IP (68.183.235.153) or to upstream Bitcoin seeds
+// (contrib/seeds/generate-seeds.py).
 BOOST_AUTO_TEST_CASE(mainnet_fixed_seed_is_the_live_seed)
 {
     const auto params = CreateChainParams("main");
     const std::vector<SeedSpec6>& seeds = params->FixedSeeds();
-    BOOST_CHECK_EQUAL(seeds.size(), 1U);
-    // 68.183.235.153:8455 as an IPv4-mapped IPv6 address
-    const uint8_t expected[16] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff,0x44,0xb7,0xeb,0x99};
+    BOOST_REQUIRE_EQUAL(seeds.size(), 1U);
+    // 163.47.9.132:8455 as an IPv4-mapped IPv6 address
+    const uint8_t expected[16] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff,0xa3,0x2f,0x09,0x84};
     for (int i = 0; i < 16; ++i) {
         BOOST_CHECK_EQUAL(seeds.at(0).addr[i], expected[i]);
     }
     BOOST_CHECK_EQUAL(seeds.at(0).port, 8455);
+    BOOST_CHECK_EQUAL(seeds.at(0).port, params->GetDefaultPort());
+    // Round-trip through the same conversion net.cpp's convertSeed6 uses.
+    struct in6_addr ip;
+    memcpy(&ip, seeds.at(0).addr, sizeof(ip));
+    const CService svc(ip, seeds.at(0).port);
+    BOOST_CHECK(svc.IsIPv4());
+    BOOST_CHECK(svc.IsRoutable());
+    BOOST_CHECK_EQUAL(svc.ToStringIPPort(), "163.47.9.132:8455");
+}
+
+BOOST_AUTO_TEST_CASE(regtest_has_no_fixed_seeds)
+{
+    BOOST_CHECK(CreateChainParams("regtest")->FixedSeeds().empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

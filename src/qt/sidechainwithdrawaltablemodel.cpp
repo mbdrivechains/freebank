@@ -16,6 +16,7 @@
 
 #include <bmmcache.h>
 #include <consensus/validation.h>
+#include <mainchainaddress.h>
 #include <policy/withdrawalbundle.h>
 #include <sidechain.h>
 #include <txdb.h>
@@ -198,7 +199,7 @@ void SidechainWithdrawalTableModel::UpdateModel()
         object.id = wt.GetID();
         object.amount = wt.amount;
         object.amountMainchainFee = wt.mainchainFee;
-        object.destination = QString::fromStdString(wt.strDestination);
+        object.destination = QString::fromStdString(MainchainDisplayAddress(wt.strDestination));
         object.nCumulativeWeight = GetTransactionWeight(wjtx);
         object.fMine = fMine;
 

@@ -272,6 +272,11 @@ public:
     std::string operator()(const CNoDestination& no) const { return {}; }
 };
 
+// CONSENSUS-FROZEN for fMainchain=true: withdrawal bundles are built and
+// verified with this decode, and v0.2.13+ stores L1 P2SH / bech32 / taproot
+// withdrawal destinations as "carrier" strings that depend on it exactly
+// (sidechain SCRIPT_ADDRESS prefix, sidechain bech32 HRP, BIP173 checksum).
+// See mainchainaddress.h. Any change here splits the chain.
 CTxDestination DecodeDestination(const std::string& str, const CChainParams& params, bool fMainchain)
 {
     std::vector<unsigned char> data;

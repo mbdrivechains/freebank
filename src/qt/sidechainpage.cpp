@@ -25,6 +25,7 @@
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <init.h>
+#include <mainchainaddress.h>
 #include <miner.h>
 #include <net.h>
 #include <policy/withdrawalbundle.h>
@@ -513,13 +514,18 @@ void SidechainPage::on_pushButtonWithdraw_clicked()
         return;
     }
 
-    // Check destination
-    std::string strDest = ui->payTo->text().toStdString();
-    CTxDestination dest = DecodeDestination(strDest, true);
-    if (!IsValidDestination(dest)) {
+    // Check destination: the user's mainchain (L1) address; the wallet stores
+    // its consensus carrier form (mainchainaddress.h)
+    const std::string strDestL1 = ui->payTo->text().trimmed().toStdString();
+    CScript scriptL1;
+    std::string strParseError;
+    std::string strDest;
+    if (ParseMainchainAddress(strDestL1, scriptL1, strParseError))
+        strDest = EncodeMainchainCarrier(scriptL1);
+    if (strDest.empty()) {
         // Invalid address message box
         messageBox.setWindowTitle("Invalid withdrawal destination!");
-        messageBox.setText("Check the address you have entered and try again.");
+        messageBox.setText(QString::fromStdString("Check the mainchain address you have entered and try again. " + strParseError));
         messageBox.exec();
         return;
     }
@@ -545,7 +551,7 @@ void SidechainPage::on_pushButtonWithdraw_clicked()
     QString strMcFeeAmount = BitcoinUnits::formatWithMainchainUnit(unit, mainchainFeeAmount, false, BitcoinUnits::separatorAlways);
 
     // Show the Withdrawalconfirmation dialog and check results before executing
-    wtConfDialog->SetInfo(strWTAmount, strFeeAmount, strMcFeeAmount, QString::fromStdString(strDest), QString::fromStdString(strRefundDest));
+    wtConfDialog->SetInfo(strWTAmount, strFeeAmount, strMcFeeAmount, QString::fromStdString(EncodeMainchainAddress(scriptL1)), QString::fromStdString(strRefundDest));
     wtConfDialog->exec();
     if (!wtConfDialog->GetConfirmed())
         return;
@@ -1112,7 +1118,7 @@ void SidechainPage::SetCurrentWithdrawalBundle(const std::string& strHash, bool 
         feeItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
         QTableWidgetItem* destItem = new QTableWidgetItem(
-                QString::fromStdString(wt.strDestination));
+                QString::fromStdString(MainchainDisplayAddress(wt.strDestination)));
 
         ui->tableWidgetWTs->setItem(nRows /* row */, 0 /* col */, amountItem);
         ui->tableWidgetWTs->setItem(nRows /* row */, 1 /* col */, feeItem);

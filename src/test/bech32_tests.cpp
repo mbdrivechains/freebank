@@ -64,4 +64,72 @@ BOOST_AUTO_TEST_CASE(bip173_testvectors_invalid)
     }
 }
 
+BOOST_AUTO_TEST_CASE(bip350_testvectors_valid)
+{
+    // BIP350 bech32m valid vectors: DecodeEx reports BECH32M and EncodeM round-trips.
+    static const std::string CASES[] = {
+        "A1LQFN3A",
+        "a1lqfn3a",
+        "an83characterlonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11sg7hg6",
+        "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx",
+        "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8",
+        "split1checkupstagehandshakeupstreamerranterredcaperredlc445v",
+        "?1v759aa",
+    };
+    for (const std::string& str : CASES) {
+        const bech32::DecodeResult dec = bech32::DecodeEx(str);
+        BOOST_CHECK(dec.encoding == bech32::Encoding::BECH32M);
+        std::string recode = bech32::EncodeM(dec.hrp, dec.data);
+        BOOST_CHECK(!recode.empty());
+        BOOST_CHECK(CaseInsensitiveEqual(str, recode));
+        // CONSENSUS-FROZEN: the legacy decoder (used for withdrawal destinations)
+        // must keep rejecting every bech32m string.
+        BOOST_CHECK(bech32::Decode(str).first.empty());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(bip350_testvectors_invalid)
+{
+    static const std::string CASES[] = {
+        " 1xj0phk",
+        "\x7f""1g6xzxy",
+        "\x80""1vctc34",
+        "an84characterslonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11d6pts4",
+        "qyrz8wqd2c9m",
+        "1qyrz8wqd2c9m",
+        "y1b0jsk6g",
+        "lt1igcx5c0",
+        "in1muywd",
+        "mm1crxm3i",
+        "au1s5cgom",
+        "M1VUXWEZ",
+        "16plkw9",
+        "1p2gdwpf",
+    };
+    for (const std::string& str : CASES) {
+        BOOST_CHECK(bech32::DecodeEx(str).encoding == bech32::Encoding::INVALID);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(bech32_decodeex_reports_bip173)
+{
+    // DecodeEx agrees with the legacy Decode on every BIP173 vector and says BECH32.
+    static const std::string CASES[] = {
+        "A12UEL5L",
+        "a12uel5l",
+        "abcdef1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw",
+        "split1checkupstagehandshakeupstreamerranterredcaperred2y9e3w",
+        "?1ezyfcl",
+    };
+    for (const std::string& str : CASES) {
+        const bech32::DecodeResult dec = bech32::DecodeEx(str);
+        const auto legacy = bech32::Decode(str);
+        BOOST_CHECK(dec.encoding == bech32::Encoding::BECH32);
+        BOOST_CHECK_EQUAL(dec.hrp, legacy.first);
+        BOOST_CHECK(dec.data == legacy.second);
+    }
+    // EncodeM refuses an upper-case HRP rather than asserting
+    BOOST_CHECK(bech32::EncodeM("A", {}).empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

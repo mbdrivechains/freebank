@@ -6,6 +6,7 @@
 #define BITCOIN_L1CLIENT_H
 
 #include <amount.h>
+#include <primitives/transaction.h>
 #include <uint256.h>
 
 #include <string>
@@ -141,6 +142,11 @@ L1Transport GetL1Transport();
 /** Process-wide L1 client for the selected transport. */
 L1Client& GetL1Client();
 
+/** The process-wide enforcer-transport client, whatever -mainchaintransport says.
+ *  GetL1Client() returns this same object on the enforcer transport; exposed so
+ *  unit tests can drive the real enforcer methods through a fake -grpcurlbin. */
+L1Client& GetEnforcerL1Client();
+
 /** True if strTransport names a valid -mainchaintransport value. */
 bool IsValidL1Transport(const std::string& strTransport);
 
@@ -208,5 +214,60 @@ struct L1WithdrawalEvent {
 /** Parse a GetTwoWayPegData response into withdrawal-bundle events (deposits
  * ignored). Used by HaveSpent/HaveFailedWithdrawalBundle + ListWithdrawalBundleStatus. */
 bool ParseEnforcerWithdrawalEvents(const UniValue& response, std::vector<L1WithdrawalEvent>& vEvents);
+
+/** Fold withdrawal-bundle events (oldest first, as GetTwoWayPegData returns
+ * them) into the m6ids L1 is STILL tracking for this slot: Submitted adds,
+ * Succeeded/Failed removes. Mirrors the enforcer's pending_m6ids (M3 adds,
+ * M6 removes only the paid m6id, max-age expiry removes) and the legacy
+ * mainchain listwithdrawalstatus (scdb.GetState: live bundles only). Keeps
+ * first-submission order; a repeated Submitted for a pending m6id is counted
+ * once; a Succeeded/Failed with no earlier Submitted is ignored. Pure. */
+std::vector<uint256> PendingM6idsFromEvents(const std::vector<L1WithdrawalEvent>& vEvents);
+
+/** v0.2.13 item 1 - locating a Succeeded M6 on the L1.
+ *
+ * OP_DRIVECHAIN is a per-L1 parameter (enforcer NetworkParams::op_drivechain):
+ * OP_NOP5 0xb4 on BIP300 / alphanet / the regtest bench, OP_NOP8 0xb7 on
+ * betanet, eCash mainnet unpublished. v0.2.12 matched only OP_NOP5, so the
+ * first beta M6 would have halted deposit crediting for good. */
+
+/** OP_DRIVECHAIN byte of a treasury (CTIP) script, exactly
+ *  `<op> 0x01 <nSidechain> OP_TRUE` (4 bytes) with <op> an upgradable NOP
+ *  (OP_NOP1, OP_NOP4..OP_NOP10; never CLTV/CSV), else 0. A cheap SHAPE
+ *  prefilter only: the M6 itself is identified by its m6id. Pure. */
+unsigned char TreasuryScriptOpcode(const CScript& script, unsigned int nSidechain);
+inline bool IsTreasuryScript(const CScript& script, unsigned int nSidechain)
+{ return TreasuryScriptOpcode(script, nSidechain) != 0; }
+
+/** The enforcer's m6id of an L1 M6 that spends a treasury UTXO worth
+ *  nPrevTreasury (port of bip300301_enforcer OpDrivechain::compute_m6id):
+ *  exactly one input; vout[0] a treasury script for nSidechain; fee =
+ *  nPrevTreasury - vout[0] - sum(payouts) >= 0; blind = clear vin and replace
+ *  vout[0] with OP_RETURN PUSH8(fee big-endian); m6id = its txid. False if the
+ *  tx is not M6-shaped or an amount is out of range. Pure. */
+bool ComputeM6id(const CMutableTransaction& mtx, CAmount nPrevTreasury, unsigned int nSidechain, uint256& m6id);
+
+/** One non-coinbase, non-deposit tx of a Succeeded event's L1 block that passed
+ *  the treasury-shape prefilter, with the output its single input spends. */
+struct M6Candidate {
+    int nTx;                    //!< index in the L1 block
+    CMutableTransaction mtx;
+    CAmount nPrevValue;         //!< value of the spent output (T_{n-1} if it is the CTIP)
+    CScript scriptPrev;         //!< script of the spent output
+};
+
+/** The index into vCandidate of the M6 whose m6id is `m6id` and whose input
+ *  spends a treasury output of the same script (the CTIP): -1 if none matches,
+ *  -2 if more than one does (the caller fails closed either way). nMatches gets
+ *  the match count. Opcode-agnostic: a lookalike under another OP_NOPx cannot
+ *  match the enforcer's m6id, and a second (e.g. foreign) M6 in the same block
+ *  has a different m6id. Pure. */
+int LocateM6(const std::vector<M6Candidate>& vCandidate, const uint256& m6id, unsigned int nSidechain, int& nMatches);
+
+/** The double-propose guard's decision from a fetched event history: appends
+ * the still-pending m6ids to vHashWithdrawalBundle and returns true iff there
+ * is at least one (then no new bundle may be proposed). The body of
+ * EnforcerL1Client::ListWithdrawalBundleStatus after the fetch. Pure. */
+bool L1StillTracksWithdrawalBundle(const std::vector<L1WithdrawalEvent>& vEvents, std::vector<uint256>& vHashWithdrawalBundle);
 
 #endif // BITCOIN_L1CLIENT_H

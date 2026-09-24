@@ -6,21 +6,32 @@
 #include "bmmcache.h"
 #include "base58.h"
 #include "chainparams.h"
+#include "consensus/merkle.h"
 #include "consensus/validation.h"
 #include "core_io.h"
+#include "mainchainaddress.h"
+#include "arith_uint256.h"
+#include "consensus/params.h"
+#include <limits>
+#include "policy/corepolicy.h"
 #include "miner.h"
 #include "policy/policy.h"
 #include "random.h"
 #include "script/sigcache.h"
 #include "sidechain.h"
+#include "txdb.h"
 #include "uint256.h"
 #include "util.h"
 #include "utilstrencodings.h"
 #include "validation.h"
+#include "validationinterface.h"
 
 #include "test/test_bitcoin.h"
 
 #include <boost/test/unit_test.hpp>
+
+extern bool g_fMainchainMainFamily; // base58.cpp (A9)
+void EvictUnpayableWithdrawals();    // validation.cpp (withdrawal poison-row guard sweep)
 
 static CFeeRate blockMinFeeRate = CFeeRate(DEFAULT_BLOCK_MIN_TX_FEE);
 
@@ -767,6 +778,605 @@ BOOST_AUTO_TEST_CASE(withdrawal_burn_claim_is_consumed)
         std::vector<CTxOut> vout{burn};
         std::set<size_t> setClaimed;
         BOOST_CHECK(!ClaimWithdrawalBurn(bad, vout, setClaimed));
+    }
+}
+
+// v0.2.13 item 5 / poison rows: withdrawal rows as stored in psidechaintree,
+// fed straight to the bundle builder and verifier (no L1 call on these paths).
+namespace {
+SidechainWithdrawal MakeWithdrawalRow(const std::string& strDest, CAmount nPayout, CAmount nMainchainFee, int n)
+{
+    SidechainWithdrawal wt;
+    wt.nSidechain = THIS_SIDECHAIN;
+    wt.strDestination = strDest;
+    wt.strRefundDestination = "";
+    wt.amount = nPayout + nMainchainFee;
+    wt.mainchainFee = nMainchainFee;
+    wt.status = WITHDRAWAL_UNSPENT;
+    wt.hashBlindTx = ArithToUint256(arith_uint256(n + 1)); // distinct IDs
+    return wt;
+}
+
+/** The L1 family matching this fixture's (regtest) params: -regtest on, so
+ *  mainchain P2PKH uses prefix 111, and carriers use the regtest HRP fbkrt. */
+struct RegtestFamilyScope {
+    std::string strRegtest;
+    bool fMain;
+    RegtestFamilyScope() : strRegtest(gArgs.GetArg("-regtest", "0")), fMain(g_fMainchainMainFamily)
+    {
+        gArgs.ForceSetArg("-regtest", "1");
+        g_fMainchainMainFamily = false;
+    }
+    ~RegtestFamilyScope()
+    {
+        gArgs.ForceSetArg("-regtest", strRegtest);
+        g_fMainchainMainFamily = fMain;
+    }
+};
+
+CScript ScriptFromHex(const std::string& h)
+{
+    const std::vector<unsigned char> v = ParseHex(h);
+    return CScript(v.begin(), v.end());
+}
+
+const std::string L1_P2PKH_REGTEST = "mfcHP2WMCVLsVZA8yrovmhMgxNFW9r98xw"; // 76a914<01..14>88ac
+
+/** Moves the consensus nWithdrawalGuardHeight for one test (the test params
+ *  override - it is never a CLI knob) and restores it however the test exits,
+ *  so a failed REQUIRE cannot leak a moved H into later cases. */
+struct GuardHeightScope {
+    Consensus::Params& consensus;
+    const int nSaved;
+    GuardHeightScope()
+        : consensus(const_cast<Consensus::Params&>(Params().GetConsensus())),
+          nSaved(consensus.nWithdrawalGuardHeight) {}
+    void Set(int nHeight) { consensus.nWithdrawalGuardHeight = nHeight; }
+    void Restore() { consensus.nWithdrawalGuardHeight = nSaved; }
+    ~GuardHeightScope() { Restore(); }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(withdrawal_bundle_pays_carrier_scripts)
+{
+    RegtestFamilyScope family;
+    // Every supported L1 payout type (h20 = 01..14, h32 = 01..20), stored the
+    // way v0.2.13's createwithdrawal stores it
+    const std::vector<std::string> vScriptHex = {
+        "76a9140102030405060708090a0b0c0d0e0f101112131488ac",
+        "a9140102030405060708090a0b0c0d0e0f101112131487",
+        "00140102030405060708090a0b0c0d0e0f1011121314",
+        "00200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "51200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    };
+    std::vector<SidechainWithdrawal> vWrite;
+    for (size_t i = 0; i < vScriptHex.size(); i++) {
+        const std::string strCarrier = EncodeMainchainCarrier(ScriptFromHex(vScriptHex[i]));
+        BOOST_REQUIRE_MESSAGE(!strCarrier.empty(), vScriptHex[i]);
+        vWrite.push_back(MakeWithdrawalRow(strCarrier, COIN, 10000 + i, i));
+    }
+    BOOST_CHECK_EQUAL(vWrite[0].strDestination, L1_P2PKH_REGTEST);
+    BOOST_CHECK_EQUAL(vWrite[4].strDestination, "fbkrt1pqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5z5tpwxqergd3c8g7rusq4stfpm");
+    BOOST_REQUIRE(psidechaintree->WriteWithdrawalUpdate(vWrite));
+
+    CTransactionRef tx, dtx;
+    BOOST_REQUIRE(CreateWithdrawalBundleTx(1, tx, dtx, true /* fReplicationCheck */, false));
+    for (const std::string& strHex : vScriptHex) {
+        const CScript spk = ScriptFromHex(strHex);
+        bool fFound = false;
+        for (const CTxOut& out : tx->vout)
+            fFound |= out.nValue == COIN && out.scriptPubKey == spk;
+        BOOST_CHECK_MESSAGE(fFound, "bundle does not pay " << strHex);
+    }
+    std::string strReason;
+    BOOST_CHECK(CoreIsStandardTx(*tx, true, CFeeRate(DUST_RELAY_TX_FEE), strReason));
+
+    // The verifier accepts it, replication included (what every validator runs)
+    std::string strFail;
+    std::vector<SidechainWithdrawal> vWithdrawal;
+    uint256 hashBundle, hashBundleID;
+    BOOST_CHECK(VerifyWithdrawalBundles(strFail, 1, std::vector<CTransactionRef>{dtx}, vWithdrawal, hashBundle, hashBundleID, true /* fReplicate */));
+    BOOST_CHECK_MESSAGE(strFail.empty(), strFail);
+    BOOST_CHECK(hashBundle == tx->GetHash());
+    BOOST_CHECK_EQUAL(vWithdrawal.size(), vScriptHex.size());
+}
+
+// The withdrawal poison row. Without the guard a dust or undecodable row blocks
+// every bundle; the guard (active from nWithdrawalGuardHeight, 0 on main and
+// regtest since the 2026-09-24 sign-off) makes the builder - and so
+// replication - leave it out. The "before" half moves the guard height above
+// the bundle height (test params override) and shows the v0.2.12 behaviour.
+BOOST_AUTO_TEST_CASE(withdrawal_bundle_poison_row)
+{
+    RegtestFamilyScope family;
+    GuardHeightScope guard;
+    BOOST_CHECK_EQUAL(guard.nSaved, 0);
+
+    std::vector<SidechainWithdrawal> vGood;
+    for (int i = 0; i < 3; i++)
+        vGood.push_back(MakeWithdrawalRow(L1_P2PKH_REGTEST, COIN, 1000, i));
+    BOOST_REQUIRE(psidechaintree->WriteWithdrawalUpdate(vGood));
+
+    CTransactionRef tx, dtx;
+    BOOST_CHECK(CreateWithdrawalBundleTx(1, tx, dtx, true, false));
+
+    for (const std::string strPoison : {"dust", "garbage"}) {
+        SidechainWithdrawal bad = strPoison == std::string("dust")
+            ? MakeWithdrawalRow(L1_P2PKH_REGTEST, 100 /* sats, < 546 */, 5000, 10)
+            : MakeWithdrawalRow("garbage", COIN, 5000, 11);
+        BOOST_REQUIRE(psidechaintree->WriteWithdrawalUpdate({bad}));
+
+        // BEFORE the guard height: the v0.2.12 behaviour - no bundle at all
+        guard.Set(100);
+        BOOST_CHECK_MESSAGE(!CreateWithdrawalBundleTx(1, tx, dtx, true, false), strPoison << " row did not block the pre-guard bundle");
+        guard.Restore();
+
+        // AT/AFTER the guard height: the row is left out, the others are paid,
+        // and the verifier (with replication) accepts the bundle
+        BOOST_REQUIRE_MESSAGE(CreateWithdrawalBundleTx(1, tx, dtx, true, false), strPoison << " row still blocks the bundle");
+        const size_t nDataOutputs = UseCUSFBundleFormat() ? 1 : 2; // fee output (+ legacy return marker)
+        BOOST_CHECK_EQUAL(tx->vout.size(), nDataOutputs + vGood.size());
+        std::string strFail;
+        std::vector<SidechainWithdrawal> vWithdrawal;
+        uint256 hashBundle, hashBundleID;
+        BOOST_CHECK(VerifyWithdrawalBundles(strFail, 1, std::vector<CTransactionRef>{dtx}, vWithdrawal, hashBundle, hashBundleID, true));
+        BOOST_CHECK_MESSAGE(strFail.empty(), strFail);
+        BOOST_CHECK_EQUAL(vWithdrawal.size(), vGood.size());
+        for (const SidechainWithdrawal& w : vWithdrawal)
+            BOOST_CHECK(w.GetID() != bad.GetID());
+
+        bad.status = WITHDRAWAL_SPENT; // tidy for the next case
+        BOOST_REQUIRE(psidechaintree->WriteWithdrawalUpdate({bad}));
+    }
+}
+
+// The block/mempool rule: which withdrawals are payable, independent of the L1 family.
+BOOST_AUTO_TEST_CASE(withdrawal_guard_payable_rule)
+{
+    const std::vector<std::pair<std::string, CAmount>> vPayable = {
+        {"16L5yRNPTuciSgXGHqYwn9N6NeoKqopAu", 546},  // P2PKH, main-family prefix 0
+        {L1_P2PKH_REGTEST, 546},                       // P2PKH, prefix 111
+        {"sJLjAYgP91q8wd7MKjUPZTAhmRri9baprg", 540}, // P2SH carrier
+    };
+    std::string strReason;
+    // Identical answers whatever the node's L1 family (the A9 flag / -regtest)
+    for (const bool fMain : {false, true}) {
+        for (const std::string strRegtest : {"0", "1"}) {
+            const std::string strRegtestSaved = gArgs.GetArg("-regtest", "0");
+            const bool fMainSaved = g_fMainchainMainFamily;
+            gArgs.ForceSetArg("-regtest", strRegtest);
+            g_fMainchainMainFamily = fMain;
+            for (const auto& p : vPayable) {
+                BOOST_CHECK_MESSAGE(CheckWithdrawalPayable(MakeWithdrawalRow(p.first, p.second, 1000, 0), strReason), p.first << ": " << strReason);
+                BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow(p.first, p.second - 1, 1000, 0), strReason)); // dust
+            }
+            // Carriers for the regtest HRP (this fixture's params) - witness dust is lower
+            const std::string cP2WPKH = EncodeMainchainCarrier(ScriptFromHex("00140102030405060708090a0b0c0d0e0f1011121314"));
+            const std::string cP2TR = EncodeMainchainCarrier(ScriptFromHex("51200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"));
+            BOOST_CHECK(CheckWithdrawalPayable(MakeWithdrawalRow(cP2WPKH, 294, 1000, 0), strReason));
+            BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow(cP2WPKH, 293, 1000, 0), strReason));
+            BOOST_CHECK(CheckWithdrawalPayable(MakeWithdrawalRow(cP2TR, 330, 1000, 0), strReason));
+            BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow(cP2TR, 329, 1000, 0), strReason));
+            // Undecodable, a FreeBank P2PKH (prefix 75), empty
+            BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow("garbage", COIN, 1000, 0), strReason));
+            BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow("XBSZw7mydzfL3x926kpTKBZNJCyYbqe9tN", COIN, 1000, 0), strReason));
+            BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow("", COIN, 1000, 0), strReason));
+            gArgs.ForceSetArg("-regtest", strRegtestSaved);
+            g_fMainchainMainFamily = fMainSaved;
+        }
+    }
+    // Payout must be positive
+    SidechainWithdrawal w = MakeWithdrawalRow(L1_P2PKH_REGTEST, COIN, 1000, 0);
+    w.amount = w.mainchainFee;
+    BOOST_CHECK(!CheckWithdrawalPayable(w, strReason));
+    // Activation predicate
+    BOOST_CHECK(WithdrawalGuardActive(10, 10));
+    BOOST_CHECK(!WithdrawalGuardActive(9, 10));
+    BOOST_CHECK(!WithdrawalGuardActive(1000000, std::numeric_limits<int>::max()));
+    // The signed-off heights (operator, 2026-09-24): from genesis on main (the
+    // eCash beta AND mainnet params) and on regtest.
+    BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nWithdrawalGuardHeight, 0);
+    BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nWithdrawalGuardHeight, 0);
+    BOOST_CHECK(WithdrawalGuardActive(0, 0));
+}
+
+namespace {
+/** A spendable coin in the chainstate, as a deposit would leave one: this
+ *  chain's coinbases pay only fees, so TestChain100Setup has no funded coins. */
+COutPoint FundCoinForTest(int n, CAmount nValue)
+{
+    const COutPoint out(ArithToUint256(arith_uint256(0xfb0000 + n)), 0);
+    LOCK(cs_main);
+    pcoinsTip->AddCoin(out, Coin(CTxOut(nValue, CScript() << OP_TRUE), 1, false, false, false, 0), false);
+    return out;
+}
+
+/** A withdrawal transaction as CWallet::CreateWithdrawal lays it out: change
+ *  (here OP_TRUE, so a child can spend it), the burn, the withdrawal object. */
+CTransactionRef MakeWithdrawalTx(const COutPoint& in, CAmount nIn, const std::string& strDest,
+                                 CAmount nPayout, CAmount nMainchainFee)
+{
+    const CAmount nTxFee = 20000;
+    CMutableTransaction mtx;
+    mtx.vin.push_back(CTxIn(in));
+    mtx.vout.push_back(CTxOut(nIn - nPayout - nMainchainFee - nTxFee, CScript() << OP_TRUE));
+    mtx.vout.push_back(CTxOut(nPayout + nMainchainFee, CScript() << OP_RETURN));
+    SidechainWithdrawal wt;
+    wt.nSidechain = THIS_SIDECHAIN;
+    wt.strDestination = strDest;
+    wt.strRefundDestination = "";
+    wt.amount = nPayout + nMainchainFee;
+    wt.mainchainFee = nMainchainFee;
+    wt.hashBlindTx = CTransaction(mtx).GetHash();
+    mtx.vout.push_back(CTxOut(0, wt.GetScript()));
+    return MakeTransactionRef(std::move(mtx));
+}
+
+/** An ordinary spend of an OP_TRUE output to a fresh OP_TRUE output. */
+CTransactionRef MakeSpendTx(const COutPoint& in, CAmount nIn)
+{
+    CMutableTransaction mtx;
+    mtx.vin.push_back(CTxIn(in));
+    mtx.vout.push_back(CTxOut(nIn - 20000, CScript() << OP_TRUE));
+    return MakeTransactionRef(std::move(mtx));
+}
+
+/** Spend output n of `parent` (an OP_TRUE output). */
+CTransactionRef MakeChildTx(const CTransactionRef& parent, uint32_t n)
+{
+    return MakeSpendTx(COutPoint(parent->GetHash(), n), parent->vout[n].nValue);
+}
+
+/** The standardness setting a real node runs with: init.cpp sets
+ *  fRequireStandard from the chain params (false on main and regtest - a
+ *  withdrawal tx carries a non-push OP_RETURN object), but the unit-test
+ *  binary never runs init, so the global keeps its `true` default. */
+struct NodeStandardnessScope {
+    const bool fSaved;
+    NodeStandardnessScope() : fSaved(fRequireStandard) { fRequireStandard = Params().RequireStandard(); }
+    ~NodeStandardnessScope() { fRequireStandard = fSaved; }
+};
+
+/** Empties the (global) mempool when the test ends however it ends: the
+ *  pooled txs spend coins injected into this fixture's pcoinsTip. */
+struct MempoolClearScope {
+    ~MempoolClearScope()
+    {
+        LOCK(cs_main);
+        mempool.clear();
+    }
+};
+
+bool AcceptForTest(const CTransactionRef& tx, std::string& strReject)
+{
+    LOCK(cs_main);
+    CValidationState state;
+    const bool fOk = AcceptToMemoryPool(mempool, state, tx, nullptr /* pfMissingInputs */,
+                                        nullptr /* plTxnReplaced */, true /* bypass_limits */, 0 /* nAbsurdFee */);
+    strReject = state.GetRejectReason();
+    return fOk;
+}
+
+bool BlockHasTx(const CBlock& block, const CTransactionRef& tx)
+{
+    for (const CTransactionRef& t : block.vtx)
+        if (t->GetHash() == tx->GetHash())
+            return true;
+    return false;
+}
+
+bool InMempool(const CTransactionRef& tx)
+{
+    LOCK(mempool.cs);
+    return mempool.exists(tx->GetHash());
+}
+} // namespace
+
+// Card 2's HIGH final-review finding. ATMP applies the guard only when the
+// NEXT block is at or past H, so an unpayable withdrawal admitted below H can
+// still be pooled when the chain reaches H-1. Unfixed, the height-H template
+// includes it and still passes TestBlockValidity (ConnectBlock returns under
+// fJustCheck before its sidechain-object checks), so the node BMM-mines a
+// block that ConnectBlock rejects (bad-withdrawal-unpayable) - on every try
+// while the tx stays pooled, so block production stalls.
+//
+// The unit fixture cannot connect a block (AcceptBlockHeader needs a live
+// mainchain connection; TestChain100Setup's tip stays at genesis), so "the
+// chain reaches H-1" is played by the test params override: the tx is
+// admitted with H two above the tip, then H drops to tip+1, which is exactly
+// the pool state right after the tip change that crosses. Pinned:
+//  1. before H the template carries the tx (v0.2.12 behaviour, still valid);
+//  2. at H the template leaves the tx and its child out, keeps the rest, and
+//     passes TestBlockValidity (BlockAssembler::TestPackageTransactions);
+//  3. the tip-change sweep ConnectTip and UpdateMempoolForReorg run
+//     (EvictUnpayableWithdrawals) evicts the tx and its child and nothing else;
+//  4. at H the mempool rule refuses the tx outright.
+BOOST_AUTO_TEST_CASE(withdrawal_guard_crossing_mempool)
+{
+    MempoolClearScope mempoolClear;
+    RegtestFamilyScope family;
+    GuardHeightScope guard;
+    NodeStandardnessScope standardness;
+    const CScript scriptCoinbase = GetCoinbaseScript();
+    std::string strReject;
+
+    const int nTip = chainActive.Height();
+    guard.Set(nTip + 2); // admission is for block nTip+1: guard inactive
+
+    const CTransactionRef txDust = MakeWithdrawalTx(FundCoinForTest(1, COIN), COIN,
+        L1_P2PKH_REGTEST, 100 /* sats, below the 546 P2PKH dust */, 5000);
+    const CTransactionRef txGarbage = MakeWithdrawalTx(FundCoinForTest(2, COIN), COIN, "garbage", COIN / 10, 5000);
+    const CTransactionRef txGarbageChild = MakeChildTx(txGarbage, 0);    // descends from a poison tx
+    const CTransactionRef txPayable = MakeWithdrawalTx(FundCoinForTest(3, COIN), COIN,
+        L1_P2PKH_REGTEST, 546 /* exactly the P2PKH dust edge: payable */, 5000);
+    const CTransactionRef txPayableChild = MakeChildTx(txPayable, 0);
+    const CTransactionRef txPlain = MakeSpendTx(FundCoinForTest(4, COIN), COIN); // no withdrawal at all
+    const std::vector<CTransactionRef> vPoison = {txDust, txGarbage, txGarbageChild};
+    const std::vector<CTransactionRef> vKeep = {txPayable, txPayableChild, txPlain};
+    for (const std::vector<CTransactionRef>& v : {vPoison, vKeep})
+        for (const CTransactionRef& tx : v)
+            BOOST_REQUIRE_MESSAGE(AcceptForTest(tx, strReject), "pre-H admission refused: " << strReject);
+
+    // 1. Before H the unpayable withdrawals are still valid and mined as before
+    {
+        CBlock block;
+        std::string strError;
+        BOOST_REQUIRE(BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
+            std::vector<CMutableTransaction>(), uint256(), scriptCoinbase));
+        for (const std::vector<CTransactionRef>& v : {vPoison, vKeep})
+            for (const CTransactionRef& tx : v)
+                BOOST_CHECK(BlockHasTx(block, tx));
+    }
+
+    // The chain reaches H-1 with all of them still pooled
+    guard.Set(nTip + 1);
+
+    // 2. The height-H template leaves the poison txs and the child out
+    //    (unfixed: it carries all three, and that block dies at connect)
+    {
+        CBlock block;
+        std::string strError;
+        BOOST_REQUIRE(BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
+            std::vector<CMutableTransaction>(), uint256(), scriptCoinbase));
+        for (const CTransactionRef& tx : vPoison)
+            BOOST_CHECK(!BlockHasTx(block, tx));
+        for (const CTransactionRef& tx : vKeep)
+            BOOST_CHECK(BlockHasTx(block, tx));
+    }
+
+    // 3. The tip-change sweep evicts exactly the poison txs and the child
+    {
+        LOCK(cs_main);
+        EvictUnpayableWithdrawals();
+    }
+    for (const CTransactionRef& tx : vPoison)
+        BOOST_CHECK_MESSAGE(!InMempool(tx), "still pooled at H: " << tx->GetHash().ToString());
+    for (const CTransactionRef& tx : vKeep)
+        BOOST_CHECK(InMempool(tx));
+
+    // 4. At H the mempool rule refuses them outright
+    BOOST_CHECK(!AcceptForTest(txDust, strReject));
+    BOOST_CHECK_EQUAL(strReject, "invalid-withdrawal-unpayable");
+    BOOST_CHECK(!AcceptForTest(txGarbage, strReject));
+    BOOST_CHECK_EQUAL(strReject, "invalid-withdrawal-unpayable");
+
+    // The sweep does nothing while the guard is inactive for the next block
+    guard.Set(nTip + 2);
+    BOOST_REQUIRE(AcceptForTest(txDust, strReject));
+    {
+        LOCK(cs_main);
+        EvictUnpayableWithdrawals();
+    }
+    BOOST_CHECK(InMempool(txDust));
+}
+
+namespace {
+/** What the node reports through CMainSignals::BlockChecked, per block hash
+ *  ("" = valid). ConnectTip calls it synchronously with ConnectBlock's verdict. */
+struct BlockCheckedRecorder : public CValidationInterface {
+    std::map<uint256, std::string> mapReason;
+    BlockCheckedRecorder() { RegisterValidationInterface(this); }
+    ~BlockCheckedRecorder()
+    {
+        UnregisterValidationInterface(this);
+        SyncWithValidationInterfaceQueue(); // no in-flight callback outlives this object
+    }
+    std::string Reason(const uint256& hash) const
+    {
+        const auto it = mapReason.find(hash);
+        return it == mapReason.end() ? "(never checked)" : it->second;
+    }
+protected:
+    void BlockChecked(const CBlock& block, const CValidationState& state) override
+    {
+        mapReason[block.GetHash()] = state.IsValid() ? "" : state.GetRejectReason();
+    }
+};
+
+/** In-memory house/bill/pool/asset DBs for one test. A real connect reads
+ *  their best-block markers and flushes them; TestingSetup, under which no
+ *  block ever connects, does not create them. */
+struct SideDBScope {
+    std::unique_ptr<BitAssetDB> asset;
+    std::unique_ptr<BillDB> bill;
+    std::unique_ptr<HouseDB> house;
+    std::unique_ptr<PoolDB> pool;
+    SideDBScope()
+    {
+        asset.swap(passettree);
+        bill.swap(pbilltree);
+        house.swap(phousetree);
+        pool.swap(ppooltree);
+        passettree.reset(new BitAssetDB(1 << 20, true /* fMemory */));
+        pbilltree.reset(new BillDB(1 << 20, true /* fMemory */));
+        phousetree.reset(new HouseDB(1 << 20, true /* fMemory */));
+        ppooltree.reset(new PoolDB(1 << 20, true /* fMemory */));
+    }
+    ~SideDBScope()
+    {
+        passettree.swap(asset);
+        pbilltree.swap(bill);
+        phousetree.swap(house);
+        ppooltree.swap(pool);
+    }
+};
+
+/** The miner's own block on the current tip (coinbase with the height,
+ *  prev-block and version commits, from GenerateBMMBlock), with `tx`
+ *  appended by hand - past the template's skip of unpayable withdrawals. */
+std::shared_ptr<const CBlock> BlockWithTx(const CTransactionRef& tx, const CScript& scriptCoinbase)
+{
+    CBlock block;
+    std::string strError;
+    BOOST_REQUIRE_MESSAGE(BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
+        std::vector<CMutableTransaction>(), uint256(), scriptCoinbase), strError);
+    BOOST_REQUIRE_EQUAL(block.vtx.size(), 1U); // empty mempool: coinbase only
+    {
+        // The earliest valid timestamp: a current one would latch
+        // IsInitialBlockDownload() to false for every later test in the process
+        LOCK(cs_main);
+        block.nTime = chainActive.Tip()->GetMedianTimePast() + 1;
+    }
+    block.vtx.push_back(tx);
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    return std::make_shared<const CBlock>(block);
+}
+
+/** Feeds a block to the node's own entry point, ProcessNewBlock -> AcceptBlock
+ *  -> ActivateBestChain -> ConnectTip -> ConnectBlock(fJustCheck=false): the
+ *  path every mined or relayed block takes. Returns ProcessNewBlock's result
+ *  (true = stored and handed to ActivateBestChain; ConnectBlock's verdict
+ *  arrives through BlockChecked).
+ *
+ *  There is no mainchain here. CheckBlock and AcceptBlockHeader open an L1
+ *  RPC (CheckMainchainConnection) and verify BMM for every block except the
+ *  genesis, and ConnectTip always passes fCheckBMM, which is why no block
+ *  ever connects in this fixture (TestChain100Setup's tip stays at genesis).
+ *  Both of those read the genesis hash from the global Params(), while
+ *  ConnectBlock's genesis shortcut reads the chainparams the node is handed.
+ *  So for this one call the global names THIS block as the genesis, which
+ *  skips its L1, BMM and header checks and nothing else, and the node is
+ *  handed an unmodified copy of the params (genesis intact, the test's H), so
+ *  ConnectBlock runs in full: every tx, the sidechain-object loop with the
+ *  poison-row guard, and the index writes. */
+bool ProcessBlockWithoutMainchain(const std::shared_ptr<const CBlock>& pblock)
+{
+    const CChainParams paramsConnect(Params());
+    struct GenesisScope {
+        Consensus::Params& consensus;
+        const uint256 hashSaved;
+        explicit GenesisScope(const uint256& hash)
+            : consensus(const_cast<Consensus::Params&>(Params().GetConsensus())),
+              hashSaved(consensus.hashGenesisBlock)
+        {
+            consensus.hashGenesisBlock = hash;
+        }
+        ~GenesisScope() { consensus.hashGenesisBlock = hashSaved; }
+    } genesis(pblock->GetHash());
+    return ProcessNewBlock(paramsConnect, pblock, true /* fForceProcessing */, nullptr, true /* fUnitTest */);
+}
+
+const CBlockIndex* TipForTest()
+{
+    LOCK(cs_main);
+    return chainActive.Tip();
+}
+
+bool BlockFailedForTest(const uint256& hash)
+{
+    LOCK(cs_main);
+    const BlockMap::const_iterator it = mapBlockIndex.find(hash);
+    return it != mapBlockIndex.end() && (it->second->nStatus & BLOCK_FAILED_VALID);
+}
+
+std::vector<SidechainWithdrawal> WithdrawalRows()
+{
+    return psidechaintree->GetWithdrawals(THIS_SIDECHAIN);
+}
+} // namespace
+
+// Card 2's consensus half: from nWithdrawalGuardHeight, ConnectBlock refuses a
+// block carrying a withdrawal the mainchain can never pay (validation.cpp,
+// bad-withdrawal-unpayable). No other test reaches that line: the template
+// leaves such a withdrawal out, and TestBlockValidity returns under fJustCheck
+// before the check. So each block here is the miner's own template with the
+// withdrawal tx appended by hand (what a v0.2.12 or hostile miner produces),
+// fed through ProcessNewBlock to a real ConnectBlock (ProcessBlockWithoutMainchain).
+// Pinned, at the shipped regtest H = 0:
+//  1. a sub-dust payout, and separately an undecodable destination: the block
+//     is refused with bad-withdrawal-unpayable and marked failed, the tip does
+//     not move, and no withdrawal row is written;
+//  2. the same block shape paying exactly the P2PKH dust edge connects and
+//     writes its row.
+// With the flag day moved to H = tip + 2 (the test params override):
+//  3. below H a sub-dust block still connects (blocks before the soft fork
+//     stay valid); at H the same shape is refused.
+BOOST_AUTO_TEST_CASE(withdrawal_guard_connectblock)
+{
+    GuardHeightScope guard;
+    SideDBScope sideDBs;
+    BlockCheckedRecorder checked;
+    const CScript scriptCoinbase = GetCoinbaseScript();
+    BOOST_REQUIRE_EQUAL(guard.nSaved, 0);
+    // No L1 socket is ever opened: ProcessNewBlock still asks the mainchain for
+    // its block hashes (UpdateMainBlockHashCache, failure tolerated under
+    // fUnitTest), and the jsonrpc client returns before connecting when it
+    // has no credentials.
+    BOOST_REQUIRE(gArgs.GetArg("-rpcuser", "").empty() && gArgs.GetArg("-rpcpassword", "").empty());
+
+    const CBlockIndex* const pindexGenesis = TipForTest();
+    BOOST_REQUIRE_EQUAL(pindexGenesis->nHeight, 0);
+
+    // 1. Unpayable: refused by ConnectBlock, nothing applied
+    const std::vector<std::pair<std::string, CTransactionRef>> vUnpayable = {
+        {"dust", MakeWithdrawalTx(FundCoinForTest(21, COIN), COIN, L1_P2PKH_REGTEST, 100 /* sats, below the 546 P2PKH dust */, 5000)},
+        {"garbage", MakeWithdrawalTx(FundCoinForTest(22, COIN), COIN, "garbage", COIN / 10, 5000)},
+    };
+    for (const auto& p : vUnpayable) {
+        const std::shared_ptr<const CBlock> pblock = BlockWithTx(p.second, scriptCoinbase);
+        BOOST_CHECK_MESSAGE(ProcessBlockWithoutMainchain(pblock), p.first << ": block not stored");
+        BOOST_CHECK_EQUAL(checked.Reason(pblock->GetHash()), "bad-withdrawal-unpayable");
+        BOOST_CHECK_MESSAGE(TipForTest() == pindexGenesis, p.first << ": tip advanced");
+        BOOST_CHECK_MESSAGE(BlockFailedForTest(pblock->GetHash()), p.first << ": block not marked failed");
+        BOOST_CHECK_MESSAGE(WithdrawalRows().empty(), p.first << ": withdrawal row written");
+    }
+
+    // 2. The same shape, payable (exactly the P2PKH dust edge): connects
+    {
+        const std::shared_ptr<const CBlock> pblock = BlockWithTx(
+            MakeWithdrawalTx(FundCoinForTest(23, COIN), COIN, L1_P2PKH_REGTEST, 546, 5000), scriptCoinbase);
+        BOOST_CHECK(ProcessBlockWithoutMainchain(pblock));
+        BOOST_CHECK_EQUAL(checked.Reason(pblock->GetHash()), "");
+        BOOST_REQUIRE_MESSAGE(TipForTest()->GetBlockHash() == pblock->GetHash(), "payable block did not connect");
+        BOOST_CHECK_EQUAL(TipForTest()->nHeight, 1);
+        const std::vector<SidechainWithdrawal> vRow = WithdrawalRows();
+        BOOST_REQUIRE_EQUAL(vRow.size(), 1U);
+        BOOST_CHECK_EQUAL(vRow[0].strDestination, L1_P2PKH_REGTEST);
+        BOOST_CHECK_EQUAL(vRow[0].amount - vRow[0].mainchainFee, 546);
+    }
+
+    // 3. The flag day: H = 3
+    guard.Set(TipForTest()->nHeight + 2);
+    {
+        // Height 2, below H: the v0.2.12 rule, the sub-dust block connects
+        const std::shared_ptr<const CBlock> pblock = BlockWithTx(
+            MakeWithdrawalTx(FundCoinForTest(24, COIN), COIN, L1_P2PKH_REGTEST, 100, 5000), scriptCoinbase);
+        BOOST_CHECK(ProcessBlockWithoutMainchain(pblock));
+        BOOST_CHECK_EQUAL(checked.Reason(pblock->GetHash()), "");
+        BOOST_REQUIRE_MESSAGE(TipForTest()->GetBlockHash() == pblock->GetHash(), "pre-H sub-dust block did not connect");
+        BOOST_CHECK_EQUAL(TipForTest()->nHeight, 2);
+        BOOST_CHECK_EQUAL(WithdrawalRows().size(), 2U);
+    }
+    {
+        // Height 3, at H: refused
+        const CBlockIndex* const pindexTip = TipForTest();
+        const std::shared_ptr<const CBlock> pblock = BlockWithTx(
+            MakeWithdrawalTx(FundCoinForTest(25, COIN), COIN, L1_P2PKH_REGTEST, 100, 5000), scriptCoinbase);
+        BOOST_CHECK(ProcessBlockWithoutMainchain(pblock));
+        BOOST_CHECK_EQUAL(checked.Reason(pblock->GetHash()), "bad-withdrawal-unpayable");
+        BOOST_CHECK(TipForTest() == pindexTip);
+        BOOST_CHECK(BlockFailedForTest(pblock->GetHash()));
+        BOOST_CHECK_EQUAL(WithdrawalRows().size(), 2U);
     }
 }
 

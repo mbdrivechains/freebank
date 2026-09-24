@@ -9,11 +9,16 @@
 #include <base58.h>
 #include <script/standard.h>
 #include <hash.h>
+#include <mainchainaddress.h>
+#include <policy/corepolicy.h>
+#include <policy/feerate.h>
+#include <policy/policy.h>
 #include <streams.h>
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
 
 #include <algorithm>
+#include <memory>
 #include <sstream>
 
 const uint32_t nType = 1;
@@ -363,6 +368,51 @@ bool ClaimDepositPayoutOutput(const CTxOut& required,
             setClaimed.insert(i);
             return true;
         }
+    }
+    return false;
+}
+
+bool CheckWithdrawalPayable(const SidechainWithdrawal& withdrawal, std::string& strReason)
+{
+    if (!(withdrawal.amount > 0 && withdrawal.mainchainFee > 0 && withdrawal.amount > withdrawal.mainchainFee)) {
+        strReason = "withdrawal payout must be positive";
+        return false;
+    }
+    const CScript scriptPayout = MainchainPayoutScriptAnyFamily(withdrawal.strDestination);
+    if (scriptPayout.empty()) {
+        strReason = "withdrawal destination does not decode to a mainchain script";
+        return false;
+    }
+    txnouttype whichType;
+    std::string strStandard;
+    if (!CoreIsStandard(scriptPayout, whichType, strStandard) || whichType == TX_NULL_DATA) {
+        strReason = "withdrawal destination is not a standard mainchain script";
+        return false;
+    }
+    if (CoreIsDust(CTxOut(withdrawal.amount - withdrawal.mainchainFee, scriptPayout), CFeeRate(DUST_RELAY_TX_FEE))) {
+        strReason = "withdrawal payout is below the mainchain dust threshold";
+        return false;
+    }
+    return true;
+}
+
+bool WithdrawalGuardActive(int nHeight, int nGuardHeight)
+{
+    return nHeight >= nGuardHeight;
+}
+
+bool TxHasUnpayableWithdrawal(const CTransaction& tx, std::string& strReason)
+{
+    for (const CTxOut& txout : tx.vout) {
+        std::vector<unsigned char> vch;
+        if (!txout.scriptPubKey.IsSidechainObj(vch))
+            continue;
+        std::unique_ptr<SidechainObj> obj(ParseSidechainObj(vch));
+        if (!obj || obj->sidechainop != DB_SIDECHAIN_WITHDRAWAL_OP)
+            continue;
+        const SidechainWithdrawal* withdrawal = dynamic_cast<const SidechainWithdrawal*>(obj.get());
+        if (withdrawal && !CheckWithdrawalPayable(*withdrawal, strReason))
+            return true;
     }
     return false;
 }

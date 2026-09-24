@@ -546,13 +546,32 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 // - transaction finality (locktime)
 // - premature witness (in case segwit transactions are added to mempool before
 //   segwit activation)
+// - the withdrawal poison-row guard (from nWithdrawalGuardHeight)
 bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package)
 {
+    // Withdrawal poison-row guard (v0.2.13): from nWithdrawalGuardHeight a block
+    // holding an unpayable withdrawal is invalid (ConnectBlock
+    // bad-withdrawal-unpayable), but ATMP applies the rule only from that height,
+    // so one admitted earlier can still be pooled here. Included, the template
+    // still passes TestBlockValidity (ConnectBlock returns under fJustCheck
+    // before its sidechain-object checks), so we would BMM-mine a block that
+    // ConnectBlock then rejects - again on every template while the tx stays
+    // pooled: block production stalls and each try spends an L1 BMM bid. The
+    // mempool sweep (EvictUnpayableWithdrawals) evicts it on the tip change;
+    // this skip is the template-side half and holds whatever path the pool
+    // took. Testing the whole package also drops every descendant, because a
+    // descendant's package always carries its unconfirmed withdrawal ancestor.
+    const bool fWithdrawalGuard = WithdrawalGuardActive(nHeight, chainparams.GetConsensus().nWithdrawalGuardHeight);
     for (const CTxMemPool::txiter it : package) {
         if (!IsFinalTx(it->GetTx(), nHeight, nLockTimeCutoff))
             return false;
         if (!fIncludeWitness && it->GetTx().HasWitness())
             return false;
+        std::string strUnpayable;
+        if (fWithdrawalGuard && TxHasUnpayableWithdrawal(it->GetTx(), strUnpayable)) {
+            LogPrintf("%s: skipping unpayable withdrawal %s (%s)\n", __func__, it->GetTx().GetHash().ToString(), strUnpayable);
+            return false;
+        }
     }
     return true;
 }
