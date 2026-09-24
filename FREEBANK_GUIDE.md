@@ -6,7 +6,7 @@ This file is meant to be *complete enough on its own* that you can hand it to an
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
 you through running FreeBank, standing up a bank, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
-or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.12), and the quick start in
+or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.14), and the quick start in
 section 3 was run verbatim against the release binaries. Where something is designed but
 not built, it says so.
 
@@ -152,14 +152,15 @@ coinbase scan).
 ### 2.4 Verifying what you download
 
 Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.12** (`sethdseed` to provision a
-wallet from a seed, and the live fixed seed shipped as a bootstrap fallback; v0.2.11 hardened the
-enforcer transport, v0.2.10 added the baked DNS seed for zero-config peer discovery, §5.3):
-`freebank-0.2.12-x86_64-linux-gnu.tar.gz`, sha256
-`d3c59222fb31eb7036097ad643c24c1efd3cf5b0eec504f3c19e027180c52ad6`; its source is the
-commit the public tag `v0.2.12` points at (`git rev-parse 'v0.2.12^{commit}'`). The commands
+arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.14** (`coinbasetag=` so block
+producers can name their blocks, §5.2, and a mempool that refuses sidechain objects no honest
+transaction carries; v0.2.13 hardened the withdrawal path for a shared eCash slot, added the explorer
+RPCs and moved the fixed seed to `163.47.9.132:8455`; v0.2.12 added `sethdseed`):
+`freebank-0.2.14-x86_64-linux-gnu.tar.gz`, sha256
+`8e997c20079210b15748f4c4119491cc677d1bcb351722b734729db5ead42f67`; its source is the
+commit the public tag `v0.2.14` points at (`git rev-parse 'v0.2.14^{commit}'`). The commands
 below are written for v0.2.8 because that is what the sidechain proposal on alpha
-commits to — substitute `0.2.12` to verify the current binaries the same way.
+commits to — substitute `0.2.14` to verify the current binaries the same way.
 
 The sidechain proposal (M1) that activated slot 130 on alpha commits to v0.2.8:
 
@@ -915,13 +916,13 @@ testing, nothing more. For real money, run your own validated stack (5.2).
    attaches to the unsigned binary:
    ```bash
    # Linux:
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/freebank-0.2.12-x86_64-linux-gnu.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.14/freebank-0.2.14-x86_64-linux-gnu.tar.gz
    # macOS (Apple Silicon):
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/freebank-0.2.12-arm64-apple-darwin.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.14/freebank-0.2.14-arm64-apple-darwin.tar.gz
 
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.12/SHA256SUMS
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.14/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing        # macOS: shasum -a 256 -c  -> OK
-   tar -xzf freebank-0.2.12-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
+   tar -xzf freebank-0.2.14-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
    xattr -dr com.apple.quarantine freebank 2>/dev/null   # macOS only: clear quarantine if present
    ```
    `freebankd` shells out to `grpcurl` for the enforcer transport — install it (`brew install grpcurl`,
@@ -1509,7 +1510,7 @@ touches it.
 
 ---
 
-## 8. Built vs designed — as of v0.2.12
+## 8. Built vs designed — as of v0.2.14
 
 | Area | Status |
 |---|---|
@@ -1532,9 +1533,12 @@ touches it.
 | Cash-credit lines | **Not built** (designed) |
 | Strict-DER / low-S payload signatures; L1 identity pin | Built |
 | Forknet (alpha/mainnet-style L1) support in `freebankd` | Built (v0.2.9): `-mainchainblockpin` + address prefix from the L1 family; verified live on alphanet |
+| Withdrawals to P2SH, bech32 and taproot L1 addresses | Built (v0.2.13) |
+| Explorer RPCs (`getblockstats`, `getindexinfo`, per-transaction weight) | Built (v0.2.13) |
+| Block-producer name in the coinbase (`coinbasetag=`) | Built (v0.2.14); self-declared, not consensus |
 | Third-party audit; mutation testing | **Not done** |
 
-Test posture: 28 end-to-end integration gates and 446 unit cases, including two-node
+Test posture: 34 end-to-end integration gates and 489 unit cases, including two-node
 byte-compare convergence against a never-connected control node, reorg coverage across
 every operation family, `-reindex` reproduction, and a property harness for bills. Three
 inherited consensus-critical defects (from the chassis) were found and fixed in v0.2.8;
