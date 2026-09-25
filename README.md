@@ -88,8 +88,16 @@ from the upstream sidechain chassis, v0.2.9 makes the node able to follow a
 mainnet-family L1 (the eCash alpha network) and fixes an identity check that never ran,
 v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves,
 v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed,
-v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers, and
-v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send:
+v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers,
+v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send, and
+v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block:
+
+- **An unreadable eCash transaction next to a withdrawal payout no longer stops deposit
+  crediting** (v0.2.15). When the node looks through an L1 block for a paid bundle, it now skips
+  transactions it cannot decode (an eCash version-3/TRUC transaction is one) and any that are not
+  version 1 or 2, instead of halting deposit crediting for good. The payout itself is always
+  version 2, so it is still found. Withdrawal bundle records also stop carrying 4 bytes of
+  leftover memory. No consensus change.
 
 - **Block producers can name their blocks** (v0.2.14). One config line, `coinbasetag=<name>` in
   `freebank.conf` (or `-coinbasetag=`), writes the producer's name into the coinbase of every block
@@ -259,6 +267,20 @@ Two things worth knowing before you start:
   from eCash's own releases and the enforcer runs with `--network-preset=betanet`. Pin the
   fork block with `-mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
   The signet walkthrough below still describes the stack's shape.
+- **Next to BitWindow.** A BitWindow set to the eCash network already runs the beta L1 (with
+  the REST and txindex FreeBank needs) and the enforcer, and ships `grpcurl` in its `assets/bin`.
+  Once both are fully synced, run the release binary beside them. It finds the seed by itself:
+
+  ```
+  freebankd -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 \
+    -mainchainrest=127.0.0.1:18302 -mainchainchain=main \
+    -mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042 \
+    -grpcurlbin=<BitWindow data dir>/assets/bin/grpcurl
+  ```
+
+  Don't also start FreeBank from BitWindow's Sidechains tab. Released BitWindow versions (up
+  to 0.2.230) launch it with the Rust command line, and the C++ node will not start that way.
+  If you ran the Rust FreeBank before, wipe its data first.
 - **The full walkthrough is a separate page**: [`doc/signet.md`](doc/signet.md) —
   written for someone starting from zero, with every dependency linked, the
   network/magic-bytes pitfalls explained, join parameters for the FreeBank signet, and a

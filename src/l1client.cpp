@@ -122,7 +122,8 @@ private:
      * ordering + cumulative CTIP amount) and the tx-index-in-block (nTx), so we
      * fetch them from the mainchain node's REST interface. */
     bool RestGet(const std::string& strPath, std::string& strBody);
-    bool RestGetRawTx(const uint256& txid, CMutableTransaction& tx);
+    L1TxFetch RestFetchRawTx(const uint256& txid, CMutableTransaction& tx);
+    bool RestGetRawTx(const uint256& txid, CMutableTransaction& tx) { return RestFetchRawTx(txid, tx) == L1TxFetch::OK; }
     bool RestGetBlockTxids(const uint256& hashBlock, std::vector<uint256>& vTxid);
 
     /* Fetch all withdrawal-bundle events for THIS_SIDECHAIN via GetTwoWayPegData. */
@@ -463,6 +464,72 @@ int LocateM6(const std::vector<M6Candidate>& vCandidate, const uint256& m6id, un
     if (nMatches > 1)
         return -2;
     return nIndex;
+}
+
+L1TxFetch ClassifyRawTxBody(std::string body, CMutableTransaction& tx)
+{
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
+        body.pop_back();
+
+    // A non-hex body is a misbehaving REST server, not an unreadable tx.
+    if (body.empty() || !IsHex(body))
+        return L1TxFetch::FAILED;
+
+    return DecodeHexTx(tx, body) ? L1TxFetch::OK : L1TxFetch::UNDECODABLE;
+}
+
+// An L1 tx the M6 scan can read as-is: it decoded, and it is v1 or v2. FreeBank's
+// decoder gives v3 and v10-17 its own layouts, so it misreads such L1 txs.
+static bool IsPlainL1Tx(L1TxFetch r, const CMutableTransaction& mtx)
+{
+    return r == L1TxFetch::OK && (mtx.nVersion == 1 || mtx.nVersion == 2);
+}
+
+bool BuildM6Candidates(const std::vector<uint256>& vBlockTxid, const std::set<uint256>& setDepositTxid,
+                       unsigned int nSidechain,
+                       const std::function<L1TxFetch(const uint256&, CMutableTransaction&)>& fetch,
+                       std::vector<M6Candidate>& vCandidate, int& nSkipped, std::string& strError)
+{
+    vCandidate.clear();
+    nSkipped = 0;
+    // Candidates: non-coinbase, non-deposit txs with one input and a
+    // treasury-shaped vout[0] (any upgradable NOP), plus the output their
+    // input spends.
+    for (size_t j = 1; j < vBlockTxid.size(); j++) {
+        if (setDepositTxid.count(vBlockTxid[j]))
+            continue;
+
+        CMutableTransaction mtx;
+        const L1TxFetch r = fetch(vBlockTxid[j], mtx);
+        if (r == L1TxFetch::FAILED) {
+            strError = strprintf("REST raw-tx fetch failed for %s", vBlockTxid[j].ToString());
+            return false;
+        }
+        if (!IsPlainL1Tx(r, mtx)) {
+            nSkipped++;
+            continue;
+        }
+        if (mtx.vin.size() != 1 || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, nSidechain))
+            continue;
+
+        CMutableTransaction mtxPrev;
+        const L1TxFetch rPrev = fetch(mtx.vin[0].prevout.hash, mtxPrev);
+        if (rPrev != L1TxFetch::FAILED && !IsPlainL1Tx(rPrev, mtxPrev)) {
+            nSkipped++;
+            continue;
+        }
+        if (rPrev != L1TxFetch::OK || mtx.vin[0].prevout.n >= mtxPrev.vout.size()) {
+            strError = strprintf("REST fetch of the output spent by %s failed", vBlockTxid[j].ToString());
+            return false;
+        }
+        M6Candidate c;
+        c.nTx = (int)j;
+        c.mtx = mtx;
+        c.nPrevValue = mtxPrev.vout[mtx.vin[0].prevout.n].nValue;
+        c.scriptPrev = mtxPrev.vout[mtx.vin[0].prevout.n].scriptPubKey;
+        vCandidate.push_back(c);
+    }
+    return true;
 }
 
 //
@@ -939,19 +1006,12 @@ EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale)
     return r;
 }
 
-bool EnforcerL1Client::RestGetRawTx(const uint256& txid, CMutableTransaction& tx)
+L1TxFetch EnforcerL1Client::RestFetchRawTx(const uint256& txid, CMutableTransaction& tx)
 {
     std::string body;
     if (!RestGet("/rest/tx/" + txid.ToString() + ".hex", body))
-        return false;
-
-    while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
-        body.pop_back();
-
-    if (!IsHex(body))
-        return false;
-
-    return DecodeHexTx(tx, body);
+        return L1TxFetch::FAILED;
+    return ClassifyRawTxBody(body, tx);
 }
 
 bool EnforcerL1Client::RestGetBlockTxids(const uint256& hashBlock, std::vector<uint256>& vTxid)
@@ -1136,7 +1196,8 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     // synthesize the equivalent entry from Succeeded withdrawal events. Like
     // the deposits above this re-emits every event each call; the miner's
     // HaveDepositNonAmount dedup is the backstop. Fail the batch closed on
-    // any error.
+    // any error, except that other L1 txs in the M6's block which FreeBank
+    // cannot decode are skipped (BuildM6Candidates, v0.2.15).
     std::vector<L1WithdrawalEvent> vEvent;
     if (!ParseEnforcerWithdrawalEvents(result, vEvent)) {
         LogPrintf("ERROR Enforcer client: failed to parse withdrawal events (batch failed closed)\n");
@@ -1186,41 +1247,24 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
                 return std::vector<SidechainDeposit>();
             }
 
-            // Candidates: non-coinbase, non-deposit txs with one input and a
-            // treasury-shaped vout[0] (any upgradable NOP), plus the output
-            // their input spends.
             std::vector<M6Candidate> vCandidate;
-            for (size_t j = 1; j < vBlockTxid.size(); j++) {
-                if (setDepositTxid.count(vBlockTxid[j]))
-                    continue;
-
-                CMutableTransaction mtx;
-                if (!RestGetRawTx(vBlockTxid[j], mtx)) {
-                    LogPrintf("ERROR Enforcer client: REST raw-tx fetch failed for %s (batch failed closed)\n", vBlockTxid[j].ToString());
-                    return std::vector<SidechainDeposit>();
-                }
-                if (mtx.vin.size() != 1 || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, THIS_SIDECHAIN))
-                    continue;
-
-                CMutableTransaction mtxPrev;
-                if (!RestGetRawTx(mtx.vin[0].prevout.hash, mtxPrev) || mtx.vin[0].prevout.n >= mtxPrev.vout.size()) {
-                    LogPrintf("ERROR Enforcer client: REST fetch of the output spent by %s failed (batch failed closed)\n", vBlockTxid[j].ToString());
-                    return std::vector<SidechainDeposit>();
-                }
-                M6Candidate c;
-                c.nTx = (int)j;
-                c.mtx = mtx;
-                c.nPrevValue = mtxPrev.vout[mtx.vin[0].prevout.n].nValue;
-                c.scriptPrev = mtxPrev.vout[mtx.vin[0].prevout.n].scriptPubKey;
-                vCandidate.push_back(c);
+            int nSkipped = 0;
+            std::string strCandidateError;
+            auto fetch = [this](const uint256& txid, CMutableTransaction& mtx) { return RestFetchRawTx(txid, mtx); };
+            if (!BuildM6Candidates(vBlockTxid, setDepositTxid, THIS_SIDECHAIN, fetch, vCandidate, nSkipped, strCandidateError)) {
+                LogPrintf("ERROR Enforcer client: %s (batch failed closed)\n", strCandidateError);
+                return std::vector<SidechainDeposit>();
             }
+            if (nSkipped)
+                LogPrintf("Enforcer client: skipped %d L1 tx(s) FreeBank cannot decode (e.g. v3/TRUC) while locating M6 %s in block %s\n",
+                          nSkipped, ev.m6id.ToString(), ev.hashMainBlock.ToString());
 
             int nMatches = 0;
             const int nIndex = LocateM6(vCandidate, ev.m6id, THIS_SIDECHAIN, nMatches);
             if (nIndex < 0) {
                 LogPrintf("ERROR Enforcer client: expected exactly 1 M6 with m6id %s in block %s, found %d "
-                          "(%u treasury-shaped candidates: OP_NOPx 0x01 <slot> OP_TRUE at vout[0]) (batch failed closed)\n",
-                          ev.m6id.ToString(), ev.hashMainBlock.ToString(), nMatches, vCandidate.size());
+                          "(%u treasury-shaped candidates: OP_NOPx 0x01 <slot> OP_TRUE at vout[0]; %d undecodable txs skipped) (batch failed closed)\n",
+                          ev.m6id.ToString(), ev.hashMainBlock.ToString(), nMatches, vCandidate.size(), nSkipped);
                 return std::vector<SidechainDeposit>();
             }
             nTxM6 = vCandidate[nIndex].nTx;

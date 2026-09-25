@@ -4,6 +4,7 @@
 
 #include <l1client.h>
 
+#include <core_io.h>
 #include <fs.h>
 #include <primitives/transaction.h>
 #include <test/test_bitcoin.h>
@@ -11,6 +12,8 @@
 #include <univalue.h>
 #include <utilstrencodings.h>
 #include <validation.h>
+
+#include <map>
 
 #include <boost/test/unit_test.hpp>
 
@@ -645,6 +648,153 @@ BOOST_AUTO_TEST_CASE(l1client_locate_m6)
     v = {candidate(3, m6Beta, nTreasury, scriptNop8), candidate(5, dup, nTreasury, scriptNop8)};
     BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), -2);
     BOOST_CHECK_EQUAL(nMatches, 2);
+}
+
+// v0.2.15: an L1 tx FreeBank cannot decode in the same block as our M6 (an eCash
+// v3/TRUC tx: FreeBank's v3 layout reads a replay byte TRUC does not have) is
+// skipped instead of failing the whole deposit batch, which v0.2.14 did for good.
+BOOST_AUTO_TEST_CASE(l1client_build_m6_candidates_skips_undecodable)
+{
+    const CAmount nTreasury = 10 * COIN, nFee = 5000;
+    const CScript scriptNop8 = ScriptHex("b7018251");
+
+    // The CTIP our M6 spends, and our M6 (built by the enforcer: v2)
+    CMutableTransaction ctip;
+    ctip.nVersion = 2;
+    ctip.vin.push_back(CTxIn(COutPoint(uint256S("c1"), 0)));
+    ctip.vout.push_back(CTxOut(nTreasury, scriptNop8));
+    const uint256 keyCtip = uint256S("c7"), keyM6 = uint256S("e6"), keyTruc = uint256S("7c"), keyLook = uint256S("1a");
+    const CMutableTransaction blindedOurs = MakeBlindedBundle(nFee, Payouts(0x11));
+    const uint256 m6idOurs = CTransaction(blindedOurs).GetHash();
+    const CMutableTransaction m6 = IntoM6(blindedOurs, 0xb7, COutPoint(keyCtip, 0), nTreasury, nFee);
+
+    // An eCash v3 (TRUC) tx: plain Bitcoin serialization, nVersion 3, no replay byte
+    CMutableTransaction plain;
+    plain.nVersion = 2;
+    plain.vin.push_back(CTxIn(COutPoint(uint256S("f0"), 1)));
+    plain.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    std::string strTruc = EncodeHexTx(CTransaction(plain));
+    BOOST_REQUIRE_EQUAL(strTruc.substr(0, 8), "02000000");
+    strTruc.replace(0, 8, "03000000");
+    CMutableTransaction probe;
+    BOOST_CHECK(!DecodeHexTx(probe, strTruc)); // the root cause
+    BOOST_CHECK(DecodeHexTx(probe, EncodeHexTx(CTransaction(plain)))); // the same tx as v2 is fine
+
+    // A fake L1: txid -> raw hex, decoded with FreeBank's own decoder like RestFetchRawTx
+    std::map<uint256, std::string> mapL1 = {
+        {keyCtip, EncodeHexTx(CTransaction(ctip))},
+        {keyM6, EncodeHexTx(CTransaction(m6))},
+        {keyTruc, strTruc},
+    };
+    auto fetch = [&mapL1](const uint256& txid, CMutableTransaction& mtx) {
+        const auto it = mapL1.find(txid);
+        if (it == mapL1.end())
+            return L1TxFetch::FAILED;
+        return ClassifyRawTxBody(it->second, mtx); // what RestFetchRawTx does after RestGet
+    };
+    const uint256 keyCoinbase = uint256S("cb");
+    std::vector<M6Candidate> vCandidate;
+    int nSkipped = -1, nMatches = -1;
+    std::string strError;
+
+    // A TRUC tx beside our M6: skipped, and our M6 is still found
+    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyTruc, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK_EQUAL(nSkipped, 1);
+    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
+    BOOST_CHECK_EQUAL(vCandidate[0].nTx, 2);
+    BOOST_CHECK_EQUAL(vCandidate[0].nPrevValue, nTreasury);
+    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
+
+    // A treasury-shaped lookalike whose spent output sits in an undecodable tx: skipped too
+    CMutableTransaction look = IntoM6(MakeBlindedBundle(0, Payouts(0x55)), 0xb7, COutPoint(keyTruc, 0), COIN * 2, 0);
+    mapL1[keyLook] = EncodeHexTx(CTransaction(look));
+    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyLook, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK_EQUAL(nSkipped, 1);
+    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
+    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
+
+    // Deposit txs are excluded before any fetch
+    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyTruc, keyM6}, {keyTruc}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK_EQUAL(nSkipped, 0);
+    BOOST_CHECK_EQUAL(vCandidate.size(), 1U);
+
+    // A fetch that FAILED (transport, not decoding) still fails the batch closed
+    const uint256 keyMissing = uint256S("0d");
+    strError.clear();
+    BOOST_CHECK(!BuildM6Candidates({keyCoinbase, keyMissing, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK(strError.find(keyMissing.ToString()) != std::string::npos);
+    // ...and so does a failed fetch of a candidate's spent output
+    mapL1.erase(keyCtip);
+    strError.clear();
+    BOOST_CHECK(!BuildM6Candidates({keyCoinbase, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK(strError.find("spent by " + keyM6.ToString()) != std::string::npos);
+    mapL1[keyCtip] = EncodeHexTx(CTransaction(ctip));
+
+    // A v3 tx FreeBank's decoder reads "successfully" (its own replay-byte layout),
+    // treasury-shaped, spending an output the L1 does not have: skipped by version.
+    // Without the v1/v2 rule its prevout fetch FAILED and failed the batch closed.
+    CMutableTransaction crafted;
+    crafted.nVersion = 3;
+    crafted.vin.push_back(CTxIn(COutPoint(uint256S("0e"), 0)));
+    crafted.vout.push_back(CTxOut(COIN, scriptNop8));
+    const uint256 keyCrafted = uint256S("cf");
+    mapL1[keyCrafted] = EncodeHexTx(CTransaction(crafted));
+    CMutableTransaction probeCrafted;
+    BOOST_REQUIRE(ClassifyRawTxBody(mapL1[keyCrafted], probeCrafted) == L1TxFetch::OK);
+    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyCrafted, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK_EQUAL(nSkipped, 1);
+    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
+    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
+
+    // Residual, pinned on purpose: if the CTIP our M6 spends sits in an
+    // undecodable tx (a v3 M5, issue 1), our M6 is skipped, and a second M6 with
+    // the SAME m6id spending another treasury output of the same value would be
+    // selected instead. That needs a v3 M5 (the deposit loop fails closed on it
+    // first) and an attacker paying every bundle payout again; v0.2.14 halted on
+    // the same block. The consensus release's L1-canonical decoder removes it.
+    const uint256 keyM6OnTruc = uint256S("e7"), keyCtip2 = uint256S("c8"), keyDup = uint256S("d0");
+    mapL1[keyM6OnTruc] = EncodeHexTx(CTransaction(IntoM6(blindedOurs, 0xb7, COutPoint(keyTruc, 0), nTreasury, nFee)));
+    CMutableTransaction ctip2(ctip);
+    ctip2.vin[0].prevout = COutPoint(uint256S("c2"), 0);
+    mapL1[keyCtip2] = EncodeHexTx(CTransaction(ctip2));
+    mapL1[keyDup] = EncodeHexTx(CTransaction(IntoM6(blindedOurs, 0xb7, COutPoint(keyCtip2, 0), nTreasury, nFee)));
+    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyM6OnTruc, keyDup}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK_EQUAL(nSkipped, 1);
+    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
+    BOOST_CHECK_EQUAL(vCandidate[0].nTx, 2);
+    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
+
+    // If our M6 itself were undecodable it is skipped, and LocateM6 still fails closed
+    mapL1[keyM6] = "03000000" + EncodeHexTx(CTransaction(m6)).substr(8);
+    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
+    BOOST_CHECK_EQUAL(nSkipped, 1);
+    BOOST_CHECK(vCandidate.empty());
+    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), -1);
+}
+
+// v0.2.15: a REST /rest/tx/<txid>.hex body. A body that is not a tx (empty, not
+// hex, odd length) is a misbehaving server: FAILED, which fails the batch closed.
+// Valid hex FreeBank cannot decode is UNDECODABLE, which the M6 scan may skip.
+BOOST_AUTO_TEST_CASE(l1client_classify_raw_tx_body)
+{
+    CMutableTransaction plain;
+    plain.nVersion = 2;
+    plain.vin.push_back(CTxIn(COutPoint(uint256S("f0"), 1)));
+    plain.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    const std::string strV2 = EncodeHexTx(CTransaction(plain));
+    std::string strTruc = strV2;
+    strTruc.replace(0, 8, "03000000");
+
+    CMutableTransaction tx;
+    BOOST_CHECK(ClassifyRawTxBody("", tx) == L1TxFetch::FAILED);
+    BOOST_CHECK(ClassifyRawTxBody(" \r\n", tx) == L1TxFetch::FAILED);
+    BOOST_CHECK(ClassifyRawTxBody("<html>502 Bad Gateway</html>", tx) == L1TxFetch::FAILED);
+    BOOST_CHECK(ClassifyRawTxBody(strV2.substr(0, strV2.size() - 1), tx) == L1TxFetch::FAILED); // odd length
+    BOOST_CHECK(ClassifyRawTxBody(strV2.substr(0, strV2.size() - 2), tx) == L1TxFetch::UNDECODABLE); // truncated
+    BOOST_CHECK(ClassifyRawTxBody("00", tx) == L1TxFetch::UNDECODABLE);
+    BOOST_CHECK(ClassifyRawTxBody(strTruc, tx) == L1TxFetch::UNDECODABLE);
+    BOOST_CHECK(ClassifyRawTxBody(strV2 + "\n", tx) == L1TxFetch::OK);
+    BOOST_CHECK(CTransaction(tx).GetHash() == CTransaction(plain).GetHash());
 }
 
 // A7: the gRPC enforcer identity-pin decision logic. Kept pure (no gRPC/REST I/O)

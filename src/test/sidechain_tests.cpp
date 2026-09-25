@@ -12,7 +12,9 @@
 #include "mainchainaddress.h"
 #include "arith_uint256.h"
 #include "consensus/params.h"
+#include <cstring>
 #include <limits>
+#include <new>
 #include "policy/corepolicy.h"
 #include "miner.h"
 #include "policy/policy.h"
@@ -44,6 +46,58 @@ static BlockAssembler AssemblerForTest(const CChainParams& params) {
 }
 
 BOOST_FIXTURE_TEST_SUITE(sidechain_tests, TestChain100Setup)
+
+// GCC's -flifetime-dse treats the fill before a placement-new as a dead store and
+// drops it at -O2; this barrier keeps the 0xA5 bytes in memory.
+static void PoisonBarrier(unsigned char* buf) { __asm__ __volatile__("" : : "r"(buf) : "memory"); }
+
+// v0.2.15: default-constructed sidechain objects carry no stale memory. The
+// producer default-constructs the bundle object and writes it into the coinbase;
+// before v0.2.15 its nFailHeight went out as 4 bytes of stack. Each object is
+// built in a buffer filled with 0xA5, so a field the constructor skips reads back
+// as 0xA5..., not a lucky zero.
+BOOST_AUTO_TEST_CASE(sidechain_obj_default_init)
+{
+    {
+        alignas(SidechainWithdrawalBundle) unsigned char buf[sizeof(SidechainWithdrawalBundle)];
+        memset(buf, 0xA5, sizeof(buf));
+        PoisonBarrier(buf);
+        SidechainWithdrawalBundle* b = new (buf) SidechainWithdrawalBundle();
+        BOOST_CHECK_EQUAL(b->nSidechain, 0);
+        BOOST_CHECK_EQUAL(b->nHeight, 0);
+        BOOST_CHECK_EQUAL(b->nFailHeight, 0);
+        BOOST_CHECK_EQUAL(b->status, WITHDRAWAL_BUNDLE_CREATED);
+        // The object in the coinbase ends status, nHeight, nFailHeight
+        const CScript script = b->GetScript();
+        BOOST_REQUIRE(script.size() >= 9);
+        const std::vector<unsigned char> vTail(script.end() - 9, script.end());
+        const std::vector<unsigned char> vExpect = {(unsigned char)WITHDRAWAL_BUNDLE_CREATED, 0, 0, 0, 0, 0, 0, 0, 0};
+        BOOST_CHECK(vTail == vExpect);
+        b->~SidechainWithdrawalBundle();
+    }
+    {
+        alignas(SidechainDeposit) unsigned char buf[sizeof(SidechainDeposit)];
+        memset(buf, 0xA5, sizeof(buf));
+        PoisonBarrier(buf);
+        SidechainDeposit* d = new (buf) SidechainDeposit();
+        BOOST_CHECK_EQUAL(d->nSidechain, 0);
+        BOOST_CHECK_EQUAL(d->amtUserPayout, 0);
+        BOOST_CHECK_EQUAL(d->nBurnIndex, 0U);
+        BOOST_CHECK_EQUAL(d->nTx, 0U);
+        d->~SidechainDeposit();
+    }
+    {
+        alignas(SidechainWithdrawal) unsigned char buf[sizeof(SidechainWithdrawal)];
+        memset(buf, 0xA5, sizeof(buf));
+        PoisonBarrier(buf);
+        SidechainWithdrawal* w = new (buf) SidechainWithdrawal();
+        BOOST_CHECK_EQUAL(w->nSidechain, 0);
+        BOOST_CHECK_EQUAL(w->amount, 0);
+        BOOST_CHECK_EQUAL(w->mainchainFee, 0);
+        BOOST_CHECK_EQUAL(w->status, WITHDRAWAL_UNSPENT);
+        w->~SidechainWithdrawal();
+    }
+}
 
 BOOST_AUTO_TEST_CASE(sidechain_obj)
 {
@@ -879,6 +933,55 @@ BOOST_AUTO_TEST_CASE(withdrawal_bundle_pays_carrier_scripts)
     BOOST_CHECK_MESSAGE(strFail.empty(), strFail);
     BOOST_CHECK(hashBundle == tx->GetHash());
     BOOST_CHECK_EQUAL(vWithdrawal.size(), vScriptHex.size());
+}
+
+// v0.2.15: the bundle object the producer writes ends status, nHeight, nFailHeight
+// (9 bytes). Before v0.2.15 nFailHeight went out as 4 bytes of stack. The producer
+// now writes 'c' and eight zeros, and validators ignore those bytes either way:
+// replication compares the bundle tx and GetID zeroes them. So v0.2.14 and v0.2.15
+// nodes accept each other's bundles: not a consensus change.
+BOOST_AUTO_TEST_CASE(withdrawal_bundle_tail_bytes_ignored)
+{
+    RegtestFamilyScope family;
+    std::vector<SidechainWithdrawal> vWrite;
+    for (int i = 0; i < (int)DEFAULT_MIN_WITHDRAWAL_CREATE_BUNDLE; i++) // the producer's minimum
+        vWrite.push_back(MakeWithdrawalRow(L1_P2PKH_REGTEST, COIN, 1000, i));
+    BOOST_REQUIRE(psidechaintree->WriteWithdrawalUpdate(vWrite));
+
+    // The producer's path (no replication check)
+    CTransactionRef tx, dtx;
+    BOOST_REQUIRE(CreateWithdrawalBundleTx(1, tx, dtx, false, false));
+    int nObj = -1;
+    for (size_t i = 0; i < dtx->vout.size(); i++) {
+        const CScript& spk = dtx->vout[i].scriptPubKey;
+        if (spk.size() > 6 && spk[0] == OP_RETURN && spk[1] == 0xAC && spk[2] == 0xDC && spk[3] == 0xF6 &&
+                spk[4] == 0x6F && spk[5] == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP)
+            nObj = (int)i;
+    }
+    BOOST_REQUIRE(nObj >= 0);
+    const CScript& spkObj = dtx->vout[nObj].scriptPubKey;
+    const std::vector<unsigned char> vTail(spkObj.end() - 9, spkObj.end());
+    const std::vector<unsigned char> vZero = {(unsigned char)WITHDRAWAL_BUNDLE_CREATED, 0, 0, 0, 0, 0, 0, 0, 0};
+    BOOST_CHECK(vTail == vZero);
+
+    // Any bytes there (a v0.2.14 producer's stack, or a hostile producer's): same verdict, same IDs
+    CMutableTransaction mdtx(*dtx);
+    const std::vector<unsigned char> vJunk = {(unsigned char)WITHDRAWAL_BUNDLE_FAILED, 0x78, 0x56, 0x34, 0x12, 0xA5, 0xA5, 0xA5, 0xA5};
+    CScript& spkJunk = mdtx.vout[nObj].scriptPubKey;
+    for (size_t k = 0; k < vJunk.size(); k++)
+        spkJunk[spkJunk.size() - 9 + k] = vJunk[k];
+    // VerifyWithdrawalBundles appends to vWithdrawal, so each call gets its own
+    std::string strFail;
+    std::vector<SidechainWithdrawal> vWithdrawal, vWithdrawalJunk;
+    uint256 hashBundle, hashBundleID, hashBundleJunk, hashBundleIDJunk;
+    BOOST_CHECK(VerifyWithdrawalBundles(strFail, 1, std::vector<CTransactionRef>{dtx}, vWithdrawal, hashBundle, hashBundleID, true));
+    BOOST_CHECK_MESSAGE(strFail.empty(), strFail);
+    strFail.clear();
+    BOOST_CHECK(VerifyWithdrawalBundles(strFail, 1, std::vector<CTransactionRef>{MakeTransactionRef(mdtx)}, vWithdrawalJunk, hashBundleJunk, hashBundleIDJunk, true));
+    BOOST_CHECK_MESSAGE(strFail.empty(), strFail);
+    BOOST_CHECK(hashBundle == hashBundleJunk);
+    BOOST_CHECK(hashBundleID == hashBundleIDJunk);
+    BOOST_CHECK_EQUAL(vWithdrawalJunk.size(), vWithdrawal.size());
 }
 
 // The withdrawal poison row. Without the guard a dust or undecodable row blocks

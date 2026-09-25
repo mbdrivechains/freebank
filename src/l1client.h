@@ -9,6 +9,8 @@
 #include <primitives/transaction.h>
 #include <uint256.h>
 
+#include <functional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -263,6 +265,36 @@ struct M6Candidate {
  *  match the enforcer's m6id, and a second (e.g. foreign) M6 in the same block
  *  has a different m6id. Pure. */
 int LocateM6(const std::vector<M6Candidate>& vCandidate, const uint256& m6id, unsigned int nSidechain, int& nMatches);
+
+/** How one L1 raw-tx fetch ended. UNDECODABLE: the L1 returned the bytes but
+ *  FreeBank's decoder cannot read them. An eCash v3 (TRUC) tx is one: FreeBank's
+ *  own v3 layout reads a replay byte after nVersion, which TRUC does not have. */
+enum class L1TxFetch { OK, FAILED, UNDECODABLE };
+
+/** Classify a REST /rest/tx/<txid>.hex body (trailing whitespace trimmed): FAILED
+ *  if it is empty or not hex (a misbehaving server, not an unreadable tx), else OK
+ *  or UNDECODABLE by FreeBank's DecodeHexTx. Pure. */
+L1TxFetch ClassifyRawTxBody(std::string body, CMutableTransaction& tx);
+
+/** v0.2.15 - the M6 candidates of a Succeeded event's L1 block (vBlockTxid in
+ *  block order, coinbase first; deposit txs excluded). fetch(txid, mtx) fetches
+ *  one L1 tx. A FAILED fetch fails closed: false, with strError set.
+ *
+ *  Skipped (nSkipped counts them): a tx that is UNDECODABLE, a tx whose nVersion
+ *  is not 1 or 2, and a candidate whose spent output sits in such a tx. Our M6
+ *  can never be one of the first two: its m6id is the txid of the blinded bundle
+ *  including nVersion (enforcer compute_m6id), into_m6 keeps that version, and
+ *  FreeBank builds bundles as v2, so any L1 tx matching our m6id is a v2 tx that
+ *  decodes. The version rule also stops a crafted v3 tx that FreeBank's decoder
+ *  misparses into a treasury-shaped tx from failing the batch at its prevout.
+ *  Our M6 IS skipped if the CTIP it spends sits in an undecodable tx (a v3 M5,
+ *  issue 1); LocateM6 then fails closed, and the deposit loop has already failed
+ *  closed on that M5. v0.2.14 failed the whole batch on any undecodable tx in
+ *  the M6's L1 block, so one TRUC tx there halted deposit crediting for good. */
+bool BuildM6Candidates(const std::vector<uint256>& vBlockTxid, const std::set<uint256>& setDepositTxid,
+                       unsigned int nSidechain,
+                       const std::function<L1TxFetch(const uint256&, CMutableTransaction&)>& fetch,
+                       std::vector<M6Candidate>& vCandidate, int& nSkipped, std::string& strError);
 
 /** The double-propose guard's decision from a fetched event history: appends
  * the still-pending m6ids to vHashWithdrawalBundle and returns true iff there

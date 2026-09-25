@@ -161,7 +161,7 @@ struct SidechainWithdrawal: public SidechainObj {
     char status;
     uint256 hashBlindTx; // Hash of transaction minus the serialization output
 
-    SidechainWithdrawal(void) : SidechainObj() { sidechainop = DB_SIDECHAIN_WITHDRAWAL_OP; status = WITHDRAWAL_UNSPENT; }
+    SidechainWithdrawal(void) : SidechainObj() { sidechainop = DB_SIDECHAIN_WITHDRAWAL_OP; nSidechain = 0; amount = 0; mainchainFee = 0; status = WITHDRAWAL_UNSPENT; }
     virtual ~SidechainWithdrawal(void) { }
 
     ADD_SERIALIZE_METHODS
@@ -202,7 +202,11 @@ struct SidechainWithdrawalBundle: public SidechainObj {
     int nFailHeight;
     char status;
 
-    SidechainWithdrawalBundle(void) : SidechainObj() { sidechainop = DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP; status = WITHDRAWAL_BUNDLE_CREATED; nHeight = 0;}
+    // Every scalar is set: the producer default-constructs the bundle and writes
+    // it into the coinbase, and before v0.2.15 nFailHeight went out as 4 bytes
+    // of stack. Validators ignore those bytes (replication compares the bundle
+    // tx; GetID zeroes them), so this is not a consensus change.
+    SidechainWithdrawalBundle(void) : SidechainObj() { sidechainop = DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP; nSidechain = 0; nHeight = 0; nFailHeight = 0; status = WITHDRAWAL_BUNDLE_CREATED; }
     virtual ~SidechainWithdrawalBundle(void) { }
 
     ADD_SERIALIZE_METHODS
@@ -243,7 +247,7 @@ struct SidechainDeposit : public SidechainObj {
     uint32_t nTx; // Deposit transaction number in mainchain block
     uint256 hashMainchainBlock;
 
-    SidechainDeposit(void) : SidechainObj() { sidechainop = DB_SIDECHAIN_DEPOSIT_OP; }
+    SidechainDeposit(void) : SidechainObj() { sidechainop = DB_SIDECHAIN_DEPOSIT_OP; nSidechain = 0; amtUserPayout = 0; nBurnIndex = 0; nTx = 0; }
     virtual ~SidechainDeposit(void) { }
 
     SidechainDeposit(const SidechainDeposit* d) {
