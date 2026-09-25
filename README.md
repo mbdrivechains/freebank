@@ -95,7 +95,7 @@ v0.2.14 lets block producers name their blocks and tightens the mempool to what 
   `freebank.conf` (or `-coinbasetag=`), writes the producer's name into the coinbase of every block
   the node produces, after the height and the extra nonce, so explorers can credit the block to
   whoever won the BMM. 1 to 64 printable ASCII characters; the same downloaded binary for everyone.
-  Without it, the FreeBank explorer shows the block as "unknown producer". See
+  Without it, the [FreeBank explorer](https://explorer.ecxfreebank.com) shows the block as "unknown producer". See
   `FREEBANK_GUIDE.md` section 5.2. No consensus change: older nodes accept tagged blocks.
 - **The mempool refuses deposit and withdrawal-bundle objects outside the coinbase** (v0.2.14).
   A loose transaction that carries a deposit object or a withdrawal-bundle object is refused, as

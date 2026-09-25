@@ -871,7 +871,7 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   `freebankd` at startup with a message saying why. Write the name bare, without quotes (quotes
   become part of the tag). No slashes are needed, and keep `#` out of it (in `freebank.conf` a `#`
   starts a comment). To stop tagging, delete the line; do not use `nocoinbasetag`, which tags every
-  block `0`. Without a tag, the FreeBank explorer shows your blocks as "unknown producer"; v0.2.13
+  block `0`. Without a tag, the [FreeBank explorer](https://explorer.ecxfreebank.com) shows your blocks as "unknown producer"; v0.2.13
   and earlier cannot set one. An eCash pool can reuse the tag it already has on eCash, and the
   FreeBank explorer recognises it with its existing logo; anyone else gets a name and a logo through
   a PR to the eCash pool list,
@@ -1452,7 +1452,7 @@ touches it.
   a mainchain block. `refreshbmm` returns non-zero on an empty tick — normal.
 - Poll to a target height; a bid can be spent on a mainchain block that carries no
   commitment.
-- **The FreeBank explorer shows your blocks as "unknown producer":** set `coinbasetag=<name>` in
+- **The [FreeBank explorer](https://explorer.ecxfreebank.com) shows your blocks as "unknown producer":** set `coinbasetag=<name>` in
   `freebank.conf` (5.2) and restart `freebankd`. It is read at startup and names the blocks
   templated after that; blocks already made keep no tag.
 - After a daemon restart the first BMM request may miss the first mainchain block; the tip
