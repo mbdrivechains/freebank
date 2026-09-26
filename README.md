@@ -93,21 +93,31 @@ v0.2.14 lets block producers name their blocks and tightens the mempool to what 
 v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block, and
 v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe:
 
-- **BitWindow can bid for FreeBank blocks** (v0.2.16). Three new RPCs, `get_block_template`,
-  `connect_block` and `get_bmm_inclusions`, let BitWindow's blind-merged-mining engine build, bid for
-  and connect FreeBank blocks. A template stays the same for one eCash round, and `connect_block`
-  answers `false` only for a block that is really invalid; anything temporary is a retryable error
-  (-40), so a paid bid is never abandoned by mistake. `-bmmbidder=engine` makes the engine the node's
-  only bidder, and `-bmmblockmaxweight` caps template size. `setcoinbasetag` changes the coinbase tag
-  at runtime.
-- **`-reindex` no longer depends on luck** (v0.2.16). Before replaying blocks, the node now fills its
-  eCash block cache and waits for the enforcer if it is behind (`-replaycachewait`, default 600 s
-  without progress). Before, a replay could start with an empty cache and throw the chain away.
-  The cache loaders now log what they loaded.
+- **BitWindow can bid for FreeBank blocks** (v0.2.16; BitWindow's side is
+  [LayerTwo Labs drivechain-frontends PR #2402](https://github.com/LayerTwo-Labs/drivechain-frontends/pull/2402),
+  not yet in a BitWindow release). Three new RPCs, `get_block_template`, `connect_block` and
+  `get_bmm_inclusions`, let BitWindow's blind-merged-mining engine build, bid for and connect FreeBank
+  blocks. They need the enforcer transport; `get_block_template` also needs a loaded wallet (the
+  coinbase pays this node). A template stays the same for one eCash round. `connect_block` answers `false` only when the block will not connect (it is invalid, or
+  another block already holds its height); anything temporary is a retryable error (-40), so a paid bid
+  is never abandoned by mistake. `-bmmbidder=engine` makes the engine the node's only bidder.
+  `-bmmblockmaxweight` (default 300,000 weight units) caps the mempool transactions in a template;
+  deposits are not capped. `setcoinbasetag` changes the coinbase tag until the next restart.
+  `refreshbmm` is now refused during `-reindex`/`-loadblock` (error -10), and retries a bid the
+  enforcer refused outright instead of skipping that eCash block.
+- **`-reindex` no longer depends on luck** (v0.2.16). Before replaying blocks (`-reindex`,
+  `-reindex-chainstate`, `-loadblock`), the node fills its eCash block cache and waits for a lagging
+  enforcer. If the cache makes no progress for `-replaycachewait` seconds (default 600; 0 waits until
+  shutdown), the node stops with an error; a pending `-reindex` or `-reindex-chainstate` resumes on the
+  next start (`-loadblock` must be given again). Before, a replay could start with an empty cache
+  and throw the chain away. The main-block and BMM cache loaders now log what they loaded.
 - **Withdrawal bundles need no enforcer wallet** (v0.2.16). They go to the enforcer's
-  `BlockProducerService/ProposeWithdrawalBundle`, falling back to the old wallet call only on an
-  enforcer too old to have it. An eCash reorg now checks only the newest 1,000 cached blocks instead
-  of the whole cache. No consensus change: a binary swap.
+  `BlockProducerService/ProposeWithdrawalBundle`, falling back to the old wallet call only when the
+  enforcer answers Unimplemented. The enforcer must serve `BlockProducerService`: run it with
+  `--enable-wallet`, or without a wallet with `--enable-mempool --enable-block-template-server
+  --coinbase-recipient=<address>`. An eCash reorg now checks only the newest 1,000 cached blocks
+  instead of the whole cache, and `verifymainblockcache` reports where it started (`checked_from`).
+  v0.2.15 and v0.2.16 have no consensus change: each is a binary swap.
 
 - **An unreadable eCash transaction next to a withdrawal payout no longer stops deposit
   crediting** (v0.2.15). When the node looks through an L1 block for a paid bundle, it now skips
@@ -266,22 +276,24 @@ src/test/test_bitcoin
 
 ## Run (overview)
 
-FreeBank is a sidechain, so running it means running a small stack: a
-(drivechain-patched) signet `bitcoind` as the mainchain, the CUSF
+FreeBank is a sidechain, so running it means running a small stack: an eCash node as the
+mainchain (with `-rest=1`), the CUSF
 [bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer) watching it —
-it validates the drivechain rules and holds the mainchain wallet — and `freebankd`
+it validates the drivechain rules and can hold the mainchain wallet — and `freebankd`
 driving the enforcer over gRPC (via
-[grpcurl](https://github.com/fullstorydev/grpcurl)). The sidechain then advances by
-blind-merged-mining against the mainchain (`freebank-cli refreshbmm`). The mainchain
-node comes from LayerTwo Labs'
-[bitcoin-patched](https://github.com/LayerTwo-Labs/bitcoin-patched); FreeBank binaries
-from the [release page](https://github.com/mbdrivechains/freebank/releases).
+[grpcurl](https://github.com/fullstorydev/grpcurl)) and reading deposits from the node's
+REST interface. The sidechain advances by blind-merged-mining against the mainchain:
+`freebank-cli refreshbmm`, or, from v0.2.16, an engine such as BitWindow's driving
+`get_block_template` and `connect_block`. FreeBank binaries come from the
+[release page](https://github.com/mbdrivechains/freebank/releases).
 
 Two things worth knowing before you start:
 
 - **The live network is the eCash beta.** FreeBank runs as sidechain slot 130 on the eCash
   beta network, with a public seed at `seed.ecxfreebank.com` (port 8455). The beta L1 comes
-  from eCash's own releases and the enforcer runs with `--network-preset=betanet`. Pin the
+  from eCash's own releases (<https://releases.ecash.com/L1-ecash-bitcoin/betanet/>; source
+  [ecash-com/bitcoin](https://github.com/ecash-com/bitcoin/tree/betanet), branch `betanet`) and
+  the enforcer runs with `--network-preset=betanet`. Pin the
   fork block with `-mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
   The signet walkthrough below still describes the stack's shape.
 - **Next to BitWindow.** A BitWindow set to the eCash network already runs the beta L1 (with
@@ -295,14 +307,17 @@ Two things worth knowing before you start:
     -grpcurlbin=<BitWindow data dir>/assets/bin/grpcurl
   ```
 
-  Don't also start FreeBank from BitWindow's Sidechains tab. Released BitWindow versions (up
-  to 0.2.230) launch it with the Rust command line, and the C++ node will not start that way.
-  If you ran the Rust FreeBank before, wipe its data first.
+  Don't also start FreeBank from BitWindow's Sidechains tab. Released BitWindow versions
+  (0.2.231 and earlier, the current release as of 2026-09-26) launch it with the command line of
+  an earlier, retired FreeBank build, and this node will not start that way.
+  If you ran that earlier build, wipe its data first.
 - **The full walkthrough is a separate page**: [`doc/signet.md`](doc/signet.md) —
   written for someone starting from zero, with every dependency linked, the
-  network/magic-bytes pitfalls explained, join parameters for the FreeBank signet, and a
-  step-by-step verification order. It is deliberately precise enough to hand to an AI
-  coding agent — if you'd rather not drive four pieces of software by hand, pointing
+  network/magic-bytes pitfalls explained, and a step-by-step verification order. It is
+  written for a signet: the project's public signet was retired at the end of August 2026,
+  so use it for the shape of a signet stack of your own; for the live eCash beta, follow
+  [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) sections 2.3 and 5.2. It is deliberately precise
+  enough to hand to an AI coding agent — if you'd rather not drive four pieces of software by hand, pointing
   Claude Code (or another agentic assistant) at that page and asking it to do the
   bring-up with you works well.
 
@@ -327,10 +342,24 @@ sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 The macOS tarball is built by this repository's GitHub workflow from the tagged source, and GitHub
-records a signed build attestation for it. Check it with
+records a signed build attestation for it. Check it with GitHub CLI 2.49 or later, logged in
+(`gh auth login`):
 `gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank`.
-The Linux tarball is built by the maintainer from the same tag; reproducible builds, so that anyone
-can rebuild it byte for byte, are planned.
+Without a login, fetch the attestation from GitHub's API, take the bundle out of the wrapper the API
+returns (`jq`), and pass that file with `--bundle`:
+
+```
+curl -s https://api.github.com/repos/mbdrivechains/freebank/attestations/sha256:<tarball sha256> \
+  | jq '.attestations[0].bundle' > freebank.sigstore.json
+gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank \
+  --bundle freebank.sigstore.json
+```
+
+The Linux tarball is built by the maintainer. Its binaries report the maintainer's private commit
+(v0.2.16: `2afa30c`), whose `src/` and `depends/` trees are identical to the public tag. Building Linux
+from the public tag in CI, with an attestation, and reproducible builds so that anyone can rebuild it
+byte for byte, are planned. Linux release binaries are static except for glibc and libgcc (glibc
+2.38+); the macOS binaries use the system's libc++ and libSystem.
 
 ## Feedback
 

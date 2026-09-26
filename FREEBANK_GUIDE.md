@@ -6,7 +6,7 @@ This file is meant to be *complete enough on its own* that you can hand it to an
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
 you through running FreeBank, standing up a bank, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
-or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.15), and the quick start in
+or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.16), and the quick start in
 section 3 was run verbatim against the release binaries. Where something is designed but
 not built, it says so.
 
@@ -27,8 +27,8 @@ Give the assistant this whole file, then ask things like:
   reserves, mint notes and redeem them."*
 - *"Set up two wallets and two houses (section 4.0), then discount a bill and settle."*
 - *"My house shows `effective_status: stressed`. Why, and what do I do?"*
-- *"Rent a cloud box and bring up the full alpha stack on it — provision it through the
-  DigitalOcean or Linode API, then follow section 5.5."*
+- *"Rent a cloud box and bring up a full eCash beta stack on it — provision it through the
+  DigitalOcean or Linode API, then follow section 5.5 with the beta values from 5.2."*
 - *"What is built and what is only designed?"*
 
 **For the assistant.** Sections 3–4 are the command ground truth; section 7 is the
@@ -40,8 +40,8 @@ wallet holding its notes. Section 3 was run end-to-end as one script; the sectio
 recipes come from separate integration tests and are **not** one continuous script —
 each states the state it assumes. A returned txid is **not** acceptance — check chain
 state (`gethouse`, `getbill`, `getrawmempool`). Not in this file: the signet connection
-recipe (see `doc/signet.md`). Running `freebankd` against the eCash alpha network needs
-v0.2.9 or later (2.3, recipe in 5.2). If this file and `freebank-cli help <rpc>`
+recipe (see `doc/signet.md`). To run `freebankd` against the eCash beta network, the live
+one, use the current release (2.3, recipe in 5.2). If this file and `freebank-cli help <rpc>`
 disagree, the binary is right; say so.
 
 ---
@@ -81,19 +81,19 @@ redeemable for — that pegged coin.
 | **Bilateral settlement** | Two houses present each other's notes and settle the net at par ±0.5% in one co-signed transaction. | Yes (bilateral only) |
 | **Gold oracle** | Bonded submitters post a gold price; the fix is a braked lower median. **Consensus-inert**: nothing in consensus reads it yet. | Yes, inert |
 | **Gram display** | RPCs show a `_grams` companion beside amounts at a fixed launch scale. Presentation only — notes redeem for base coin, not gold. | Display only |
-| Two-wallet bill issuance tooling, forknet L1 support (alpha/mainnet), multi-house clearing, Chaumian bearer layer, enforced gold redemption, cash-credit lines | — | **Not built** (section 8 says which are designed) |
+| Two-wallet bill issuance tooling, multi-house clearing, Chaumian bearer layer, enforced gold redemption, cash-credit lines | — | **Not built** (section 8 says which are designed) |
 
 ---
 
 ## 2. Where FreeBank runs today
 
-FreeBank runs on a **live network you can join today** — the eCash **alpha** chain (2.3), with a
-beta network and then mainnet to follow. That is the front door: a real BIP 300/301 chain in slot
-130, producing FreeBank blocks continuously. There is also a self-contained **regtest** you drive
-yourself (2.1) — the fast lane, where the whole instrument lifecycle runs in minutes because you
-mint blocks on demand. Start with the live network to join what is actually running; reach for
-regtest when you want the complete bank → loan → redeem loop instantly, offline, and repeatable.
-Three places, pick by what you want:
+FreeBank runs on a **live network you can join today** — the eCash **beta** chain (2.3), with
+mainnet to follow (FreeBank ran on the eCash alpha before it). That is the front door: a real BIP
+300/301 chain in slot 130, producing FreeBank blocks continuously. There is also a self-contained
+**regtest** you drive yourself (2.1) — the fast lane, where the whole instrument lifecycle runs in
+minutes because you mint blocks on demand. Start with the live network to join what is actually
+running; reach for regtest when you want the complete bank → loan → redeem loop instantly, offline,
+and repeatable. Pick by what you want:
 
 ### 2.1 Your own regtest (the fast lane — full lifecycle, instant, offline)
 
@@ -102,69 +102,105 @@ A self-contained stack on your machine: a regtest Bitcoin node, the CUSF enforce
 produce blocks on demand, the whole section-4 lifecycle — register a house, issue and discount a
 bill, redeem a note — runs in minutes. **Section 3 is this.**
 
-### 2.2 The public daily-reset signet
+### 2.2 The public daily-reset signet (retired)
 
-The project runs a public BIP 300/301 signet with FreeBank active in slot 130, a block
-explorer, a faucet, and a live board at **https://ecxfreebank.com**. It **resets every day
-at 09:00 UTC**, so it is a playground, not a place to keep anything. The connection recipe
-(signet challenge, seed node, enforcer and `freebankd` flags) is in
-[`doc/signet.md`](doc/signet.md) in this repository.
+Until the end of August 2026 the project ran a public BIP 300/301 signet with FreeBank in slot
+130, a block explorer, a faucet and a live board at https://ecxfreebank.com, reset every day at
+09:00 UTC. **It has been retired**; https://ecxfreebank.com is now the project's landing page (it
+still describes the alpha and is being updated). The live network is the eCash beta (2.3). [`doc/signet.md`](doc/signet.md) in this repository
+still describes the shape of a signet stack (signet challenge, seed node, enforcer and `freebankd`
+flags), which is useful if you run a signet of your own.
 
-### 2.3 The eCash alpha network (alphanet) — activated; followable from v0.2.9, self-syncing from v0.2.10
+### 2.3 The eCash beta network — FreeBank's live home, slot 130
 
 **This is the front door: a live, public BIP 300/301 chain you can sync and take part in today.**
 
-On **2026-08-27** FreeBank was proposed and activated as **slot 130 on the eCash alpha
-network** (M1 in block 996,454, 30 of 30 acks, activated at block 996,485). Another
-sidechain, in slot 24, activated in the same window. The M1 declaration carries the
-v0.2.8 hash ids (section 2.4).
+FreeBank is **slot 130 on the eCash beta network**. The slot was proposed at beta block 968,020
+and activated at block 969,029 with 1,009 ACKs (more than the 1,008 needed within 2,016 blocks) in
+September 2026. To follow it you need:
+
+- **The L1:** eCash's own beta build (it reports itself as *Bitcoin Core (eCash betanet)
+  v31.1.0*), run unpruned with `txindex=1`, `rest=1` and a `zmqpubsequence` endpoint, and the CUSF
+  enforcer started with `--network-preset=betanet`. A BitWindow set to the eCash network runs both
+  for you (5.3).
+- **The fork pin:** `-mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
+  The beta is byte-identical to Bitcoin below its fork block, so this pin is how `freebankd` knows it
+  is on the beta; a wrong hash refuses to start.
+- **The seed:** `seed.ecxfreebank.com` (`163.47.9.132:8455`) is baked into `freebankd`, so a node
+  finds a peer with no `-addnode`.
+- **The release:** the current release (2.4); it is what the project's seed runs. The beta
+  proposal's hash ids name an earlier, retired FreeBank build; consensus never checks hash ids,
+  so they do not affect which software follows slot 130.
 
 Be precise about what that means:
 
-- **The slot is open.** A FreeBank node can follow the alpha chain from **v0.2.9**
-  (recipe in 5.2). v0.2.8 could not: its startup identity pin assumed the mainchain was a
-  *signet* and demanded a signet challenge, which a `chain=main` forknet does not have,
-  and it decoded withdrawal destinations with the signet/testnet address prefix. v0.2.9
-  adds `-mainchainblockpin` (pin the fork block) and derives the address prefix from the
-  L1 family.
-- **Blocks appear only when someone produces them.** A FreeBank block on alpha needs a
-  `freebankd` posting BMM requests through an enforcer whose wallet holds alpha coins (the
+- **Blocks appear only when someone produces them.** A FreeBank block on the beta needs a
+  `freebankd` posting BMM requests through an enforcer whose wallet holds beta coins (the
   request is a paid mainchain transaction), and a miner running enforcer templates to
   include it. To see whether slot 130 is being mined, scan recent coinbases for M7
-  commitments with the slot byte `0x82` (section 9.4). **As of September 2026 the network is producing FreeBank blocks continuously** — a followed node syncs a live chain; 5.3 is the fastest way to watch it happen, and 5.6 is the first bank and loan on it, step by step as it happened.
+  commitments with the slot byte `0x82` (section 9.4), or open the
+  [FreeBank explorer](https://explorer.ecxfreebank.com). **As of September 2026 the network is producing FreeBank blocks continuously** — a followed node syncs a live chain; 5.3 is the fastest way to watch it happen.
 - **Deposit only once you can see FreeBank blocks being produced.** A deposit is a
   mainchain transaction into the slot's escrow; it is credited by the sidechain, so with
   no blocks there is nothing to credit it — and it would be lost at the next reset
   regardless.
-- **The enforcer's self-mining and self-acking are regtest/signet-only** — on alpha,
-  blocks come from real hash. Obtain alpha coins by mining or from other participants.
-- **Alpha is disposable.** eCash has said alpha will be followed by a beta network and
-  then mainnet, each a fresh fork (see eCash's own announcements for dates). Everything on
-  alpha — the activation, deposits, any chain state — is expected to vanish at the next
-  reset. The project will re-propose slot 130 on the next network with the hash ids of the
-  then-current release; that network's fork height and magic will differ from the alpha
-  values in 5.2 and will be published here when known.
+- **Deposit only to an address from this release's `freebankd`.** An address from the earlier,
+  retired build is not valid on this chain: the deposit is recorded but paid to no one, and the
+  coins stay locked in the slot's escrow on eCash.
+- **The enforcer's self-mining and self-acking are regtest/signet-only** — on the beta,
+  blocks come from real hash. Obtain beta coins by mining or from other participants.
+- **The beta is disposable.** eCash has said the beta will be followed by mainnet, a fresh
+  fork (see eCash's own announcements for dates). Everything on the beta — the activation,
+  deposits, any chain state — is expected to vanish then. The project will propose slot 130
+  again on mainnet with the hash ids of the then-current release.
 
-Explorer for the alpha L1: https://explorer.alpha.ecash.ninja/ (a mempool.space-style
-explorer; it has no sidechain view — sidechain state comes from a synced enforcer or a
-coinbase scan).
+Explorers: the beta L1 at https://explorer.beta.ecash.ninja/ (a mempool.space-style explorer
+with no sidechain view — sidechain state comes from a synced enforcer or a coinbase scan), and
+the FreeBank chain itself at https://explorer.ecxfreebank.com.
+
+**Before the beta: the eCash alpha (history).** On **2026-08-27** FreeBank was proposed and
+activated as slot 130 on the eCash alpha network (M1 in block 996,454, 30 of 30 acks,
+activated at block 996,485); another sidechain, in slot 24, activated in the same window. That
+M1 declaration carries the v0.2.8 hash ids (section 2.4). v0.2.9 was the first release that
+could follow it: v0.2.8's startup identity pin assumed the mainchain was a *signet* and demanded
+a signet challenge, which a `chain=main` forknet does not have, and it decoded withdrawal
+destinations with the signet/testnet address prefix. v0.2.9 added `-mainchainblockpin` (pin the
+fork block) and derived the address prefix from the L1 family, and v0.2.10 added the baked DNS seed.
+FreeBank moved to the beta in September 2026, and the project no longer runs an alpha node. The
+alpha passages in 5.2, 5.4, 5.5 and 5.6 are kept as a record of how it was done. Explorer for the
+alpha L1: https://explorer.alpha.ecash.ninja/.
 
 ### 2.4 Verifying what you download
 
 Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.15** (deposit crediting keeps
-going when an unreadable eCash transaction shares a withdrawal payout's L1 block; v0.2.14 added
-`coinbasetag=` so block producers can name their blocks, §5.2; v0.2.13 hardened the withdrawal path
-for a shared eCash slot, added the explorer RPCs and moved the fixed seed to `163.47.9.132:8455`):
-`freebank-0.2.15-x86_64-linux-gnu.tar.gz`, sha256
-`1d501fd8898f110c5991449721bed0197404d434c1f6a747d8c5a01013ff7a9c`; its source is the
-commit the public tag `v0.2.15` points at (`git rev-parse 'v0.2.15^{commit}'`). The commands
-below are written for v0.2.8 because that is what the sidechain proposal on alpha
-commits to — substitute `0.2.15` to verify the current binaries the same way.
+arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.16** (three new RPCs for
+BitWindow's BMM engine to bid for FreeBank blocks, §8; a `-reindex` that fills the eCash block cache
+before it replays; withdrawal bundles that need no enforcer wallet; all with no consensus change.
+v0.2.15 kept deposit crediting going when an unreadable eCash transaction shares a withdrawal
+payout's L1 block; v0.2.14 added `coinbasetag=` so block producers can name their blocks, §5.2;
+v0.2.13 moved the fixed seed to `163.47.9.132:8455`):
+`freebank-0.2.16-x86_64-linux-gnu.tar.gz`, sha256
+`b19da93fcf2ea3195e90ea441acbdd16f669f43fdecc225721ddc48d152ee253`; its source is the
+commit the public tag `v0.2.16` points at (`git rev-parse 'v0.2.16^{commit}'`). The Linux
+binaries are static except for glibc and libgcc, so they need glibc 2.38 or later (Ubuntu 22.04
+and Debian 12 are too old). They report `v0.2.16.0-2afa30c`: `2afa30c` is the maintainer's build
+commit, whose `src/` and `depends/` trees match the public tag (README,
+[Verify your download](README.md#verify-your-download)). The commands below check the alpha
+proposal's v0.2.8 card (history); substitute `0.2.16` to verify the current binaries the same way.
 
-The sidechain proposal (M1) that activated slot 130 on alpha commits to v0.2.8:
+From v0.2.16, `SHA256SUMS` is also signed with the FreeBank release key (`SHA256SUMS.sig`; key
+fingerprint `SHA256:1d0zm9Qb9ZtzDnQHH593fgjAkk7nPqMDG79XyWlyeeY`), and the macOS tarball carries a
+GitHub build attestation. The key and the commands that check both are in the README's
+[Verify your download](README.md#verify-your-download) section.
 
-| M1 field | value |
+The sidechain proposal (M1) that activated slot 130 on the **beta** (block 968,020) carries the
+hash ids of an earlier, retired FreeBank build. No software checks them, and they do not change which
+software follows slot 130: verify the current release against `SHA256SUMS` and its signature, as
+above.
+
+The M1 that activated slot 130 on **alpha** (history) commits to v0.2.8:
+
+| Alpha M1 field | value |
 |---|---|
 | slot | `130` |
 | title | `FreeBank` |
@@ -182,10 +218,11 @@ git -C freebank-src rev-parse 'v0.2.8^{commit}'     # c67a3ad9… = hash_id_2
 ```
 
 The hash ids are proposer-chosen commitments; consensus never checks them. They exist so
-that you can confirm the software you run is the software the proposal named. The M1
-commits only to the Linux tarball; macOS users verify their tarball against `SHA256SUMS`
-and the source against hash_id_2. To read the commitment from the chain itself, decode
-the coinbase of alpha block 996,454 with the snippet in 9.4. On macOS, fetch with `curl`,
+that you can confirm the software you run is the software the proposal named (v0.2.8 on alpha).
+Each M1 commits only to the Linux tarball; macOS users
+verify their tarball against `SHA256SUMS` and the source against hash_id_2. To read the
+commitment from the chain itself, decode the coinbase of beta block 968,020 (or alpha block
+996,454) with the snippet in 9.4. On macOS, fetch with `curl`,
 not a browser, so Gatekeeper's quarantine flag never attaches to the unsigned binary.
 
 ---
@@ -198,7 +235,7 @@ not a browser, so Gatekeeper's quarantine flag never attaches to the unsigned bi
 > only as your BMM blocks land, and live state is wiped at each network reset.
 
 Three processes, all local: a regtest **Bitcoin node** (the Core build bundled with
-BitWindow — currently a v31 "eCash drynet4" build; any recent Core with `-rest -txindex
+BitWindow — a v31 "eCash drynet4" build at the 2026-08-28 run below; any recent Core with `-rest -txindex
 -zmqpubsequence` works, which is why the enforcer is started with
 `--bitcoin-core-skip-version-check`), the **CUSF enforcer** (`bip300301-enforcer`), and
 **`freebankd`**. FreeBank talks to the mainchain only through the enforcer's gRPC (via
@@ -206,7 +243,7 @@ BitWindow — currently a v31 "eCash drynet4" build; any recent Core with `-rest
 
 The whole quick start takes about three minutes of wall-clock. It was last run verbatim
 on 2026-08-28 against the v0.2.8 release binaries and the enforcer bundled with BitWindow
-(v0.3.4). All snippets assume **bash**; `python3` and `xxd` are also used.
+(bip300301_enforcer v0.3.4). All snippets assume **bash**; `python3` and `xxd` are also used.
 
 > **The one debugging fact to know before you start:** a wallet RPC that returns a txid
 > has *built* a transaction, not necessarily had it *accepted* — a mempool rejection is
@@ -735,22 +772,66 @@ to internalise before you start:
   when a BMM request wins inclusion in a mainchain block, so an operation that needs *N* sidechain
   blocks takes *N* block intervals (minutes to hours), not seconds. To *write* at all you need the
   **write path**: your own `freebankd` plus an enforcer whose wallet holds live coins, posting
-  `refreshbmm` on a timer (5.2). A BitWindow-only setup (5.3) *follows* the chain — it does not by
-  itself fund and post your BMM requests.
-- **It is disposable.** Alpha — and the beta and mainnet forks after it — reset to fresh chains; any
-  house you register or bill you issue on a live *test* network is expected to vanish at the next
-  reset (2.3). Keep nothing there you are not willing to lose.
+  `refreshbmm` on a timer (5.2). A BitWindow-only setup (5.3) *follows* the chain — released
+  BitWindow versions do not fund and post your BMM requests (v0.2.16 adds the RPCs BitWindow's BMM
+  engine needs to bid; see section 8).
+- **It is disposable.** The beta — like alpha before it — is a test network, and mainnet will be a
+  fresh fork; any house you register or bill you issue on a live *test* network is expected to
+  vanish at the next reset (2.3). Keep nothing there you are not willing to lose.
 
-### 5.1 The public daily-reset signet
+### 5.1 The public daily-reset signet (retired)
 
-Follow [`doc/signet.md`](doc/signet.md). The shape is the same as section 3 with a signet
-node instead of regtest, the project's signet challenge and seed node, and one extra
+The project's public signet was retired at the end of August 2026 (2.2). To run a signet of your
+own, follow [`doc/signet.md`](doc/signet.md). The shape is the same as section 3 with a signet
+node instead of regtest, a signet challenge and seed node, and one extra
 **mandatory** flag: `-mainchainchallenge=<the signet's challenge hex>`. That is FreeBank's
 L1 identity pin — two custom signets share a chain name *and* a genesis hash, so the
-challenge is the only thing that tells them apart. The chain resets daily at 09:00 UTC;
-after a reset, give the enforcer and `freebankd` fresh datadirs and delete `peers.dat`.
+challenge is the only thing that tells them apart. After a signet reset, give the enforcer and
+`freebankd` fresh datadirs and delete `peers.dat`.
 
-### 5.2 The eCash alpha network
+### 5.2 The eCash beta network (and the alpha recipe it grew from)
+
+The live network (2.3). Your own stack is the section-3 shape on the live chain:
+
+- **Node:** eCash's beta L1 build, run as `chain=main`, **unpruned**, with `txindex=1`, `rest=1`, a
+  `zmqpubsequence` endpoint and enough `dbcache` for your RAM, **fully synced** before you rely on
+  FreeBank for anything. eCash publishes it as `L1-ecash-bitcoin-<triplet>.zip` under
+  https://releases.ecash.com/L1-ecash-bitcoin/betanet/ (sha256s in
+  https://releases.ecash.com/index.json; source: https://github.com/ecash-com/bitcoin, branch
+  `betanet`). It reports itself as *Bitcoin Core (eCash betanet) v31.1.0*. Its defaults are the
+  alpha build's: P2P 8533, RPC 8532 (REST is served on the RPC port, so `<REST_PORT>` below is 8532
+  unless you change `rpcport`), config file **`ecash.conf`** (a `bitcoin.conf` is ignored) and
+  datadir `~/.ecash`. Fork height 967,680; network magic `eca5b104`. This guide knows of no
+  published beta assumeutxo snapshot: plan for a full sync from genesis (days), and read the alpha
+  notes below on RAM and `dbcache`.
+- **Enforcer:** `--network-preset=betanet`, pointed at the node's RPC and ZMQ, gRPC on
+  `127.0.0.1:50051`. `grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechains`
+  lists slot 130 once the validator is past 969,029. To bid (below) the enforcer also needs its
+  wallet: add `--enable-wallet` (and `--wallet-auto-create` on the first run), plus
+  `--wallet-sync-source=disabled` unless you point it at a beta Esplora server with
+  `--wallet-esplora-url` (see the alpha notes below on what `disabled` means for funding). The
+  wallet also lets the enforcer accept v0.2.16's withdrawal bundles (section 8).
+- **`freebankd` (the current release)** on its `main` network (no `-regtest`), pinned to the beta
+  fork block — the flags the project's seed runs with; substitute your node's REST port and your
+  credentials:
+
+  ```bash
+  freebankd -daemon -server -rpcuser=user -rpcpassword=pass \
+    -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 -mainchainrest=127.0.0.1:<REST_PORT> \
+    -mainchainchain=main \
+    -mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042
+  freebank-cli -rpcuser=user -rpcpassword=pass getmainchainblockcount   # the beta tip
+  ```
+
+  Then bid with `refreshbmm 0.001` on a timer, funded by the enforcer's wallet, and name your blocks
+  with `coinbasetag=` (both below).
+
+**The alpha recipe (history, August–September 2026).** The rest of this section is how the alpha
+stack was run, kept as a record. What carries over to the beta unchanged: the full-node rule
+(unpruned, `txindex=1`, fully synced), the `refreshbmm` timer funded by the enforcer's wallet, the
+first-run costs in kind (the numbers are alpha's), the node's default ports, config file and
+datadir, and `coinbasetag=`. What does not: the alphanet L1 build and its snapshots, fork block
+963,648, its magic, and the pinned command.
 
 Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the node:
 
@@ -882,15 +963,16 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
 
 ### 5.3 The fast path: download a release and watch it sync (via BitWindow)
 
-Sections 5.1–5.2 build the L1 and enforcer yourself. If you already run **BitWindow** — which
-bundles an eCash-alpha L1 node and an enforcer — the quickest way to see FreeBank live is to drop a
-downloaded `freebankd` on top of it and let it find the network on its own. As of **September 2026 the
-alpha network is producing FreeBank blocks continuously**, so there is a live chain to sync.
+Sections 5.1–5.2 build the L1 and enforcer yourself. If you already run **BitWindow** — which,
+set to the eCash network, bundles an eCash beta L1 node and an enforcer — the quickest way to see
+FreeBank live is to drop a downloaded `freebankd` on top of it and let it find the network on its
+own. As of **September 2026 the beta network is producing FreeBank blocks continuously**, so there is
+a live chain to sync.
 
 From **v0.2.10**, `freebankd` ships a DNS seed (`seed.ecxfreebank.com`) baked into its `main` chain
 params, so it discovers a peer with **no `-addnode`** — that is the whole point of this test. (Verified
-end-to-end on an Apple-Silicon Mac against a BitWindow stack, and from a fresh US cloud box on
-2026-09-04.)
+end-to-end on alpha, on an Apple-Silicon Mac against a BitWindow stack and from a fresh US cloud box,
+on 2026-09-04.)
 
 How that discovery works — worth knowing if you run your own seed or are reading the log: a node does
 not look up the bare seed name. It asks for the name with a service-bit prefix, **`x9.seed.ecxfreebank.com`**
@@ -903,7 +985,7 @@ verifies against `SHA256SUMS`, and **`freebankd` will not run without an L1** �
 reachable it exits after 60 s with an explicit `mainchain REST endpoint … did not answer` error. There
 is no light or follower mode; section 5.2's node and enforcer are required.
 
-The same fresh cloud box, given a private network route to a *remote* L1 (an enforcer and REST endpoint
+On alpha, the same fresh cloud box, given a private network route to a *remote* L1 (an enforcer and REST endpoint
 on another machine) and a pre-built `mainblockhash.dat`, then did the whole thing: `1 addresses found
 from DNS seeds` → outbound connection to the seed → 58 blocks synced in about 20 minutes, with every
 checked block hash matching the seed's, including the block that credited a live peg-in. That is the
@@ -916,47 +998,57 @@ testing, nothing more. For real money, run your own validated stack (5.2).
    attaches to the unsigned binary:
    ```bash
    # Linux:
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.15/freebank-0.2.15-x86_64-linux-gnu.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.16/freebank-0.2.16-x86_64-linux-gnu.tar.gz
    # macOS (Apple Silicon):
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.15/freebank-0.2.15-arm64-apple-darwin.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.16/freebank-0.2.16-arm64-apple-darwin.tar.gz
 
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.15/SHA256SUMS
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.16/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing        # macOS: shasum -a 256 -c  -> OK
-   tar -xzf freebank-0.2.15-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
+   tar -xzf freebank-0.2.16-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
    xattr -dr com.apple.quarantine freebank 2>/dev/null   # macOS only: clear quarantine if present
    ```
+   To also check the signature on `SHA256SUMS` (and the macOS build attestation), follow the README's
+   [Verify your download](README.md#verify-your-download) section.
    `freebankd` shells out to `grpcurl` for the enforcer transport — install it (`brew install grpcurl`,
    or your package manager).
 
-2. **Point it at BitWindow's alpha stack.** Find BitWindow's enforcer gRPC (usually `127.0.0.1:50051`)
-   and its mainchain bitcoind's **REST** port. The node must have been started with `-rest` (BitWindow's
-   default config includes `rest=1`) and must be on eCash alpha (`chain=main`, tip near the current alpha
-   height). The node must be unpruned (the enforcer refuses pruned nodes); a sync test alone never
+2. **Point it at BitWindow's beta stack.** Find BitWindow's enforcer gRPC (usually `127.0.0.1:50051`)
+   and its mainchain bitcoind's **REST** port (the README's example uses `18302`). The node must have
+   been started with `-rest` (BitWindow's default config includes `rest=1`) and must be on the eCash
+   beta (`chain=main`, tip near the current beta height), fully synced, with its enforcer synced too.
+   The node must be unpruned (the enforcer refuses pruned nodes); a sync test alone never
    exercises `txindex`, but run the full configuration anyway — every later step needs it.
 
 3. **Run `freebankd` with no `-addnode`** (create the datadir first — it refuses a missing one; replace
    `<REST_PORT>`):
    ```bash
-   mkdir -p $HOME/freebank-alpha/data
-   freebank/bin/freebankd -datadir=$HOME/freebank-alpha/data -server -rpcuser=fb -rpcpassword=test \
+   mkdir -p $HOME/freebank-beta/data
+   freebank/bin/freebankd -datadir=$HOME/freebank-beta/data -server -rpcuser=fb -rpcpassword=test \
      -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 \
      -mainchainrest=127.0.0.1:<REST_PORT> -mainchainchain=main \
-     -mainchainblockpin=963648:0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924 \
+     -mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042 \
      -grpcurlbin=$(which grpcurl) -daemon
    ```
+   BitWindow also ships `grpcurl` in its `assets/bin`, so `-grpcurlbin` can point there instead. Don't
+   also start FreeBank from BitWindow's Sidechains tab: released BitWindow versions (0.2.231 and
+   earlier, the current release as of 2026-09-26) launch it with the command line of an earlier,
+   retired FreeBank build, and this node will not start that way.
 
 4. **Confirm it synced:**
    ```bash
-   CLI="freebank/bin/freebank-cli -datadir=$HOME/freebank-alpha/data -rpcuser=fb -rpcpassword=test"
-   $CLI getpeerinfo | grep addr     # a peer at 68.183.235.153:8455 (= seed.ecxfreebank.com), found with zero config
+   CLI="freebank/bin/freebank-cli -datadir=$HOME/freebank-beta/data -rpcuser=fb -rpcpassword=test"
+   $CLI getpeerinfo | grep addr     # a peer at 163.47.9.132:8455 (= seed.ecxfreebank.com), found with zero config
    $CLI getblockcount               # climbs to the live FreeBank tip
-   $CLI getmainchainblockcount      # matches BitWindow's alpha tip
+   $CLI getmainchainblockcount      # matches BitWindow's beta tip
    ```
    Success is a peer appearing on its own **plus** `getblockcount` reaching the network height — proof of
    download → seed discovery → P2P sync → L1 validation, on a machine that built none of it. If `freebankd`
-   refuses to start with an identity-mismatch error, BitWindow's node is not on eCash alpha. This path only
+   refuses to start with an identity-mismatch error, BitWindow's node is not on the eCash beta. This path only
    *follows* the chain; to produce blocks yourself, bid via `refreshbmm` (5.2) or mine them (5.4).
 ### 5.4 Producing blocks yourself
+
+*Written on alpha (September 2026). The pieces below carry over to the beta; the difficulty and
+block-cost figures are alpha's, so check the beta's current difficulty before you rent hash.*
 
 §5.2 makes you a *follower* — you `refreshbmm` and bid for whoever is mining to include your
 request. This makes you a *producer*: you run the mining, your coinbase carries the M7 that connects
@@ -1016,6 +1108,11 @@ commits to is named by `coinbasetag=` in the `freebank.conf` of the `freebankd` 
 which is yours only if you also bid. Use the same text for both and explorers credit both blocks to you.
 
 ### 5.5 Renting the stack: the same thing on a VPS
+
+*History: this walkthrough was run on alpha on 2026-09-05 and is kept as a record. The provider API
+calls and the order of the bring-up carry over to the beta; the costs, disk sizes and timings are
+alpha's on that date, and the L1 build, snapshot, fork block, ports and pin below are alpha's — take
+the beta values from 5.2.*
 
 Everything in 5.2 runs on a rented Linux box, and that is the quickest way to have a full alpha stack
 without touching your own hardware: nothing to download to your desk, no disk to buy, gone when you
@@ -1223,12 +1320,15 @@ altogether.
 
 ### 5.6 The first bank and loan on alpha, as it happened (2026-09-05)
 
+*History: alpha has since been replaced by the beta (2.3), and the project no longer runs an alpha
+node, so 5.3 will not reach this chain; the table and txids below are a record.*
+
 Sections 3.7 and 4.3 are the regtest recipes. This is the same sequence run once on the live alpha
-chain, by a script in one day with one manual intervention (below) — every transaction is in the
-public FreeBank chain, so a node synced by 5.3 can check the end state with `gethouse 1`, `getbill 1`
+chain, by a script in one day with one manual intervention (below) — every transaction went into the
+public alpha FreeBank chain, where a synced node could check the end state with `gethouse 1`, `getbill 1`
 and `listloanbook 1`, and the txids listed after the table. `listhouses` at block 68 returned exactly
-one house and ids are sequential, so house 1 and bill 1 are the first on the alpha FreeBank chain,
-which has run unbroken since its first block on 2026-08-29. It is here because it is the one *timed*
+one house and ids are sequential, so house 1 and bill 1 were the first on the alpha FreeBank chain,
+which had run unbroken since its first block on 2026-08-29. It is here because it is the one *timed*
 transcript of the live path: what each step costs in blocks and hours when you do not own the block
 clock.
 
@@ -1442,19 +1542,26 @@ touches it.
   `txindex`) to pass the deposit's block, or run the mainchain node from a full `txindex` (no
   snapshot).
 - A lone withdrawal never bundles unless `-minwithdrawal=1` (default 10).
-- Withdrawal destinations: legacy P2PKH only; bech32 and P2SH are not decoded.
+- Withdrawal destinations (v0.2.13 and later): P2PKH, P2SH, P2WPKH, P2WSH or P2TR (taproot)
+  addresses of the L1 the node follows. Other witness versions and payouts below the L1 dust limit
+  are refused, and the refund address must be a legacy (P2PKH) FreeBank address of the same wallet.
+  (v0.2.12 and earlier took legacy P2PKH only, which is why 3.8's v0.2.8 recipe uses one.)
 - Payout timing is the enforcer's ack threshold (5 acks / 10 blocks on regtest), not
   FreeBank's.
 
 ### 7.4 BMM and node lifecycle
 
-- No `generate`, `getblocktemplate` or `submitblock`; blocks come only from `refreshbmm` +
-  a mainchain block. `refreshbmm` returns non-zero on an empty tick — normal.
+- No `generate`, `getblocktemplate` or `submitblock`; a block comes only from a winning BMM bid
+  plus the mainchain block that commits it. Either `refreshbmm` templates, bids and connects the
+  block, or (v0.2.16 and later) an outside BMM engine such as BitWindow's takes a template from
+  `get_block_template`, bids itself and connects the win with `connect_block`; `-bmmbidder=engine`
+  makes the engine the node's only bidder. `refreshbmm` returns non-zero on an empty tick — normal.
 - Poll to a target height; a bid can be spent on a mainchain block that carries no
   commitment.
 - **The [FreeBank explorer](https://explorer.ecxfreebank.com) shows your blocks as "unknown producer":** set `coinbasetag=<name>` in
   `freebank.conf` (5.2) and restart `freebankd`. It is read at startup and names the blocks
-  templated after that; blocks already made keep no tag.
+  templated after that; blocks already made keep no tag. From v0.2.16, `setcoinbasetag <name>`
+  changes it without a restart, until the next restart (`freebank.conf` stays the source).
 - After a daemon restart the first BMM request may miss the first mainchain block; the tip
   rides the second.
 - **If your ticker bids once per mainchain block (as the public seed's does), budget *two*
@@ -1504,17 +1611,17 @@ touches it.
   boost::system::generic_category()`): remove `src/libbitcoin_util.a` and rebuild.
 - **`freebankd` has two chains of its own:** `regtest` (follows a regtest L1) and `main`
   (follows any non-regtest L1 — a signet pinned by `-mainchainchallenge`, or, from
-  v0.2.9, a mainnet-family forknet such as alpha pinned by `-mainchainblockpin`). There
-  is no separate testnet or signet mode. Address prefix `X…`; bech32 HRP `fbk` (`fbkrt`
+  v0.2.9, a mainnet-family forknet such as the eCash beta, or alpha before it, pinned by
+  `-mainchainblockpin`). There is no separate testnet or signet mode. Address prefix `X…`; bech32 HRP `fbk` (`fbkrt`
   on regtest).
 
 ---
 
-## 8. Built vs designed — as of v0.2.15
+## 8. Built vs designed — as of v0.2.16
 
 | Area | Status |
 |---|---|
-| Two-way peg (deposits, withdrawal bundles, payout) | Built; verified end-to-end on regtest against the enforcer (deposit and withdrawal also exercised on the project's signet) |
+| Two-way peg (deposits, withdrawal bundles, payout) | Built; verified end-to-end against the enforcer on an eCash betanet regtest (deposit and withdrawal also exercised on the project's signet) |
 | Bills: issue / endorse / retire / default claim / recourse | Built |
 | Bill discounting to a house, house-side retire/claim, match-funding rule | Built |
 | Independent two-wallet issuance tooling (A draws on B who accepts) | **Not built** (planned next) — consensus already requires two keys; the RPC plays all roles |
@@ -1532,22 +1639,29 @@ touches it.
 | Chaumian bearer layer over notes | **Not built** (designed; op codes reserved) |
 | Cash-credit lines | **Not built** (designed) |
 | Strict-DER / low-S payload signatures; L1 identity pin | Built |
-| Forknet (alpha/mainnet-style L1) support in `freebankd` | Built (v0.2.9): `-mainchainblockpin` + address prefix from the L1 family; verified live on alphanet |
+| Forknet (alpha/beta/mainnet-style L1) support in `freebankd` | Built (v0.2.9): `-mainchainblockpin` + address prefix from the L1 family; verified live on alpha and on the eCash beta |
 | Withdrawals to P2SH, bech32 and taproot L1 addresses | Built (v0.2.13) |
 | Explorer RPCs (`getblockstats`, `getindexinfo`, per-transaction weight) | Built (v0.2.13) |
 | Block-producer name in the coinbase (`coinbasetag=`) | Built (v0.2.14); self-declared, not consensus |
+| BMM bidding from BitWindow's engine (`get_block_template`, `connect_block`, `get_bmm_inclusions`; `-bmmbidder=engine`, `-bmmblockmaxweight`, `setcoinbasetag`) | Built in `freebankd` (v0.2.16); BitWindow's side is under review upstream ([LayerTwo Labs drivechain-frontends PR #2402](https://github.com/LayerTwo-Labs/drivechain-frontends/pull/2402)), not yet in a BitWindow release |
+| Withdrawal bundles proposed with no enforcer wallet (`BlockProducerService/ProposeWithdrawalBundle`) | Built (v0.2.16); the enforcer must serve `BlockProducerService`: `--enable-wallet`, or without a wallet `--enable-mempool --enable-block-template-server --coinbase-recipient=<address>`; falls back to the wallet call when the enforcer answers Unimplemented |
+| `-reindex` that fills the eCash block cache before replaying and waits for a lagging enforcer (`-replaycachewait`) | Built (v0.2.16) |
 | Third-party audit; mutation testing | **Not done** |
 
-Test posture: 34 end-to-end integration gates and 493 unit cases, including two-node
-byte-compare convergence against a never-connected control node, reorg coverage across
-every operation family, `-reindex` reproduction, and a property harness for bills. Three
-inherited consensus-critical defects (from the chassis) were found and fixed in v0.2.8;
-more inherited issues may exist.
+Test posture (v0.2.16): the full suite passes, 48 of 48, on the release tree. That is the unit
+suite (495 cases; it needs no L1), 44 end-to-end integration gates on an eCash betanet v31.1.0
+regtest L1 with LayerTwo Labs' bip300301_enforcer master `6e5f79f` with our local fixes
+(`73d239a`) and `-mainchaintransport=enforcer`, and 3 legacy gates on a legacy BIP 300/301 regtest
+L1 over the older `jsonrpc` transport. The suite includes two-node byte-compare convergence against
+a never-connected control node, reorg coverage across every operation family, `-reindex`
+reproduction, and a property harness for bills. `make check` passes on the public source tree,
+and the macOS build workflow runs the unit suite and its portability checks. Three inherited consensus-critical defects
+(from the chassis) were found and fixed in v0.2.8; more inherited issues may exist.
 
-**Producer caveat (the enforcer, not FreeBank):** *self-mining* a busy alpha (5.4) currently
-needs a watchdog around the enforcer. Under sustained mempool churn and long uptime it can
-emit a topologically-invalid block template, and a block mined from it is rejected
-`bad-txns-inputs-missingorspent` — you pay for the hash and lose the block, silently. A fix
+**Producer caveat (the enforcer, not FreeBank; seen on alpha, not yet re-checked on the beta):**
+*self-mining* a busy chain (5.4) needs a watchdog around the enforcer. Under sustained mempool
+churn and long uptime it can emit a topologically-invalid block template, and a block mined from
+it is rejected `bad-txns-inputs-missingorspent` — you pay for the hash and lose the block, silently. A fix
 is in progress upstream; until then, cross-check `getblocktemplate` against the node's
 mempool and restart the enforcer on a bad read. *Following* the chain (5.2/5.3) is unaffected.
 
@@ -1682,7 +1796,8 @@ proposal by `sha256d` of that blob (displayed byte-reversed, like a txid).
 ```bash
 # list every drivechain message in one block's coinbase (any Core with the block)
 BLOCKCLI="bitcoin-cli"   # with your -conf/-datadir flags
-$BLOCKCLI getblock "$($BLOCKCLI getblockhash 996454)" 2 | python3 -c '
+# 968020 = the beta's slot-130 M1 (996454 on alpha)
+$BLOCKCLI getblock "$($BLOCKCLI getblockhash 968020)" 2 | python3 -c '
 import sys, json
 tags = {"d5e0c4af": "M1", "d6e1c5df": "M2", "d77d1776": "M4", "d1617368": "M7"}
 cb = json.load(sys.stdin)["tx"][0]
@@ -1706,8 +1821,9 @@ for v in cb["vout"]:
 ## 10. Links, feedback, licence
 
 - Source and releases: https://github.com/mbdrivechains/freebank
-- Public demo, explorer, faucet (daily reset): https://ecxfreebank.com
-- Signet connection: [`doc/signet.md`](doc/signet.md); wallet preview:
+- Project site (being updated; it still describes the alpha): https://ecxfreebank.com; FreeBank
+  explorer (eCash beta): https://explorer.ecxfreebank.com
+- Signet stack (the public signet is retired): [`doc/signet.md`](doc/signet.md); wallet preview:
   https://github.com/mbdrivechains/freebank-gui
 - Drivechain stack: https://github.com/LayerTwo-Labs/bip300301_enforcer,
   https://github.com/LayerTwo-Labs/bitcoin-patched, https://layertwolabs.com/download
@@ -1721,7 +1837,7 @@ Pick the channel by what you have:
   useful report — and enough for an AI assistant to file a complete one unaided — carries all of:
   - **Version + platform:** the full `freebankd --version` string (`vX.Y.Z-<commit>`) and
     OS/arch (Linux x86-64 or macOS arm64).
-  - **Network:** regtest, the public signet, or eCash alpha — and for alpha, the L1 you
+  - **Network:** regtest, a signet, or the eCash beta — and for the beta, the L1 you
     follow and the exact `-mainchainblockpin` you started with.
   - **Repro:** the smallest ordered sequence of `freebank-cli` / `grpcurl` commands that
     triggers it, copied verbatim.

@@ -1,4 +1,9 @@
-# Running FreeBank against a live signet
+# Running FreeBank against a signet
+
+> **Retired network.** The project-operated FreeBank signet described below was retired at the end of
+> August 2026; FreeBank now runs as slot 130 on the eCash beta (see the README's *Run (overview)* and
+> the guide, sections 2.3 and 5.2). This page is kept because it shows the shape of the stack and how
+> to run a signet of your own.
 
 How to bring FreeBank up as a sidechain (slot **130**) of a BIP 300/301 signet — the
 FreeBank signet behind <https://ecxfreebank.com>, or another drivechain signet such as
