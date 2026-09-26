@@ -15,7 +15,11 @@
 #include <clientversion.h>
 #include <core_io.h>
 #include <crypto/ripemd160.h>
+#include <consensus/merkle.h>
+#include <consensus/validation.h>
 #include <init.h>
+#include <l1client.h>
+#include <miner.h>
 #include <mainchainaddress.h>
 #include <validation.h>
 #include <httpserver.h>
@@ -29,6 +33,7 @@
 #include <timedata.h>
 #include <txdb.h>
 #include <util.h>
+#include <validationinterface.h>
 #include <utilstrencodings.h>
 #ifdef ENABLE_WALLET
 #include <wallet/rpcwallet.h>
@@ -38,6 +43,11 @@
 #include <warnings.h>
 
 #include <stdint.h>
+
+#include <chrono>
+#include <deque>
+#include <memory>
+#include <mutex>
 #ifdef HAVE_MALLOC_INFO
 #include <malloc.h>
 #endif
@@ -471,6 +481,608 @@ static UniValue getinfo_deprecated(const JSONRPCRequest& request)
     );
 }
 
+//
+// v0.2.16: BMM JSON-RPCs for an outside BMM engine (BitWindow's orchestrator):
+// get_block_template, connect_block, get_bmm_inclusions. Contract:
+// gateway/docs/distribution/FREEBANKD_BMM_RPC_SPEC.md as amended by freebank's
+// reply of 2026-09-26 (inbox/distribution/2026-09-26-from-freebank-bmm-spec.md).
+//
+// Byte orders: critical_hash is h* = hashMerkleRoot as ConsensusHex (internal
+// byte order, what the M8 carries). Every other hash is display order. All hex
+// is lowercase.
+//
+// Money rule: connect_block answers false only on a definite rejection. Every
+// passing failure is a JSON-RPC error, so the engine retries rather than
+// retiring a paid-for block. RPC_BMM_RETRY (-40) marks the "ask again soon" refusals.
+//
+
+// One mutex for all four BMM RPCs, refreshbmm included: mapBMMBlocks, the
+// template pin and the refusal time boxes below have no lock of their own.
+// Lock order: this mutex, then the main block cache mutexes, then cs_main. It is
+// never taken while one of those is held. BMMCache's own mutex is a leaf.
+static std::timed_mutex csBMMRpc;
+
+class BMMRpcLock
+{
+public:
+    BMMRpcLock(const std::string& strMethod, int nSeconds)
+    {
+        if (!csBMMRpc.try_lock_for(std::chrono::seconds(nSeconds)))
+            throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": another BMM call is running; try again");
+    }
+    ~BMMRpcLock() { csBMMRpc.unlock(); }
+};
+
+// The template pinned for the current round (eCash tip T, side tip): every call
+// in a round returns the same block, so a raise keeps the same h*. Guarded by csBMMRpc.
+struct BMMTemplatePin
+{
+    uint256 hashMainTip;
+    uint256 hashSideTip;
+    CBlock block;
+    CAmount nFees = 0;
+    int nHeight = 0;
+};
+static std::unique_ptr<BMMTemplatePin> pBMMTemplatePin;
+
+// h* -> T for recent templates, so get_bmm_inclusions can check T's child only.
+// Guarded by csBMMRpc.
+static std::map<uint256, uint256> mapBMMTemplateMainTip;
+static std::deque<uint256> deqBMMTemplate;
+static const size_t BMM_TEMPLATES_REMEMBERED = 64;
+
+// Refusal time boxes: (key, first seen). Guarded by csBMMRpc.
+static const int64_t BMM_REFUSAL_SECONDS = 60;
+static std::pair<uint256, int64_t> bmmTimeBoxHeader;
+static std::pair<uint256, int64_t> bmmTimeBoxPending;
+
+// How many cached eCash blocks get_bmm_inclusions scans without a pinned T: the
+// engine's 10-block connect horizon plus the tip.
+static const size_t BMM_INCLUSION_WINDOW = 11;
+
+// How far back connect_block looks for a block already on the active chain.
+static const int BMM_RESEND_DEPTH = 11;
+
+static bool BMMBidderIsEngine()
+{
+    return gArgs.GetArg("-bmmbidder", "") == "engine";
+}
+
+static void BMMRequireEnforcer(const std::string& strMethod)
+{
+    if (GetL1Transport() != L1Transport::ENFORCER)
+        throw JSONRPCError(RPC_MISC_ERROR, strMethod + " needs -mainchaintransport=enforcer "
+                           "(the legacy transport writes h* in the other byte order)");
+}
+
+static void BMMRefuseDuringImport(const std::string& strMethod)
+{
+    if (fImporting || fReindex)
+        throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": importing or reindexing blocks; try again when that finishes");
+}
+
+// How long a BMM RPC waits for another thread's eCash cache update (P2P, the
+// ticker) before it answers -40: the engine's call deadline is 30 s.
+static const int BMM_CACHE_WAIT_SECONDS = 5;
+
+/** Refresh the node's eCash view as refreshbmm does; a failure is retryable. */
+static void BMMRefreshMainView(const std::string& strMethod)
+{
+    bool fReorg = false;
+    bool fBusy = false;
+    std::vector<uint256> vDisconnected;
+    if (!TryUpdateMainBlockHashCache(fReorg, vDisconnected, BMM_CACHE_WAIT_SECONDS, fBusy)) {
+        if (fBusy)
+            throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": the eCash block cache is being updated by another thread; try again");
+        throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": failed to update the eCash block cache; try again");
+    }
+
+    if (fReorg)
+        HandleMainchainReorg(vDisconnected);
+
+    if (!CheckMainchainConnection())
+        throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": not connected to eCash; try again");
+}
+
+/** True while the refusal keyed by key is within its time box. */
+static bool BMMWithinTimeBox(std::pair<uint256, int64_t>& box, const uint256& key)
+{
+    const int64_t nNow = GetTime();
+    if (box.first != key) {
+        box.first = key;
+        box.second = nNow;
+    }
+    return nNow - box.second < BMM_REFUSAL_SECONDS;
+}
+
+static bool BMMGetPrevBlockCommit(const CBlock& block, uint256& hashPrevMain, uint256& hashPrevSide)
+{
+    if (block.vtx.empty() || !block.vtx[0]->IsCoinBase())
+        return false;
+
+    for (const CTxOut& out : block.vtx[0]->vout) {
+        if (out.scriptPubKey.IsPrevBlockCommit(hashPrevMain, hashPrevSide))
+            return true;
+    }
+    return false;
+}
+
+/** A block with merkle root h* among the last BMM_RESEND_DEPTH blocks of the active chain. */
+static bool BMMOnActiveChain(const uint256& hashCritical)
+{
+    AssertLockHeld(cs_main);
+    const CBlockIndex* pindex = chainActive.Tip();
+    for (int i = 0; pindex && i < BMM_RESEND_DEPTH; i++, pindex = pindex->pprev) {
+        if (pindex->hashMerkleRoot == hashCritical)
+            return true;
+    }
+    return false;
+}
+
+/** A block with merkle root h* that this node marked failed. */
+static bool BMMHaveFailedBlock(const uint256& hashCritical)
+{
+    AssertLockHeld(cs_main);
+    for (const auto& entry : mapBlockIndex) {
+        const CBlockIndex* pindex = entry.second;
+        if (pindex->hashMerkleRoot == hashCritical && (pindex->nStatus & BLOCK_FAILED_MASK))
+            return true;
+    }
+    return false;
+}
+
+static UniValue BMMTemplateToJSON(const BMMTemplatePin& pin)
+{
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); // with witness data, always
+    ss << pin.block;
+
+    UniValue block(UniValue::VOBJ);
+    block.pushKV("prev_main_hash", pin.hashMainTip.GetHex());
+    block.pushKV("prev_side_hash", pin.block.hashPrevBlock.GetHex());
+    block.pushKV("merkle_root", pin.block.hashMerkleRoot.GetHex());
+    block.pushKV("height", pin.nHeight);
+    block.pushKV("hex", HexStr(ss.begin(), ss.end()));
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("critical_hash", ConsensusHexFromUint256(pin.block.hashMerkleRoot));
+    result.pushKV("block", block);
+    result.pushKV("fees_sats", (int64_t)pin.nFees);
+    return result;
+}
+
+UniValue get_block_template(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "get_block_template\n"
+            "\nA BMM block template for an outside BMM engine (BitWindow). The block builds on the side tip\n"
+            "and commits to the current eCash tip T. Every call for the same (T, side tip) returns the same\n"
+            "block; mempool and coinbase-tag changes apply from the next round. Needs the enforcer transport.\n"
+            "Retryable refusals use code -40.\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"critical_hash\": \"hex\",   (string) h* = hashMerkleRoot, internal byte order (as the M8 carries it)\n"
+            "  \"block\": {\n"
+            "    \"prev_main_hash\": \"hex\", (string) T, display order\n"
+            "    \"prev_side_hash\": \"hex\", (string) hashPrevBlock, display order\n"
+            "    \"merkle_root\": \"hex\",    (string) hashMerkleRoot, display order\n"
+            "    \"height\": n,             (numeric) side-chain height of the block\n"
+            "    \"hex\": \"hex\"             (string) the serialized block, witness included; nTime and\n"
+            "                                        hashMainchainBlock are set by connect_block\n"
+            "  },\n"
+            "  \"fees_sats\": n              (numeric) coinbase fees, in sats\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("get_block_template", "")
+            + HelpExampleRpc("get_block_template", "")
+        );
+
+    const std::string strMethod = "get_block_template";
+    BMMRequireEnforcer(strMethod);
+    BMMRpcLock lock(strMethod, 5);
+    BMMRefuseDuringImport(strMethod);
+
+    if (vpwallets.empty())
+        throw JSONRPCError(RPC_WALLET_NOT_FOUND, "No wallet: the block's coinbase pays this node's wallet");
+
+    BMMRefreshMainView(strMethod);
+
+    // One snapshot of T; block creation gets it explicitly.
+    const uint256 hashMainTip = bmmCache.GetLastMainBlockHash();
+    if (hashMainTip.IsNull())
+        throw JSONRPCError(RPC_BMM_RETRY, "The eCash block cache is empty; try again");
+
+    uint256 hashSideTip;
+    uint256 hashBetterHeader;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* pindexTip = chainActive.Tip();
+        hashSideTip = pindexTip->GetBlockHash();
+        if (pindexBestHeader && pindexBestHeader != pindexTip
+                && pindexBestHeader->nHeight > pindexTip->nHeight
+                && !(pindexBestHeader->nStatus & BLOCK_FAILED_MASK))
+            hashBetterHeader = pindexBestHeader->GetBlockHash();
+    }
+
+    // A better side chain is known but not connected yet: a template on the old
+    // tip would lose. Time-boxed, so a header that never connects cannot stop us.
+    if (!hashBetterHeader.IsNull() && BMMWithinTimeBox(bmmTimeBoxHeader, hashBetterHeader))
+        throw JSONRPCError(RPC_BMM_RETRY, "A better side-chain header is known but not connected yet; try again");
+
+    // Same round: same block.
+    if (pBMMTemplatePin && pBMMTemplatePin->hashMainTip == hashMainTip && pBMMTemplatePin->hashSideTip == hashSideTip)
+        return BMMTemplateToJSON(*pBMMTemplatePin);
+
+    // One bidder per node (opt-in): refreshbmm already bid on T.
+    if (BMMBidderIsEngine() && bmmCache.HaveBMMRequestForPrevBlock(hashMainTip))
+        throw JSONRPCError(RPC_BMM_RETRY, "refreshbmm already bid on this eCash tip (-bmmbidder=engine); try again on the next eCash block");
+
+    // Pending: T itself carries a slot-130 commitment whose side block is not
+    // connected yet. A template on the old side tip would lose to it on first
+    // seen. Time-boxed (a junk h* must not stop bidding) and never when that
+    // block is marked failed.
+    uint256 hashCommitT;
+    const L1Client::Commitment commitT = GetL1Client().ReadBmmCommitment(hashMainTip, hashCommitT);
+    if (commitT == L1Client::Commitment::UNKNOWN)
+        throw JSONRPCError(RPC_BMM_RETRY, "Could not read the eCash tip's BMM commitment; try again");
+    if (commitT == L1Client::Commitment::COMMITTED) {
+        bool fSettled = false;
+        {
+            LOCK(cs_main);
+            fSettled = chainActive.Tip()->hashMainBlock == hashMainTip
+                || BMMOnActiveChain(hashCommitT)
+                || BMMHaveFailedBlock(hashCommitT);
+        }
+        if (!fSettled && BMMWithinTimeBox(bmmTimeBoxPending, hashMainTip))
+            throw JSONRPCError(RPC_BMM_RETRY, "The side block for this eCash tip is pending; try again");
+    }
+
+    CBlock block;
+    CAmount nFees = 0;
+    std::string strError;
+    if (!BlockAssembler(Params(), BMMTemplateAssemblerOptions()).GenerateBMMBlock(block, strError, &nFees, std::vector<CMutableTransaction>(),
+                uint256(), CScript(), hashMainTip))
+        throw JSONRPCError(RPC_BMM_RETRY, "Failed to build a BMM block: " + strError);
+
+    if (block.hashPrevBlock != hashSideTip)
+        throw JSONRPCError(RPC_BMM_RETRY, "The side tip moved while the template was built; try again");
+
+    uint256 hashPrevMain;
+    uint256 hashPrevSide;
+    if (!BMMGetPrevBlockCommit(block, hashPrevMain, hashPrevSide) || hashPrevMain != hashMainTip || hashPrevSide != hashSideTip)
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "The built block's PrevBlockCommit does not match its eCash tip");
+
+    int nHeight = 0;
+    {
+        LOCK(cs_main);
+        BlockMap::iterator mi = mapBlockIndex.find(hashSideTip);
+        if (mi == mapBlockIndex.end())
+            throw JSONRPCError(RPC_BMM_RETRY, "The side tip vanished; try again");
+        nHeight = mi->second->nHeight + 1;
+    }
+
+    pBMMTemplatePin.reset(new BMMTemplatePin());
+    pBMMTemplatePin->hashMainTip = hashMainTip;
+    pBMMTemplatePin->hashSideTip = hashSideTip;
+    pBMMTemplatePin->block = block;
+    pBMMTemplatePin->nFees = nFees;
+    pBMMTemplatePin->nHeight = nHeight;
+
+    if (!mapBMMTemplateMainTip.count(block.hashMerkleRoot)) {
+        mapBMMTemplateMainTip[block.hashMerkleRoot] = hashMainTip;
+        deqBMMTemplate.push_back(block.hashMerkleRoot);
+        while (deqBMMTemplate.size() > BMM_TEMPLATES_REMEMBERED) {
+            mapBMMTemplateMainTip.erase(deqBMMTemplate.front());
+            deqBMMTemplate.pop_front();
+        }
+    }
+
+    LogPrintf("%s: template h* %s at side height %d on eCash tip %s\n", __func__,
+              ConsensusHexFromUint256(block.hashMerkleRoot), nHeight, hashMainTip.ToString());
+
+    return BMMTemplateToJSON(*pBMMTemplatePin);
+}
+
+namespace {
+class BMMStateCatcher : public CValidationInterface
+{
+public:
+    uint256 hash;
+    bool found;
+    CValidationState state;
+
+    explicit BMMStateCatcher(const uint256& hashIn) : hash(hashIn), found(false), state() {}
+
+protected:
+    void BlockChecked(const CBlock& block, const CValidationState& stateIn) override {
+        if (block.GetHash() != hash)
+            return;
+        found = true;
+        state = stateIn;
+    }
+};
+}
+
+// Reject reasons that can come from a passing condition (an L1 answer, a cache
+// race, the clock, a missing parent), not from the block. A block rejected for
+// one of these is not definitely rejected.
+static bool BMMIsPassingRejectReason(const std::string& strReason)
+{
+    return strReason == "prev-blk-not-found"
+        || strReason == "time-too-new"
+        || strReason == "bad-mc-prev"               // the eCash cache is checked before; a mismatch now is a race
+        || strReason == "duplicate"                 // marked failed by another thread after the clear above
+        || strReason == "bad-prevblk"               // the parent was marked during this call (see connect_block)
+        || strReason == "bad-bmm"                   // VerifyBMM cannot tell "L1 down" from "not committed"
+        || strReason == "invalid-sidechain-deposit"; // VerifyDeposit likewise, until N13
+}
+
+UniValue connect_block(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 2)
+        throw std::runtime_error(
+            "connect_block {block} \"main_block_hash\"\n"
+            "\nConnect a block from get_block_template whose h* was committed in eCash block main_block_hash.\n"
+            "Sets nTime (the eCash block's time) and hashMainchainBlock, then processes the block.\n"
+            "Needs the enforcer transport.\n"
+            "\nArguments:\n"
+            "1. block              (object, required) the \"block\" object get_block_template returned (its \"hex\" is used)\n"
+            "2. \"main_block_hash\"  (string, required) the eCash block that commits the block's h*, display order\n"
+            "\nResult:\n"
+            "true|false  (boolean) true: the block is on the active chain (also for a re-send).\n"
+            "            false: the block is definitely rejected. Anything that may pass is a JSON-RPC error.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("connect_block", "'{\"hex\":\"...\"}' \"0000...\"")
+        );
+
+    const std::string strMethod = "connect_block";
+
+    // Parse the block from the JSON alone; malformed input is an error.
+    const UniValue& obj = request.params[0];
+    if (!obj.isObject())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "block must be the object get_block_template returned");
+    const UniValue& hex = find_value(obj, "hex");
+    if (!hex.isStr() || !IsHex(hex.get_str()))
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block.hex is missing or not hex");
+
+    CBlock block;
+    {
+        std::vector<unsigned char> vch(ParseHex(hex.get_str()));
+        CDataStream ss(vch, SER_NETWORK, PROTOCOL_VERSION);
+        try {
+            ss >> block;
+        } catch (const std::exception&) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block.hex does not decode as a block");
+        }
+        if (!ss.empty())
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block.hex has trailing bytes");
+    }
+    if (block.vtx.empty() || !block.vtx[0]->IsCoinBase())
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block has no coinbase");
+    bool fMutated = false;
+    if (BlockMerkleRoot(block, &fMutated) != block.hashMerkleRoot || fMutated)
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block's merkle root does not match its transactions");
+
+    uint256 hashPrevMain;
+    uint256 hashPrevSide;
+    if (!BMMGetPrevBlockCommit(block, hashPrevMain, hashPrevSide))
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block's coinbase has no PrevBlockCommit");
+
+    const uint256 hashMain = ParseHashV(request.params[1], "main_block_hash");
+    const uint256 hashCritical = block.hashMerkleRoot;
+
+    BMMRequireEnforcer(strMethod);
+    BMMRpcLock lock(strMethod, 30);
+
+    // A re-send of a block already on the active chain: answered from the
+    // chain alone (merkle root only), so it holds while the L1 is down.
+    {
+        LOCK(cs_main);
+        if (BMMOnActiveChain(hashCritical))
+            return true;
+    }
+
+    BMMRefuseDuringImport(strMethod);
+    BMMRefreshMainView(strMethod);
+
+    // The eCash block to connect through: M when it is T's child on this
+    // node's eCash chain; otherwise (M orphaned in a 1-block race, or not seen
+    // yet) T's child M' on this node's chain, if M' commits the same h*.
+    const uint256 hashUse = bmmCache.GetMainBlockThroughT(hashMain, hashPrevMain);
+    if (hashUse.IsNull())
+        throw JSONRPCError(RPC_BMM_RETRY, strprintf("eCash block %s is not on this node's eCash chain as the child of %s yet; try again",
+                    hashMain.ToString(), hashPrevMain.ToString()));
+
+    uint256 hashCommit;
+    const L1Client::Commitment commit = GetL1Client().ReadBmmCommitment(hashUse, hashCommit);
+    if (commit == L1Client::Commitment::UNKNOWN || commit == L1Client::Commitment::NOT_FOUND)
+        throw JSONRPCError(RPC_BMM_RETRY, strprintf("Could not read eCash block %s's BMM commitment; try again", hashUse.ToString()));
+    if (commit != L1Client::Commitment::COMMITTED || hashCommit != hashCritical)
+        throw JSONRPCError(RPC_BMM_RETRY, strprintf("eCash block %s does not commit this block's h*", hashUse.ToString()));
+
+    // nTime comes from the eCash block, never from the caller.
+    uint256 txid;
+    uint32_t nTime = 0;
+    SidechainClient client;
+    if (!client.VerifyBMM(hashUse, hashCritical, txid, nTime) || nTime == 0)
+        throw JSONRPCError(RPC_BMM_RETRY, strprintf("Could not verify BMM in eCash block %s; try again", hashUse.ToString()));
+
+    block.nTime = nTime;
+    block.hashMainchainBlock = hashUse;
+    const uint256 hashBlock = block.GetHash();
+
+    {
+        LOCK(cs_main);
+        BlockMap::iterator mi = mapBlockIndex.find(block.hashPrevBlock);
+        if (mi != mapBlockIndex.end())
+            UpdateUncommittedBlockStructures(block, mi->second, Params().GetConsensus());
+
+        // The side block this one builds on is marked failed. get_block_template
+        // built on it while it was the active tip, so the mark came later: from
+        // HandleMainchainReorg (its eCash block was orphaned) or an operator's
+        // invalidateblock. Neither is a verdict on this block, and a re-send of
+        // the parent's own block clears it; so retry, never false, and never
+        // clear the parent's mark from here.
+        if (mi != mapBlockIndex.end() && (mi->second->nStatus & BLOCK_FAILED_MASK))
+            throw JSONRPCError(RPC_BMM_RETRY, strprintf("The side block %s this block builds on is marked failed; try again",
+                        block.hashPrevBlock.ToString()));
+
+        // A mark already on this block is not a verdict from this call: it may
+        // come from HandleMainchainReorg (its eCash block was orphaned, and has
+        // just been found on this node's eCash chain again above) or from a
+        // passing failure on another thread. Clear it, as reconsiderblock
+        // would, so ProcessNewBlock gives a fresh verdict; a block that really
+        // is invalid fails again with its reason.
+        BlockMap::iterator miBlock = mapBlockIndex.find(hashBlock);
+        if (miBlock != mapBlockIndex.end() && (miBlock->second->nStatus & BLOCK_FAILED_MASK)) {
+            LogPrintf("%s: block %s was marked failed before this call; clearing the mark to check it again\n",
+                      __func__, hashBlock.ToString());
+            ResetBlockFailureFlags(miBlock->second);
+        }
+    }
+
+    // No cs_main and no cache mutex held here: ProcessNewBlock takes them.
+    std::shared_ptr<const CBlock> pblock = std::make_shared<const CBlock>(block);
+    BMMStateCatcher sc(hashBlock);
+    RegisterValidationInterface(&sc);
+    bool fNewBlock = false;
+    const bool fAccepted = ProcessNewBlock(Params(), pblock, /* fForceProcessing */ true, &fNewBlock);
+    UnregisterValidationInterface(&sc);
+
+    const std::string strReason = sc.found ? sc.state.GetRejectReason() : "";
+    const bool fInvalid = sc.found && sc.state.IsInvalid() && !sc.state.CorruptionPossible();
+
+    bool fResult = false;
+    {
+        LOCK(cs_main);
+        BlockMap::iterator mi = mapBlockIndex.find(hashBlock);
+        CBlockIndex* pindex = mi == mapBlockIndex.end() ? nullptr : mi->second;
+
+        if ((pindex && chainActive.Contains(pindex)) || BMMOnActiveChain(hashCritical)) {
+            fResult = true;
+        } else if (fInvalid && BMMIsPassingRejectReason(strReason)) {
+            // Not definite. If the node marked the block failed for it, clear
+            // the mark (as reconsiderblock would) so a retry checks it again.
+            if (pindex && (pindex->nStatus & BLOCK_FAILED_MASK))
+                ResetBlockFailureFlags(pindex);
+            throw JSONRPCError(RPC_BMM_RETRY, strprintf("Block not connected yet (%s); try again", strReason));
+        } else if (fInvalid) {
+            LogPrintf("%s: block %s (h* %s) definitely rejected: %s\n", __func__, hashBlock.ToString(),
+                      ConsensusHexFromUint256(hashCritical), FormatStateMessage(sc.state));
+            return false;
+        } else if (pindex && pindex->pprev && (pindex->pprev->nStatus & BLOCK_FAILED_MASK)) {
+            // Its parent was marked failed during this call (see above).
+            throw JSONRPCError(RPC_BMM_RETRY, "The side block this block builds on was marked failed; try again");
+        } else if (pindex && (pindex->nStatus & BLOCK_FAILED_MASK)) {
+            // Marked with no verdict caught in this call: another thread did
+            // it. Clear it and let the engine ask again.
+            ResetBlockFailureFlags(pindex);
+            throw JSONRPCError(RPC_BMM_RETRY, "Block marked failed outside this call; try again");
+        } else if (fAccepted && pindex && (pindex->nStatus & BLOCK_HAVE_DATA) && chainActive.Height() >= pindex->nHeight) {
+            // Stored and valid, but another block took its height first.
+            LogPrintf("%s: block %s lost height %d to %s\n", __func__, hashBlock.ToString(), pindex->nHeight,
+                      chainActive[pindex->nHeight]->GetBlockHash().ToString());
+            return false;
+        } else {
+            throw JSONRPCError(RPC_BMM_RETRY, strprintf("Block not connected (%s); try again",
+                        strReason.empty() ? (fAccepted ? "not on the active chain" : "processing failed") : strReason));
+        }
+    }
+
+    if (fResult)
+        SetNetworkActive(true, "connect_block RPC connected a block");
+
+    return fResult;
+}
+
+UniValue get_bmm_inclusions(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "get_bmm_inclusions \"critical_hash\"\n"
+            "\nThe eCash blocks on this node's eCash chain that commit h* for this sidechain, among the last 11\n"
+            "cached eCash blocks (or only T's child, for a template this node built). An L1 failure is an error,\n"
+            "never an empty list. Needs the enforcer transport.\n"
+            "\nArguments:\n"
+            "1. \"critical_hash\"  (string, required) h* as get_block_template returned it (internal byte order)\n"
+            "\nResult:\n"
+            "[ \"hash\", ... ]    (array) eCash block hashes, display order\n"
+            "\nExamples:\n"
+            + HelpExampleCli("get_bmm_inclusions", "\"0000...\"")
+        );
+
+    const std::string strMethod = "get_bmm_inclusions";
+
+    const std::string strHex = request.params[0].get_str();
+    const uint256 hashCritical = Uint256FromConsensusHex(strHex);
+    if (hashCritical.IsNull())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "critical_hash must be 64 hex characters");
+
+    BMMRequireEnforcer(strMethod);
+    BMMRpcLock lock(strMethod, 30);
+    BMMRefuseDuringImport(strMethod);
+    BMMRefreshMainView(strMethod);
+
+    std::vector<uint256> vCandidate;
+    {
+        std::map<uint256, uint256>::const_iterator it = mapBMMTemplateMainTip.find(hashCritical);
+        if (it != mapBMMTemplateMainTip.end()) {
+            const uint256 hashChild = bmmCache.GetMainChildBlockHash(it->second);
+            if (!hashChild.IsNull())
+                vCandidate.push_back(hashChild);
+        } else {
+            vCandidate = bmmCache.GetLastMainBlockHashes(BMM_INCLUSION_WINDOW);
+        }
+    }
+
+    UniValue result(UniValue::VARR);
+    for (const uint256& hashMain : vCandidate) {
+        uint256 hashCommit;
+        const L1Client::Commitment commit = GetL1Client().ReadBmmCommitment(hashMain, hashCommit);
+        if (commit == L1Client::Commitment::UNKNOWN)
+            throw JSONRPCError(RPC_BMM_RETRY, strprintf("Could not read eCash block %s's BMM commitment; try again", hashMain.ToString()));
+        if (commit == L1Client::Commitment::COMMITTED && hashCommit == hashCritical)
+            result.push_back(hashMain.GetHex());
+    }
+
+    return result;
+}
+
+UniValue setcoinbasetag(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "setcoinbasetag \"name\"\n"
+            "\nSet the name this node writes into the coinbase of the blocks it produces, as -coinbasetag does,\n"
+            "until the next restart (freebank.conf stays the source). \"\" clears it. A pinned\n"
+            "get_block_template round keeps its block; the new name applies from the next round.\n"
+            "\nArguments:\n"
+            "1. \"name\"  (string, required) 1 to 64 printable ASCII characters, or \"\" for no tag\n"
+            "\nResult:\n"
+            "\"name\"    (string) the tag now in use\n"
+            "\nExamples:\n"
+            + HelpExampleCli("setcoinbasetag", "\"my pool\"")
+        );
+
+    const std::string strIn = request.params[0].get_str();
+    std::string strTag;
+    CScript scriptTag;
+    if (strIn.find_first_not_of(" \t\r\n") != std::string::npos) {
+        std::string strError;
+        if (!ParseCoinbaseTag(strIn, strTag, scriptTag, strError))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, strError);
+    }
+
+    {
+        // IncrementExtraNonce, the only reader, runs under cs_main.
+        LOCK(cs_main);
+        COINBASE_FLAGS = scriptTag;
+    }
+    LogPrintf("Coinbase tag set by RPC: \"%s\"\n", strTag);
+
+    return strTag;
+}
+
 UniValue refreshbmm(const JSONRPCRequest& request)
 {
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
@@ -491,6 +1103,16 @@ UniValue refreshbmm(const JSONRPCRequest& request)
             "error                 (string) Output from sidechain client.\n"
         );
 
+    // v0.2.16: not while stored blocks are being imported or replayed
+    // (-reindex, -loadblock, startup). The replay's tip is not this node's
+    // chain yet, so a block built or connected now would build on the wrong
+    // one, and mainchain reorgs are held until the import is done.
+    // v0.2.16: one mutex for all four BMM RPCs (mapBMMBlocks has no lock)
+    BMMRpcLock lock("refreshbmm", 30);
+
+    if (fImporting || fReindex)
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Importing or reindexing blocks; refreshbmm is refused until that finishes");
+
     bool fReorg = false;
     std::vector<uint256> vDisconnected;
     if (!UpdateMainBlockHashCache(fReorg, vDisconnected))
@@ -507,6 +1129,12 @@ UniValue refreshbmm(const JSONRPCRequest& request)
     // false, we will only check for BMM commits in the mainchain and try to
     // connect those blocks but not generate a new BMM block and request.
     bool fCreateNew = request.params.size() >= 2 ? request.params[1].get_bool() : true;
+
+    // v0.2.16 one-bidder guard (opt-in): when an outside engine bids through
+    // get_block_template, refreshbmm still scans for and connects won blocks
+    // but never places a bid of its own.
+    if (fCreateNew && BMMBidderIsEngine())
+        fCreateNew = false;
 
     // If hashPrevBlock is set, we will build a block on top of that block
     // instead of the current sidechain tip.
@@ -634,15 +1262,21 @@ UniValue verifymainblockcache(const JSONRPCRequest& request)
             "\nArguments: None\n"
             "\nVerify our cache of mainchain block hashes with the mainchain.\n"
             "\nResult:\n"
-            "height  (numeric) Cache verified to this mainchain block height.\n"
+            "height        (numeric) Cache verified to this mainchain block height.\n"
+            "checked_from  (numeric) Lowest height compared; heights below it follow by prevblock links.\n"
         );
 
+    // v0.2.16: checks the newest MAIN_BLOCK_CACHE_VERIFY_TAIL heights in one
+    // batch; the cache is built along prevblock links, so a match at the
+    // oldest of them covers everything below.
     std::string strError = "";
-    if (!VerifyMainBlockCache(strError))
+    MainBlockCacheCheck check;
+    if (!VerifyMainBlockCache(strError, &check))
         throw JSONRPCError(RPC_MISC_ERROR, strError);
 
     UniValue result(UniValue::VOBJ);
-    result.pushKV("height", bmmCache.GetCachedBlockCount() - 1);
+    result.pushKV("height", check.nTo);
+    result.pushKV("checked_from", check.nFrom);
 
     return result;
 }
@@ -711,7 +1345,13 @@ UniValue rebroadcastwithdrawalbundle(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size())
         throw std::runtime_error(
             "rebroadcastwithdrawalbundle\n"
-            "\nSend the latest WithdrawalBundle transaction hex to the local mainchain node.\n"
+            "\nHand the latest WithdrawalBundle to the mainchain again. The node already does this by itself,\n"
+            "on each block it connects, until one attempt succeeds.\n"
+            "With -mainchaintransport=enforcer the bundle goes to the enforcer's block producer\n"
+            "(BlockProducerService/ProposeWithdrawalBundle, or WalletService/BroadcastWithdrawalBundle on\n"
+            "an enforcer older than 7958cef). The enforcer stores it and proposes it (M3) in the mainchain\n"
+            "blocks it produces; nothing is broadcast to the mainchain network.\n"
+            "With -mainchaintransport=jsonrpc it is sent to the local mainchain node (receivewithdrawalbundle).\n"
         );
 
     SidechainWithdrawalBundle withdrawalBundle;
@@ -1411,6 +2051,10 @@ static const CRPCCommand commands[] =
 
     /* Sidechain RPC functions */
     { "sidechain",          "refreshbmm",                   &refreshbmm,                    {"amount", "createnew", "prevblock"}},
+    { "sidechain",          "get_block_template",           &get_block_template,            {}},
+    { "sidechain",          "connect_block",                &connect_block,                 {"block", "main_block_hash"}},
+    { "sidechain",          "get_bmm_inclusions",           &get_bmm_inclusions,            {"critical_hash"}},
+    { "sidechain",          "setcoinbasetag",               &setcoinbasetag,                {"name"}},
     { "sidechain",          "getaveragemainchainfees",      &getaveragemainchainfees,       {"blockcount", "startheight"}},
     { "sidechain",          "getmainchainblockcount",       &getmainchainblockcount,        {}},
     { "sidechain",          "getmainchainblockhash",        &getmainchainblockhash,         {"height"}},

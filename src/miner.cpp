@@ -101,6 +101,15 @@ static BlockAssembler::Options DefaultOptions(const CChainParams& params)
 
 BlockAssembler::BlockAssembler(const CChainParams& params) : BlockAssembler(params, DefaultOptions(params)) {}
 
+BlockAssembler::Options BMMTemplateAssemblerOptions()
+{
+    BlockAssembler::Options options = DefaultOptions(Params());
+    const int64_t nCap = gArgs.GetArg("-bmmblockmaxweight", (int64_t)DEFAULT_BMM_BLOCK_MAX_WEIGHT);
+    if (nCap > 0 && (size_t)nCap < options.nBlockMaxWeight)
+        options.nBlockMaxWeight = nCap;
+    return options;
+}
+
 void BlockAssembler::resetBlock()
 {
     inBlock.clear();
@@ -115,7 +124,7 @@ void BlockAssembler::resetBlock()
     nFees = 0;
 }
 
-std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, bool fMineWitnessTx, bool fCheckBMM, const uint256& hashPrevBlock, CAmount* nFeesOut)
+std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, bool fMineWitnessTx, bool fCheckBMM, const uint256& hashPrevBlock, CAmount* nFeesOut, const uint256& hashMainTip)
 {
     // TODO
     // Usually this is called via RefreshBMM of the SidechainPage. SidechainPage
@@ -232,7 +241,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
 
     // Add previous sidechain block hash & previous mainchain block hash to
     // the coinbase.
-    CScript scriptPrev = GeneratePrevBlockCommit(bmmCache.GetLastMainBlockHash(), pindexPrev->GetBlockHash());
+    // v0.2.16: a caller that pinned the mainchain tip T (get_block_template)
+    // passes it in, so the commit cannot race a cache refresh on another thread.
+    CScript scriptPrev = GeneratePrevBlockCommit(hashMainTip.IsNull() ? bmmCache.GetLastMainBlockHash() : hashMainTip,
+                                                 pindexPrev->GetBlockHash());
     coinbaseTx.vout.push_back(CTxOut(0, scriptPrev));
 
     // Add current hashWithdrawalBundle to coinbase output
@@ -357,32 +369,36 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // remove without invalidating a deposit.
 
     // Look up CTIP spent by first new deposit and calculate payout
-    if (fHaveDeposits && vDepositSorted.size()) {
-        bool fFound = false;
+    if (vDepositSorted.size()) {
         const SidechainDeposit& first = vDepositSorted.front();
-        for (const CTxIn& in : first.dtx.vin) {
-            if (in.prevout.hash == lastDeposit.dtx.GetHash()
-                    && lastDeposit.dtx.vout.size() > in.prevout.n
-                    && lastDeposit.nBurnIndex == in.prevout.n) {
-                // Calculate payout amount
-                CAmount ctipAmount = lastDeposit.dtx.vout[lastDeposit.nBurnIndex].nValue;
-                if (first.amtUserPayout > ctipAmount)
-                    vDepositSorted.front().amtUserPayout -= ctipAmount;
-                else
-                    vDepositSorted.front().amtUserPayout = CAmount(0);
+        if (fHaveDeposits) {
+            bool fFound = false;
+            for (const CTxIn& in : first.dtx.vin) {
+                if (in.prevout.hash == lastDeposit.dtx.GetHash()
+                        && lastDeposit.dtx.vout.size() > in.prevout.n
+                        && lastDeposit.nBurnIndex == in.prevout.n) {
+                    // Calculate payout amount
+                    CAmount ctipAmount = lastDeposit.dtx.vout[lastDeposit.nBurnIndex].nValue;
+                    if (first.amtUserPayout > ctipAmount)
+                        vDepositSorted.front().amtUserPayout -= ctipAmount;
+                    else
+                        vDepositSorted.front().amtUserPayout = CAmount(0);
 
-                fFound = true;
-                break;
+                    fFound = true;
+                    break;
+                }
             }
+            if (!fFound) {
+                LogPrintf("%s: Error: No CTIP found for first deposit in sorted list: %s (mainchain txid)\n", __func__, first.dtx.GetHash().ToString());
+                return nullptr;
+            }
+        } else {
+            // This is the very first deposit for this sidechain so we don't
+            // need to look up the CTIP that it spent. Logged per template that
+            // carries it (a rebuild before it connects logs again), never on a
+            // build without new deposits (v0.2.15 logged it on every one).
+            LogPrintf("%s: first deposit for this sidechain: %s (mainchain txid)\n", __func__, first.dtx.GetHash().ToString());
         }
-        if (!fFound) {
-            LogPrintf("%s: Error: No CTIP found for first deposit in sorted list: %s (mainchain txid)\n", __func__, first.dtx.GetHash().ToString());
-            return nullptr;
-        }
-    } else {
-        // This is the very first deposit for this sidechain so we don't need
-        // to look up the CTIP that it spent
-        LogPrintf("%s: The sidechain has received its first deposit!\n", __func__);
     }
 
     // Now that we have the value for the known CTIP that was spent for the
@@ -457,7 +473,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         vOutPackages.push_back(vOut);
     }
 
-    LogPrintf("%s: Created deposit outputs for: %u deposits!\n", __func__, vOutPackages.size());
+    if (vOutPackages.size())
+        LogPrintf("%s: Created deposit outputs for: %u deposits!\n", __func__, vOutPackages.size());
 
     for (const auto& v : vOutPackages) {
         // Add all of the outputs for this deposit to the coinbase tx
@@ -902,8 +919,16 @@ void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned
     pblock->hashMerkleRoot = BlockMerkleRoot(*pblock);
 }
 
-bool BlockAssembler::GenerateBMMBlock(CBlock& block, std::string& strError, CAmount* nFeesOut, const std::vector<CMutableTransaction>& vtx, const uint256& hashPrevBlock, const CScript& scriptPubKey)
+bool BlockAssembler::GenerateBMMBlock(CBlock& block, std::string& strError, CAmount* nFeesOut, const std::vector<CMutableTransaction>& vtx, const uint256& hashPrevBlock, const CScript& scriptPubKey, const uint256& hashMainTip)
 {
+    // v0.2.16: the old "replace every tx but the coinbase" path wrote through
+    // this temporary assembler's unset member pblock (undefined behaviour) and
+    // would have left a stale witness commitment. No caller passes txs; refuse.
+    if (vtx.size()) {
+        strError = "Replacing a BMM block's transactions is not supported!\n";
+        return false;
+    }
+
     // Either generate a new scriptPubKey or use the one that has optionally
     // been passed in
     std::unique_ptr<CBlockTemplate> pblocktemplate;
@@ -921,9 +946,9 @@ bool BlockAssembler::GenerateBMMBlock(CBlock& block, std::string& strError, CAmo
             strError = "Failed to get script for mining!\n";
             return false;
         }
-        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(coinbaseScript->reserveScript, true, false, hashPrevBlock, nFeesOut);
+        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(coinbaseScript->reserveScript, true, false, hashPrevBlock, nFeesOut, hashMainTip);
     } else {
-        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(scriptPubKey, true, false, hashPrevBlock, nFeesOut);
+        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(scriptPubKey, true, false, hashPrevBlock, nFeesOut, hashMainTip);
     }
 
     if (!pblocktemplate.get()) {
@@ -931,26 +956,17 @@ bool BlockAssembler::GenerateBMMBlock(CBlock& block, std::string& strError, CAmo
         return false;
     }
 
-    if (mapBlockIndex.count(pblocktemplate->block.hashPrevBlock) == 0) {
-        strError = "Invalid hashPrevBlock!\n";
-        return false;
-    }
-
-    // If an optional vector of transactions was passed in, we replace all
-    // but the coinbase with them.
-    if (vtx.size()) {
-        // Replace all transactions besides coinbase.
-        pblock->vtx.resize(1);
-        for (const CMutableTransaction& m : vtx)
-            pblock->vtx.push_back(MakeTransactionRef(m));
-    }
-
     unsigned int nExtraNonce = 0;
     CBlock *pblock = &pblocktemplate->block;
-    CBlockIndex* prevBlock = mapBlockIndex[pblock->hashPrevBlock];
     {
+        // v0.2.16: mapBlockIndex is read under cs_main
         LOCK(cs_main);
-        IncrementExtraNonce(pblock, prevBlock, nExtraNonce);
+        BlockMap::iterator mi = mapBlockIndex.find(pblock->hashPrevBlock);
+        if (mi == mapBlockIndex.end()) {
+            strError = "Invalid hashPrevBlock!\n";
+            return false;
+        }
+        IncrementExtraNonce(pblock, mi->second, nExtraNonce);
     }
 
     block = *pblock;

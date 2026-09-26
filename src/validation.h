@@ -21,6 +21,7 @@
 #include <versionbits.h>
 
 #include <algorithm>
+#include <deque>
 #include <exception>
 #include <list>
 #include <map>
@@ -245,7 +246,7 @@ static const bool DEFAULT_VERIFY_WITHDRAWAL_BUNDLE_ACCEPT_BLOCK = true;
 
 extern BMMCache bmmCache;
 
-extern std::mutex mainBlockCacheMutex;
+extern std::timed_mutex mainBlockCacheMutex;
 extern std::mutex mainBlockCacheReorgMutex;
 
 /**
@@ -607,16 +608,67 @@ void SetNetworkActive(bool fActive, const std::string& strReason = "");
 uint256 GetMainBlockHash(const CBlockHeader& block);
 
 /**
+ * Progress of an UpdateMainBlockHashCache walk, kept by a caller that retries
+ * (FillMainBlockCacheForReplay). The hashes an attempt fetched before it failed
+ * survive, so the next attempt continues from there instead of starting again
+ * at the L1 tip. Only for a caller that is the cache's sole writer meanwhile.
+ */
+struct MainBlockCacheWalk {
+    uint256 hashTip;               //!< L1 tip the saved walk started from
+    std::deque<uint256> deqHash;   //!< hashes fetched so far, oldest (the cursor) first; hashTip not included
+    uint256 hashCursor;            //!< deqHash.front()
+    int nCursor = 0;               //!< L1 height of hashCursor
+    int64_t nLastProgress = 0;     //!< GetTime() when the last ancestor batch arrived
+};
+
+/**
  * Update the BMM cache of mainchain blocks. Detect mainchain reorg & return
  * list of disconnected mainchain blocks if a reorg was detected.
+ * pWalk (optional): keep and resume the walk's progress across failed attempts.
  */
-bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected);
+bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected, MainBlockCacheWalk* pWalk = nullptr);
 
-/* Verify the contents of the mainchain block cache with the mainchain */
-bool VerifyMainBlockCache(std::string& strError);
+//! -replaycachewait default: seconds without progress before startup gives up
+//! filling the main block cache for a block replay (0 = wait until shutdown)
+static const int64_t DEFAULT_REPLAY_CACHE_WAIT = 600;
 
-/** Disconnect blocks with a BMM commit from an orphan mainchain block */
+/**
+ * Fill the main block cache before a block replay (-reindex,
+ * -reindex-chainstate, -loadblock, bootstrap.dat) starts. Retries until the
+ * cache reaches the L1 tip, shutdown is requested, or nothing has progressed
+ * for nNoProgressSeconds (0 = no limit). Mainchain orphans it finds are queued
+ * for after the import. False with strError set when it gave up.
+ */
+bool FillMainBlockCacheForReplay(int64_t nNoProgressSeconds, std::string& strError);
+
+//! How many of the newest cached mainchain heights VerifyMainBlockCache checks (v0.2.16)
+static const uint32_t MAIN_BLOCK_CACHE_VERIFY_TAIL = 1000;
+
+struct MainBlockCacheCheck {
+    bool fL1Failed = false;   //!< the L1 did not answer; nothing was learned
+    bool fBoundaryOK = false; //!< the tail's oldest height matched the L1
+    int nFrom = -1;           //!< checked heights nFrom..nTo
+    int nTo = -1;
+};
+
+/* Verify the newest MAIN_BLOCK_CACHE_VERIFY_TAIL entries of the mainchain
+ * block cache with the mainchain, in one batch (v0.2.16) */
+bool VerifyMainBlockCache(std::string& strError, MainBlockCacheCheck* pCheck = nullptr);
+
+/**
+ * UpdateMainBlockHashCache for a caller that must answer quickly (the BMM
+ * RPCs): waits at most nWaitSeconds for the cache mutex. fBusy: it timed out.
+ */
+bool TryUpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected, int nWaitSeconds, bool& fBusy);
+
+/** Disconnect blocks with a BMM commit from an orphan mainchain block. While
+ *  blocks are being imported or replayed (fImporting, fReindex) the orphans
+ *  are queued instead, for HandleQueuedMainchainReorgs. */
 void HandleMainchainReorg(const std::vector<uint256>& vOrphan);
+
+/** Handle the mainchain orphans queued during the block import (ThreadImport
+ *  calls it once the import is done). */
+void HandleQueuedMainchainReorgs();
 
 CScript EncodeWithdrawalFees(const CAmount& amount);
 

@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <map>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -32,6 +33,13 @@ public:
     std::vector<uint256> GetMainBlockHashCache() const;
 
     std::vector<uint256> GetRecentMainBlockHashes() const;
+
+    // v0.2.16: up to n of the newest cached mainchain block hashes, oldest first
+    std::vector<uint256> GetLastMainBlockHashes(size_t n) const;
+
+    // v0.2.16: the cached mainchain block whose parent is hashBlock (null if
+    // hashBlock is not cached or is the cached tip)
+    uint256 GetMainChildBlockHash(const uint256& hashBlock) const;
 
     void ClearBMMBlocks();
 
@@ -81,6 +89,17 @@ public:
 
     void ResetMainBlockCache();
 
+    // v0.2.16: replace the whole main block cache (hashes oldest first, from
+    // the genesis block) in one step under the cache mutex
+    void ReplaceMainBlockCache(const std::deque<uint256>& deqHash);
+
+    // v0.2.16: the n cached main block hashes from height nHeight up
+    bool GetMainBlockHashesFrom(int nHeight, size_t n, std::vector<uint256>& vHash) const;
+
+    // v0.2.16, in one step: hashMain if it is cached as the child of
+    // hashPrevMain, otherwise hashPrevMain's cached child (null if none)
+    uint256 GetMainBlockThroughT(const uint256& hashMain, const uint256& hashPrevMain) const;
+
     void CacheWithdrawalID(const uint256& wtid);
 
     std::set<uint256> GetCachedWithdrawalID();
@@ -88,6 +107,13 @@ public:
     bool IsMyWT(const uint256& wtid);
 
 private:
+    void CacheMainBlockHashLocked(const uint256& hash);
+    uint256 GetMainChildBlockHashLocked(const uint256& hashBlock) const;
+
+    // v0.2.16: guards mapMainBlock and vMainBlockHash (a leaf lock). The other
+    // members are guarded by their callers, as before.
+    mutable std::mutex csMainBlockCache;
+
     // BMM blocks that we have created with the intention of connecting to the
     // side blockchain once the BMM h* hash is included on the mainchain
     std::map<uint256 /* hashMerkleRoot */, CBlock> mapBMMBlocks;

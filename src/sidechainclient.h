@@ -44,9 +44,10 @@ public:
 
     /*
      * Send BMM commitment request to mainchain node, create mainchain BMM
-     * request transaction.
+     * request transaction. On a null txid, *pfNotSent (if given) says the
+     * mainchain definitely sent no bid (L1Client::SendBMMRequest).
      */
-    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight = 0, CAmount amount = CAmount(0));
+    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight = 0, CAmount amount = CAmount(0), bool* pfNotSent = nullptr);
 
     /*
      * Request the CTIP - Critical Transaction Index Pair for this sidechain

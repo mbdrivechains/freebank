@@ -3,6 +3,10 @@
 #include <primitives/block.h>
 #include <util.h>
 
+// The main block cache (vMainBlockHash, mapMainBlock) has its own leaf mutex:
+// nothing else is locked while it is held.
+#define LOCK_MAIN_CACHE std::lock_guard<std::mutex> lockMainCache(csMainBlockCache)
+
 BMMCache::BMMCache()
 {
 
@@ -54,12 +58,14 @@ std::vector<uint256> BMMCache::GetBroadcastedWithdrawalBundleCache() const
 
 std::vector<uint256> BMMCache::GetMainBlockHashCache() const
 {
+    LOCK_MAIN_CACHE;
     return vMainBlockHash;
 }
 
 std::vector<uint256> BMMCache::GetRecentMainBlockHashes() const
 {
     // Return up to three of the most recent mainchain block hashes
+    LOCK_MAIN_CACHE;
     std::vector<uint256> vHash;
     std::vector<uint256>::const_reverse_iterator rit = vMainBlockHash.rbegin();
     for (; rit != vMainBlockHash.rend(); rit++) {
@@ -69,6 +75,32 @@ std::vector<uint256> BMMCache::GetRecentMainBlockHashes() const
     }
     std::reverse(vHash.begin(), vHash.end());
     return vHash;
+}
+
+std::vector<uint256> BMMCache::GetLastMainBlockHashes(size_t n) const
+{
+    LOCK_MAIN_CACHE;
+    size_t nStart = vMainBlockHash.size() > n ? vMainBlockHash.size() - n : 0;
+    return std::vector<uint256>(vMainBlockHash.begin() + nStart, vMainBlockHash.end());
+}
+
+uint256 BMMCache::GetMainChildBlockHash(const uint256& hashBlock) const
+{
+    LOCK_MAIN_CACHE;
+    return GetMainChildBlockHashLocked(hashBlock);
+}
+
+uint256 BMMCache::GetMainChildBlockHashLocked(const uint256& hashBlock) const
+{
+    std::map<uint256, MainBlockIndex>::const_iterator it = mapMainBlock.find(hashBlock);
+    if (it == mapMainBlock.end())
+        return uint256();
+
+    size_t nChild = it->second.index + 1;
+    if (nChild >= vMainBlockHash.size())
+        return uint256();
+
+    return vMainBlockHash[nChild];
 }
 
 void BMMCache::ClearBMMBlocks()
@@ -149,6 +181,12 @@ std::vector<uint256> BMMCache::GetVerifiedDepositCache() const
 
 void BMMCache::CacheMainBlockHash(const uint256& hash)
 {
+    LOCK_MAIN_CACHE;
+    CacheMainBlockHashLocked(hash);
+}
+
+void BMMCache::CacheMainBlockHashLocked(const uint256& hash)
+{
     // Don't re-cache the genesis block
     if (vMainBlockHash.size() == 1 && hash == vMainBlockHash.front())
         return;
@@ -166,6 +204,7 @@ void BMMCache::CacheMainBlockHash(const uint256& hash)
 
 bool BMMCache::UpdateMainBlockCache(std::deque<uint256>& deqHashNew, bool& fReorg, std::vector<uint256>& vOrphan)
 {
+    LOCK_MAIN_CACHE;
     if (deqHashNew.empty()) {
         LogPrintf("%s: Error - called with empty list of new block hashes!\n", __func__);
         return false;
@@ -173,7 +212,7 @@ bool BMMCache::UpdateMainBlockCache(std::deque<uint256>& deqHashNew, bool& fReor
 
     // If the main block cache doesn't have the genesis block yet, add it first
     if (vMainBlockHash.empty())
-        CacheMainBlockHash(deqHashNew.front());
+        CacheMainBlockHashLocked(deqHashNew.front());
 
     // Figure out the block in our cache that we will append the new blocks to
     MainBlockIndex index;
@@ -209,20 +248,21 @@ bool BMMCache::UpdateMainBlockCache(std::deque<uint256>& deqHashNew, bool& fReor
     //
     // Check if we already know the first block in the deque and remove it if
     // we do.
-    if (HaveMainBlock(deqHashNew.front()))
+    if (mapMainBlock.count(deqHashNew.front()))
         deqHashNew.pop_front();
 
     // Append new blocks
     for (const uint256& u : deqHashNew)
-        CacheMainBlockHash(u);
+        CacheMainBlockHashLocked(u);
 
-    LogPrintf("%s: Updated cached mainchain tip to: %s.\n", __func__, deqHashNew.back().ToString());
+    LogPrintf("%s: Updated cached mainchain tip to: %s.\n", __func__, vMainBlockHash.back().ToString());
 
     return true;
 }
 
 uint256 BMMCache::GetLastMainBlockHash() const
 {
+    LOCK_MAIN_CACHE;
     if (vMainBlockHash.empty())
         return uint256();
 
@@ -231,6 +271,7 @@ uint256 BMMCache::GetLastMainBlockHash() const
 
 uint256 BMMCache::GetMainPrevBlockHash(const uint256& hashBlock) const
 {
+    LOCK_MAIN_CACHE;
     if (vMainBlockHash.size() < 2)
         return uint256();
 
@@ -252,11 +293,13 @@ uint256 BMMCache::GetMainPrevBlockHash(const uint256& hashBlock) const
 
 int BMMCache::GetCachedBlockCount() const
 {
+    LOCK_MAIN_CACHE;
     return vMainBlockHash.size();
 }
 
 int BMMCache::GetMainchainBlockHeight(const uint256& hash) const
 {
+    LOCK_MAIN_CACHE;
     if (!mapMainBlock.count(hash))
         return -1;
 
@@ -267,6 +310,7 @@ int BMMCache::GetMainchainBlockHeight(const uint256& hash) const
 
 bool BMMCache::HaveMainBlock(const uint256& hash) const
 {
+    LOCK_MAIN_CACHE;
     return mapMainBlock.count(hash);
 }
 
@@ -287,8 +331,50 @@ bool BMMCache::MainBlockChecked(const uint256& hashBlock) const
 
 void BMMCache::ResetMainBlockCache()
 {
+    LOCK_MAIN_CACHE;
     vMainBlockHash.clear();
     mapMainBlock.clear();
+}
+
+void BMMCache::ReplaceMainBlockCache(const std::deque<uint256>& deqHash)
+{
+    // Build the replacement outside the lock, then swap it in: a reader sees
+    // the old cache or the new one, never an empty or half-built one.
+    std::vector<uint256> vHash;
+    std::map<uint256, MainBlockIndex> mapIndex;
+    vHash.reserve(deqHash.size());
+    for (const uint256& u : deqHash) {
+        if (mapIndex.count(u))
+            continue;
+        MainBlockIndex index;
+        index.hash = u;
+        index.index = vHash.size();
+        vHash.push_back(u);
+        mapIndex[u] = index;
+    }
+
+    LOCK_MAIN_CACHE;
+    vMainBlockHash.swap(vHash);
+    mapMainBlock.swap(mapIndex);
+}
+
+bool BMMCache::GetMainBlockHashesFrom(int nHeight, size_t n, std::vector<uint256>& vHash) const
+{
+    LOCK_MAIN_CACHE;
+    vHash.clear();
+    if (nHeight < 0 || (size_t)nHeight + n > vMainBlockHash.size())
+        return false;
+    vHash.assign(vMainBlockHash.begin() + nHeight, vMainBlockHash.begin() + nHeight + n);
+    return true;
+}
+
+uint256 BMMCache::GetMainBlockThroughT(const uint256& hashMain, const uint256& hashPrevMain) const
+{
+    LOCK_MAIN_CACHE;
+    std::map<uint256, MainBlockIndex>::const_iterator it = mapMainBlock.find(hashMain);
+    if (it != mapMainBlock.end() && it->second.index > 0 && vMainBlockHash[it->second.index - 1] == hashPrevMain)
+        return hashMain;
+    return GetMainChildBlockHashLocked(hashPrevMain);
 }
 
 void BMMCache::CacheWithdrawalID(const uint256& wtid)

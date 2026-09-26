@@ -89,8 +89,25 @@ mainnet-family L1 (the eCash alpha network) and fixes an identity check that nev
 v0.2.11 hardens the enforcer transport against the ways a real host stack misbehaves,
 v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed,
 v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers,
-v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send, and
-v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block:
+v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send,
+v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block, and
+v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe:
+
+- **BitWindow can bid for FreeBank blocks** (v0.2.16). Three new RPCs, `get_block_template`,
+  `connect_block` and `get_bmm_inclusions`, let BitWindow's blind-merged-mining engine build, bid for
+  and connect FreeBank blocks. A template stays the same for one eCash round, and `connect_block`
+  answers `false` only for a block that is really invalid; anything temporary is a retryable error
+  (-40), so a paid bid is never abandoned by mistake. `-bmmbidder=engine` makes the engine the node's
+  only bidder, and `-bmmblockmaxweight` caps template size. `setcoinbasetag` changes the coinbase tag
+  at runtime.
+- **`-reindex` no longer depends on luck** (v0.2.16). Before replaying blocks, the node now fills its
+  eCash block cache and waits for the enforcer if it is behind (`-replaycachewait`, default 600 s
+  without progress). Before, a replay could start with an empty cache and throw the chain away.
+  The cache loaders now log what they loaded.
+- **Withdrawal bundles need no enforcer wallet** (v0.2.16). They go to the enforcer's
+  `BlockProducerService/ProposeWithdrawalBundle`, falling back to the old wallet call only on an
+  enforcer too old to have it. An eCash reorg now checks only the newest 1,000 cached blocks instead
+  of the whole cache. No consensus change: a binary swap.
 
 - **An unreadable eCash transaction next to a withdrawal payout no longer stops deposit
   crediting** (v0.2.15). When the node looks through an L1 block for a paid bundle, it now skips
@@ -288,6 +305,32 @@ Two things worth knowing before you start:
   coding agent — if you'd rather not drive four pieces of software by hand, pointing
   Claude Code (or another agentic assistant) at that page and asking it to do the
   bring-up with you works well.
+
+## Verify your download
+
+Each release lists its files' SHA-256 hashes in `SHA256SUMS`, signed with the FreeBank release key
+(`SHA256SUMS.sig`). The key's public half is below and is also published as a signing key on the
+maintainer's GitHub account ([mblowes](https://api.github.com/users/mblowes/ssh_signing_keys)), so you
+can check it from two places:
+
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAi2C9Lpi3gHPva6tlbLE+wdF1Cer3uUnmwZYr6SeRjR FreeBank release signing
+fingerprint SHA256:1d0zm9Qb9ZtzDnQHH593fgjAkk7nPqMDG79XyWlyeeY
+```
+
+To verify (OpenSSH 8.1 or later):
+
+```
+echo 'freebank-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAi2C9Lpi3gHPva6tlbLE+wdF1Cer3uUnmwZYr6SeRjR' > allowed_signers
+ssh-keygen -Y verify -f allowed_signers -I freebank-release -n file -s SHA256SUMS.sig < SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+The macOS tarball is built by this repository's GitHub workflow from the tagged source, and GitHub
+records a signed build attestation for it. Check it with
+`gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank`.
+The Linux tarball is built by the maintainer from the same tag; reproducible builds, so that anyone
+can rebuild it byte for byte, are planned.
 
 ## Feedback
 

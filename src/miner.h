@@ -120,6 +120,10 @@ struct update_for_parent_inclusion
 };
 
 /** Generate a new block, without valid proof-of-work */
+//! -bmmblockmaxweight default (v0.2.16): the weight cap for get_block_template's
+//! mempool transactions. The BMM engine stores every template in its bid records.
+static const unsigned int DEFAULT_BMM_BLOCK_MAX_WEIGHT = 300000;
+
 class BlockAssembler
 {
 private:
@@ -165,12 +169,12 @@ public:
      * If an optional vector of transactions is passed in, all but the coinbase
      * will be replaced with those transactions.
      */
-    bool GenerateBMMBlock(CBlock& block, std::string& strError, CAmount* nFeesOut = nullptr, const std::vector<CMutableTransaction>& vtx = std::vector<CMutableTransaction>(), const uint256& hashPrevBlock = uint256(), const CScript& scriptPubKey = CScript());
+    bool GenerateBMMBlock(CBlock& block, std::string& strError, CAmount* nFeesOut = nullptr, const std::vector<CMutableTransaction>& vtx = std::vector<CMutableTransaction>(), const uint256& hashPrevBlock = uint256(), const CScript& scriptPubKey = CScript(), const uint256& hashMainTip = uint256());
 
 private:
     // Note: Moved to private, should always use GenerateBMMBlock().
     /** Construct a new block template with coinbase to scriptPubKeyIn */
-    std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn, bool fMineWitnessTx=true, bool fCheckBMM = true, const uint256& hashPrevBlock = uint256(), CAmount* nFeesOut = nullptr);
+    std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn, bool fMineWitnessTx=true, bool fCheckBMM = true, const uint256& hashPrevBlock = uint256(), CAmount* nFeesOut = nullptr, const uint256& hashMainTip = uint256());
 
     // utility functions
     /** Clear the block's state and prepare for assembling a new block */
@@ -207,6 +211,12 @@ private:
       * of updated descendants. */
     int UpdatePackagesForAdded(const CTxMemPool::setEntries& alreadyAdded, indexed_modified_transaction_set &mapModifiedTx);
 };
+
+/** Block assembler options for get_block_template (v0.2.16): the usual ones,
+ *  with the transaction weight capped at -bmmblockmaxweight. Deposits come
+ *  after the transactions and are still bounded by MAX_BLOCK_WEIGHT only,
+ *  so the cap never truncates them. */
+BlockAssembler::Options BMMTemplateAssemblerOptions();
 
 /** Modify the extranonce in a block. The coinbase scriptSig becomes
  *  <height> <extranonce> + COINBASE_FLAGS (the -coinbasetag push, or nothing). */

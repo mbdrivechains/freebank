@@ -20,6 +20,7 @@
 #include <validation.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <map>
@@ -49,7 +50,7 @@ public:
     std::vector<SidechainDeposit> UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex) override;
     bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx) override;
     bool VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime) override;
-    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount) override;
+    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent) override;
     bool GetCTIP(std::pair<uint256, uint32_t>& ctip) override;
     bool GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFees) override;
     bool GetBlockCount(int& nBlocks) override;
@@ -68,11 +69,13 @@ private:
 };
 
 //
-// EnforcerL1Client - reads mainchain state from the CUSF bip300301_enforcer
-// ValidatorService (gRPC) by shelling out to grpcurl. Read-path only: the
-// write-path (SendBMMRequest, BroadcastWithdrawalBundle) and the deposit /
-// withdrawal-status queries need the enforcer wallet service and land in
-// Phase 2b - until then those methods log once and report failure.
+// EnforcerL1Client - the CUSF bip300301_enforcer transport, by shelling out to
+// grpcurl: mainchain state and withdrawal-bundle events from ValidatorService,
+// BMM requests from WalletService (SendBMMRequest needs the enforcer wallet),
+// withdrawal bundles to BlockProducerService/ProposeWithdrawalBundle (with a
+// fallback to WalletService/BroadcastWithdrawalBundle for enforcers older than
+// 7958cef), and deposit txs from the mainchain node's REST interface
+// (-mainchainrest).
 //
 
 class EnforcerL1Client final : public L1Client
@@ -82,7 +85,7 @@ public:
     std::vector<SidechainDeposit> UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex) override;
     bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx) override;
     bool VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime) override;
-    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount) override;
+    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent) override;
     bool GetCTIP(std::pair<uint256, uint32_t>& ctip) override;
     bool GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFees) override;
     bool GetBlockCount(int& nBlocks) override;
@@ -92,6 +95,7 @@ public:
     bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override;
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
+    Commitment ReadBmmCommitment(const uint256& hashMainBlock, uint256& hashCommitment) override;
 
     /* The init-time REST reachability probe borrows the private RestGet. */
     friend bool ::ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch);
@@ -110,6 +114,25 @@ private:
 
     /* Shared grpcurl shell-out for any enforcer service. */
     bool CallEnforcer(const std::string& strService, const std::string& strMethod, const std::string& strRequest, UniValue& result);
+
+    /* The same shell-out for a call whose reply is not needed. Returns grpcurl's
+     * exit status (-1 if it could not be run) and its stderr in strError, so the
+     * caller can tell a method the enforcer lacks from a transient failure
+     * (ClassifyGrpcurlFailure). */
+    int CallEnforcerStatus(const std::string& strService, const std::string& strMethod, const std::string& strRequest, std::string& strError);
+
+    /* Run one grpcurl call; stdout (with stderr merged in if fStderr) goes to
+     * strOutput. Returns the exit status, or -1 if it could not be run. */
+    int RunGrpcurl(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput);
+
+    /* One enforcer method that takes a withdrawal bundle (D7) */
+    struct BundleMethod {
+        const char* pszService;
+        const char* pszMethod;
+    };
+
+    /* Log a failed withdrawal-bundle call once per method and exit status */
+    void LogBundleFailure(const BundleMethod& method, int nExit, const std::string& strError, const std::string& strHint);
 
     /* GetChainTip convenience wrapper */
     bool GetChainTip(L1BlockHeader& header);
@@ -137,6 +160,12 @@ private:
 
     std::mutex mutexLogged;
     std::set<std::string> setLogged;
+
+    /* D7: true once WalletService/BroadcastWithdrawalBundle has taken a bundle
+     * after ProposeWithdrawalBundle answered Unimplemented (an enforcer older
+     * than 7958cef). Changed only by a successful call on the other method,
+     * never by a transient failure. */
+    std::atomic<bool> fBundleViaWallet{false};
 
     /* Located M6s by (L1 block hash, m6id) -> (index in block, tx). UpdateDeposits
      * re-reads every Succeeded event of the full L1 history on each template;
@@ -536,46 +565,66 @@ bool BuildM6Candidates(const std::vector<uint256>& vBlockTxid, const std::set<ui
 // EnforcerL1Client
 //
 
-bool EnforcerL1Client::CallEnforcer(const std::string& strService, const std::string& strMethod, const std::string& strRequest, UniValue& result)
+int EnforcerL1Client::RunGrpcurl(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput)
 {
     // Requests are built internally from hex strings and integers only; the
     // binary and address come from the node operator's own configuration.
     // (base64 in the withdrawal-bundle payload has no single quote, so the
     // single-quoted -d '...' stays safe.)
     if (strRequest.find('\'') != std::string::npos)
-        return false;
+        return -1;
 
     std::string strBin = gArgs.GetArg("-grpcurlbin", "grpcurl");
     std::string strAddr = gArgs.GetArg("-enforceraddr", "127.0.0.1:50051");
 
-    std::string strCommand = BuildGrpcurlCommand(strBin, strRequest, strAddr, strService, strMethod);
+    std::string strCommand = BuildGrpcurlCommand(strBin, strRequest, strAddr, strService, strMethod, fStderr);
     if (strCommand.empty()) {
         LogOnce("grpcurl-badpath", "ERROR Enforcer client: -grpcurlbin path '" + strBin +
             "' contains a double quote and cannot be run; set -grpcurlbin to a plain path\n");
-        return false;
+        return -1;
     }
 
     FILE* pipe = popen(strCommand.c_str(), "r");
     if (!pipe) {
         LogPrintf("ERROR Enforcer client failed to run grpcurl (%s)\n", strMethod);
-        return false;
+        return -1;
     }
 
-    std::string strOutput;
     char buffer[4096];
     size_t nRead;
     while ((nRead = fread(buffer, 1, sizeof(buffer), pipe)) > 0)
         strOutput.append(buffer, nRead);
 
     int status = pclose(pipe);
-    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        // 127 = the shell couldn't find the grpcurl binary at all - that is
-        // misconfiguration, not a routine failure, so say so once
-        if (status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 127)
-            LogOnce("grpcurl-missing", "ERROR Enforcer client: grpcurl binary '" + strBin +
-                "' not found - the enforcer transport cannot work; set -grpcurlbin\n");
-        // Otherwise can be enabled for debug -- too noisy (includes routine
-        // "block not found" gRPC errors)
+    if (status == -1 || !WIFEXITED(status))
+        return -1;
+
+    // 127 = the shell couldn't find the grpcurl binary at all - that is
+    // misconfiguration, not a routine failure, so say so once
+    if (WEXITSTATUS(status) == 127)
+        LogOnce("grpcurl-missing", "ERROR Enforcer client: grpcurl binary '" + strBin +
+            "' not found - the enforcer transport cannot work; set -grpcurlbin\n");
+
+    return WEXITSTATUS(status);
+}
+
+int EnforcerL1Client::CallEnforcerStatus(const std::string& strService, const std::string& strMethod, const std::string& strRequest, std::string& strError)
+{
+    // stderr is merged into the output: on success the reply is not needed, and
+    // on failure grpcurl prints nothing to stdout, so the output is its stderr
+    std::string strOutput;
+    int nExit = RunGrpcurl(strService, strMethod, strRequest, true, strOutput);
+    if (nExit != 0)
+        strError = strOutput;
+    return nExit;
+}
+
+bool EnforcerL1Client::CallEnforcer(const std::string& strService, const std::string& strMethod, const std::string& strRequest, UniValue& result)
+{
+    std::string strOutput;
+    if (RunGrpcurl(strService, strMethod, strRequest, false, strOutput) != 0) {
+        // Can be enabled for debug -- too noisy (includes routine "block not
+        // found" gRPC errors)
         // LogPrintf("ERROR Enforcer client %s failed\n", strMethod);
         return false;
     }
@@ -637,6 +686,19 @@ void EnforcerL1Client::LogUnimplemented(const std::string& strMethod, const std:
         " is not available on the enforcer transport yet (" + strReason + ")\n");
 }
 
+void EnforcerL1Client::LogBundleFailure(const BundleMethod& method, int nExit, const std::string& strError, const std::string& strHint)
+{
+    // The auto-send in ConnectBlock retries on every block until a call
+    // succeeds, so one line per method and exit status is enough
+    std::string strDetail = strError.substr(0, 300);
+    std::replace(strDetail.begin(), strDetail.end(), '\n', ' ');
+    std::string strMethod = std::string(method.pszService) + "/" + method.pszMethod;
+    LogOnce("bundle-fail:" + strMethod + ":" + std::to_string(nExit),
+        "ERROR Enforcer client: withdrawal bundle not accepted by " + strMethod +
+        " (grpcurl exit " + std::to_string(nExit) + ": " + strDetail + ")" + strHint +
+        "; retried on every block, logged once per method and exit status\n");
+}
+
 bool EnforcerL1Client::BroadcastWithdrawalBundle(const std::string& hex)
 {
     // The enforcer expects a BLINDED M6: a ZERO-input tx (the input spending the
@@ -662,9 +724,48 @@ bool EnforcerL1Client::BroadcastWithdrawalBundle(const std::string& hex)
     std::string strRequest = "{\"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) +
         ", \"transaction\": \"" + strB64 + "\"}";
 
-    UniValue result(UniValue::VOBJ);
-    if (!CallWallet("BroadcastWithdrawalBundle", strRequest, result))
-        return false;
+    // D7 (v0.2.16): the bundle goes to BlockProducerService/
+    // ProposeWithdrawalBundle (enforcer 7958cef and later). The enforcer
+    // registers that service with --enable-wallet or with
+    // --enable-block-template-server, so it also reaches BitWindow's enforcer,
+    // which runs no wallet and so has no WalletService. Enforcers older than
+    // 7958cef only have WalletService/BroadcastWithdrawalBundle. Both take the
+    // same request and do the same thing: store the bundle in the enforcer's DB
+    // (INSERT OR IGNORE), so calling both is harmless. Try the method that last
+    // worked; only when the enforcer says it lacks it (Unimplemented) try the
+    // other once, and remember that one if it works. A transient failure
+    // changes nothing: the next call tries the same method again.
+    static const BundleMethod PROPOSE = {"cusf.mainchain.v1.BlockProducerService", "ProposeWithdrawalBundle"};
+    static const BundleMethod BROADCAST = {"cusf.mainchain.v1.WalletService", "BroadcastWithdrawalBundle"};
+
+    const bool fViaWallet = fBundleViaWallet.load();
+    const BundleMethod& first = fViaWallet ? BROADCAST : PROPOSE;
+    const BundleMethod& second = fViaWallet ? PROPOSE : BROADCAST;
+
+    std::string strError;
+    int nExit = CallEnforcerStatus(first.pszService, first.pszMethod, strRequest, strError);
+    if (nExit != 0) {
+        if (ClassifyGrpcurlFailure(nExit, strError) != GrpcurlFailure::UNIMPLEMENTED) {
+            LogBundleFailure(first, nExit, strError, "");
+            return false;
+        }
+
+        std::string strError2;
+        int nExit2 = CallEnforcerStatus(second.pszService, second.pszMethod, strRequest, strError2);
+        if (nExit2 != 0) {
+            std::string strHint;
+            if (ClassifyGrpcurlFailure(nExit2, strError2) == GrpcurlFailure::UNIMPLEMENTED)
+                strHint = "; the enforcer serves neither ProposeWithdrawalBundle nor BroadcastWithdrawalBundle: "
+                    "it needs --enable-wallet or --enable-block-template-server";
+            LogBundleFailure(first, nExit, strError, "");
+            LogBundleFailure(second, nExit2, strError2, strHint);
+            return false;
+        }
+
+        fBundleViaWallet = !fViaWallet;
+        LogPrintf("Enforcer client: this enforcer does not have %s/%s; withdrawal bundles now go to %s/%s\n",
+            first.pszService, first.pszMethod, second.pszService, second.pszMethod);
+    }
 
     // A successful call registers the (blinded) bundle with the enforcer; its
     // block producer then proposes it (M3) and acks it (M4) via generate_blocks
@@ -1348,8 +1449,31 @@ bool EnforcerL1Client::VerifyBMM(const uint256& hashMainBlock, const uint256& ha
     return true;
 }
 
-uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount)
+L1Client::Commitment EnforcerL1Client::ReadBmmCommitment(const uint256& hashMainBlock, uint256& hashCommitment)
 {
+    hashCommitment.SetNull();
+
+    std::string strRequest = "{\"block_hash\": {\"hex\": \"" + hashMainBlock.ToString() +
+        "\"}, \"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) + "}";
+
+    UniValue result(UniValue::VOBJ);
+    if (!CallValidator("GetBmmHStarCommitment", strRequest, result))
+        return Commitment::UNKNOWN;
+
+    bool fBlockFound = false;
+    bool fHaveCommitment = false;
+    if (!ParseEnforcerBmmCommitment(result, fBlockFound, fHaveCommitment, hashCommitment))
+        return Commitment::UNKNOWN;
+
+    if (!fBlockFound)
+        return Commitment::NOT_FOUND;
+
+    return fHaveCommitment ? Commitment::COMMITTED : Commitment::NONE;
+}
+
+uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent)
+{
+    fNotSent = false;
     // WalletService/CreateBmmCriticalDataTransaction. Builds, funds (from the
     // enforcer wallet), signs and broadcasts the BMM request in one call.
     if (amount == CAmount(0))
@@ -1369,17 +1493,33 @@ uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& 
         ", \"critical_hash\": {\"hex\": \"" + ConsensusHexFromUint256(hashBMM) + "\"}" +
         ", \"prev_bytes\": {\"hex\": \"" + hashBlockMain.ToString() + "\"}}";
 
-    UniValue result(UniValue::VOBJ);
-    if (!CallWallet("CreateBmmCriticalDataTransaction", strRequest, result)) {
-        // Fails (non-zero grpcurl exit) on: stale prev_bytes (not the tip),
-        // AlreadyExists for this tip, inactive sidechain, or unfunded wallet.
-        // Null txid == "no request created", same as the JSON-RPC twin.
+    // Fails (non-zero grpcurl exit) on: stale prev_bytes (not the tip),
+    // inactive sidechain, or a wallet / broadcast error (e.g. unfunded).
+    // The enforcer has no AlreadyExists for a second bid on the same tip:
+    // one bid per tip is freebankd's own rule (RefreshBMM's
+    // StorePrevBlockBMMCreated). A txid back does not prove the L1 mempool
+    // took the bid either - the enforcer only pushes it to its P2P peers.
+    // It broadcasts before it replies, so a failure without a definite
+    // refusal (a timeout, a broadcast error) may still have sent the bid:
+    // fNotSent is set only for a refusal (GrpcurlBMMRequestNotSent).
+    // stderr is merged into the output, for that classification.
+    std::string strOutput;
+    int nExit = RunGrpcurl("cusf.mainchain.v1.WalletService", "CreateBmmCriticalDataTransaction", strRequest, true, strOutput);
+    if (nExit != 0) {
+        fNotSent = GrpcurlBMMRequestNotSent(nExit, strOutput);
+        std::string strDetail = strOutput.substr(0, 300);
+        std::replace(strDetail.begin(), strDetail.end(), '\n', ' ');
+        LogPrintf("ERROR Enforcer client: BMM request failed (grpcurl exit %d: %s); %s\n", nExit, strDetail,
+            fNotSent ? "no bid was sent" : "the bid may have gone out");
         return uint256();
     }
 
+    UniValue result(UniValue::VOBJ);
     std::string strTxid;
-    if (!GetHexField(find_value(result, "txid"), strTxid))
+    if (!result.read(strOutput) || !GetHexField(find_value(result, "txid"), strTxid)) {
+        LogPrintf("ERROR Enforcer client: BMM request answered without a readable txid; the bid may have gone out\n");
         return uint256();
+    }
 
     uint256 txid = uint256S(strTxid);
     if (!txid.IsNull())
@@ -1612,12 +1752,47 @@ bool IsValidL1Transport(const std::string& strTransport)
     return strTransport == "jsonrpc" || strTransport == "enforcer";
 }
 
-std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod)
+std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod, bool fStderr)
 {
     if (strBin.find('"') != std::string::npos)
         return "";
     return "\"" + strBin + "\" -plaintext -max-time 15 -d '" + strRequest + "' " +
-        strAddr + " " + strService + "/" + strMethod + " 2>/dev/null";
+        strAddr + " " + strService + "/" + strMethod + (fStderr ? " 2>&1" : " 2>/dev/null");
+}
+
+GrpcurlFailure ClassifyGrpcurlFailure(int nExit, const std::string& strError)
+{
+    if (nExit == 0)
+        return GrpcurlFailure::NONE;
+    // The server answered Unimplemented (64 + gRPC code 12)
+    if (nExit == 76)
+        return GrpcurlFailure::UNIMPLEMENTED;
+    // grpcurl resolves the method through the server's reflection before it
+    // calls; a method the enforcer does not know never reaches the server
+    if (nExit == 1 && (strError.find("does not include a method named") != std::string::npos ||
+            strError.find("does not expose service") != std::string::npos))
+        return GrpcurlFailure::UNIMPLEMENTED;
+    return GrpcurlFailure::OTHER;
+}
+
+bool GrpcurlBMMRequestNotSent(int nExit, const std::string& strError)
+{
+    if (nExit == 0 || nExit == -1)
+        return false;
+    // The shell could not find grpcurl, or the enforcer lacks the method
+    if (nExit == 127 || ClassifyGrpcurlFailure(nExit, strError) == GrpcurlFailure::UNIMPLEMENTED)
+        return true;
+    // InvalidArgument / FailedPrecondition: refused before the tx was built
+    if (nExit == 67 || nExit == 73)
+        return true;
+    // Unknown from create_bmm_request's build or sign step, before the broadcast
+    if (nExit == 66 && (strError.find("failed to build BMM tx") != std::string::npos ||
+            strError.find("failed to sign BMM tx") != std::string::npos))
+        return true;
+    // grpcurl never reached the enforcer
+    if (nExit == 1 && strError.find("Failed to dial target host") != std::string::npos)
+        return true;
+    return false;
 }
 
 const std::string& DefaultMainchainTransport()
@@ -1878,8 +2053,11 @@ bool JsonRpcL1Client::VerifyBMM(const uint256& hashMainBlock, const uint256& has
     }
 }
 
-uint256 JsonRpcL1Client::SendBMMRequest(const uint256& hashCritical, const uint256& hashBlockMain, int nHeight, CAmount amount)
+uint256 JsonRpcL1Client::SendBMMRequest(const uint256& hashCritical, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent)
 {
+    // A failed call here cannot tell a refusal from a lost reply: never
+    // report "not sent", so the tip stays claimed (the pre-v0.2.16 rule).
+    fNotSent = false;
     uint256 txid = uint256();
     std::string strPrevHash = hashBlockMain.ToString();
 

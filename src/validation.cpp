@@ -321,7 +321,7 @@ CScript COINBASE_FLAGS;
 const std::string strMessageMagic = "Bitcoin Signed Message:\n";
 const std::string strRefundMessageMagic = "REFUND DhjM9iNapSA 3e243e21\n";
 
-std::mutex mainBlockCacheMutex;
+std::timed_mutex mainBlockCacheMutex;
 std::mutex mainBlockCacheReorgMutex;
 
 // Internal stuff
@@ -11947,6 +11947,9 @@ void LoadBMMCache()
     fs::path path = GetDataDir() / "bmm.dat";
     CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
     if (filein.IsNull()) {
+        // Said out loud (v0.2.16): a missing file used to return silently, so
+        // a replay against an empty cache left no trace in the log.
+        LogPrintf("%s: no bmm.dat; BMM and deposit checks start uncached and ask the mainchain\n", __func__);
         return;
     }
 
@@ -12009,7 +12012,7 @@ void LoadBMMCache()
         }
     }
     catch (const std::exception& e) {
-        LogPrintf("%s: Error reading BMM cache: %s", __func__, e.what());
+        LogPrintf("%s: Error reading BMM cache: %s\n", __func__, e.what());
         return;
     }
 
@@ -12022,6 +12025,8 @@ void LoadBMMCache()
     for (const uint256& u : vDepositTXID) {
         bmmCache.CacheVerifiedDeposit(u);
     }
+    LogPrintf("%s: loaded %u withdrawal-bundle, %u BMM, %u deposit entries\n", __func__,
+              vHashWithdrawal.size(), vHashBMM.size(), vDepositTXID.size());
 }
 
 void DumpBMMCache()
@@ -12063,7 +12068,7 @@ void DumpBMMCache()
 
     }
     catch (const std::exception& e) {
-        LogPrintf("%s: Error writing BMM cache: %s", __func__, e.what());
+        LogPrintf("%s: Error writing BMM cache: %s\n", __func__, e.what());
         return;
     }
 
@@ -12079,6 +12084,8 @@ void LoadMainBlockCache()
     fs::path path = GetDataDir() / "mainblockhash.dat";
     CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
     if (filein.IsNull()) {
+        // Said out loud (v0.2.16), as for bmm.dat: see LoadBMMCache.
+        LogPrintf("%s: no mainblockhash.dat; the cache starts empty and is filled from the mainchain\n", __func__);
         return;
     }
 
@@ -12125,12 +12132,16 @@ void LoadMainBlockCache()
         }
     }
     catch (const std::exception& e) {
-        LogPrintf("%s: Error reading main block cache: %s", __func__, e.what());
+        LogPrintf("%s: Error reading main block cache: %s\n", __func__, e.what());
         return;
     }
 
     for (const uint256& u : vHash)
         bmmCache.CacheMainBlockHash(u);
+    // N is the file's count, so it matches DumpMainBlockCache's "Wrote N" from
+    // the stop that wrote it (the integration gates compare the two).
+    LogPrintf("%s: loaded %u L1 block hashes (tip %s)\n", __func__, vHash.size(),
+              vHash.empty() ? std::string("none") : vHash.back().ToString());
 }
 
 void DumpMainBlockCache()
@@ -12157,7 +12168,7 @@ void DumpMainBlockCache()
         }
     }
     catch (const std::exception& e) {
-        LogPrintf("%s: Error writing main block cache: %s", __func__, e.what());
+        LogPrintf("%s: Error writing main block cache: %s\n", __func__, e.what());
         return;
     }
 
@@ -12192,7 +12203,7 @@ void DumpWithdrawalIDCache()
         }
     }
     catch (const std::exception& e) {
-        LogPrintf("%s: Error writing Withdrawal ID cache: %s", __func__, e.what());
+        LogPrintf("%s: Error writing Withdrawal ID cache: %s\n", __func__, e.what());
         return;
     }
 
@@ -12254,7 +12265,7 @@ void LoadWithdrawalIDCache()
         }
     }
     catch (const std::exception& e) {
-        LogPrintf("%s: Error reading Withdrawal ID cache: %s", __func__, e.what());
+        LogPrintf("%s: Error reading Withdrawal ID cache: %s\n", __func__, e.what());
         return;
     }
 
@@ -12781,10 +12792,40 @@ void SetNetworkActive(bool fActive, const std::string& strReason)
 //! between one request per block and one per thousand.
 static const uint32_t MAIN_BLOCK_CACHE_BATCH = 1000;
 
-bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
-{
-    std::lock_guard<std::mutex> lock(mainBlockCacheMutex);
+//! Mainchain orphans found while blocks are imported or replayed (v0.2.16).
+//! HandleMainchainReorg cannot act on them yet: the side blocks anchored in
+//! them may not be indexed or active until the replay reaches them, and the
+//! cache has already dropped them (BMMCache::UpdateMainBlockCache), so nothing
+//! would find them again. ThreadImport handles them once the import is done.
+static std::mutex mutexQueuedMainOrphans;
+static std::vector<uint256> vQueuedMainOrphans;
 
+static void QueueMainchainOrphans(const std::vector<uint256>& vOrphan)
+{
+    std::lock_guard<std::mutex> lock(mutexQueuedMainOrphans);
+    vQueuedMainOrphans.insert(vQueuedMainOrphans.end(), vOrphan.begin(), vOrphan.end());
+    LogPrintf("%s: %u mainchain orphans held until the block import finishes (%u queued)\n", __func__,
+              vOrphan.size(), vQueuedMainOrphans.size());
+}
+
+void HandleQueuedMainchainReorgs()
+{
+    std::vector<uint256> vOrphan;
+    {
+        std::lock_guard<std::mutex> lock(mutexQueuedMainOrphans);
+        vOrphan.swap(vQueuedMainOrphans);
+    }
+    if (vOrphan.empty())
+        return;
+    LogPrintf("%s: handling %u mainchain orphans queued during the block import\n", __func__, vOrphan.size());
+    HandleMainchainReorg(vOrphan);
+}
+
+// The walk itself; mainBlockCacheMutex is held. fFresh (v0.2.16): ignore the
+// cache, walk down to the genesis block and swap the result in whole
+// (BMMCache::ReplaceMainBlockCache); on a failure the cache is left as it was.
+static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& vDisconnected, MainBlockCacheWalk* pWalk, bool fFresh)
+{
     //
     // Note: bitcoin core does not count genesis block towards block count but
     // we will cache it.
@@ -12811,7 +12852,9 @@ bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
     // same as the current mainchain tip. If it is we don't need to do anything
     // else. If it isn't we will continue to update / reorg handling.
     int nCachedBlocks = bmmCache.GetCachedBlockCount();
-    if (nMainBlocks + 1 == nCachedBlocks && hashCachedTip == hashMainTip) {
+    if (!fFresh && nMainBlocks + 1 == nCachedBlocks && hashCachedTip == hashMainTip) {
+        if (pWalk)
+            pWalk->deqHash.clear();
         return true;
     }
 
@@ -12831,15 +12874,52 @@ bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
     size_t nBatchPos = 0;
     uint256 hashCursor = hashMainTip;
     int nCursor = nMainBlocks;
-    for (int i = nMainBlocks; i > 0; i--) {
+
+    // Resume the walk an earlier failed attempt saved (pWalk, v0.2.16): at its
+    // cursor if the L1 tip has not moved; otherwise walk down from the new tip
+    // until the old tip turns up and splice the saved hashes in below it.
+    // Without this a cold refill (~970 batches on production) that fails
+    // anywhere starts again from the tip and may never finish.
+    bool fSplice = pWalk && !pWalk->deqHash.empty();
+    if (fSplice && pWalk->hashTip == hashMainTip) {
+        deqHashNew.swap(pWalk->deqHash);
+        hashCursor = pWalk->hashCursor;
+        nCursor = pWalk->nCursor;
+        fSplice = false;
+        LogPrintf("%s: resuming at mainchain block %d (%u hashes kept)\n", __func__, nCursor, deqHashNew.size());
+    }
+    // On a failure keep the longer walk: the saved one until it is spliced in.
+    const auto SaveWalk = [&]() {
+        if (!pWalk || fSplice || deqHashNew.empty())
+            return;
+        pWalk->hashTip = hashMainTip;
+        pWalk->deqHash.swap(deqHashNew);
+        pWalk->hashCursor = hashCursor;
+        pWalk->nCursor = nCursor;
+    };
+
+    unsigned int nBatches = 0;
+    while (nCursor > 0) {
         // Refill the batch when exhausted. The batch starts AT the cursor
         // block, so skip its first entry (already consumed as the cursor).
         if (nBatchPos >= vBatch.size()) {
+            // A cold refill is many serial calls; do not hold up a shutdown.
+            if (ShutdownRequested()) {
+                LogPrintf("%s: Shutdown requested; stopped at mainchain block %d\n", __func__, nCursor);
+                SaveWalk();
+                return false;
+            }
             if (!client.GetAncestorHashes(hashCursor, nCursor, MAIN_BLOCK_CACHE_BATCH, vBatch) || vBatch.size() < 2) {
-                LogPrintf("%s: Failed to get to mainchain block: %u\n", __func__, i - 1);
+                LogPrintf("%s: Failed to get to mainchain block: %u\n", __func__, nCursor - 1);
+                SaveWalk();
                 return false;
             }
             nBatchPos = 1;
+            if (pWalk) {
+                pWalk->nLastProgress = GetTime();
+                if (++nBatches % 50 == 0)
+                    LogPrintf("%s: walked down to mainchain block %d\n", __func__, nCursor);
+            }
         }
 
         hashPrevBlock = vBatch[nBatchPos++];
@@ -12847,58 +12927,255 @@ bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
         // Advance the cursor to the oldest hash consumed so the next refill
         // continues from there.
         hashCursor = hashPrevBlock;
-        nCursor = i - 1;
+        nCursor--;
 
         // Check if the prevblock is in our cache. Once we find a prevblock in
         // our cache we can update our cache from that block up to the new
         // mainchain tip.
-        if (bmmCache.HaveMainBlock(hashPrevBlock)) {
+        if (!fFresh && bmmCache.HaveMainBlock(hashPrevBlock)) {
             deqHashNew.push_front(hashPrevBlock);
             break;
         }
 
         deqHashNew.push_front(hashPrevBlock);
+
+        // Reached the tip the saved walk started from: everything below it is
+        // already fetched, so continue from the saved cursor.
+        if (fSplice && hashPrevBlock == pWalk->hashTip) {
+            deqHashNew.insert(deqHashNew.begin(), pWalk->deqHash.begin(), pWalk->deqHash.end());
+            hashCursor = pWalk->hashCursor;
+            nCursor = pWalk->nCursor;
+            pWalk->deqHash.clear();
+            vBatch.clear();
+            nBatchPos = 0;
+            fSplice = false;
+            LogPrintf("%s: resuming at mainchain block %d (%u hashes kept)\n", __func__, nCursor, deqHashNew.size());
+        }
     }
+    if (pWalk)
+        pWalk->deqHash.clear();
+
     // Also add the new mainchain tip
     deqHashNew.push_back(hashMainTip);
+
+    if (fFresh) {
+        if (nCursor != 0) {
+            LogPrintf("%s: fresh refill stopped at mainchain block %d; cache left as it was\n", __func__, nCursor);
+            return false;
+        }
+        bmmCache.ReplaceMainBlockCache(deqHashNew);
+        LogPrintf("%s: main block cache refilled from scratch: %u hashes (tip %s)\n", __func__,
+                  deqHashNew.size(), hashMainTip.ToString());
+        return true;
+    }
 
     return bmmCache.UpdateMainBlockCache(deqHashNew, fReorg, vDisconnected);
 }
 
-bool VerifyMainBlockCache(std::string& strError)
+bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected, MainBlockCacheWalk* pWalk)
 {
-    SidechainClient client;
+    std::lock_guard<std::timed_mutex> lock(mainBlockCacheMutex);
+    return UpdateMainBlockHashCacheLocked(fReorg, vDisconnected, pWalk, false);
+}
 
-    const std::vector<uint256> vHash = bmmCache.GetMainBlockHashCache();
-    if (!vHash.size()) {
-        strError = "No mainchain blocks in cache!";
+bool TryUpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected, int nWaitSeconds, bool& fBusy)
+{
+    fBusy = false;
+    std::unique_lock<std::timed_mutex> lock(mainBlockCacheMutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::seconds(nWaitSeconds))) {
+        fBusy = true;
         return false;
     }
+    return UpdateMainBlockHashCacheLocked(fReorg, vDisconnected, nullptr, false);
+}
 
-    // Compare cached hash at height with mainchain block hash at height
-    for (size_t i = 0; i < vHash.size(); i++) {
-        uint256 hashBlock;
+static bool RefillMainBlockCacheFresh()
+{
+    std::lock_guard<std::timed_mutex> lock(mainBlockCacheMutex);
+    bool fReorg = false;
+    std::vector<uint256> vIgnore;
+    return UpdateMainBlockHashCacheLocked(fReorg, vIgnore, nullptr, true);
+}
 
-        if (!client.GetBlockHash(i, hashBlock)) {
-            strError = "Failed to request mainchain block hash!";
-            return false;
+bool FillMainBlockCacheForReplay(int64_t nNoProgressSeconds, std::string& strError)
+{
+    SidechainClient client;
+    MainBlockCacheWalk walk;
+    int64_t nLastProgress = GetTime();
+    int nLastMainBlocks = -1;
+    int64_t nBackoff = 1;
+    while (!ShutdownRequested()) {
+        // Behind-enforcer guard. An L1 view shorter than the cache loaded from
+        // disk (an enforcer still syncing after a restart) would make the
+        // refill pop good cached hashes as a mainchain reorg
+        // (BMMCache::UpdateMainBlockCache), and every replayed block anchored
+        // in them would fail bad-mc-prev. Wait for it to catch up; its height
+        // rising counts as progress. Only while its tip is one of the cached
+        // hashes, i.e. it is behind on the cached chain: a shorter L1 whose
+        // tip is not cached is a different chain (an L1 reset or a reorg to a
+        // shorter chain), and the refill below handles it as the reorg it is.
+        int nMainBlocks = 0;
+        bool fAnswered = client.GetBlockCount(nMainBlocks);
+        if (fAnswered && nMainBlocks > nLastMainBlocks) {
+            if (nLastMainBlocks >= 0) {
+                nLastProgress = GetTime();
+                nBackoff = 1;
+            }
+            nLastMainBlocks = nMainBlocks;
+        }
+        const int nCached = bmmCache.GetCachedBlockCount();
+        bool fBehind = false;
+        if (fAnswered && nMainBlocks + 1 < nCached) {
+            uint256 hashMainTip;
+            fAnswered = client.GetBlockHash(nMainBlocks, hashMainTip);
+            fBehind = fAnswered && bmmCache.HaveMainBlock(hashMainTip);
+            if (fAnswered && !fBehind)
+                LogPrintf("%s: the mainchain tip %s (height %d) is below the %d blocks cached and not one of them: "
+                          "a different or reorged mainchain; updating the cache from it\n", __func__,
+                          hashMainTip.ToString(), nMainBlocks, nCached - 1);
         }
 
-        if (hashBlock != vHash[i]) {
-            strError = "Invalid hash cached: ";
-            strError += vHash[i].ToString();
-            strError += " height: ";
-            strError += std::to_string(i);
+        std::string strWhy;
+        if (!fAnswered) {
+            strWhy = "the mainchain (enforcer) does not answer";
+        } else if (fBehind) {
+            strWhy = strprintf("the mainchain reports tip height %d, below the %d blocks already cached and on the same chain; "
+                               "waiting for it to catch up. If the mainchain was rolled back or restored from an older copy "
+                               "for good, stop freebankd and delete mainblockhash.dat in the data directory",
+                               nMainBlocks, nCached - 1);
+        } else {
+            const int64_t nBefore = walk.nLastProgress;
+            bool fReorg = false;
+            std::vector<uint256> vOrphan;
+            if (UpdateMainBlockHashCache(fReorg, vOrphan, &walk)) {
+                // The replay has not built anything yet, so the side blocks
+                // anchored in the orphans can only be found after it.
+                if (fReorg) {
+                    LogPrintf("%s: Mainchain reorg detected. Orphans: %u\n", __func__, vOrphan.size());
+                    QueueMainchainOrphans(vOrphan);
+                }
+                LogPrintf("%s: cache ready for replay: %d L1 block hashes (tip %s)\n", __func__,
+                          bmmCache.GetCachedBlockCount(), bmmCache.GetLastMainBlockHash().ToString());
+                return true;
+            }
+            if (walk.nLastProgress != nBefore) {
+                nLastProgress = std::max(nLastProgress, walk.nLastProgress);
+                nBackoff = 1;
+            }
+            strWhy = walk.deqHash.empty() ? std::string("the refill failed")
+                : strprintf("the refill failed at mainchain block %d", walk.nCursor);
+        }
+        if (ShutdownRequested())
+            break;
 
+        const int64_t nStalled = GetTime() - nLastProgress;
+        if (nNoProgressSeconds > 0 && nStalled >= nNoProgressSeconds) {
+            strError = strprintf("no progress for %d seconds (%s)", nStalled, strWhy);
             return false;
+        }
+        LogPrintf("%s: %s; no progress for %d s, retrying in %d s\n", __func__, strWhy, nStalled, nBackoff);
+        int64_t nRetry = GetTime() + nBackoff;
+        if (nNoProgressSeconds > 0)
+            nRetry = std::min(nRetry, nLastProgress + nNoProgressSeconds);
+        while (GetTime() < nRetry && !ShutdownRequested())
+            MilliSleep(200);
+        nBackoff = std::min<int64_t>(nBackoff * 2, 30);
+    }
+    strError = "shutdown requested";
+    return false;
+}
+
+bool VerifyMainBlockCache(std::string& strError, MainBlockCacheCheck* pCheck)
+{
+    // v0.2.16: only the newest MAIN_BLOCK_CACHE_VERIFY_TAIL cached heights,
+    // in one ancestor batch. The cache is built by walking prevblock links,
+    // so if its entry at the tail's oldest height still matches the L1,
+    // everything below it does too. The old per-height walk was one
+    // GetBlockHash per cached block, and on the enforcer transport each of
+    // those walks back from the tip: it never finished on a production cache.
+    MainBlockCacheCheck check;
+    const auto Finish = [&](bool fOK) {
+        if (pCheck)
+            *pCheck = check;
+        return fOK;
+    };
+
+    SidechainClient client;
+
+    const int nCached = bmmCache.GetCachedBlockCount();
+    if (nCached <= 0) {
+        strError = "No mainchain blocks in cache!";
+        return Finish(false);
+    }
+
+    int nMainBlocks = 0;
+    if (!client.GetBlockCount(nMainBlocks)) {
+        strError = "Failed to request the mainchain block count!";
+        check.fL1Failed = true;
+        return Finish(false);
+    }
+
+    const int nTop = nCached - 1;
+    if (nTop > nMainBlocks) {
+        strError = strprintf("The cache reaches mainchain height %d, above the mainchain tip at %d", nTop, nMainBlocks);
+        // The heights up to the L1 tip are checked below; only what is above
+        // it is unknown to the L1.
+    }
+    const int nHeight = std::min(nTop, nMainBlocks);
+
+    uint256 hashAtHeight;
+    if (!client.GetBlockHash(nHeight, hashAtHeight)) {
+        strError = "Failed to request mainchain block hash!";
+        check.fL1Failed = true;
+        return Finish(false);
+    }
+
+    const uint32_t nWant = std::min<uint32_t>(nHeight + 1, MAIN_BLOCK_CACHE_VERIFY_TAIL);
+    std::vector<uint256> vL1;
+    if (!client.GetAncestorHashes(hashAtHeight, nHeight, nWant, vL1) || vL1.size() != nWant) {
+        strError = "Failed to request mainchain ancestor hashes!";
+        check.fL1Failed = true;
+        return Finish(false);
+    }
+
+    const int nFrom = nHeight + 1 - (int)nWant;
+    std::vector<uint256> vCache;
+    if (!bmmCache.GetMainBlockHashesFrom(nFrom, nWant, vCache)) {
+        strError = "The cache changed while it was checked";
+        check.fL1Failed = true; // nothing learned; not a reason to reset
+        return Finish(false);
+    }
+
+    // vL1 is newest first, vCache oldest first.
+    check.nFrom = nFrom;
+    check.nTo = nHeight;
+    check.fBoundaryOK = vL1.back() == vCache.front();
+    for (uint32_t i = 0; i < nWant; i++) {
+        const uint256& hashCached = vCache[nWant - 1 - i];
+        if (vL1[i] != hashCached) {
+            strError = "Invalid hash cached: " + hashCached.ToString() + " height: " + std::to_string(nHeight - (int)i);
+            return Finish(false);
         }
     }
 
-    return true;
+    if (nTop > nMainBlocks)
+        return Finish(false);
+
+    return Finish(true);
 }
 
 void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
 {
+    // During a block import or replay, hold the orphans for ThreadImport
+    // (QueueMainchainOrphans). If the import finished between the check and
+    // the push, its drain may already have run, so drain here instead.
+    if (fImporting || fReindex) {
+        QueueMainchainOrphans(vOrphan);
+        if (!fImporting && !fReindex)
+            HandleQueuedMainchainReorgs();
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(mainBlockCacheReorgMutex);
 
     // For mainchain blocks that were orphaned - invalidate bmm blocks with
@@ -12910,30 +13187,29 @@ void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
     // cache and then verify that the blocks to be orphaned actually are missing
     // from the mainchain.
 
-    // Check the mainchain block cache
+    // Check the mainchain block cache (v0.2.16: its tail only, one batch).
+    //  - The L1 did not answer: the update that found this reorg just read
+    //    the L1, so go on with the cache as it is.
+    //  - A mismatch above the tail's oldest height: the L1 moved again since
+    //    that update; the next update handles it as a reorg.
+    //  - A mismatch at the oldest height: the cache is wrong deeper than the
+    //    tail. Refill it from scratch into a temporary and swap it in, so no
+    //    reader ever sees an empty cache; if the refill fails the old cache
+    //    stays and the orphans are not acted on.
     std::string strError = "";
-    if (!VerifyMainBlockCache(strError)) {
-        LogPrintf("%s: Main block cache invalid: %s. Resyncing...\n",
-                __func__, strError);
-        // Reset the mainchain block cache and then re-sync it
-        bmmCache.ResetMainBlockCache();
-
-        // TODO
-        // If during this call a reorg is detected and we have more orphans then
-        // something bad happened and needs to be handled. Since we just reset
-        // the mainchain block cache, have a mutex lock, and are updating the
-        // cache from scratch now, it should be impossible.
-        bool fReorg = false;
-        std::vector<uint256> vOrphanIgnore;
-        if (!UpdateMainBlockHashCache(fReorg, vOrphanIgnore)) {
-            // TODO
-            // If we make it to this point there might be a connection issue or
-            // something going on. Maybe the mainchain node went down during the
-            // function? There might be something better to do than just logging
-            // the error here.
-            LogPrintf("%s: Failed to re-update main block cache after reset!",
-                    __func__);
-            return;
+    MainBlockCacheCheck check;
+    if (!VerifyMainBlockCache(strError, &check)) {
+        if (check.fL1Failed) {
+            LogPrintf("%s: could not check the main block cache (%s); continuing with it\n", __func__, strError);
+        } else if (check.fBoundaryOK) {
+            LogPrintf("%s: main block cache tail differs from the mainchain (%s), but not at height %d; "
+                      "the next update handles it\n", __func__, strError, check.nFrom);
+        } else {
+            LogPrintf("%s: Main block cache invalid: %s. Refilling it from scratch...\n", __func__, strError);
+            if (!RefillMainBlockCacheFresh()) {
+                LogPrintf("%s: Failed to refill the main block cache; kept the old one\n", __func__);
+                return;
+            }
         }
     }
 

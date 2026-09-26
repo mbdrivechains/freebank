@@ -7,6 +7,10 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    permissions:
+      contents: read
+      id-token: write      # signed build provenance (attestation) for tagged releases
+      attestations: write
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +133,14 @@ jobs:
           "$B/freebank-cli" -regtest -datadir=/tmp/fbsmoke2 -rpcuser=s -rpcpassword=s getblockchaininfo | head -3
           "$B/freebank-cli" -regtest -datadir=/tmp/fbsmoke2 -rpcuser=s -rpcpassword=s stop
           sleep 2
+
+      - name: Attest build provenance (tagged releases)
+        # Records, signed by GitHub (Sigstore), that this tarball was built by this workflow from this
+        # commit. Anyone can check it: gh attestation verify <tarball> --repo mbdrivechains/freebank
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: freebank-*-arm64-apple-darwin.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

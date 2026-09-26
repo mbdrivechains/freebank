@@ -881,6 +881,43 @@ BOOST_AUTO_TEST_CASE(l1client_grpcurl_command_quotes_binary_path)
     BOOST_CHECK_EQUAL(BuildGrpcurlCommand("grpcurl", "{}", "127.0.0.1:50051", "s", "m").find("\"grpcurl\" -plaintext"), 0U);
     // A path that cannot be quoted safely is refused
     BOOST_CHECK(BuildGrpcurlCommand("/tmp/a\"b/grpcurl", "{}", "127.0.0.1:50051", "s", "m").empty());
+    // fStderr merges stderr into the output instead
+    BOOST_CHECK(BuildGrpcurlCommand("grpcurl", "{}", "127.0.0.1:50051", "s", "m", true).find("s/m 2>&1") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(l1client_grpcurl_failure_classify)
+{
+    // grpcurl v1.9.1 against enforcer 73d239a (2026-09-26): a server status exits 64 + code
+    BOOST_CHECK(ClassifyGrpcurlFailure(0, "") == GrpcurlFailure::NONE);
+    BOOST_CHECK(ClassifyGrpcurlFailure(76, "ERROR:\n  Code: Unimplemented\n") == GrpcurlFailure::UNIMPLEMENTED);
+    BOOST_CHECK(ClassifyGrpcurlFailure(1, "Error invoking method \"x\": service \"cusf.mainchain.v1.BlockProducerService\" does not include a method named \"ProposeWithdrawalBundle\"") == GrpcurlFailure::UNIMPLEMENTED);
+    BOOST_CHECK(ClassifyGrpcurlFailure(1, "server does not expose service \"cusf.mainchain.v1.WalletService\"") == GrpcurlFailure::UNIMPLEMENTED);
+    // Transient: never flips the withdrawal-bundle method
+    BOOST_CHECK(ClassifyGrpcurlFailure(78, "ERROR:\n  Code: Unavailable\n") == GrpcurlFailure::OTHER);
+    BOOST_CHECK(ClassifyGrpcurlFailure(1, "Failed to dial target host \"127.0.0.1:1\": connection refused") == GrpcurlFailure::OTHER);
+    BOOST_CHECK(ClassifyGrpcurlFailure(-1, "") == GrpcurlFailure::OTHER);
+}
+
+BOOST_AUTO_TEST_CASE(l1client_bmm_request_not_sent)
+{
+    // Definite: the enforcer refused before building the tx, or never got the call
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(67, "ERROR:\n  Code: InvalidArgument\n  Message: invalid prev_bytes"));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(73, "ERROR:\n  Code: FailedPrecondition\n  Message: sidechain is not active"));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(66, "ERROR:\n  Code: Unknown\n  Message: error creating BMM request: failed to build BMM tx: Insufficient funds"));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(66, "ERROR:\n  Code: Unknown\n  Message: error creating BMM request: failed to sign BMM tx: x"));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(76, "ERROR:\n  Code: Unimplemented\n"));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(1, "server does not expose service \"cusf.mainchain.v1.WalletService\""));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(1, "Failed to dial target host \"127.0.0.1:1\": dial tcp 127.0.0.1:1: connect: connection refused"));
+    BOOST_CHECK(GrpcurlBMMRequestNotSent(127, "sh: 1: grpcurl: not found"));
+    // Possibly sent: the enforcer broadcasts before it replies
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(0, ""));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(-1, ""));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(68, "ERROR:\n  Code: DeadlineExceeded\n"));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(66, "ERROR:\n  Code: Unknown\n  Message: error creating BMM request: failed to broadcast BMM request tx via RPC: x"));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(66, "ERROR:\n  Code: Unknown\n  Message: error creating BMM request: broadcast deposit transaction failed: ab"));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(77, "ERROR:\n  Code: Internal\n"));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(78, "ERROR:\n  Code: Unavailable\n"));
+    BOOST_CHECK(!GrpcurlBMMRequestNotSent(1, "Error invoking method \"x\": rpc error"));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

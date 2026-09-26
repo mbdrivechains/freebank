@@ -510,6 +510,8 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-blockmintxfee=<amt>", strprintf(_("Set lowest fee rate (in %s/kB) for transactions to be included in block creation. (default: %s)"), CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)));
     if (showDebug)
         strUsage += HelpMessageOpt("-blockversion=<n>", "Override block version to test forking scenarios");
+    strUsage += HelpMessageOpt("-bmmblockmaxweight=<n>", strprintf(_("Cap the weight of the transactions in a get_block_template block at <n> (the BMM engine stores every template it bids on). Deposits are added after them and are not capped. Never above -blockmaxweight (default: %u)"), DEFAULT_BMM_BLOCK_MAX_WEIGHT));
+    strUsage += HelpMessageOpt("-bmmbidder=<who>", _("Who bids for this node's blocks. \"engine\": an outside BMM engine (BitWindow) bids through get_block_template, so refreshbmm only connects won blocks and never bids, and get_block_template refuses on an eCash tip refreshbmm already bid on. Unset: no guard; do not let two bidders drive one node (default: unset)"));
     strUsage += HelpMessageOpt("-coinbasetag=<name>", strprintf(_("Write this name into the coinbase of every block this node produces, after the height and the extra nonce, so block explorers can credit the block to you. 1 to %u printable ASCII characters. Not a consensus setting: nodes without it accept tagged blocks (default: none)"), MAX_COINBASE_TAG_BYTES));
 
     strUsage += HelpMessageGroup(_("RPC server options:"));
@@ -537,6 +539,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-mainchainchain=<name>", _("L1 IDENTITY PIN: refuse to start unless the mainchain reports this chain name (main/test/signet/regtest). Reachability is not identity - a second node taking the default -mainchainrest will happily follow SOMEONE ELSE'S mainchain."));
     strUsage += HelpMessageOpt("-mainchainchallenge=<hex>", _("L1 IDENTITY PIN for signet: refuse to start unless the mainchain reports this signet_challenge. Required to tell two custom signets apart - they share a chain name AND a genesis hash (Core's signet genesis is hardcoded, not derived from the challenge)."));
     strUsage += HelpMessageOpt("-mainchainblockpin=<height>:<blockhash>", _("L1 IDENTITY PIN for a mainnet-family L1 (a forknet such as eCash alphanet, or mainnet): refuse to start unless the mainchain's active chain carries this block hash at this height. A forknet has no signet_challenge and is byte-identical to Bitcoin below its fork height, so pin the fork block. Outside regtest the enforcer transport requires -mainchainchallenge OR -mainchainblockpin."));
+    strUsage += HelpMessageOpt("-replaycachewait=<n>", strprintf(_("Before a block replay (-reindex, -reindex-chainstate, -loadblock, bootstrap.dat) the mainchain block cache is filled from the mainchain first. Give up and refuse to start after <n> seconds without progress; a pending -reindex resumes on the next start (0 = wait until shutdown, default: %d)"), DEFAULT_REPLAY_CACHE_WAIT));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
     strUsage += HelpMessageOpt("-minwithdrawal=<n>", strprintf(_("Minimum number of pending withdrawals before this node forms a withdrawal bundle (policy, not consensus; default: %u). Set 1 to bundle a lone withdrawal."), DEFAULT_MIN_WITHDRAWAL_CREATE_BUNDLE));
     strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
@@ -711,7 +714,10 @@ void ThreadImport(std::vector<fs::path> vImportFiles)
     // scan for better chains in the block chain database, that are not yet connected in the active best chain
     CValidationState state;
     if (!ActivateBestChain(state, chainparams)) {
-        LogPrintf("Failed to connect best block");
+        // Any error stops the node here. Staying up on an L1 blip (N12) waits
+        // for errors tagged as L1-unknown: ConnectBlock also returns a bare
+        // state.Error for DB-write failures that do not call AbortNode.
+        LogPrintf("Failed to connect best block (%s)\n", FormatStateMessage(state));
         StartShutdown();
         return;
     }
@@ -722,6 +728,9 @@ void ThreadImport(std::vector<fs::path> vImportFiles)
         return;
     }
     } // End scope of CImportingNow
+    // Mainchain orphans found during the import were held until now
+    // (HandleMainchainReorg): the blocks anchored in them are indexed now.
+    HandleQueuedMainchainReorgs();
     if (gArgs.GetArg("-persistmempool", DEFAULT_PERSIST_MEMPOOL)) {
         LoadMempool();
         fDumpMempoolLater = !fRequestShutdown;
@@ -2004,6 +2013,53 @@ bool AppInitMain()
         vImportFiles.push_back(strFile);
     }
 
+    // Fill the mainchain block cache BEFORE a block replay (v0.2.16, (c)
+    // option 1). Every replayed block's mainchain-prev commitment is checked
+    // against this cache (bad-mc-prev), and a miss fails the block. The refill
+    // below used to run only after ThreadImport had started, with nothing
+    // ordering the two: on a production-sized L1 (~970 serial batch calls) the
+    // replay won, and a -reindex without a loadable mainblockhash.dat reset
+    // the chain to height 0. The replay cases: -reindex (including one resumed
+    // from the on-disk flag), -reindex-chainstate or an empty chainstate over
+    // an indexed chain (an interrupted one), -loadblock, bootstrap.dat.
+    // -updatemainblockcache=0 skips this as it skips the refill below.
+    bool fUpdateCache = gArgs.GetBoolArg("-updatemainblockcache", true);
+    std::string strReplay;
+    {
+        LOCK(cs_main);
+        if (fReindex)
+            strReplay = "-reindex";
+        else if (fReindexChainState || (chainActive.Tip() == nullptr && mapBlockIndex.size() > 1))
+            strReplay = "-reindex-chainstate";
+        else if (!vImportFiles.empty())
+            strReplay = "-loadblock";
+        else if (fs::exists(GetDataDir() / "bootstrap.dat"))
+            strReplay = "bootstrap.dat";
+    }
+    bool fReplayCacheFilled = false;
+    if (fUpdateCache && !strReplay.empty()) {
+        const int64_t nWait = gArgs.GetArg("-replaycachewait", DEFAULT_REPLAY_CACHE_WAIT);
+        uiInterface.InitMessage(_("Filling the mainchain block cache before the block replay..."));
+        LogPrintf("%s: block replay pending (%s): filling the mainchain block cache first (-replaycachewait=%d)\n",
+                  __func__, strReplay, nWait);
+        std::string strError;
+        if (!FillMainBlockCacheForReplay(nWait, strError)) {
+            // Nothing has been replayed: ThreadImport does not exist yet, and
+            // WriteReindexing(true) above keeps a -reindex pending.
+            genesisWaitConnection.disconnect();
+            if (ShutdownRequested())
+                return false;
+            return InitError(strprintf(_("Could not fill the mainchain block cache before the block replay (%s): %s. "
+                                         "Nothing was replayed. A pending -reindex or -reindex-chainstate resumes on the next start; "
+                                         "-loadblock needs the option again. Check that the enforcer (-enforceraddr) and the mainchain "
+                                         "node are up and synced, or raise -replaycachewait (0 = wait until shutdown). If the mainchain "
+                                         "was rolled back or restored from an older copy for good, delete mainblockhash.dat in the data "
+                                         "directory first."),
+                                       strReplay, strError));
+        }
+        fReplayCacheFilled = true;
+    }
+
     threadGroup.create_thread(boost::bind(&ThreadImport, vImportFiles));
 
     // Wait for genesis block to be processed
@@ -2023,9 +2079,9 @@ bool AppInitMain()
     }
 
     // Try to sync mainchain block cache - may not work if RPC connection hasn't
-    // been setup yet. Don't exit if the update fails.
-    bool fUpdateCache = gArgs.GetBoolArg("-updatemainblockcache", true);
-    if (fUpdateCache) {
+    // been setup yet. Don't exit if the update fails. Skipped when the replay
+    // fill above has just brought the cache to the L1 tip.
+    if (fUpdateCache && !fReplayCacheFilled) {
         uiInterface.InitMessage(_("Updating mainchain block cache..."));
         bool fReorg = false;
         std::vector<uint256> vOrphan;

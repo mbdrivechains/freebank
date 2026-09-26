@@ -44,9 +44,13 @@ bool SidechainClient::VerifyBMM(const uint256& hashMainBlock, const uint256& has
     return GetL1Client().VerifyBMM(hashMainBlock, hashBMM, txid, nTime);
 }
 
-uint256 SidechainClient::SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount)
+uint256 SidechainClient::SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool* pfNotSent)
 {
-    return GetL1Client().SendBMMRequest(hashBMM, hashBlockMain, nHeight, amount);
+    bool fNotSent = false;
+    uint256 txid = GetL1Client().SendBMMRequest(hashBMM, hashBlockMain, nHeight, amount, fNotSent);
+    if (pfNotSent)
+        *pfNotSent = txid.IsNull() && fNotSent;
+    return txid;
 }
 
 bool SidechainClient::GetCTIP(std::pair<uint256, uint32_t>& ctip)
@@ -96,8 +100,18 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
         if (CreateBMMBlock(block, strError, nFees, hashPrevBlock)) {
             nTxn = block.vtx.size();
             hashCreatedMerkleRoot = block.hashMerkleRoot;
-            txid = SendBMMRequest(block.hashMerkleRoot, vHashMainBlock.back(), 0, amount);
-            bmmCache.StorePrevBlockBMMCreated(vHashMainBlock.back());
+            bool fNotSent = false;
+            txid = SendBMMRequest(block.hashMerkleRoot, vHashMainBlock.back(), 0, amount, &fNotSent);
+            // A bid that may have gone out claims this tip, even without a
+            // txid back (a timeout after the enforcer broadcast it): a second
+            // bid would drop this block from the cache, and a win for it
+            // would never be connected. Only a definite refusal leaves the
+            // tip open, so the next call builds a new block and bids again.
+            if (!fNotSent)
+                bmmCache.StorePrevBlockBMMCreated(vHashMainBlock.back());
+            if (txid.IsNull())
+                strError = fNotSent ? "BMM request refused, no bid sent; the next call bids again"
+                                    : "BMM request failed, the bid may have gone out; no new bid on this mainchain tip";
             return true;
         } else {
             strError = "Failed to create new BMM block!";
@@ -153,8 +167,14 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
                 // Send BMM request to mainchain
                 nTxn = block.vtx.size();
                 hashCreatedMerkleRoot = block.hashMerkleRoot;
-                txid = SendBMMRequest(block.hashMerkleRoot, vHashMainBlock.back(), 0, amount);
-                bmmCache.StorePrevBlockBMMCreated(vHashMainBlock.back());
+                bool fNotSent = false;
+                txid = SendBMMRequest(block.hashMerkleRoot, vHashMainBlock.back(), 0, amount, &fNotSent);
+                // See above: only a definite refusal leaves the tip open.
+                if (!fNotSent)
+                    bmmCache.StorePrevBlockBMMCreated(vHashMainBlock.back());
+                if (txid.IsNull())
+                    strError = fNotSent ? "BMM request refused, no bid sent; the next call bids again"
+                                        : "BMM request failed, the bid may have gone out; no new bid on this mainchain tip";
             } else {
                 strError = "Failed to create a new BMM request!";
                 return false;

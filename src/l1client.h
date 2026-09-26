@@ -113,7 +113,10 @@ public:
     virtual std::vector<SidechainDeposit> UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex) = 0;
     virtual bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx) = 0;
     virtual bool VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime) = 0;
-    virtual uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount) = 0;
+    /* The bid's txid, or null if none came back. On a null txid fNotSent says
+     * the L1 definitely sent no bid (a refusal before any broadcast), so the
+     * tip may be bid on again; false means a bid may have gone out. */
+    virtual uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent) = 0;
     virtual bool GetCTIP(std::pair<uint256, uint32_t>& ctip) = 0;
     virtual bool GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFees) = 0;
     virtual bool GetBlockCount(int& nBlocks) = 0;
@@ -136,6 +139,20 @@ public:
     virtual bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) = 0;
     virtual bool HaveSpentWithdrawalBundle(const uint256& hash) = 0;
     virtual bool HaveFailedWithdrawalBundle(const uint256& hash) = 0;
+
+    /**
+     * v0.2.16: read a mainchain block's slot-130 h* commitment without knowing
+     * h* in advance. Unlike VerifyBMM, a failed call (UNKNOWN) is kept apart
+     * from "no commitment" (NONE) and "block unknown to the L1" (NOT_FOUND).
+     * The BMM JSON-RPCs rely on that split. Only the enforcer transport answers;
+     * the legacy transport always says UNKNOWN.
+     */
+    enum class Commitment { COMMITTED, NONE, NOT_FOUND, UNKNOWN };
+    virtual Commitment ReadBmmCommitment(const uint256& hashMainBlock, uint256& hashCommitment)
+    {
+        hashCommitment.SetNull();
+        return Commitment::UNKNOWN;
+    }
 };
 
 /** Transport selected by -mainchaintransport (jsonrpc | enforcer). */
@@ -154,8 +171,33 @@ bool IsValidL1Transport(const std::string& strTransport);
 
 /** The shell command the enforcer transport runs for one grpcurl call. The binary path is
  *  double-quoted (BitWindow's macOS path contains a space); a path containing a double quote
- *  cannot be quoted safely and yields "". Pure, unit-tested. */
-std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod);
+ *  cannot be quoted safely and yields "". stderr goes to /dev/null, or into stdout if fStderr.
+ *  Pure, unit-tested. */
+std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod, bool fStderr = false);
+
+/** How one grpcurl call failed, as far as the withdrawal-bundle fallback (D7) cares. */
+enum class GrpcurlFailure {
+    NONE,          // exit 0
+    UNIMPLEMENTED, // the enforcer does not have this method
+    OTHER,         // anything else: down, timeout, any other gRPC code - may be transient
+};
+
+/** Classify a grpcurl run from its exit status and stderr. Checked 2026-09-26 with grpcurl v1.9.1
+ *  against enforcer 73d239a: a gRPC error from the server exits 64 + its code (Unimplemented = 12
+ *  -> 76, FailedPrecondition -> 73); grpcurl's own errors exit 1. A method missing from the
+ *  server's reflection (an enforcer older than the method) never reaches the server: exit 1 with
+ *  'does not include a method named' (or 'does not expose service' for a whole service). Both
+ *  count as UNIMPLEMENTED; a failed dial is also exit 1 but OTHER. Pure. */
+GrpcurlFailure ClassifyGrpcurlFailure(int nExit, const std::string& strError);
+
+/** True if a failed WalletService/CreateBmmCriticalDataTransaction call (grpcurl exit nExit, output
+ *  strError) definitely sent no bid. The enforcer (73d239a, lib/server/wallet/grpc.rs and
+ *  lib/wallet/mod.rs create_bmm_request) refuses with InvalidArgument (stale prev_bytes, 67) or
+ *  FailedPrecondition (inactive sidechain, 73) before building the tx, and a build or sign failure
+ *  (e.g. an unfunded wallet) says so in its Unknown (66) message. A failed dial, a missing binary
+ *  and an UNIMPLEMENTED method never reach it. Everything else - a timeout, an Unknown from the
+ *  broadcast, any other code, a killed grpcurl - may come after the bid went out. Pure. */
+bool GrpcurlBMMRequestNotSent(int nExit, const std::string& strError);
 
 //
 // Enforcer wire helpers - exposed for unit tests (l1client_tests.cpp).
