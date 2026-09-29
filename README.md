@@ -75,9 +75,8 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 - **Clearing pools**: on-chain AMM pools between a house's notes and the base coin —
   swaps, LP shares, and orderly pool retirement. RPCs: `createpool`, `listpools`,
   `swapnote`, `addpoolliquidity`, `removepoolliquidity`, `listmylp`, `retirepool`.
-- **Gram display (being removed)**: RPCs report values in grams alongside base units at
-  a fixed launch scale that tracks no market (`getgramrate`). Presentation-only, removed in
-  v0.2.17. The unit is ECX; gold notes backed by wrapped gold are planned for a later release.
+- **The unit is ECX.** v0.2.17 removed the gram display (`getgramrate` and the `*_grams` RPC
+  fields). Gold notes backed by wrapped gold are planned for a later release.
 
 ## Robustness
 
@@ -91,8 +90,37 @@ v0.2.11 hardens the enforcer transport against the ways a real host stack misbeh
 v0.2.12 lets a wallet be provisioned from an external seed and ships the live fixed seed,
 v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers,
 v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send,
-v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block, and
-v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe:
+v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block,
+v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe, and
+v0.2.17 checks every peg step against eCash itself:
+
+- **Every peg step is checked against eCash** (v0.2.17). **This is a consensus change: every node
+  must upgrade and restart once with `-reindex`.** On the eCash beta the chain is replaced from block
+  211 (see below). What each node now checks for itself, through the enforcer:
+  - a deposit must be exactly what eCash recorded: the same transaction, address, amount and running
+    number, each one chained to the treasury output before it;
+  - a block's blind-merged-mining commitment must be in the eCash block it names;
+  - a withdrawal bundle is paid or failed only as eCash says, and once paid it stays paid;
+  - a new withdrawal bundle must list exactly the withdrawals the node would list itself.
+
+  Each question has three answers: yes, no, or "can't tell yet" (eCash or the enforcer not reachable,
+  or behind). "Can't tell" makes the node wait; it never rejects a block or penalises a peer for it.
+  At startup the node checks the enforcer's drivechain settings against the values fixed for the
+  network and refuses to run on a mismatch.
+- **A deposit made out to the full deposit address is paid** (v0.2.17). `getdepositaddress` returns
+  `s130_<address>_<checksum>`; a deposit made out to exactly that string, for example by passing it
+  unchanged to the enforcer's `CreateDepositTransaction`, is now paid to `<address>`. Before, it was
+  recorded and paid to no one. A wrong slot or checksum is still recorded and not paid, so the bare
+  address remains the safest thing to give the enforcer. On the beta this pays the first beta deposit
+  (10 ECX, block 211), which is why the beta chain is replaced from that block.
+- **A hard stop no longer needs `-reindex`** (v0.2.17). After a crash or `kill -9` the node fetches
+  and replays the blocks it had not yet saved, without applying their sidechain effects twice.
+- **The enforcer is reached without grpcurl** (v0.2.17). freebankd talks to the enforcer directly
+  (the Connect protocol, JSON over HTTP/1.1). `-enforcertransport=grpcurl` keeps the old way.
+- **Smaller fixes** (v0.2.17): `walletpassphrase` can no longer deadlock the node (Bitcoin Core
+  #18487); no block template while the node is behind; `-rpcallowip` is refused without `-rpcbind`;
+  a warning when an unencrypted wallet holds funds; the fee floors of Bitcoin Core 29.1+ (0.1 sat/vB to
+  relay, 0.001 sat/vB in a block).
 
 - **BitWindow can bid for FreeBank blocks** (v0.2.16; BitWindow's side is
   [LayerTwo Labs drivechain-frontends PR #2402](https://github.com/LayerTwo-Labs/drivechain-frontends/pull/2402),
@@ -118,7 +146,7 @@ v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reinde
   `--enable-wallet`, or without a wallet with `--enable-mempool --enable-block-template-server
   --coinbase-recipient=<address>`. An eCash reorg now checks only the newest 1,000 cached blocks
   instead of the whole cache, and `verifymainblockcache` reports where it started (`checked_from`).
-  v0.2.15 and v0.2.16 have no consensus change: each is a binary swap.
+  v0.2.15 and v0.2.16 have no consensus change: each is a binary swap (v0.2.17 is not).
 
 - **An unreadable eCash transaction next to a withdrawal payout no longer stops deposit
   crediting** (v0.2.15). When the node looks through an L1 block for a paid bundle, it now skips
@@ -281,7 +309,7 @@ FreeBank is a sidechain, so running it means running a small stack: an eCash nod
 mainchain (with `-rest=1`), the CUSF
 [bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer) watching it —
 it validates the drivechain rules and can hold the mainchain wallet — and `freebankd`
-driving the enforcer over gRPC (via
+driving the enforcer (directly from v0.2.17; older releases need
 [grpcurl](https://github.com/fullstorydev/grpcurl)) and reading deposits from the node's
 REST interface. The sidechain advances by blind-merged-mining against the mainchain:
 `freebank-cli refreshbmm`, or, from v0.2.16, an engine such as BitWindow's driving

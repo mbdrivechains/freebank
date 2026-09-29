@@ -289,6 +289,16 @@ static bool ThreadHTTP(struct event_base* base, struct evhttp* http)
     return event_base_got_break(base) == 0;
 }
 
+std::string RPCBindExposureError(bool fRPCAllowIP, bool fRPCBind, const std::string& strNetwork)
+{
+    if (!fRPCAllowIP || fRPCBind || strNetwork == CBaseChainParams::REGTEST)
+        return "";
+    return "-rpcallowip is set without -rpcbind, which would bind the JSON-RPC port on every interface "
+           "(0.0.0.0 and ::), not only loopback. Add -rpcbind=<addr> for each address the RPC server "
+           "should listen on (e.g. -rpcbind=127.0.0.1 plus the one private interface you need), or remove "
+           "-rpcallowip to keep the default loopback-only RPC. Never expose the RPC port to the internet.";
+}
+
 /** Bind HTTP server to specified addresses */
 static bool HTTPBindAddresses(struct evhttp* http)
 {

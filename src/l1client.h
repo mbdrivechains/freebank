@@ -21,7 +21,7 @@ class UniValue;
 /** Transport used to reach the mainchain (L1). */
 enum class L1Transport {
     JSONRPC,  // drivechain-patched mainchain node JSON-RPC (BTX / eCash-v1)
-    ENFORCER, // CUSF bip300301_enforcer gRPC via grpcurl (eCash-v2 / Cygnet)
+    ENFORCER, // CUSF bip300301_enforcer, Connect over HTTP/1.1 or gRPC via grpcurl (eCash-v2 / Cygnet)
 };
 
 /** Mainchain-connection defaults. Orchestrated installs (BitWindow) launch the
@@ -57,6 +57,40 @@ extern bool g_fMainchainMainFamily;
 /** Parse a -mainchainblockpin value "<height>:<blockhash>" (forknet / mainnet-family
  *  L1 identity pin). Pure, no I/O, unit-tested. Returns false on any malformation. */
 bool ParseMainchainBlockPin(const std::string& strPin, int& nHeight, uint256& hashBlock);
+
+/** v0.2.17 D2: the enforcer's BIP300 settings (ValidatorService/GetChainInfo).
+ *  They come from its command line (--network-preset), so a wrongly started
+ *  enforcer reports other "paid"/"failed" events than everyone else's. */
+struct EnforcerSettings {
+    uint32_t nBundleMaxAge = 0;
+    uint32_t nBundleThreshold = 0;
+    uint32_t nUsedSlotMaxAge = 0;
+    uint32_t nUsedSlotThreshold = 0;
+    uint32_t nUnusedSlotMaxAge = 0;
+    uint32_t nUnusedSlotThreshold = 0;
+    uint32_t nActivationHeight = 0;
+};
+
+/** Parse a GetChainInfo reply (proto3 JSON: a zero field is omitted). Pure. */
+bool ParseEnforcerChainInfo(const UniValue& response, EnforcerSettings& settings);
+
+/** "" if an enforcer with these settings suits the L1 forked at nForkHeight
+ *  (the -mainchainblockpin height), else what differs. The activation height
+ *  must be the fork height; the thresholds are checked where the preset is
+ *  known (betanet 967680, alphanet 963648). Pure. */
+std::string CompareEnforcerSettings(int nForkHeight, const EnforcerSettings& got);
+
+/** v0.2.17 D2 + D5: ask the enforcer for its settings and compare them with
+ *  the -mainchainblockpin fork. OK also when there is nothing to compare (no
+ *  pin: regtest, a signet). */
+enum class EnforcerSettingsCheck { OK, MISMATCH, NOTREADY };
+EnforcerSettingsCheck CheckEnforcerSettings(std::string& strError);
+
+/** v0.2.17 D6: is a -enforceraddr / -mainchainrest "host:port" on this machine
+ *  or a private network (loopback, RFC1918, 100.64/10 as tailnets use, fc00::/7)?
+ *  The link has no password and no encryption. A host name counts as not
+ *  local. Pure. */
+bool IsLocalOrPrivateL1Address(const std::string& strHostPort);
 
 /** Result of the enforcer-side (gRPC) L1 identity probe. */
 enum EnforcerIdentity {
@@ -100,10 +134,14 @@ EnforcerIdentity ClassifyEnforcerIdentity(bool fEnfTipOK, int nEnfTipHeight,
  * One virtual per mainchain query. Two implementations, selected once at
  * startup by -mainchaintransport: JsonRpcL1Client speaks the legacy
  * drivechain JSON-RPC surface; EnforcerL1Client reads from the CUSF
- * enforcer's gRPC ValidatorService by shelling out to grpcurl (the enforcer
- * is invoked at runtime by service name - nothing of it is vendored or
- * linked).
+ * enforcer's ValidatorService over the Connect protocol (a persistent HTTP/1.1
+ * JSON client, enforcerconnect.h; the default since v0.2.17) or by shelling out
+ * to grpcurl (-enforcertransport=grpcurl). The enforcer is invoked at runtime
+ * by service name - nothing of it is vendored or linked.
  */
+enum class L1Answer;
+struct L1PegEvents;
+
 class L1Client
 {
 public:
@@ -137,6 +175,21 @@ public:
      * sync of a few thousand blocks take the better part of an hour.
      */
     virtual bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) = 0;
+
+    /**
+     * v0.2.17 D3: the slot-130 peg events of the L1 blocks after hashStart up
+     * to and including hashEnd (hashStart == hashEnd: exactly that block),
+     * asked of one bounded range instead of the whole L1 history. YES: events
+     * holds them, oldest first. NO: hashStart is not an ancestor of hashEnd.
+     * UNKNOWN: anything else (L1 unreachable, hashEnd not processed yet, a reply
+     * we cannot fully read). The JSON-RPC mainchain cannot answer it: UNKNOWN.
+     */
+    virtual L1Answer GetPegEvents(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events);
+
+    /** v0.2.17 D4: is the L1 view behind its own node (the enforcer's tip
+     *  below the -mainchainrest node's)? A bid on a stale L1 tip is wasted and
+     *  can block the next one. False when it cannot tell. */
+    virtual bool IsBehindItsNode(std::string& strWhy) { return false; }
     virtual bool HaveSpentWithdrawalBundle(const uint256& hash) = 0;
     virtual bool HaveFailedWithdrawalBundle(const uint256& hash) = 0;
 
@@ -169,13 +222,49 @@ L1Client& GetEnforcerL1Client();
 /** True if strTransport names a valid -mainchaintransport value. */
 bool IsValidL1Transport(const std::string& strTransport);
 
+/** v0.2.17: how the enforcer transport reaches the enforcer (-enforcertransport). */
+enum class EnforcerTransport {
+    CONNECT, // Connect protocol: JSON over a persistent HTTP/1.1 connection (enforcerconnect.h)
+    GRPCURL, // one grpcurl process per call (-grpcurlbin); the fallback
+};
+static const char* const DEFAULT_ENFORCER_TRANSPORT = "connect";
+
+/** True if strTransport names a valid -enforcertransport value (connect | grpcurl). */
+bool IsValidEnforcerTransport(const std::string& strTransport);
+
+/** The transport -enforcertransport selects; read on every call. */
+EnforcerTransport GetEnforcerTransport();
+
+/** How a failed call's status is named in the log: "grpcurl exit" or "connect status". */
+std::string EnforcerStatusLabel();
+
 /** The shell command the enforcer transport runs for one grpcurl call. The binary path is
  *  double-quoted (BitWindow's macOS path contains a space); a path containing a double quote
  *  cannot be quoted safely and yields "". stderr goes to /dev/null, or into stdout if fStderr.
- *  Pure, unit-tested. */
-std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod, bool fStderr = false);
+ *  nMaxTime is grpcurl's -max-time. Pure, unit-tested. */
+std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod, bool fStderr = false, int nMaxTime = 15);
 
-/** How one grpcurl call failed, as far as the withdrawal-bundle fallback (D7) cares. */
+/** Where the enforcer transport's grpcurl is (v0.2.17). */
+struct GrpcurlLocation {
+    std::string strPath;   //!< what is run; "grpcurl" (a bare PATH lookup by the shell) if none was found
+    std::string strSource; //!< "-grpcurlbin", "PATH", "next to freebankd", or the directory searched
+    bool fFound = false;
+};
+
+/** The default search when -grpcurlbin is not set: each PATH entry, then strExeDir (freebankd's
+ *  directory), then /opt/homebrew/bin and /usr/local/bin (a macOS GUI launch has a bare PATH).
+ *  fnIsExecutable is injected so the order can be unit-tested. Pure. */
+GrpcurlLocation FindGrpcurl(const std::string& strPathEnv, const std::string& strExeDir,
+                            const std::function<bool(const std::string&)>& fnIsExecutable);
+
+/** -grpcurlbin as given if set (fFound says whether it exists), else FindGrpcurl over the real
+ *  PATH and executable directory. A hit is cached; a miss is looked up again after 30 s, so a
+ *  grpcurl installed later is picked up. Logs the choice whenever it changes. */
+GrpcurlLocation GetGrpcurlLocation();
+
+/** How one enforcer call failed, as far as the withdrawal-bundle fallback (D7) cares. The
+ *  Connect transport reports its outcome in grpcurl's exit convention (enforcerconnect.h), so
+ *  this classifier and GrpcurlBMMRequestNotSent serve both transports. */
 enum class GrpcurlFailure {
     NONE,          // exit 0
     UNIMPLEMENTED, // the enforcer does not have this method
@@ -252,6 +341,11 @@ struct L1WithdrawalEvent {
     uint256 m6id;
     uint256 hashMainBlock;
     char status;
+    // v0.2.17 D7: what a Succeeded event carries (ParsePegEvents fills them
+    // when present): the treasury's running number and the M6 itself
+    bool fHaveSequence = false;
+    uint64_t nSequence = 0;
+    std::vector<unsigned char> vchTx;
     L1WithdrawalEvent() : status(0) {}
 };
 
@@ -291,23 +385,6 @@ inline bool IsTreasuryScript(const CScript& script, unsigned int nSidechain)
  *  tx is not M6-shaped or an amount is out of range. Pure. */
 bool ComputeM6id(const CMutableTransaction& mtx, CAmount nPrevTreasury, unsigned int nSidechain, uint256& m6id);
 
-/** One non-coinbase, non-deposit tx of a Succeeded event's L1 block that passed
- *  the treasury-shape prefilter, with the output its single input spends. */
-struct M6Candidate {
-    int nTx;                    //!< index in the L1 block
-    CMutableTransaction mtx;
-    CAmount nPrevValue;         //!< value of the spent output (T_{n-1} if it is the CTIP)
-    CScript scriptPrev;         //!< script of the spent output
-};
-
-/** The index into vCandidate of the M6 whose m6id is `m6id` and whose input
- *  spends a treasury output of the same script (the CTIP): -1 if none matches,
- *  -2 if more than one does (the caller fails closed either way). nMatches gets
- *  the match count. Opcode-agnostic: a lookalike under another OP_NOPx cannot
- *  match the enforcer's m6id, and a second (e.g. foreign) M6 in the same block
- *  has a different m6id. Pure. */
-int LocateM6(const std::vector<M6Candidate>& vCandidate, const uint256& m6id, unsigned int nSidechain, int& nMatches);
-
 /** How one L1 raw-tx fetch ended. UNDECODABLE: the L1 returned the bytes but
  *  FreeBank's decoder cannot read them. An eCash v3 (TRUC) tx is one: FreeBank's
  *  own v3 layout reads a replay byte after nVersion, which TRUC does not have. */
@@ -318,30 +395,105 @@ enum class L1TxFetch { OK, FAILED, UNDECODABLE };
  *  or UNDECODABLE by FreeBank's DecodeHexTx. Pure. */
 L1TxFetch ClassifyRawTxBody(std::string body, CMutableTransaction& tx);
 
-/** v0.2.15 - the M6 candidates of a Succeeded event's L1 block (vBlockTxid in
- *  block order, coinbase first; deposit txs excluded). fetch(txid, mtx) fetches
- *  one L1 tx. A FAILED fetch fails closed: false, with strError set.
- *
- *  Skipped (nSkipped counts them): a tx that is UNDECODABLE, a tx whose nVersion
- *  is not 1 or 2, and a candidate whose spent output sits in such a tx. Our M6
- *  can never be one of the first two: its m6id is the txid of the blinded bundle
- *  including nVersion (enforcer compute_m6id), into_m6 keeps that version, and
- *  FreeBank builds bundles as v2, so any L1 tx matching our m6id is a v2 tx that
- *  decodes. The version rule also stops a crafted v3 tx that FreeBank's decoder
- *  misparses into a treasury-shaped tx from failing the batch at its prevout.
- *  Our M6 IS skipped if the CTIP it spends sits in an undecodable tx (a v3 M5,
- *  issue 1); LocateM6 then fails closed, and the deposit loop has already failed
- *  closed on that M5. v0.2.14 failed the whole batch on any undecodable tx in
- *  the M6's L1 block, so one TRUC tx there halted deposit crediting for good. */
-bool BuildM6Candidates(const std::vector<uint256>& vBlockTxid, const std::set<uint256>& setDepositTxid,
-                       unsigned int nSidechain,
-                       const std::function<L1TxFetch(const uint256&, CMutableTransaction&)>& fetch,
-                       std::vector<M6Candidate>& vCandidate, int& nSkipped, std::string& strError);
+/** v0.2.17: find tx txid in a raw L1 block (its bytes), reading every tx in the
+ *  L1's layout: OK with the tx and its index; FAILED if it is not there;
+ *  UNDECODABLE if the block cannot be read. Pure. */
+L1TxFetch FindL1TxInBlock(const std::vector<unsigned char>& vchBlock, const uint256& txid, CMutableTransaction& tx, int& nTx);
 
 /** The double-propose guard's decision from a fetched event history: appends
  * the still-pending m6ids to vHashWithdrawalBundle and returns true iff there
  * is at least one (then no new bundle may be proposed). The body of
  * EnforcerL1Client::ListWithdrawalBundleStatus after the fetch. Pure. */
 bool L1StillTracksWithdrawalBundle(const std::vector<L1WithdrawalEvent>& vEvents, std::vector<uint256>& vHashWithdrawalBundle);
+
+//
+// v0.2.17 P3: the L1 questions consensus asks, behind one injectable.
+//
+// Design (docs-local/SOFTFORK_V0216_DESIGN_DRAFT.md 3.1): every consensus
+// question to the L1 has three answers. YES; NO, a definite answer from a
+// successful call with a fully recognised response (the block is invalid);
+// UNKNOWN, anything else (the block is not marked, it is retried).
+//
+
+enum class L1Answer { YES, NO, UNKNOWN };
+
+/** One slot-130 deposit event of an L1 block (enforcer GetTwoWayPegData,
+ *  validator.proto Deposit). ParsePegEvents fills every field or fails. */
+struct L1DepositEvent {
+    uint256 hashMainBlock;
+    COutPoint outpoint;              //!< (MainchainTxid, vout) of the new treasury output
+    uint64_t nSequence = 0;          //!< the treasury's running number (deposits and M6s share it)
+    CAmount nValue = 0;              //!< output.value_sats: what this deposit added to the treasury
+    std::vector<unsigned char> vchAddress; //!< output.address.hex; empty if absent or ""
+};
+
+/** The slot-130 events of one L1 block or window, oldest first. */
+struct L1PegEvents {
+    std::vector<L1DepositEvent> vDeposit;
+    std::vector<L1WithdrawalEvent> vWithdrawal;
+};
+
+/**
+ * L1Oracle: the L1 answers ConnectBlock and CheckBlock depend on, asked as of a
+ * named L1 block, never the enforcer's current tip. GetL1Oracle() is the
+ * transport-backed oracle unless a unit test injected one (SetL1OracleForTest),
+ * so the peg-binding tests (src/test/pegbind_tests.cpp) can give any
+ * YES/NO/UNKNOWN answer without a mainchain.
+ *
+ * v0.2.17: one question, the peg events of a range of L1 blocks
+ * (L1Client::GetPegEvents). ConnectBlock's bundle-mark check (B3) asks it.
+ */
+class L1Oracle
+{
+public:
+    virtual ~L1Oracle() {}
+
+    /** The slot-130 events of the L1 blocks in (hashStart, hashEnd], or of
+     *  exactly hashEnd if hashStart == hashEnd (L1Client::GetPegEvents). The one
+     *  question the v0.2.17 peg checks ask. */
+    virtual L1Answer EventsInWindow(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events) = 0;
+
+    /** v0.2.17 C1: does L1 block hashMainBlock carry the BMM bid hashBMM
+     *  (h*) for this sidechain? YES; NO (the L1 has processed the block and it
+     *  carries no bid or another one); UNKNOWN (not processed yet, or no
+     *  answer). */
+    virtual L1Answer BmmCommitment(const uint256& hashMainBlock, const uint256& hashBMM) = 0;
+};
+
+/** v0.2.17 B3 + D1, decisions 2026-09-29: a bundle's outcome on the L1 from
+ *  its events (oldest first). 'S' if any event says paid: a payment is final
+ *  (a paid bundle proposed again and failed must not count as failed). Else
+ *  the last event: 'F' failed, 'U' proposed again after a failure; 0 if none.
+ *  Pure. */
+char BundleOutcome(const std::vector<L1WithdrawalEvent>& vEvents, const uint256& m6id);
+
+/** The enforcer's m6id of a FreeBank bundle: the txid of the bundle tx with
+ *  its inputs stripped (enforcer compute_m6id of the zero-input BlindedM6).
+ *  Pure. */
+uint256 BundleM6id(const CTransaction& txBundle);
+
+/** v0.2.17 D3: parse a GetTwoWayPegData reply strictly. Every event must be a
+ *  deposit or a withdrawal-bundle event with all its fields; anything else
+ *  (a missing field, an event kind we do not know) fails the whole reply, so
+ *  a reply we cannot fully read is never taken for "no such event". proto3
+ *  JSON omits an empty list: no "blocks" or no "events" is none. Pure. */
+bool ParsePegEvents(const UniValue& response, L1PegEvents& events);
+
+/** v0.2.17 D3: what a failed GetTwoWayPegData call means. NO only for the
+ *  enforcer's "start block is not an ancestor of end block"; UNKNOWN for
+ *  everything else ("end block not found": not processed yet; transport
+ *  errors; timeouts). Pure. */
+L1Answer ClassifyPegEventsError(const std::string& strError);
+
+/** The injected test oracle if one is set, else the transport-backed one. */
+L1Oracle& GetL1Oracle();
+
+/** Unit tests only: answer every L1Oracle question from pOracle (nullptr
+ *  restores the transport-backed oracle). Never called outside src/test. */
+void SetL1OracleForTest(L1Oracle* pOracle);
+
+/** Unit tests only: GetL1Client() returns pClient (nullptr restores the
+ *  transport's client). Never called outside src/test. */
+void SetL1ClientForTest(L1Client* pClient);
 
 #endif // BITCOIN_L1CLIENT_H

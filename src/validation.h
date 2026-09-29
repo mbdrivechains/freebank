@@ -69,8 +69,12 @@ struct BitAssetTransactionData {
 static const bool DEFAULT_WHITELISTRELAY = true;
 /** Default for -whitelistforcerelay. */
 static const bool DEFAULT_WHITELISTFORCERELAY = true;
-/** Default for -minrelaytxfee, minimum relay fee for transactions */
-static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000;
+/** Default for -minrelaytxfee, minimum relay fee for transactions.
+ * v0.2.17: 100 sat/kvB (0.1 sat/vB), as Bitcoin Core 29.1+ and the eCash node
+ * (v31.1.0). Node policy, not consensus: a v0.2.16 node still relays only
+ * >= 1000 sat/kvB. The wallet's own floor (-mintxfee, DEFAULT_TRANSACTION_MINFEE)
+ * stays 1000 so wallet transactions still relay through older nodes. */
+static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 100;
 //! -maxtxfee default
 static const CAmount DEFAULT_TRANSACTION_MAXFEE = 0.1 * COIN;
 //! Discourage users to set fees higher than this amount (in satoshis) per kB
@@ -142,7 +146,11 @@ static const int64_t BLOCK_DOWNLOAD_TIMEOUT_BASE = 1000000;
 /** Additional block download timeout per parallel downloading peer (i.e. 5 min) */
 static const int64_t BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 500000;
 
+/** -maxtipage default on regtest (Core's 24 h; the bench and tests rely on it) */
 static const int64_t DEFAULT_MAX_TIP_AGE = 24 * 60 * 60;
+/** v0.2.17: -maxtipage default on FreeBank's own network. Side blocks come about every
+ *  20 minutes, so 24 h left initial block download about 70 blocks behind. */
+static const int64_t DEFAULT_MAX_TIP_AGE_FREEBANK = 2 * 60 * 60;
 /** Maximum age of our tip in seconds for us to be considered current for fee estimation */
 static const int64_t MAX_FEE_ESTIMATION_TIP_AGE = 3 * 60 * 60;
 
@@ -304,6 +312,8 @@ void UnloadBlockIndex();
 void ThreadScriptCheck();
 /** Check whether we are doing an initial block download (synchronizing from disk or network) */
 bool IsInitialBlockDownload();
+/** The -maxtipage default for a network: DEFAULT_MAX_TIP_AGE on regtest, DEFAULT_MAX_TIP_AGE_FREEBANK otherwise. */
+int64_t GetDefaultMaxTipAge(const std::string& strNetworkID);
 /** Retrieve a transaction (from memory pool, or from disk, if possible) */
 bool GetTransaction(const uint256& hash, CTransactionRef& tx, const Consensus::Params& params, uint256& hashBlock, bool fAllowSlow = false, CBlockIndex* blockIndex = nullptr);
 /** Find the best known block, and make it the tip of the block chain */
@@ -432,10 +442,22 @@ bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
 /** Functions for validating blocks and updating the block tree */
 
 /** Verify BMM for this block with the mainchain */
-bool VerifyBMM(const CBlock& block);
+/** v0.2.17 C1: the BMM check of a (non-genesis) block, with its coinbase's
+ *  PrevBlockCommit. True, or false with state: invalid for a definite no,
+ *  state.Error when the L1 cannot tell yet (the block is neither stored nor
+ *  marked, no penalty; it is fetched again). */
+bool CheckBlockBMM(const CBlock& block, CValidationState& state);
 
-/** Verify deposit with the mainchain */
-bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx);
+/** v0.2.17: when this node last could not tell a header's or block's BMM (its
+ *  L1 view lags). Headers that fail to connect meanwhile are this node's doing,
+ *  not the peer's (net_processing). */
+extern std::atomic<int64_t> g_nLastBmmUnknown;
+
+enum class L1Answer;
+/** v0.2.17 B3 + D1: the pending bundle's outcome on the L1 as of hashMainBlock
+ *  (see validation.cpp). Used by ConnectBlock and the block builder. */
+L1Answer GetBundleOutcomeOnL1(const SidechainWithdrawalBundle& bundle, const CBlockIndex* pindexPrev,
+                              const uint256& hashMainBlock, char& cOutcome);
 
 /** Context-independent validity checks */
 bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckMerkleRoot = true, bool fCheckBMM = true);
@@ -472,7 +494,9 @@ CScript GenerateWithdrawalBundleHashCommit(const uint256& hashWithdrawalBundle);
 CScript GenerateBlockVersionCommit(const int32_t nVersion);
 
 /** Verify the status of withdrawal to refund & check refund signature */
-bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig, SidechainWithdrawal& withdrawal);
+/** fRequireUnspent=false only for VerifyDB's level-4 reconnect (N2), where the
+ *  refunded row is already SPENT because level 3 left the sidechain DB alone. */
+bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig, SidechainWithdrawal& withdrawal, bool fRequireUnspent = true);
 
 /** RAII wrapper for VerifyDB: Verify consistency of the block and coin databases */
 class CVerifyDB {
@@ -665,6 +689,10 @@ bool TryUpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnect
  *  blocks are being imported or replayed (fImporting, fReindex) the orphans
  *  are queued instead, for HandleQueuedMainchainReorgs. */
 void HandleMainchainReorg(const std::vector<uint256>& vOrphan);
+
+/** v0.2.17 C4: clear the marks HandleMainchainReorg set on side blocks whose L1
+ *  block is on the L1's main chain again. */
+void ReconsiderSideBlocksOfReturnedL1Blocks();
 
 /** Handle the mainchain orphans queued during the block import (ThreadImport
  *  calls it once the import is done). */

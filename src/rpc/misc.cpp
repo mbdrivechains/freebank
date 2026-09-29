@@ -5,7 +5,6 @@
 
 #include <base58.h>
 #include <bill.h>
-#include <gramscale.h>
 #include <house.h>
 #include <oracle.h>
 #include <pool.h>
@@ -24,6 +23,7 @@
 #include <validation.h>
 #include <httpserver.h>
 #include <net.h>
+#include <net_processing.h>
 #include <netbase.h>
 #include <rpc/blockchain.h>
 #include <rpc/server.h>
@@ -534,6 +534,12 @@ static const size_t BMM_TEMPLATES_REMEMBERED = 64;
 // Refusal time boxes: (key, first seen). Guarded by csBMMRpc.
 static const int64_t BMM_REFUSAL_SECONDS = 60;
 static std::pair<uint256, int64_t> bmmTimeBoxHeader;
+
+// v0.2.17: how long a peer's version-message starting height above our tip
+// refuses templates on its own, before the peer's headers back it up. Honest
+// headers arrive within seconds; the bound stops a peer that lies about its
+// height from stopping bidding for as long as it stays connected.
+static const int64_t BMM_PEER_START_SECONDS = 120;
 static std::pair<uint256, int64_t> bmmTimeBoxPending;
 
 // How many cached eCash blocks get_bmm_inclusions scans without a pinned T: the
@@ -574,7 +580,9 @@ static void BMMRefreshMainView(const std::string& strMethod)
     if (!TryUpdateMainBlockHashCache(fReorg, vDisconnected, BMM_CACHE_WAIT_SECONDS, fBusy)) {
         if (fBusy)
             throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": the eCash block cache is being updated by another thread; try again");
-        throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": failed to update the eCash block cache; try again");
+        throw JSONRPCError(RPC_BMM_RETRY, strMethod + ": failed to update the eCash block cache; try again"
+                           + (GetL1Transport() == L1Transport::ENFORCER && GetEnforcerTransport() == EnforcerTransport::GRPCURL &&
+                              !GetGrpcurlLocation().fFound ? " (grpcurl not found; see getmainchaininfo)" : ""));
     }
 
     if (fReorg)
@@ -593,6 +601,65 @@ static bool BMMWithinTimeBox(std::pair<uint256, int64_t>& box, const uint256& ke
         box.second = nNow;
     }
     return nNow - box.second < BMM_REFUSAL_SECONDS;
+}
+
+/** v0.2.17: refuse while this node is behind (JudgeBMMBehind): -10 in initial
+ *  block download, -40 while a peer has or claims a better chain (no time box),
+ *  -40 for a better header no peer vouches for (time-boxed from when it stands
+ *  alone, so a header that never connects cannot stop bidding). */
+static void BMMRefuseWhileBehind(const std::string& strMethod)
+{
+    AssertLockNotHeld(cs_main);
+
+    PeerTipEvidence evidence;
+    if (g_connman)
+        evidence = GetPeerTipEvidence(*g_connman, BMM_PEER_START_SECONDS);
+
+    const bool fIBD = IsInitialBlockDownload();
+
+    uint256 hashBetterHeader;
+    int nTipHeight = -1;
+    int nBestHeaderHeight = -1;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* pindexTip = chainActive.Tip();
+        nTipHeight = pindexTip ? pindexTip->nHeight : -1;
+        if (pindexTip && pindexBestHeader && pindexBestHeader != pindexTip
+                && pindexBestHeader->nHeight > pindexTip->nHeight
+                && !(pindexBestHeader->nStatus & BLOCK_FAILED_MASK)) {
+            hashBetterHeader = pindexBestHeader->GetBlockHash();
+            nBestHeaderHeight = pindexBestHeader->nHeight;
+        }
+    }
+
+    // The header's time box starts when no peer vouches for it any more.
+    const bool fPeerEvidence = evidence.nBestKnownHeight >= 0 || evidence.nRecentStartingHeight >= 0
+        || (fIBD && evidence.nStartingHeight >= 0);
+    bool fHeaderBoxOpen = false;
+    if (hashBetterHeader.IsNull() || fPeerEvidence)
+        bmmTimeBoxHeader = std::make_pair(uint256(), (int64_t)0);
+    else
+        fHeaderBoxOpen = BMMWithinTimeBox(bmmTimeBoxHeader, hashBetterHeader);
+
+    const int nAhead = std::max(std::max(evidence.nBestKnownHeight, evidence.nStartingHeight), nBestHeaderHeight);
+    // A lone regtest node (the integration gates, a local bench) starts a chain
+    // on its own: with no peer and no better header it is not behind, as
+    // Bitcoin Core's getblocktemplate allows on regtest.
+    if (Params().MineBlocksOnDemand() && evidence.nPeers == 0 && hashBetterHeader.IsNull())
+        return;
+    switch (JudgeBMMBehind(fIBD, evidence, fHeaderBoxOpen)) {
+    case BMMBehind::NO:
+        return;
+    case BMMBehind::IBD:
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, strprintf("%s: in initial block download "
+            "(side tip %d, best seen %d, %d peers); try again when synced", strMethod, nTipHeight, nAhead, evidence.nPeers));
+    case BMMBehind::PEER:
+        throw JSONRPCError(RPC_BMM_RETRY, strprintf("%s: a peer has a better side chain (side tip %d, peer at %d); "
+            "try again when synced", strMethod, nTipHeight, std::max(evidence.nBestKnownHeight, evidence.nRecentStartingHeight)));
+    case BMMBehind::HEADER:
+        throw JSONRPCError(RPC_BMM_RETRY, strprintf("%s: a better side-chain header is known but not connected yet "
+            "(side tip %d, header %d); try again", strMethod, nTipHeight, nBestHeaderHeight));
+    }
 }
 
 static bool BMMGetPrevBlockCommit(const CBlock& block, uint256& hashPrevMain, uint256& hashPrevSide)
@@ -658,7 +725,12 @@ UniValue get_block_template(const JSONRPCRequest& request)
             "\nA BMM block template for an outside BMM engine (BitWindow). The block builds on the side tip\n"
             "and commits to the current eCash tip T. Every call for the same (T, side tip) returns the same\n"
             "block; mempool and coinbase-tag changes apply from the next round. Needs the enforcer transport.\n"
-            "Retryable refusals use code -40.\n"
+            "Retryable refusals use code -40. Never answers while this node is behind: -10 in initial block\n"
+            "download, -40 while a peer has or claims a better side chain or a better header is not connected.\n"
+            "Sequence for an engine: 1. get_block_template (on each new L1 tip T). 2. Bid for critical_hash on L1\n"
+            "(an M8 BMM request for T's child block). 3. After each new L1 block, get_bmm_inclusions critical_hash.\n"
+            "4. When it lists an L1 block, connect_block block \"that hash\". Run the node with -bmmbidder=engine so\n"
+            "its own refreshbmm never bids against the engine.\n"
             "\nResult:\n"
             "{\n"
             "  \"critical_hash\": \"hex\",   (string) h* = hashMerkleRoot, internal byte order (as the M8 carries it)\n"
@@ -685,6 +757,11 @@ UniValue get_block_template(const JSONRPCRequest& request)
     if (vpwallets.empty())
         throw JSONRPCError(RPC_WALLET_NOT_FOUND, "No wallet: the block's coinbase pays this node's wallet");
 
+    // v0.2.17: never a template while this node is behind (a Mac sync got one
+    // 65 blocks behind, and its engine bid on it). Judged before the eCash view
+    // is touched: it needs no eCash call.
+    BMMRefuseWhileBehind(strMethod);
+
     BMMRefreshMainView(strMethod);
 
     // One snapshot of T; block creation gets it explicitly.
@@ -693,21 +770,10 @@ UniValue get_block_template(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_BMM_RETRY, "The eCash block cache is empty; try again");
 
     uint256 hashSideTip;
-    uint256 hashBetterHeader;
     {
         LOCK(cs_main);
-        const CBlockIndex* pindexTip = chainActive.Tip();
-        hashSideTip = pindexTip->GetBlockHash();
-        if (pindexBestHeader && pindexBestHeader != pindexTip
-                && pindexBestHeader->nHeight > pindexTip->nHeight
-                && !(pindexBestHeader->nStatus & BLOCK_FAILED_MASK))
-            hashBetterHeader = pindexBestHeader->GetBlockHash();
+        hashSideTip = chainActive.Tip()->GetBlockHash();
     }
-
-    // A better side chain is known but not connected yet: a template on the old
-    // tip would lose. Time-boxed, so a header that never connects cannot stop us.
-    if (!hashBetterHeader.IsNull() && BMMWithinTimeBox(bmmTimeBoxHeader, hashBetterHeader))
-        throw JSONRPCError(RPC_BMM_RETRY, "A better side-chain header is known but not connected yet; try again");
 
     // Same round: same block.
     if (pBMMTemplatePin && pBMMTemplatePin->hashMainTip == hashMainTip && pBMMTemplatePin->hashSideTip == hashSideTip)
@@ -813,7 +879,7 @@ static bool BMMIsPassingRejectReason(const std::string& strReason)
         || strReason == "bad-mc-prev"               // the eCash cache is checked before; a mismatch now is a race
         || strReason == "duplicate"                 // marked failed by another thread after the clear above
         || strReason == "bad-prevblk"               // the parent was marked during this call (see connect_block)
-        || strReason == "bad-bmm"                   // VerifyBMM cannot tell "L1 down" from "not committed"
+        || strReason == "bad-bmm"                   // the commitment was read just before; a "no" now is an eCash reorg
         || strReason == "invalid-sidechain-deposit"; // VerifyDeposit likewise, until N13
 }
 
@@ -824,7 +890,7 @@ UniValue connect_block(const JSONRPCRequest& request)
             "connect_block {block} \"main_block_hash\"\n"
             "\nConnect a block from get_block_template whose h* was committed in eCash block main_block_hash.\n"
             "Sets nTime (the eCash block's time) and hashMainchainBlock, then processes the block.\n"
-            "Needs the enforcer transport.\n"
+            "Needs the enforcer transport. Call it after get_bmm_inclusions lists main_block_hash for the block's h*.\n"
             "\nArguments:\n"
             "1. block              (object, required) the \"block\" object get_block_template returned (its \"hex\" is used)\n"
             "2. \"main_block_hash\"  (string, required) the eCash block that commits the block's h*, display order\n"
@@ -1002,7 +1068,8 @@ UniValue get_bmm_inclusions(const JSONRPCRequest& request)
             "get_bmm_inclusions \"critical_hash\"\n"
             "\nThe eCash blocks on this node's eCash chain that commit h* for this sidechain, among the last 11\n"
             "cached eCash blocks (or only T's child, for a template this node built). An L1 failure is an error,\n"
-            "never an empty list. Needs the enforcer transport.\n"
+            "never an empty list. Needs the enforcer transport. Call it after each new L1 block; pass a listed\n"
+            "hash to connect_block. An empty list means no inclusion yet; after the next L1 tip, build anew.\n"
             "\nArguments:\n"
             "1. \"critical_hash\"  (string, required) h* as get_block_template returned it (internal byte order)\n"
             "\nResult:\n"
@@ -1087,8 +1154,15 @@ UniValue refreshbmm(const JSONRPCRequest& request)
 {
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
-            "refreshbmm\n"
-            "\nRefresh automated BMM. Basic testing implementation\n"
+            "refreshbmm amount ( createnew \"prevblock\" )\n"
+            "\nThis node's own BMM loop: call it at least once per L1 block (polling more often is fine).\n"
+            "Each call (1) scans new L1 blocks for the h* of a block this node bid on and connects that block\n"
+            "(bmm_block_submitted), then (2) if this node has not bid on the current L1 tip yet, builds a new\n"
+            "FreeBank block and bids for it (an M8 BMM request through -mainchaintransport, paying \"amount\" to the L1\n"
+            "miner; bmm_block_created + txid). One bid per L1 tip: a second call on the same tip only scans.\n"
+            "A won block is connected by the first call after the L1 block that includes the bid.\n"
+            "Do not also run an outside BMM engine (BitWindow, get_block_template) on this node unless\n"
+            "-bmmbidder=engine is set: then refreshbmm only connects won blocks and never bids.\n"
             "\nArguments:\n"
             "1. \"amount\"                (numeric) Amount to pay mainchain miner for including BMM request (required)\n"
             "2. \"createnew\" true|false  (bool) Create a new BMM block if possible\n (optional, default: true)\n"
@@ -1099,8 +1173,11 @@ UniValue refreshbmm(const JSONRPCRequest& request)
             "bmm_block_submitted   (string) Hash of BMM block connected to sidechain.\n"
             "ntxn                  (number) Number of txn in new BMM request (if created).\n"
             "nfees                 (number) Total fees in new block (if created).\n"
+            "bmm_block_submitted_blind (string) h* (merkle root) of the connected block.\n"
             "txid                  (string) Mainchain BMM request TXID.\n"
-            "error                 (string) Output from sidechain client.\n"
+            "error                 (string) Output from sidechain client (\"already created for mainchain tip\" is normal).\n"
+            "\nExamples:\n"
+            + HelpExampleCli("refreshbmm", "0.0001")
         );
 
     // v0.2.16: not while stored blocks are being imported or replayed
@@ -1177,6 +1254,58 @@ UniValue refreshbmm(const JSONRPCRequest& request)
     result.pushKV("txid", txid.ToString());
     result.pushKV("error", strError);
 
+    return result;
+}
+
+UniValue getmainchaininfo(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "getmainchaininfo\n"
+            "\nHow this node reaches the mainchain (eCash). Local state only: no mainchain call is made.\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"transport\": \"enforcer\"|\"jsonrpc\", (string) -mainchaintransport\n"
+            "  \"enforceraddr\": \"host:port\",      (string, enforcer only) the enforcer's gRPC/Connect address\n"
+            "  \"enforcertransport\": \"connect\"|\"grpcurl\", (string, enforcer only) -enforcertransport: how calls reach the\n"
+            "                                      enforcer (connect: HTTP/1.1 JSON, no other program; grpcurl: one process per call)\n"
+            "  \"grpcurl\": {                        (object, enforcertransport grpcurl only) the grpcurl binary the transport runs\n"
+            "    \"found\": true|false,              (boolean) false: the enforcer transport cannot work\n"
+            "    \"path\": \"path\",                  (string) what is run\n"
+            "    \"source\": \"...\"                  (string) -grpcurlbin, PATH, next to freebankd, or the directory\n"
+            "  },\n"
+            "  \"warnings\": \"...\"                  (string) what stops the transport working, or empty\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getmainchaininfo", "")
+            + HelpExampleRpc("getmainchaininfo", "")
+        );
+
+    UniValue result(UniValue::VOBJ);
+    std::string strWarnings;
+    if (GetL1Transport() == L1Transport::ENFORCER) {
+        result.pushKV("transport", "enforcer");
+        result.pushKV("enforceraddr", gArgs.GetArg("-enforceraddr", "127.0.0.1:50051"));
+        const bool fGrpcurl = GetEnforcerTransport() == EnforcerTransport::GRPCURL;
+        result.pushKV("enforcertransport", fGrpcurl ? "grpcurl" : "connect");
+        // grpcurl matters only on -enforcertransport=grpcurl: the default (connect) runs no other program
+        if (fGrpcurl) {
+            const GrpcurlLocation loc = GetGrpcurlLocation();
+            UniValue grpcurl(UniValue::VOBJ);
+            grpcurl.pushKV("found", loc.fFound);
+            grpcurl.pushKV("path", loc.strPath);
+            grpcurl.pushKV("source", loc.strSource);
+            result.pushKV("grpcurl", grpcurl);
+            if (!loc.fFound)
+                strWarnings = loc.strSource == "-grpcurlbin"
+                    ? "grpcurl not found at -grpcurlbin=" + loc.strPath
+                    : "grpcurl not found (looked in PATH, next to freebankd, /opt/homebrew/bin, /usr/local/bin); "
+                      "install it, set -grpcurlbin=<path>, or use -enforcertransport=connect";
+        }
+    } else {
+        result.pushKV("transport", "jsonrpc");
+    }
+    result.pushKV("warnings", strWarnings);
     return result;
 }
 
@@ -1323,9 +1452,13 @@ UniValue listmywithdrawals(const JSONRPCRequest& request)
         throw std::runtime_error(
             "listmywithdrawals\n"
             "\nArguments: None\n"
-            "\nList your sidechain withdrawals.\n"
+            "\nThe IDs of the withdrawals created through this node (createwithdrawal), kept in withdrawalid.dat in\n"
+            "the datadir, so another node or a restored wallet does not list them. Use getwithdrawal \"id\" for status.\n"
             "\nResult:\n"
-            "id             (string)\n"
+            "[\n"
+            "  { \"id\" : \"hex\" },  (object) a withdrawal ID\n"
+            "  ...\n"
+            "]\n"
         );
 
     std::set<uint256> setID = bmmCache.GetCachedWithdrawalID();
@@ -1377,7 +1510,11 @@ UniValue getwithdrawalbundle(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size())
         throw std::runtime_error(
             "getwithdrawalbundle\n"
-            "\nGet the latest WithdrawalBundle transaction hex.\n"
+            "\nThe latest withdrawal bundle this node knows (created, spent or failed), as the raw L1 transaction\n"
+            "hex (decode it with the L1 node's decoderawtransaction). An error if no bundle was ever created. A\n"
+            "bundle forms when enough withdrawals wait (see createwithdrawal); the enforcer proposes it on L1.\n"
+            "\nResult:\n"
+            "\"hex\"    (string) the bundle transaction\n"
         );
 
     SidechainWithdrawalBundle withdrawalBundle;
@@ -1410,7 +1547,9 @@ UniValue getwithdrawal(const JSONRPCRequest& request)
             "  \"refunddestination\" : \"str\",(string)\n"
             "  \"amount\" : n,                (numeric) sats, payout + mainchain fee\n"
             "  \"amountmainchainfee\" : n,    (numeric) sats\n"
-            "  \"status\" : \"str\",           (string)\n"
+            "  \"status\" : \"str\",           (string) \"Unspent\" (waiting for a bundle; refundable),\n"
+            "                                \"Pending - in WithdrawalBundle\" (waiting for L1 ACKs), or \"Spent\"\n"
+            "                                (paid on L1, or refunded)\n"
             "  \"hashblindtx\" : \"hex\"       (string)\n"
             "}\n"
         );
@@ -1442,8 +1581,9 @@ UniValue formatdepositaddress(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
             "formatdepositaddress \"address\"\n"
-            "\nTakes any string and returns a sidechain deposit address\n"
-            "Use this command to turn a sidechain receiving address into a deposit address.\n"
+            "\nTakes any string and returns the full deposit-address form s130_<address>_<checksum>.\n"
+            "Use this command to turn a FreeBank receiving address into the form BitWindow's deposit screen takes.\n"
+            "A direct enforcer CreateDepositTransaction takes the bare address instead (see getdepositaddress).\n"
             "\nArguments:\n"
             "1. \"address\"      (string, required) The destination to be formatted as a deposit address\n"
             "\nResult:\n"
@@ -1505,9 +1645,7 @@ static UniValue BillToJSON(const CBill& bill, bool fIncludeBody)
     obj.pushKV("id", (uint64_t)bill.nBillID);
     obj.pushKV("bill_id", bill.billID.ToString());
     obj.pushKV("amount", ValueFromAmount(bill.amount));
-    obj.pushKV("amount_grams", GramsUV((int64_t)bill.amount));
     obj.pushKV("escrow", ValueFromAmount(bill.amountEscrow));
-    obj.pushKV("escrow_grams", GramsUV((int64_t)bill.amountEscrow));
     obj.pushKV("status", std::string(1, bill.status));
     obj.pushKV("issued_height", (uint64_t)bill.nIssuedHeight);
     obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
@@ -1611,7 +1749,6 @@ UniValue listloanbook(const JSONRPCRequest& request)
     ret.pushKV("house_id", (uint64_t)nFilter);
     ret.pushKV("count", nCount);
     ret.pushKV("face_total", amountFace);
-    ret.pushKV("face_total_grams", GramsUV((int64_t)amountFace));
     if (nFilter != 0) {
         CHouse house;
         const bool fHave = phousetree->GetHouse(nFilter, house);
@@ -1669,9 +1806,7 @@ static UniValue HouseToJSON(const CHouse& house)
     obj.pushKV("denominationmggold", house.nDenomMgGold);
     obj.pushKV("lambdax10", (uint64_t)HOUSE_LAMBDA_X10[house.nTier <= MAX_HOUSE_TIER ? house.nTier : 0]);
     obj.pushKV("activeescrow", ValueFromAmount(house.ActiveEscrow()));
-    obj.pushKV("activeescrow_grams", GramsUV((int64_t)house.ActiveEscrow()));
     obj.pushKV("mintedunits", house.nMintedUnits);
-    obj.pushKV("mintedunits_grams", GramsUV((int64_t)house.nMintedUnits));
     // Term-deposit accounting (Phase 3.8): the D in the shared cap N + D <=
     // lambda*E, and the weighted-average REMAINING term (blocks) of the deposit
     // book - the market's view of the maturity profile (a full bucketed ladder
@@ -1707,7 +1842,6 @@ static UniValue HouseToJSON(const CHouse& house)
     // and reserve (attested till / rho). Publish all three - the market prices
     // which constraint is binding.
     obj.pushKV("mintcapunits", HouseMintCapUnits(house));
-    obj.pushKV("mintcapunits_grams", GramsUV((int64_t)HouseMintCapUnits(house)));
     obj.pushKV("capitalcapunits", HouseCapitalCapUnits(house));
     obj.pushKV("reservecapunits", HouseReserveCapUnits(house));
     // The attested ratio and the redemption spread it implies (3.5). Published
@@ -1749,7 +1883,6 @@ static UniValue HouseToJSON(const CHouse& house)
         obj.pushKV("attest_deadline", (uint64_t)nDeadline);
         obj.pushKV("lastattestheight", (uint64_t)house.nLastAttestHeight);
         obj.pushKV("lastattestreserves", ValueFromAmount(house.amountLastAttestReserves));
-        obj.pushKV("lastattestreserves_grams", GramsUV((int64_t)house.amountLastAttestReserves));
         // Settlement (Phase 3.7 pt2): the per-house cadence stamp + the derived
         // par-eligibility the clearing board keys its "par lamp" on.
         obj.pushKV("lastsettleheight", (uint64_t)house.nLastSettleHeight);
@@ -1850,9 +1983,7 @@ static UniValue PoolToJSON(const CPool& pool)
     obj.pushKV("house_id", (uint64_t)pool.nPoolID);   // v1 invariant: one pool per house
     obj.pushKV("fee_bps", (uint64_t)pool.nFeeBps);
     obj.pushKV("note_reserve", pool.nNoteReserve);
-    obj.pushKV("note_reserve_grams", GramsUV((int64_t)pool.nNoteReserve));
     obj.pushKV("btx_reserve", pool.amountBtxReserve);
-    obj.pushKV("btx_reserve_grams", GramsUV((int64_t)pool.amountBtxReserve));
     obj.pushKV("lp_supply", pool.nLpSupply);
     obj.pushKV("locked_lp", POOL_MIN_LIQUIDITY);
     // Spot price of one note unit in sats, scaled by 1e8 for precision
@@ -2006,33 +2137,6 @@ UniValue listoraclesubmitters(const JSONRPCRequest& request)
     return ret;
 }
 
-UniValue getgramrate(const JSONRPCRequest& request)
-{
-    if (request.fHelp || request.params.size() != 0)
-        throw std::runtime_error(
-            "getgramrate\n"
-            "Report the launch presentation scale (satoshis per gram of gold).\n"
-            "PRESENTATION ONLY: redemption is fixed at par in ECX and this scale\n"
-            "is NOT consensus-enforced.\n"
-            "\nResult:\n"
-            "{\n"
-            "  \"sats_per_gram\": n,   (numeric) satoshis representing one gram of gold\n"
-            "  \"grams_per_ecx\": n,   (numeric) grams of gold per 1 ECX (1e8 / sats_per_gram)\n"
-            "  \"disclaimer\": \"x\"     (string) presentation-scale caveat\n"
-            "}\n"
-            "\nExamples:\n"
-            + HelpExampleCli("getgramrate", "")
-            + HelpExampleRpc("getgramrate", "")
-        );
-
-    UniValue ret(UniValue::VOBJ);
-    ret.pushKV("sats_per_gram", g_launchSatsPerGram);
-    ret.pushKV("grams_per_ecx", GramsFromSats(COIN));
-    ret.pushKV("disclaimer",
-               "launch presentation scale; redemption is fixed ECX; NOT consensus-enforced");
-    return ret;
-}
-
 static const CRPCCommand commands[] =
 { //  category              name                        actor (function)           argNames
   //  --------------------- ------------------------    -----------------------    ----------
@@ -2055,6 +2159,7 @@ static const CRPCCommand commands[] =
     { "sidechain",          "connect_block",                &connect_block,                 {"block", "main_block_hash"}},
     { "sidechain",          "get_bmm_inclusions",           &get_bmm_inclusions,            {"critical_hash"}},
     { "sidechain",          "setcoinbasetag",               &setcoinbasetag,                {"name"}},
+    { "sidechain",          "getmainchaininfo",             &getmainchaininfo,              {}},
     { "sidechain",          "getaveragemainchainfees",      &getaveragemainchainfees,       {"blockcount", "startheight"}},
     { "sidechain",          "getmainchainblockcount",       &getmainchainblockcount,        {}},
     { "sidechain",          "getmainchainblockhash",        &getmainchainblockhash,         {"height"}},
@@ -2076,7 +2181,6 @@ static const CRPCCommand commands[] =
     { "pools",              "listpools",                    &listpools,                     {}},
     { "pools",              "getpool",                      &getpool,                       {"id"}},
 
-    { "freebank",           "getgramrate",                  &getgramrate,                   {}},
 
     { "oracle",             "getgoldfix",                   &getgoldfix,                    {}},
     { "oracle",             "listoraclesubmitters",         &listoraclesubmitters,          {}},

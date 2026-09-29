@@ -113,6 +113,11 @@ void BMMCache::StoreBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBun
     setWithdrawalBundleBroadcasted.insert(hashWithdrawalBundle);
 }
 
+void BMMCache::ForgetBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle)
+{
+    setWithdrawalBundleBroadcasted.erase(hashWithdrawalBundle);
+}
+
 void BMMCache::StorePrevBlockBMMCreated(const uint256& hashPrevBlock)
 {
     setPrevBlockBMMCreated.insert(hashPrevBlock);

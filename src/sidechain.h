@@ -242,7 +242,7 @@ struct SidechainDeposit : public SidechainObj {
     uint8_t nSidechain;
     std::string strDest;
     CAmount amtUserPayout;
-    CMutableTransaction dtx; // Mainchain deposit transaction
+    L1MutableTransaction dtx; // Mainchain deposit transaction (v0.2.17 A5: read and hashed as the L1 does)
     uint32_t nBurnIndex; // Deposit burn output index
     uint32_t nTx; // Deposit transaction number in mainchain block
     uint256 hashMainchainBlock;
@@ -340,6 +340,14 @@ void SelectUnspentWithdrawal(std::vector<SidechainWithdrawal>& vWithdrawal);
  * not the cumulative burn.
  */
 bool GetDepositPayoutOutput(const SidechainDeposit& deposit, CTxOut& out);
+
+/**
+ * v0.2.17 consensus: if strDest is exactly a full deposit address for this
+ * sidechain, s130_<address>_<checksum> as GenerateDepositAddress makes it,
+ * with <address> valid and canonical, set strAddressOut to <address> and
+ * return true. Anything else returns false.
+ */
+bool ParseFullDepositAddress(const std::string& strDest, std::string& strAddressOut);
 
 /**
  * Claim a coinbase output satisfying `required`, marking it consumed.

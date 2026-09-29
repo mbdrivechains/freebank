@@ -37,7 +37,11 @@ private:
     const std::string m_reason;
 };
 
-static CFeeRate blockMinFeeRate = CFeeRate(DEFAULT_BLOCK_MIN_TX_FEE);
+// v0.2.17: DEFAULT_BLOCK_MIN_TX_FEE is 1 sat/kvB, where CFeeRate::GetFee rounds
+// every small package up to 1 sat and the "just below the minimum" cases in
+// TestPackageSelection cannot be built. The selection logic is what is under
+// test, so pin the assembler's floor to the upstream 1000 sat/kvB here.
+static CFeeRate blockMinFeeRate = CFeeRate(1000);
 
 static BlockAssembler AssemblerForTest(const CChainParams& params) {
     BlockAssembler::Options options;

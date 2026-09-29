@@ -17,7 +17,6 @@
 #include <compat/sanity.h>
 #include <consensus/validation.h>
 #include <fs.h>
-#include <gramscale.h>
 #include <house.h>
 #include <httpserver.h>
 #include <httprpc.h>
@@ -73,6 +72,51 @@
 
 bool fFeeEstimatesInitialized = false;
 bool fMainchainIdentityMismatch = false;
+
+/** v0.2.17 D5: the enforcer was not verified at startup (unreachable or still
+ *  syncing). MaybeVerifyEnforcer checks it on first contact. */
+static std::atomic<bool> g_fEnforcerUnverified{false};
+
+static void RefuseEnforcer(const std::string& strWhy)
+{
+    const std::string strMessage = strprintf(_("mainchain ENFORCER checked on first contact: %s. Shutting down: "
+                                               "a wrong enforcer makes this node split off."), strWhy);
+    LogPrintf("ERROR: %s\n", strMessage);
+    uiInterface.ThreadSafeMessageBox(strMessage, "", CClientUIInterface::MSG_ERROR);
+    StartShutdown();
+}
+
+/** v0.2.17 D5 (every 30 s): verify an enforcer that could not be verified at
+ *  startup, as startup would have: its identity (a mismatch must persist, as
+ *  over startup's 60 s window), then its settings (D2). Before, a node started
+ *  while its enforcer was down never checked it. */
+static void MaybeVerifyEnforcer()
+{
+    static int nMismatch = 0;
+    if (!g_fEnforcerUnverified)
+        return;
+    std::string strDetail;
+    const EnforcerIdentity r = ProbeEnforcerIdentity(strDetail);
+    if (r == ENFORCER_IDENTITY_NOTREADY) {
+        nMismatch = 0; // "in a row": an unanswered check breaks the run
+        return;
+    }
+    if (r == ENFORCER_IDENTITY_MISMATCH) {
+        if (++nMismatch >= 12)
+            RefuseEnforcer(strprintf("it indexes a different L1 than the pinned REST node (%s)", strDetail));
+        return;
+    }
+    nMismatch = 0;
+    const EnforcerSettingsCheck settings = CheckEnforcerSettings(strDetail);
+    if (settings == EnforcerSettingsCheck::NOTREADY)
+        return;
+    g_fEnforcerUnverified = false;
+    if (settings == EnforcerSettingsCheck::MISMATCH) {
+        RefuseEnforcer(strDetail);
+        return;
+    }
+    LogPrintf("mainchain enforcer verified on first contact (identity and settings)\n");
+}
 static const bool DEFAULT_PROXYRANDOMIZE = true;
 static const bool DEFAULT_REST_ENABLE = false;
 static const bool DEFAULT_STOPAFTERBLOCKIMPORT = false;
@@ -474,7 +518,7 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-logtimemicros", strprintf("Add microsecond precision to debug timestamps (default: %u)", DEFAULT_LOGTIMEMICROS));
         strUsage += HelpMessageOpt("-mocktime=<n>", "Replace actual time with <n> seconds since epoch (default: 0)");
         strUsage += HelpMessageOpt("-maxsigcachesize=<n>", strprintf("Limit sum of signature cache and script execution cache sizes to <n> MiB (default: %u)", DEFAULT_MAX_SIG_CACHE_SIZE));
-        strUsage += HelpMessageOpt("-maxtipage=<n>", strprintf("Maximum tip age in seconds to consider node in initial block download (default: %u)", DEFAULT_MAX_TIP_AGE));
+        strUsage += HelpMessageOpt("-maxtipage=<n>", strprintf("Maximum tip age in seconds to consider node in initial block download (default: %u, regtest: %u)", DEFAULT_MAX_TIP_AGE_FREEBANK, DEFAULT_MAX_TIP_AGE));
     }
     strUsage += HelpMessageOpt("-maxtxfee=<amt>", strprintf(_("Maximum total fees (in %s) to use in a single wallet transaction or raw transaction; setting this too low may abort large transactions (default: %s)"),
         CURRENCY_UNIT, FormatMoney(DEFAULT_TRANSACTION_MAXFEE)));
@@ -518,7 +562,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-rest", strprintf(_("Accept public REST requests (default: %u)"), DEFAULT_REST_ENABLE));
     strUsage += HelpMessageOpt("-rpcallowip=<ip>", _("Allow JSON-RPC connections from specified source. Valid for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24). This option can be specified multiple times"));
     strUsage += HelpMessageOpt("-rpcauth=<userpw>", _("Username and hashed password for JSON-RPC connections. The field <userpw> comes in the format: <USERNAME>:<SALT>$<HASH>. A canonical python script is included in share/rpcuser. The client then connects normally using the rpcuser=<USERNAME>/rpcpassword=<PASSWORD> pair of arguments. This option can be specified multiple times"));
-    strUsage += HelpMessageOpt("-rpcbind=<addr>[:port]", _("Bind to given address to listen for JSON-RPC connections. This option is ignored unless -rpcallowip is also passed. Port is optional and overrides -rpcport. Use [host]:port notation for IPv6. This option can be specified multiple times (default: 127.0.0.1 and ::1 i.e., localhost, or if -rpcallowip has been specified, 0.0.0.0 and :: i.e., all addresses)"));
+    strUsage += HelpMessageOpt("-rpcbind=<addr>[:port]", _("Bind to given address to listen for JSON-RPC connections. This option is ignored unless -rpcallowip is also passed. Port is optional and overrides -rpcport. Use [host]:port notation for IPv6. This option can be specified multiple times (default: 127.0.0.1 and ::1 i.e., localhost). -rpcallowip without -rpcbind would bind 0.0.0.0 and :: (all addresses), so the node refuses to start with that combination except on regtest"));
     strUsage += HelpMessageOpt("-rpccookiefile=<loc>", _("Location of the auth cookie. Relative paths will be prefixed by a net-specific datadir location. (default: data dir)"));
     strUsage += HelpMessageOpt("-rpcpassword=<pw>", _("Password for JSON-RPC connections"));
     strUsage += HelpMessageOpt("-rpcport=<port>", strprintf(_("Listen for JSON-RPC connections on <port> (default: %u)"), defaultBaseParams->RPCPort()));
@@ -532,9 +576,10 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-server", _("Accept command line and JSON-RPC commands"));
 
     strUsage += HelpMessageGroup(_("Sidechain options:"));
-    strUsage += HelpMessageOpt("-mainchaintransport=<mode>", _("How to reach the mainchain: enforcer (CUSF bip300301_enforcer gRPC via grpcurl; default) or jsonrpc (drivechain-patched node HTTP-RPC; default on regtest)"));
-    strUsage += HelpMessageOpt("-enforceraddr=<addr:port>", _("CUSF enforcer gRPC address for -mainchaintransport=enforcer (default: 127.0.0.1:50051)"));
-    strUsage += HelpMessageOpt("-grpcurlbin=<path>", _("grpcurl binary used by -mainchaintransport=enforcer (default: grpcurl)"));
+    strUsage += HelpMessageOpt("-mainchaintransport=<mode>", _("How to reach the mainchain: enforcer (CUSF bip300301_enforcer; default) or jsonrpc (drivechain-patched node HTTP-RPC; default on regtest)"));
+    strUsage += HelpMessageOpt("-enforceraddr=<addr:port>", _("CUSF enforcer address (its gRPC/Connect port) for -mainchaintransport=enforcer (default: 127.0.0.1:50051)"));
+    strUsage += HelpMessageOpt("-enforcertransport=<mode>", strprintf(_("How -mainchaintransport=enforcer talks to the enforcer: connect (the Connect protocol, JSON over a persistent HTTP/1.1 connection; needs no other program) or grpcurl (one grpcurl process per call, see -grpcurlbin) (default: %s)"), DEFAULT_ENFORCER_TRANSPORT));
+    strUsage += HelpMessageOpt("-grpcurlbin=<path>", _("grpcurl binary used by -enforcertransport=grpcurl (default: the first grpcurl in PATH, next to freebankd, /opt/homebrew/bin or /usr/local/bin; getmainchaininfo shows which)"));
     strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; probed at startup (default: 127.0.0.1:38332)"));
     strUsage += HelpMessageOpt("-mainchainchain=<name>", _("L1 IDENTITY PIN: refuse to start unless the mainchain reports this chain name (main/test/signet/regtest). Reachability is not identity - a second node taking the default -mainchainrest will happily follow SOMEONE ELSE'S mainchain."));
     strUsage += HelpMessageOpt("-mainchainchallenge=<hex>", _("L1 IDENTITY PIN for signet: refuse to start unless the mainchain reports this signet_challenge. Required to tell two custom signets apart - they share a chain name AND a genesis hash (Core's signet genesis is hardcoded, not derived from the challenge)."));
@@ -546,7 +591,6 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-housefailfast", _("Regtest only when disabled: set 0 to bypass the wallet's one-op-per-house fail-fast so ops reach ATMP (integration-gate knob; changes WHICH LAYER refuses, never whether it is refused - consensus is untouched; default: 1)"));
     strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
     strUsage += HelpMessageOpt("-deferwindow=<n>", _("Regtest only: override the option-clause deferral window in blocks (default: 12960 = 90 days; integration-gate knob)"));
-    strUsage += HelpMessageOpt("-launchsatspergram=<n>", _("Regtest only: override the launch presentation scale in satoshis per gram of gold (default: 4822613; presentation only, NOT consensus)"));
     strUsage += HelpMessageOpt("-diskformatversion=<n>", _("Regtest only: write and demand this on-disk undo/coins record format version (default: compiled-in; exists so the format gate itself can be tested)"));
 
     return strUsage;
@@ -995,6 +1039,9 @@ bool AppInitParameterInteraction()
     const std::string strMainchainTransport = gArgs.GetArg("-mainchaintransport", DefaultMainchainTransport());
     if (!IsValidL1Transport(strMainchainTransport))
         return InitError(strprintf(_("Unknown -mainchaintransport value '%s' (expected: jsonrpc or enforcer)"), strMainchainTransport));
+    const std::string strEnforcerTransport = gArgs.GetArg("-enforcertransport", DEFAULT_ENFORCER_TRANSPORT);
+    if (!IsValidEnforcerTransport(strEnforcerTransport))
+        return InitError(strprintf(_("Unknown -enforcertransport value '%s' (expected: connect or grpcurl)"), strEnforcerTransport));
     // The enforcer transport verifies deposits over the mainchain REST endpoint,
     // separately from the enforcer gRPC connection. A node with the gRPC
     // connection but no working REST follows empty blocks fine, then REJECTS
@@ -1090,11 +1137,42 @@ bool AppInitParameterInteraction()
             }
             if (!fVerified)
                 InitWarning(_("mainchain enforcer L1 identity UNVERIFIED at startup (enforcer "
-                              "unreachable or still syncing); continuing. A wrong enforcer would "
-                              "surface loudly at runtime when BMM cannot proceed."));
+                              "unreachable or still syncing); continuing. It is checked again when "
+                              "it first answers, and this node shuts down then if it is wrong."));
+
+            // v0.2.17 D2: the enforcer's BIP300 settings come from its command
+            // line; a wrong preset gives other "paid"/"failed" events than
+            // everyone else's, and this node would split off.
+            std::string strSettings;
+            const EnforcerSettingsCheck settings = fVerified ? CheckEnforcerSettings(strSettings)
+                                                             : EnforcerSettingsCheck::NOTREADY;
+            if (settings == EnforcerSettingsCheck::MISMATCH) {
+                fMainchainIdentityMismatch = true;
+                return InitError(strprintf(_("mainchain ENFORCER settings do not suit this L1: %s. Start the "
+                                             "enforcer with this network's --network-preset. Refusing to start."),
+                                           strSettings));
+            }
+            // v0.2.17 D5: not checked now, checked on first contact
+            g_fEnforcerUnverified = settings != EnforcerSettingsCheck::OK;
         }
     }
     LogPrintf("Using mainchain transport: %s\n", strMainchainTransport);
+    if (strMainchainTransport == "enforcer") {
+        LogPrintf("Using enforcer transport: %s (-enforceraddr %s)\n", strEnforcerTransport, gArgs.GetArg("-enforceraddr", "127.0.0.1:50051"));
+
+        // v0.2.17 D6: the enforcer and eCash node links have no password and
+        // no encryption: whoever answers there decides what this node believes
+        // about eCash. BitAssets allowed its mainchain node on this machine only.
+        for (const char* pszArg : {"-enforceraddr", "-mainchainrest"}) {
+            const std::string strAddr = gArgs.GetArg(pszArg, pszArg == std::string("-enforceraddr") ? "127.0.0.1:50051"
+                                                                                                    : DEFAULT_MAINCHAIN_REST);
+            if (!strAddr.empty() && !IsLocalOrPrivateL1Address(strAddr))
+                InitWarning(strprintf(_("%s=%s is neither on this machine nor on a private network. The link has no "
+                                        "password and no encryption: whoever answers there decides what this node "
+                                        "believes about eCash. Use a local address or a private link (a tailnet)."),
+                                      pszArg, strAddr));
+        }
+    }
 
     // The withdrawal-bundle wire format is per-network consensus; the override
     // flag is a bench/test knob and must never appear on a public network.
@@ -1129,22 +1207,6 @@ bool AppInitParameterInteraction()
                       HOUSE_ATTEST_CADENCE, HOUSE_STRESSED_WINDOW, HOUSE_DEFER_WINDOW);
     }
 
-    // Launch presentation scale (sats per gram of gold). Presentation only;
-    // NOT consensus. The override exists so regtest can exercise the gram
-    // display without pinning to the frozen launch ratio.
-    if (gArgs.IsArgSet("-launchsatspergram") &&
-            chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
-        return InitError(_("-launchsatspergram is a regtest-only test override; on other "
-                           "networks the launch presentation scale is fixed."));
-    if (chainparams.NetworkIDString() == CBaseChainParams::REGTEST &&
-            gArgs.IsArgSet("-launchsatspergram")) {
-        const int64_t nScale = gArgs.GetArg("-launchsatspergram", DEFAULT_LAUNCH_SATS_PER_GRAM);
-        if (nScale < 1 || nScale > MAX_MONEY)
-            return InitError(_("-launchsatspergram out of range."));
-        g_launchSatsPerGram = nScale;
-        LogPrintf("REGTEST override: launch scale %d sats/gram\n", g_launchSatsPerGram);
-    }
-
     // Regtest-only: lets the disk-format gate itself be exercised (bring a chain
     // up under one version, restart demanding another, watch it refuse). NOT a
     // compatibility knob - it changes the marker, never the record layout, and
@@ -1160,6 +1222,15 @@ bool AppInitParameterInteraction()
             return InitError(_("-diskformatversion out of range."));
         nDiskFormatVersion = (int)nFmt;
         LogPrintf("REGTEST override: on-disk record format version %d\n", nDiskFormatVersion);
+    }
+
+    // v0.2.17 port guard: -rpcallowip without -rpcbind binds RPC on 0.0.0.0/::
+    // (httpserver.cpp HTTPBindAddresses). Refuse outside regtest.
+    if (gArgs.GetBoolArg("-server", false)) {
+        const std::string strExposure = RPCBindExposureError(gArgs.IsArgSet("-rpcallowip"),
+                gArgs.IsArgSet("-rpcbind"), chainparams.NetworkIDString());
+        if (!strExposure.empty())
+            return InitError(strExposure);
     }
 
     // ********************************************************* Step 3: parameter-to-internal-flags
@@ -1327,7 +1398,7 @@ bool AppInitParameterInteraction()
     if (gArgs.GetArg("-rpcserialversion", DEFAULT_RPC_SERIALIZE_VERSION) > 1)
         return InitError("unknown rpcserialversion requested.");
 
-    nMaxTipAge = gArgs.GetArg("-maxtipage", DEFAULT_MAX_TIP_AGE);
+    nMaxTipAge = gArgs.GetArg("-maxtipage", GetDefaultMaxTipAge(chainparams.NetworkIDString()));
 
     fEnableReplacement = gArgs.GetBoolArg("-mempoolreplacement", DEFAULT_ENABLE_REPLACEMENT);
     if ((!fEnableReplacement) && gArgs.IsArgSet("-mempoolreplacement")) {
@@ -1820,8 +1891,18 @@ bool AppInitMain()
                         if (hashSideBest.IsNull())
                             return true;   // bootstrap: marker starts with the first flush
                         BlockMap::iterator it = mapBlockIndex.find(hashSideBest);
-                        if (it == mapBlockIndex.end())
-                            return false;
+                        if (it == mapBlockIndex.end()) {
+                            // v0.2.17: a block this node connected whose index
+                            // entry was not flushed either (a hard kill after
+                            // new blocks): not an error yet. ConnectBlock skips
+                            // it on the same chain (the marker is known by then)
+                            // and stops with -reindex on any other. This
+                            // refusal forced a full -reindex after every hard
+                            // stop that followed new blocks.
+                            LogPrintf("House/Bill/Pool database is at block %s, not in the block index yet (an unclean "
+                                      "stop); it is checked as blocks reconnect\n", hashSideBest.ToString());
+                            return true;
+                        }
                         const CBlockIndex* pMarker = it->second;
                         const CBlockIndex* pTip = chainActive.Tip();
                         if (pMarker == pTip)
@@ -1860,7 +1941,24 @@ bool AppInitMain()
                     //   already stuck; this turns a silent invalid-deposit-input
                     //   loop into a named remedy.
                     const CBlockIndex* pTipD = chainActive.Tip();
-                    if (pTipD) {
+                    // v0.2.17: with the sidechain DB's own marker ahead of the
+                    // tip (at a descendant, or at a block not in the index yet:
+                    // an unclean stop after new blocks), the pointer is ahead
+                    // too, and ConnectBlock replays those blocks without
+                    // re-applying them; check it only when the marker is at the
+                    // tip (or absent: a DB from before v0.2.17).
+                    uint256 hashSidechainBest;
+                    const bool fSidechainMarker = psidechaintree->GetBestBlock(hashSidechainBest) && !hashSidechainBest.IsNull();
+                    bool fSidechainAhead = false;
+                    if (fSidechainMarker && pTipD && hashSidechainBest != pTipD->GetBlockHash()) {
+                        BlockMap::iterator itS = mapBlockIndex.find(hashSidechainBest);
+                        fSidechainAhead = itS == mapBlockIndex.end() ||
+                            (itS->second->nHeight > pTipD->nHeight && itS->second->GetAncestor(pTipD->nHeight) == pTipD);
+                        if (fSidechainAhead)
+                            LogPrintf("Sidechain database is at block %s, ahead of the chain tip (an unclean stop); "
+                                      "those blocks replay\n", hashSidechainBest.ToString());
+                    }
+                    if (pTipD && !fSidechainAhead) {
                         uint256 hashDepositPtr;
                         const bool fPtr = psidechaintree->GetLastDepositID(hashDepositPtr);
                         const uint256 hashWant = pTipD->hashLastDeposit;
@@ -2181,6 +2279,7 @@ bool AppInitMain()
     // A failed mainchain check turns network activity off; look every 30 s for the
     // mainchain to answer again and turn it back on (v0.2.11).
     scheduler.scheduleEvery(&MaybeRestoreMainchainConnection, 30 * 1000);
+    scheduler.scheduleEvery(&MaybeVerifyEnforcer, 30 * 1000);
 
     uiInterface.InitMessage(_("Done loading"));
 

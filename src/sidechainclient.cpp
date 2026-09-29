@@ -7,6 +7,7 @@
 #include <bmmcache.h>
 #include <chainparams.h>
 #include <l1client.h>
+#include <util.h>
 #include <miner.h>
 #include <sidechain.h>
 
@@ -94,8 +95,20 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
     // Get our cached BMM blocks
     std::vector<CBlock> vBMMCache = bmmCache.GetBMMBlockCache();
 
+    // v0.2.17 D4: no new bid while the L1 view is behind its own node: the
+    // bid would name an L1 block that already has a child (wasted, and it can
+    // block the next bid). Asked only when a bid is about to be made.
+    const auto MayBid = [&]() {
+        std::string strWhy;
+        if (!GetL1Client().IsBehindItsNode(strWhy))
+            return true;
+        LogPrintf("RefreshBMM: %s\n", strWhy);
+        strError = strWhy;
+        return false;
+    };
+
     // If we don't have any existing BMM requests cached, create our first
-    if (vBMMCache.empty() && fCreateNew) {
+    if (vBMMCache.empty() && fCreateNew && MayBid()) {
         CBlock block;
         if (CreateBMMBlock(block, strError, nFees, hashPrevBlock)) {
             nTxn = block.vtx.size();
@@ -120,38 +133,58 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
     }
 
     // Check new main:blocks for our BMM requests
+    bool fAnyUnknown = false;
     for (const uint256& u : vHashMainBlock) {
         // Skip if we've already checked this block
         if (bmmCache.MainBlockChecked(u))
             continue;
 
-        // Check main:block for any of our current BMM requests
+        // Check main:block for any of our current BMM requests.
+        // v0.2.17 C3: the block is recorded as checked only after a definite
+        // answer for every bid. It was recorded after every scan, so a bid won
+        // while the enforcer did not answer was never connected (paid, no block).
+        bool fUnknown = false;
         for (const CBlock& b : vBMMCache) {
-            // Send 'verifybmm' rpc request to mainchain
             const uint256& hashMerkleRoot = b.hashMerkleRoot;
+            const L1Answer answer = GetL1Oracle().BmmCommitment(u, hashMerkleRoot);
+            if (answer == L1Answer::NO)
+                continue;
             uint256 txid;
             uint32_t nTime = 0;
-            if (VerifyBMM(u, hashMerkleRoot, txid, nTime)) {
-                CBlock block = b;
+            if (answer != L1Answer::YES || !VerifyBMM(u, hashMerkleRoot, txid, nTime)) {
+                fUnknown = true;
+                continue;
+            }
+            CBlock block = b;
 
-                // Copy the block time and hash from the mainchain block into
-                // our new sidechain block.
-                block.nTime = nTime;
-                block.hashMainchainBlock = u;
+            // Copy the block time and hash from the mainchain block into
+            // our new sidechain block.
+            block.nTime = nTime;
+            block.hashMainchainBlock = u;
 
-                // Submit BMM block
-                if (SubmitBMMBlock(block)) {
-                    hashConnected = block.GetHash();
-                    hashConnectedMerkleRoot = hashMerkleRoot;
-                } else {
-                    strError = "Failed to submit block with valid BMM!";
-                    return false;
-                }
+            // Submit BMM block
+            if (SubmitBMMBlock(block)) {
+                hashConnected = block.GetHash();
+                hashConnectedMerkleRoot = hashMerkleRoot;
+            } else {
+                strError = "Failed to submit block with valid BMM!";
+                return false;
             }
         }
 
         // Record that we checked this mainchain block
-        bmmCache.AddCheckedMainBlock(u);
+        if (!fUnknown)
+            bmmCache.AddCheckedMainBlock(u);
+        fAnyUnknown |= fUnknown;
+    }
+
+    // v0.2.17 C3: keep our bid blocks while an L1 block is still unanswered.
+    // The L1 block that carries a won bid is usually the new L1 tip, and the
+    // new-tip branch below clears the bid blocks: the won block would be gone
+    // before the L1 could answer about it.
+    if (fAnyUnknown) {
+        strError = "Waiting for the L1 to answer about a new block before bidding again";
+        return true;
     }
 
     // Was there a new mainchain block since the last request we made?
@@ -161,7 +194,7 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
         bmmCache.ClearBMMBlocks();
 
         // Create a new BMM request
-        if (fCreateNew) {
+        if (fCreateNew && MayBid()) {
             CBlock block;
             if (CreateBMMBlock(block, strError, nFees, hashPrevBlock)) {
                 // Send BMM request to mainchain

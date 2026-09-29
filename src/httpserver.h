@@ -18,6 +18,13 @@ struct event_base;
 class CService;
 class HTTPRequest;
 
+/** v0.2.17 port guard. Core 0.16 binds the RPC server to every interface
+ * (0.0.0.0 and ::) when -rpcallowip is set without -rpcbind (HTTPBindAddresses).
+ * Returns the reason to refuse startup for that combination on any network but
+ * regtest, or "" when the combination is fine. Pure, so it is unit-testable.
+ */
+std::string RPCBindExposureError(bool fRPCAllowIP, bool fRPCBind, const std::string& strNetwork);
+
 /** Initialize HTTP server.
  * Call this before RegisterHTTPHandler or EventBase().
  */

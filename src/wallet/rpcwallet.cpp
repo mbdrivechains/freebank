@@ -4,7 +4,6 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <amount.h>
-#include <gramscale.h>
 #include <base58.h>
 #include <bill.h>
 #include <house.h>
@@ -203,16 +202,41 @@ UniValue getdepositaddress(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size())
+    if (request.fHelp || request.params.size() > 1)
         throw std::runtime_error(
-            "getdepositaddress\n"
-            "\nReturns a new sidechain deposit address for receiving deposits from the mainchain.\n"
-            "\nResult:\n"
-            "\"address\"    (string) The new sidechain deposit address\n"
+            "getdepositaddress ( verbose )\n"
+            "\nReturns a new deposit address of this wallet, for moving eCash (L1) coins into FreeBank (slot 130).\n"
+            "A deposit address has TWO forms, and each tool wants a different one:\n"
+            "  full form  s130_<address>_<checksum>  for BitWindow's deposit screen and any wallet that asks for a\n"
+            "             \"deposit address\": it checks the slot and checksum, then strips them.\n"
+            "  bare form  <address> (a legacy FreeBank address, X...)  for a DIRECT enforcer call:\n"
+            "             WalletService/CreateDepositTransaction {sidechain_id: 130, address: <bare form>,\n"
+            "             value_sats, fee_sats}. The enforcer writes the string it is given into the deposit\n"
+            "             unchanged. Give it the bare form: since v0.2.17 FreeBank also pays a deposit made out\n"
+            "             to the exact full form, but v0.2.16 and older paid no one for it, and a full form with\n"
+            "             a typo (wrong slot or checksum) is still recorded and paid to no one.\n"
+            "Sequence: 1. getdepositaddress true. 2. Send the deposit on L1 (BitWindow with the full form, or the\n"
+            "enforcer with the bare form). 3. Wait for the L1 transaction to confirm. 4. The next FreeBank block\n"
+            "connected after that L1 block pays the deposit, minus a " + FormatMoney(SIDECHAIN_DEPOSIT_FEE) + " " + CURRENCY_UNIT + " deposit fee, to the\n"
+            "address (see listtransactions / getbalance). A deposit of " + FormatMoney(SIDECHAIN_DEPOSIT_FEE) + " or less is not paid.\n"
+            "\nArguments:\n"
+            "1. verbose  (boolean, optional, default=false) false: return the full form as a string (unchanged since\n"
+            "            v0.2.16). true: return both forms, labelled.\n"
+            "\nResult (verbose=false):\n"
+            "\"deposit_address\"    (string) The full form s130_<address>_<checksum>\n"
+            "\nResult (verbose=true):\n"
+            "{\n"
+            "  \"deposit_address\": \"s130_...\", (string) full form, for BitWindow and deposit-address fields\n"
+            "  \"address\": \"X...\",             (string) bare form, for the enforcer's CreateDepositTransaction\n"
+            "  \"sidechain_id\": 130           (numeric) the slot, for CreateDepositTransaction's sidechain_id\n"
+            "}\n"
             "\nExamples:\n"
             + HelpExampleCli("getdepositaddress", "")
-            + HelpExampleRpc("getdepositaddress", "")
+            + HelpExampleCli("getdepositaddress", "true")
+            + HelpExampleRpc("getdepositaddress", "true")
         );
+
+    const bool fVerbose = !request.params.empty() && !request.params[0].isNull() && request.params[0].get_bool();
 
     LOCK2(cs_main, pwallet->cs_wallet);
 
@@ -232,7 +256,16 @@ UniValue getdepositaddress(const JSONRPCRequest& request)
 
     pwallet->SetAddressBook(dest, "sidechain", "deposit");
 
-    return GenerateDepositAddress(EncodeDestination(dest));
+    const std::string strAddress = EncodeDestination(dest);
+    const std::string strDepositAddress = GenerateDepositAddress(strAddress);
+    if (!fVerbose)
+        return strDepositAddress;
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("deposit_address", strDepositAddress);
+    obj.pushKV("address", strAddress);
+    obj.pushKV("sidechain_id", (int)THIS_SIDECHAIN);
+    return obj;
 }
 
 CTxDestination GetAccountDestination(CWallet* const pwallet, std::string strAccount, bool bForceNew=false)
@@ -2453,46 +2486,55 @@ UniValue walletpassphrase(const JSONRPCRequest& request)
         );
     }
 
-    LOCK2(cs_main, pwallet->cs_wallet);
-
-    if (request.fHelp)
-        return true;
-    if (!pwallet->IsCrypted()) {
-        throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrase was called.");
-    }
-
-    // Note that the walletpassphrase is stored in request.params[0] which is not mlock()ed
-    SecureString strWalletPass;
-    strWalletPass.reserve(100);
-    // TODO: get rid of this .c_str() by implementing SecureString::operator=(std::string)
-    // Alternately, find a way to make request.params[0] mlock()'d to begin with.
-    strWalletPass = request.params[0].get_str().c_str();
-
-    // Get the timeout
-    int64_t nSleepTime = request.params[1].get_int64();
-    // Timeout cannot be negative, otherwise it will relock immediately
-    if (nSleepTime < 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Timeout cannot be negative.");
-    }
-    // Clamp timeout to 2^30 seconds
-    if (nSleepTime > (int64_t)1 << 30) {
-        nSleepTime = (int64_t)1 << 30;
-    }
-
-    if (strWalletPass.length() > 0)
+    int64_t nSleepTime;
     {
-        if (!pwallet->Unlock(strWalletPass)) {
-            throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
+        LOCK2(cs_main, pwallet->cs_wallet);
+
+        if (request.fHelp)
+            return true;
+        if (!pwallet->IsCrypted()) {
+            throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrase was called.");
         }
+
+        // Note that the walletpassphrase is stored in request.params[0] which is not mlock()ed
+        SecureString strWalletPass;
+        strWalletPass.reserve(100);
+        // TODO: get rid of this .c_str() by implementing SecureString::operator=(std::string)
+        // Alternately, find a way to make request.params[0] mlock()'d to begin with.
+        strWalletPass = request.params[0].get_str().c_str();
+
+        // Get the timeout
+        nSleepTime = request.params[1].get_int64();
+        // Timeout cannot be negative, otherwise it will relock immediately
+        if (nSleepTime < 0) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Timeout cannot be negative.");
+        }
+        // Clamp timeout to 2^30 seconds
+        if (nSleepTime > (int64_t)1 << 30) {
+            nSleepTime = (int64_t)1 << 30;
+        }
+
+        if (strWalletPass.length() > 0)
+        {
+            if (!pwallet->Unlock(strWalletPass)) {
+                throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
+            }
+        }
+        else
+            throw std::runtime_error(
+                "walletpassphrase <passphrase> <timeout>\n"
+                "Stores the wallet decryption key in memory for <timeout> seconds.");
+
+        pwallet->TopUpKeyPool();
+
+        pwallet->nRelockTime = GetTime() + nSleepTime;
     }
-    else
-        throw std::runtime_error(
-            "walletpassphrase <passphrase> <timeout>\n"
-            "Stores the wallet decryption key in memory for <timeout> seconds.");
 
-    pwallet->TopUpKeyPool();
-
-    pwallet->nRelockTime = GetTime() + nSleepTime;
+    // Bitcoin Core PR #18487 (backport, v0.2.17): RPCRunLater must be called
+    // without cs_wallet held. It removes the previous relock timer and waits
+    // for its callback if that is running, and the callback (LockWallet) takes
+    // cs_wallet: a walletpassphrase inside its locked section when an earlier
+    // unlock's timer fired hung the node for good (cs_main held too).
     RPCRunLater(strprintf("lockwallet(%s)", pwallet->GetName()), boost::bind(LockWallet, pwallet), nSleepTime);
 
     return NullUniValue;
@@ -2883,6 +2925,10 @@ UniValue getwalletinfo(const JSONRPCRequest& request)
             "  \"keypoolsize\": xxxx,             (numeric) how many new keys are pre-generated (only counts external keys)\n"
             "  \"keypoolsize_hd_internal\": xxxx, (numeric) how many new keys are pre-generated for internal use (used for change outputs, only appears if the wallet is using this feature, otherwise external keys are used)\n"
             "  \"unlocked_until\": ttt,           (numeric) the timestamp in seconds since epoch (midnight Jan 1 1970 GMT) that the wallet is unlocked for transfers, or 0 if the wallet is locked\n"
+            "                                    (only present when the wallet is encrypted)\n"
+            "  \"encrypted\": true|false,         (boolean) whether the wallet's private keys are encrypted (see encryptwallet)\n"
+            "  \"encryption_warning\": \"...\",     (string, optional) present only when the wallet is NOT encrypted and holds\n"
+            "                                    funds (balance + unconfirmed + immature > 0); says how to encrypt\n"
             "  \"paytxfee\": x.xxxx,              (numeric) the transaction fee configuration, set in " + CURRENCY_UNIT + "/kB\n"
             "  \"hdmasterkeyid\": \"<hash160>\"     (string, optional) the Hash160 of the HD master pubkey (only present when HD is enabled)\n"
             "}\n"
@@ -2917,6 +2963,10 @@ UniValue getwalletinfo(const JSONRPCRequest& request)
     if (pwallet->IsCrypted()) {
         obj.pushKV("unlocked_until", pwallet->nRelockTime);
     }
+    obj.pushKV("encrypted", pwallet->IsCrypted());
+    const std::string strEncWarning = pwallet->GetEncryptionWarning();
+    if (!strEncWarning.empty())
+        obj.pushKV("encryption_warning", strEncWarning);
     obj.pushKV("paytxfee",      ValueFromAmount(payTxFee.GetFeePerK()));
     if (!masterKeyID.IsNull())
          obj.pushKV("hdmasterkeyid", masterKeyID.GetHex());
@@ -3584,7 +3634,9 @@ UniValue createwithdrawal(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 5)
         throw std::runtime_error(
             "createwithdrawal \"address\" \"refundaddress\" amount fee mainchainfee\n"
-            "\nCreate a withdrawal so that it can be included in a bundle.\n"
+            "\nWithdraw FreeBank coins to an eCash (L1) address. The withdrawal waits in a pool until a\n"
+            "block producer bundles it; the bundle then needs L1 miners' ACKs before it pays out, so a payout\n"
+            "takes many L1 blocks (see the lifecycle below).\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nArguments:\n"
             "1. \"address\"            (string, required) The MAINCHAIN address to pay: P2PKH, P2SH, P2WPKH, P2WSH\n"
@@ -3602,7 +3654,21 @@ UniValue createwithdrawal(const JSONRPCRequest& request)
             "  \"txid\" : \"hex\",          (string) The transaction id.\n"
             "  \"destination\" : \"str\",   (string) The mainchain address, normalized\n"
             "  \"scriptpubkey\" : \"hex\",  (string) The mainchain payout script\n"
+            "  \"id\" : \"hex\"             (string) The withdrawal ID, for getwithdrawal and createwithdrawalrefundrequest\n"
             "}\n"
+            + std::string(
+            "\nLifecycle of a withdrawal (check each step with getwithdrawal \"id\"):\n"
+            "  1. createwithdrawal: amount + mainchainfee (the withdrawal) and fee (this transaction's FreeBank\n"
+            "     fee) leave the wallet at once. Status \"Unspent\" once the transaction is in a FreeBank block.\n"
+            "  2. A block producer bundles the Unspent withdrawals once at least -minwithdrawal of them wait (its\n"
+            "     policy; default " + std::to_string(DEFAULT_MIN_WITHDRAWAL_CREATE_BUNDLE) + "), no bundle is pending, and " + std::to_string(WITHDRAWAL_BUNDLE_FAIL_WAIT_PERIOD) + " FreeBank blocks have passed since a failed\n"
+            "     one. Status \"Pending - in WithdrawalBundle\" (see getwithdrawalbundle).\n"
+            "  3. The node hands the bundle to the enforcer, which proposes it on L1 (M3); L1 miners ACK it. It\n"
+            "     pays out (M6) once it has the L1's BIP300 threshold of ACKs (mainnet: 13,150 within 26,300\n"
+            "     blocks; test networks use far fewer). Status \"Spent\" = paid on L1.\n"
+            "  4. If the bundle fails instead, its withdrawals go back to \"Unspent\" and are bundled again.\n"
+            "  While a withdrawal is \"Unspent\" (not yet in a bundle) createwithdrawalrefundrequest \"id\" (or\n"
+            "  refundallwithdrawals) returns amount + mainchainfee to its refundaddress.\n"            ) +
             "\nExamples:\n"
             + HelpExampleCli("createwithdrawal", "\"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\" \"XrefundLegacyAddress\" 0.3 0.1 0.1")
             + HelpExampleRpc("createwithdrawal", "\"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\", \"XrefundLegacyAddress\", 0.3, 0.1, 0.1")
@@ -3664,6 +3730,7 @@ UniValue createwithdrawal(const JSONRPCRequest& request)
     response.pushKV("txid", txid.ToString());
     response.pushKV("destination", EncodeMainchainAddress(scriptL1));
     response.pushKV("scriptpubkey", HexStr(scriptL1.begin(), scriptL1.end()));
+    response.pushKV("id", wtid.ToString());
     return response;
 }
 
@@ -3676,13 +3743,19 @@ UniValue createwithdrawalrefundrequest(const JSONRPCRequest& request)
 
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
-            "createwithdrawalrefundrequest \"wtid\"\n"
-            "\nCreate a withdrawal refund request.\n"
+            "createwithdrawalrefundrequest \"id\"\n"
+            "\nCancel a withdrawal that is still \"Unspent\" (not yet in a bundle; see getwithdrawal) and get its\n"
+            "amount + mainchain fee back. The request is signed with the key of the withdrawal's refundaddress, so\n"
+            "that key must be in this wallet. The block that includes the request pays the refund to the\n"
+            "refundaddress (a coinbase output) and marks the withdrawal \"Spent\". A withdrawal already in a\n"
+            "bundle cannot be refunded; if that bundle fails it becomes \"Unspent\" again.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nArguments:\n"
-            "1. \"id\"        (string, required) The withdrawal ID from leveldb.\n"
+            "1. \"id\"        (string, required) The withdrawal ID (createwithdrawal's \"id\", or listmywithdrawals).\n"
             "\nResult:\n"
-            "\"txid\"           (string) The transaction id.\n"
+            "{\n"
+            "  \"txid\" : \"hex\"    (string) The refund request transaction id.\n"
+            "}\n"
             "\nExamples:\n"
             + HelpExampleCli("createwithdrawalrefundrequest", "\"bd63ef0e581c53ec261fea45436c171033a313d6c3a4bcac435da0b8a353249a\"")
             + HelpExampleRpc("createwithdrawalrefundrequest", "\"bd63ef0e581c53ec261fea45436c171033a313d6c3a4bcac435da0b8a353249a\"")
@@ -3762,10 +3835,14 @@ UniValue refundallwithdrawals(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size())
         throw std::runtime_error(
             "refundallwithdrawals\n"
-            "\nCreate a withdrawal refund request for all of my withdrawals.\n"
+            "\nCreate a refund request (see createwithdrawalrefundrequest) for every withdrawal in this node's\n"
+            "listmywithdrawals that is still \"Unspent\"; the others are skipped.\n"
             + HelpRequiringPassphrase(pwallet) +
-            "\nResult (array):\n"
-            "\"txid\"           (string) The transaction id.\n"
+            "\nResult:\n"
+            "[\n"
+            "  { \"txid\" : \"hex\" },  (object) one refund request transaction per refunded withdrawal\n"
+            "  ...\n"
+            "]\n"
             "\nExamples:\n"
             + HelpExampleCli("refundallwithdrawals", "")
             + HelpExampleRpc("refundallwithdrawals", "")
@@ -4312,7 +4389,6 @@ UniValue listmynotes(const JSONRPCRequest& request)
             "  {\n"
             "    \"house_id\": n,             (numeric) the house ID\n"
             "    \"units\": n,                (numeric) total note units held\n"
-            "    \"grams\": n,                (numeric) presentation-only gram-of-gold view (units / launch scale)\n"
             "    \"demanded_units\": n,       (numeric) units stamped with a demand (option clause)\n"
             "    \"coins\": n,                (numeric) number of note UTXOs\n"
             "    \"house_status\": \"x\",       (string) effective status: o/s/d/i/w\n"
@@ -4345,7 +4421,6 @@ UniValue listmynotes(const JSONRPCRequest& request)
         obj.pushKV("house_id", (uint64_t)kv.first);
         obj.pushKV("units", kv.second.units);
         // Presentation-only gram view of the holding (units are base-native sats).
-        obj.pushKV("grams", GramsUV((int64_t)kv.second.units));
         obj.pushKV("demanded_units", kv.second.demandedUnits);
         // B3: the formal-demand view - custody units, protested units, and the
         // oldest pre-auth demand height (the discharge deadline's anchor).
@@ -4438,13 +4513,9 @@ UniValue listmylp(const JSONRPCRequest& request)
         obj.pushKV("lp_supply", pool.nLpSupply);
         obj.pushKV("share_bps", shareBps);
         obj.pushKV("my_note_units", myNote);
-        obj.pushKV("my_note_units_grams", GramsUV((int64_t)myNote));
         obj.pushKV("my_btx_sats", myBtx);
-        obj.pushKV("my_btx_sats_grams", GramsUV((int64_t)myBtx));
         obj.pushKV("note_reserve", pool.nNoteReserve);
-        obj.pushKV("note_reserve_grams", GramsUV((int64_t)pool.nNoteReserve));
         obj.pushKV("btx_reserve", (int64_t)pool.amountBtxReserve);
-        obj.pushKV("btx_reserve_grams", GramsUV((int64_t)pool.amountBtxReserve));
         obj.pushKV("fee_bps", (uint64_t)pool.nFeeBps);
         ret.push_back(obj);
     }
@@ -5983,9 +6054,7 @@ UniValue listmybills(const JSONRPCRequest& request)
         obj.pushKV("id", (uint64_t)bill.nBillID);
         obj.pushKV("bill_id", bill.billID.ToString());
         obj.pushKV("amount", ValueFromAmount(bill.amount));
-        obj.pushKV("amount_grams", GramsUV((int64_t)bill.amount));
         obj.pushKV("escrow", ValueFromAmount(bill.amountEscrow));
-        obj.pushKV("escrow_grams", GramsUV((int64_t)bill.amountEscrow));
         obj.pushKV("status", std::string(1, bill.status));
         obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
         obj.pushKV("grace_blocks", (uint64_t)bill.nGraceBlocks);
@@ -6626,7 +6695,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "getaddressinfo",                   &getaddressinfo,                {"address"} },
     { "wallet",             "getbalance",                       &getbalance,                    {"account","minconf","include_watchonly"} },
     { "wallet",             "getnewaddress",                    &getnewaddress,                 {"account","address_type"} },
-    { "wallet",             "getdepositaddress",                &getdepositaddress,             {} },
+    { "wallet",             "getdepositaddress",                &getdepositaddress,             {"verbose"} },
     { "wallet",             "getrawchangeaddress",              &getrawchangeaddress,           {"address_type"} },
     { "wallet",             "getreceivedbyaccount",             &getreceivedbyaccount,          {"account","minconf"} },
     { "wallet",             "getreceivedbyaddress",             &getreceivedbyaddress,          {"address","minconf"} },

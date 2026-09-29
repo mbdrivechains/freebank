@@ -71,6 +71,7 @@ BITCOIN_TESTS =\
   test/checkqueue_tests.cpp \
   test/coinbasetag_tests.cpp \
   test/coins_tests.cpp \
+  test/enforcerconnect_tests.cpp \
   test/l1client_tests.cpp \
   test/compress_tests.cpp \
   test/crypto_tests.cpp \
@@ -87,6 +88,7 @@ BITCOIN_TESTS =\
   test/multisig_tests.cpp \
   test/net_tests.cpp \
   test/netbase_tests.cpp \
+  test/pegbind_tests.cpp \
   test/pmt_tests.cpp \
   test/policyestimator_tests.cpp \
   test/prevector_tests.cpp \
@@ -102,6 +104,7 @@ BITCOIN_TESTS =\
   test/scriptnum_tests.cpp \
   test/serialize_tests.cpp \
   test/sidechain_tests.cpp \
+  test/sidechain_test_util.h \
   test/sighash_tests.cpp \
   test/sigopcount_tests.cpp \
   test/skiplist_tests.cpp \

@@ -14,6 +14,7 @@
 #include <validation.h>
 
 #include <map>
+#include <set>
 
 #include <boost/test/unit_test.hpp>
 
@@ -24,6 +25,22 @@
 // wire format changes these fixtures must be re-captured, not hand-edited.
 
 BOOST_FIXTURE_TEST_SUITE(l1client_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(l1client_enforcer_transport_values)
+{
+    BOOST_CHECK(IsValidEnforcerTransport("connect"));
+    BOOST_CHECK(IsValidEnforcerTransport("grpcurl"));
+    BOOST_CHECK(!IsValidEnforcerTransport(""));
+    BOOST_CHECK(!IsValidEnforcerTransport("grpc"));
+    BOOST_CHECK(!IsValidEnforcerTransport("Connect"));
+    BOOST_CHECK_EQUAL(std::string(DEFAULT_ENFORCER_TRANSPORT), "connect");
+    BOOST_CHECK(GetEnforcerTransport() == EnforcerTransport::CONNECT);
+    gArgs.ForceSetArg("-enforcertransport", "grpcurl");
+    BOOST_CHECK(GetEnforcerTransport() == EnforcerTransport::GRPCURL);
+    BOOST_CHECK_EQUAL(EnforcerStatusLabel(), "grpcurl exit");
+    gArgs.ForceSetArg("-enforcertransport", DEFAULT_ENFORCER_TRANSPORT);
+    BOOST_CHECK_EQUAL(EnforcerStatusLabel(), "connect status");
+}
 
 BOOST_AUTO_TEST_CASE(l1client_transport_values)
 {
@@ -366,6 +383,7 @@ BOOST_AUTO_TEST_CASE(l1client_bundle_guard_through_enforcer_client)
     }
     BOOST_REQUIRE_EQUAL(chmod(script.string().c_str(), 0700), 0);
     gArgs.ForceSetArg("-grpcurlbin", script.string());
+    gArgs.ForceSetArg("-enforcertransport", "grpcurl"); // the fake is a grpcurl (v0.2.17 default: connect)
 
     const std::string X(64, '1'), Y(64, '2');
     auto blk = [](const std::string& strM6, const std::string& strEvent) {
@@ -403,6 +421,7 @@ BOOST_AUTO_TEST_CASE(l1client_bundle_guard_through_enforcer_client)
     BOOST_CHECK(vHash.empty());
 
     gArgs.ForceSetArg("-grpcurlbin", "grpcurl");
+    gArgs.ForceSetArg("-enforcertransport", DEFAULT_ENFORCER_TRANSPORT);
     fs::remove_all(dir);
 }
 
@@ -584,194 +603,6 @@ BOOST_AUTO_TEST_CASE(l1client_m6id_roundtrip)
     BOOST_CHECK(m6id0 == CTransaction(blinded0).GetHash());
 }
 
-BOOST_AUTO_TEST_CASE(l1client_locate_m6)
-{
-    const CAmount nTreasury = 10 * COIN, nFee = 5000;
-    const CScript scriptNop5 = ScriptHex("b4018251"), scriptNop8 = ScriptHex("b7018251");
-    const COutPoint ctip(uint256S("aa00000000000000000000000000000000000000000000000000000000000001"), 0);
-
-    const CMutableTransaction blindedOurs = MakeBlindedBundle(nFee, Payouts(0x11));
-    const CMutableTransaction blindedForeign = MakeBlindedBundle(nFee, Payouts(0x33));
-    const uint256 m6idOurs = CTransaction(blindedOurs).GetHash();
-    const uint256 m6idForeign = CTransaction(blindedForeign).GetHash();
-
-    auto candidate = [](int nTx, const CMutableTransaction& mtx, CAmount nPrev, const CScript& scriptPrev) {
-        M6Candidate c;
-        c.nTx = nTx;
-        c.mtx = mtx;
-        c.nPrevValue = nPrev;
-        c.scriptPrev = scriptPrev;
-        return c;
-    };
-    const CMutableTransaction m6Beta = IntoM6(blindedOurs, 0xb7, ctip, nTreasury, nFee);
-    int nMatches = -1;
-
-    // A betanet (NOP8) M6 alone: found
-    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury, scriptNop8)}, m6idOurs, 130, nMatches), 0);
-    BOOST_CHECK_EQUAL(nMatches, 1);
-    // v0.2.12's exact-NOP5 comparison finds nothing in the same block: the halt
-    const CScript scriptV0212 = CScript() << OP_NOP5 << std::vector<unsigned char>{130} << OP_TRUE;
-    BOOST_CHECK(m6Beta.vout[0].scriptPubKey != scriptV0212);
-
-    // A NOP5 lookalike in the same block (on beta OP_NOP5 is a plain NOP anyone
-    // can mint) does not match; "accept both opcodes" would have counted 2.
-    CMutableTransaction lookalike = IntoM6(MakeBlindedBundle(0, Payouts(0x55)), 0xb4, COutPoint(uint256S("cc"), 0), COIN * 2, 0);
-    std::vector<M6Candidate> v = {candidate(1, lookalike, COIN * 2, CScript() << OP_TRUE),
-                                  candidate(2, m6Beta, nTreasury, scriptNop8)};
-    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), 1);
-    BOOST_CHECK_EQUAL(nMatches, 1);
-    // ...even if it spends a NOP5 "treasury" of its own
-    v[0].scriptPrev = scriptNop5;
-    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), 1);
-    BOOST_CHECK_EQUAL(nMatches, 1);
-
-    // Two real M6s in one L1 block (ours + a foreign bundle on the shared slot):
-    // each event finds its own
-    const CMutableTransaction m6Foreign = IntoM6(blindedForeign, 0xb7, COutPoint(uint256S("dd"), 0), nTreasury, nFee);
-    v = {candidate(4, m6Foreign, nTreasury, scriptNop8), candidate(7, m6Beta, nTreasury, scriptNop8)};
-    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), 1);
-    BOOST_CHECK_EQUAL(LocateM6(v, m6idForeign, 130, nMatches), 0);
-
-    // The M6 must spend a treasury output under its own script (the CTIP)
-    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury, CScript() << OP_TRUE)}, m6idOurs, 130, nMatches), -1);
-    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury, scriptNop5)}, m6idOurs, 130, nMatches), -1);
-    // Wrong previous treasury value -> different m6id -> not found
-    BOOST_CHECK_EQUAL(LocateM6({candidate(3, m6Beta, nTreasury + 1, scriptNop8)}, m6idOurs, 130, nMatches), -1);
-    BOOST_CHECK_EQUAL(nMatches, 0);
-    // Nothing at all
-    BOOST_CHECK_EQUAL(LocateM6({}, m6idOurs, 130, nMatches), -1);
-
-    // Residual, fails closed: a duplicate with identical outputs spending another
-    // treasury-shaped output of the same value (the attacker pays every payout
-    // again) is ambiguous
-    const CMutableTransaction dup = IntoM6(blindedOurs, 0xb7, COutPoint(uint256S("ee"), 0), nTreasury, nFee);
-    v = {candidate(3, m6Beta, nTreasury, scriptNop8), candidate(5, dup, nTreasury, scriptNop8)};
-    BOOST_CHECK_EQUAL(LocateM6(v, m6idOurs, 130, nMatches), -2);
-    BOOST_CHECK_EQUAL(nMatches, 2);
-}
-
-// v0.2.15: an L1 tx FreeBank cannot decode in the same block as our M6 (an eCash
-// v3/TRUC tx: FreeBank's v3 layout reads a replay byte TRUC does not have) is
-// skipped instead of failing the whole deposit batch, which v0.2.14 did for good.
-BOOST_AUTO_TEST_CASE(l1client_build_m6_candidates_skips_undecodable)
-{
-    const CAmount nTreasury = 10 * COIN, nFee = 5000;
-    const CScript scriptNop8 = ScriptHex("b7018251");
-
-    // The CTIP our M6 spends, and our M6 (built by the enforcer: v2)
-    CMutableTransaction ctip;
-    ctip.nVersion = 2;
-    ctip.vin.push_back(CTxIn(COutPoint(uint256S("c1"), 0)));
-    ctip.vout.push_back(CTxOut(nTreasury, scriptNop8));
-    const uint256 keyCtip = uint256S("c7"), keyM6 = uint256S("e6"), keyTruc = uint256S("7c"), keyLook = uint256S("1a");
-    const CMutableTransaction blindedOurs = MakeBlindedBundle(nFee, Payouts(0x11));
-    const uint256 m6idOurs = CTransaction(blindedOurs).GetHash();
-    const CMutableTransaction m6 = IntoM6(blindedOurs, 0xb7, COutPoint(keyCtip, 0), nTreasury, nFee);
-
-    // An eCash v3 (TRUC) tx: plain Bitcoin serialization, nVersion 3, no replay byte
-    CMutableTransaction plain;
-    plain.nVersion = 2;
-    plain.vin.push_back(CTxIn(COutPoint(uint256S("f0"), 1)));
-    plain.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
-    std::string strTruc = EncodeHexTx(CTransaction(plain));
-    BOOST_REQUIRE_EQUAL(strTruc.substr(0, 8), "02000000");
-    strTruc.replace(0, 8, "03000000");
-    CMutableTransaction probe;
-    BOOST_CHECK(!DecodeHexTx(probe, strTruc)); // the root cause
-    BOOST_CHECK(DecodeHexTx(probe, EncodeHexTx(CTransaction(plain)))); // the same tx as v2 is fine
-
-    // A fake L1: txid -> raw hex, decoded with FreeBank's own decoder like RestFetchRawTx
-    std::map<uint256, std::string> mapL1 = {
-        {keyCtip, EncodeHexTx(CTransaction(ctip))},
-        {keyM6, EncodeHexTx(CTransaction(m6))},
-        {keyTruc, strTruc},
-    };
-    auto fetch = [&mapL1](const uint256& txid, CMutableTransaction& mtx) {
-        const auto it = mapL1.find(txid);
-        if (it == mapL1.end())
-            return L1TxFetch::FAILED;
-        return ClassifyRawTxBody(it->second, mtx); // what RestFetchRawTx does after RestGet
-    };
-    const uint256 keyCoinbase = uint256S("cb");
-    std::vector<M6Candidate> vCandidate;
-    int nSkipped = -1, nMatches = -1;
-    std::string strError;
-
-    // A TRUC tx beside our M6: skipped, and our M6 is still found
-    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyTruc, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK_EQUAL(nSkipped, 1);
-    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
-    BOOST_CHECK_EQUAL(vCandidate[0].nTx, 2);
-    BOOST_CHECK_EQUAL(vCandidate[0].nPrevValue, nTreasury);
-    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
-
-    // A treasury-shaped lookalike whose spent output sits in an undecodable tx: skipped too
-    CMutableTransaction look = IntoM6(MakeBlindedBundle(0, Payouts(0x55)), 0xb7, COutPoint(keyTruc, 0), COIN * 2, 0);
-    mapL1[keyLook] = EncodeHexTx(CTransaction(look));
-    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyLook, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK_EQUAL(nSkipped, 1);
-    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
-    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
-
-    // Deposit txs are excluded before any fetch
-    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyTruc, keyM6}, {keyTruc}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK_EQUAL(nSkipped, 0);
-    BOOST_CHECK_EQUAL(vCandidate.size(), 1U);
-
-    // A fetch that FAILED (transport, not decoding) still fails the batch closed
-    const uint256 keyMissing = uint256S("0d");
-    strError.clear();
-    BOOST_CHECK(!BuildM6Candidates({keyCoinbase, keyMissing, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK(strError.find(keyMissing.ToString()) != std::string::npos);
-    // ...and so does a failed fetch of a candidate's spent output
-    mapL1.erase(keyCtip);
-    strError.clear();
-    BOOST_CHECK(!BuildM6Candidates({keyCoinbase, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK(strError.find("spent by " + keyM6.ToString()) != std::string::npos);
-    mapL1[keyCtip] = EncodeHexTx(CTransaction(ctip));
-
-    // A v3 tx FreeBank's decoder reads "successfully" (its own replay-byte layout),
-    // treasury-shaped, spending an output the L1 does not have: skipped by version.
-    // Without the v1/v2 rule its prevout fetch FAILED and failed the batch closed.
-    CMutableTransaction crafted;
-    crafted.nVersion = 3;
-    crafted.vin.push_back(CTxIn(COutPoint(uint256S("0e"), 0)));
-    crafted.vout.push_back(CTxOut(COIN, scriptNop8));
-    const uint256 keyCrafted = uint256S("cf");
-    mapL1[keyCrafted] = EncodeHexTx(CTransaction(crafted));
-    CMutableTransaction probeCrafted;
-    BOOST_REQUIRE(ClassifyRawTxBody(mapL1[keyCrafted], probeCrafted) == L1TxFetch::OK);
-    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyCrafted, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK_EQUAL(nSkipped, 1);
-    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
-    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
-
-    // Residual, pinned on purpose: if the CTIP our M6 spends sits in an
-    // undecodable tx (a v3 M5, issue 1), our M6 is skipped, and a second M6 with
-    // the SAME m6id spending another treasury output of the same value would be
-    // selected instead. That needs a v3 M5 (the deposit loop fails closed on it
-    // first) and an attacker paying every bundle payout again; v0.2.14 halted on
-    // the same block. The consensus release's L1-canonical decoder removes it.
-    const uint256 keyM6OnTruc = uint256S("e7"), keyCtip2 = uint256S("c8"), keyDup = uint256S("d0");
-    mapL1[keyM6OnTruc] = EncodeHexTx(CTransaction(IntoM6(blindedOurs, 0xb7, COutPoint(keyTruc, 0), nTreasury, nFee)));
-    CMutableTransaction ctip2(ctip);
-    ctip2.vin[0].prevout = COutPoint(uint256S("c2"), 0);
-    mapL1[keyCtip2] = EncodeHexTx(CTransaction(ctip2));
-    mapL1[keyDup] = EncodeHexTx(CTransaction(IntoM6(blindedOurs, 0xb7, COutPoint(keyCtip2, 0), nTreasury, nFee)));
-    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyM6OnTruc, keyDup}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK_EQUAL(nSkipped, 1);
-    BOOST_REQUIRE_EQUAL(vCandidate.size(), 1U);
-    BOOST_CHECK_EQUAL(vCandidate[0].nTx, 2);
-    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), 0);
-
-    // If our M6 itself were undecodable it is skipped, and LocateM6 still fails closed
-    mapL1[keyM6] = "03000000" + EncodeHexTx(CTransaction(m6)).substr(8);
-    BOOST_CHECK(BuildM6Candidates({keyCoinbase, keyM6}, {}, 130, fetch, vCandidate, nSkipped, strError));
-    BOOST_CHECK_EQUAL(nSkipped, 1);
-    BOOST_CHECK(vCandidate.empty());
-    BOOST_CHECK_EQUAL(LocateM6(vCandidate, m6idOurs, 130, nMatches), -1);
-}
-
 // v0.2.15: a REST /rest/tx/<txid>.hex body. A body that is not a tx (empty, not
 // hex, odd length) is a misbehaving server: FAILED, which fails the batch closed.
 // Valid hex FreeBank cannot decode is UNDECODABLE, which the M6 scan may skip.
@@ -792,9 +623,27 @@ BOOST_AUTO_TEST_CASE(l1client_classify_raw_tx_body)
     BOOST_CHECK(ClassifyRawTxBody(strV2.substr(0, strV2.size() - 1), tx) == L1TxFetch::FAILED); // odd length
     BOOST_CHECK(ClassifyRawTxBody(strV2.substr(0, strV2.size() - 2), tx) == L1TxFetch::UNDECODABLE); // truncated
     BOOST_CHECK(ClassifyRawTxBody("00", tx) == L1TxFetch::UNDECODABLE);
-    BOOST_CHECK(ClassifyRawTxBody(strTruc, tx) == L1TxFetch::UNDECODABLE);
     BOOST_CHECK(ClassifyRawTxBody(strV2 + "\n", tx) == L1TxFetch::OK);
     BOOST_CHECK(CTransaction(tx).GetHash() == CTransaction(plain).GetHash());
+
+    // v0.2.17 A5: an eCash v3 (TRUC) tx reads in the L1's layout, and its txid
+    // as an L1 tx is the double SHA-256 of its bytes (FreeBank's own layout read
+    // a replay byte after nVersion 3 and could not decode it)
+    BOOST_CHECK(ClassifyRawTxBody(strTruc, tx) == L1TxFetch::OK);
+    BOOST_CHECK_EQUAL(tx.nVersion, 3);
+    const std::vector<unsigned char> vchTruc = ParseHex(strTruc);
+    BOOST_CHECK(L1MutableTransaction(tx).GetHash() == Hash(vchTruc.begin(), vchTruc.end()));
+    // ... and round-trips byte for byte, as a deposit record keeps it
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << L1MutableTransaction(tx);
+    BOOST_CHECK_EQUAL(HexStr(ss.begin(), ss.end()), strTruc);
+    L1MutableTransaction txBack;
+    ss >> txBack;
+    BOOST_CHECK(txBack.GetHash() == L1MutableTransaction(tx).GetHash());
+    // A FreeBank-layout tx (a bill, v11) is not an L1 tx: its payload is left over
+    CMutableTransaction bill = plain;
+    bill.nVersion = TRANSACTION_BILL_VERSION;
+    BOOST_CHECK(ClassifyRawTxBody(EncodeHexTx(CTransaction(bill)), tx) == L1TxFetch::UNDECODABLE);
 }
 
 // A7: the gRPC enforcer identity-pin decision logic. Kept pure (no gRPC/REST I/O)
@@ -883,6 +732,8 @@ BOOST_AUTO_TEST_CASE(l1client_grpcurl_command_quotes_binary_path)
     BOOST_CHECK(BuildGrpcurlCommand("/tmp/a\"b/grpcurl", "{}", "127.0.0.1:50051", "s", "m").empty());
     // fStderr merges stderr into the output instead
     BOOST_CHECK(BuildGrpcurlCommand("grpcurl", "{}", "127.0.0.1:50051", "s", "m", true).find("s/m 2>&1") != std::string::npos);
+    // A per-call budget other than the default 15 s
+    BOOST_CHECK(BuildGrpcurlCommand("grpcurl", "{}", "127.0.0.1:50051", "s", "m", false, 60).find(" -max-time 60 -d ") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(l1client_grpcurl_failure_classify)
@@ -918,6 +769,329 @@ BOOST_AUTO_TEST_CASE(l1client_bmm_request_not_sent)
     BOOST_CHECK(!GrpcurlBMMRequestNotSent(77, "ERROR:\n  Code: Internal\n"));
     BOOST_CHECK(!GrpcurlBMMRequestNotSent(78, "ERROR:\n  Code: Unavailable\n"));
     BOOST_CHECK(!GrpcurlBMMRequestNotSent(1, "Error invoking method \"x\": rpc error"));
+}
+
+// v0.2.17: without -grpcurlbin, grpcurl is looked for in PATH, then next to
+// freebankd, then /opt/homebrew/bin and /usr/local/bin (a macOS GUI launch has
+// PATH=/usr/bin:/bin:/usr/sbin:/sbin only).
+BOOST_AUTO_TEST_CASE(l1client_find_grpcurl_order)
+{
+    std::set<std::string> setExec;
+    auto isExec = [&](const std::string& strPath) { return setExec.count(strPath) > 0; };
+    const std::string strMacPath = "/usr/bin:/bin:/usr/sbin:/sbin";
+    const std::string strExeDir = "/Applications/BitWindow.app/Contents/MacOS";
+
+    // Nowhere: not found, and the bare name is what would run
+    GrpcurlLocation loc = FindGrpcurl(strMacPath, strExeDir, isExec);
+    BOOST_CHECK(!loc.fFound);
+    BOOST_CHECK_EQUAL(loc.strPath, "grpcurl");
+    BOOST_CHECK_EQUAL(loc.strSource, "");
+
+    // Homebrew on Intel, then Apple silicon wins over it
+    setExec.insert("/usr/local/bin/grpcurl");
+    loc = FindGrpcurl(strMacPath, strExeDir, isExec);
+    BOOST_CHECK(loc.fFound);
+    BOOST_CHECK_EQUAL(loc.strPath, "/usr/local/bin/grpcurl");
+    BOOST_CHECK_EQUAL(loc.strSource, "/usr/local/bin");
+    setExec.insert("/opt/homebrew/bin/grpcurl");
+    BOOST_CHECK_EQUAL(FindGrpcurl(strMacPath, strExeDir, isExec).strPath, "/opt/homebrew/bin/grpcurl");
+
+    // Next to freebankd beats both
+    setExec.insert(strExeDir + "/grpcurl");
+    loc = FindGrpcurl(strMacPath, strExeDir, isExec);
+    BOOST_CHECK_EQUAL(loc.strPath, strExeDir + "/grpcurl");
+    BOOST_CHECK_EQUAL(loc.strSource, "next to freebankd");
+
+    // PATH beats everything, in PATH order; empty entries and a trailing slash are fine
+    setExec.insert("/home/u/go/bin/grpcurl");
+    setExec.insert("/usr/bin/grpcurl");
+    loc = FindGrpcurl("::/home/u/go/bin/:/usr/bin", strExeDir, isExec);
+    BOOST_CHECK_EQUAL(loc.strPath, "/home/u/go/bin/grpcurl");
+    BOOST_CHECK_EQUAL(loc.strSource, "PATH");
+    BOOST_CHECK_EQUAL(FindGrpcurl("/usr/bin:/home/u/go/bin", strExeDir, isExec).strPath, "/usr/bin/grpcurl");
+
+    // No PATH and no executable directory: the fixed directories still count
+    BOOST_CHECK_EQUAL(FindGrpcurl("", "", isExec).strPath, "/opt/homebrew/bin/grpcurl");
+}
+
+// -grpcurlbin is used as given; "found" says whether it exists.
+BOOST_AUTO_TEST_CASE(l1client_grpcurlbin_override)
+{
+    gArgs.ForceSetArg("-grpcurlbin", "/nonexistent/dir/grpcurl");
+    GrpcurlLocation loc = GetGrpcurlLocation();
+    BOOST_CHECK(!loc.fFound);
+    BOOST_CHECK_EQUAL(loc.strPath, "/nonexistent/dir/grpcurl");
+    BOOST_CHECK_EQUAL(loc.strSource, "-grpcurlbin");
+
+    gArgs.ForceSetArg("-grpcurlbin", "/bin/sh");
+    loc = GetGrpcurlLocation();
+    BOOST_CHECK(loc.fFound);
+    BOOST_CHECK_EQUAL(loc.strPath, "/bin/sh");
+
+    gArgs.ForceSetArg("-grpcurlbin", "sh"); // a bare name is looked up in PATH
+    BOOST_CHECK(GetGrpcurlLocation().fFound);
+    gArgs.ForceSetArg("-grpcurlbin", "no-such-grpcurl-binary");
+    BOOST_CHECK(!GetGrpcurlLocation().fFound);
+
+    gArgs.ForceSetArg("-grpcurlbin", "grpcurl"); // as l1client_bundle_guard_through_enforcer_client leaves it
+}
+
+
+// v0.2.17 D3: the strict peg-events parser. Shapes from validator.proto at the
+// enforcer we run (73d239a): every field is a wrapper, so zero values and
+// empty strings are present; an empty list is omitted.
+static L1PegEvents ParsePegOK(const std::string& strJson)
+{
+    UniValue v;
+    BOOST_REQUIRE(v.read(strJson));
+    L1PegEvents events;
+    BOOST_CHECK_MESSAGE(ParsePegEvents(v, events), "should parse: " << strJson);
+    return events;
+}
+static void ParsePegFails(const std::string& strJson)
+{
+    UniValue v;
+    BOOST_REQUIRE(v.read(strJson));
+    L1PegEvents events;
+    BOOST_CHECK_MESSAGE(!ParsePegEvents(v, events), "should not parse: " << strJson);
+    BOOST_CHECK(events.vDeposit.empty() && events.vWithdrawal.empty());
+}
+
+BOOST_AUTO_TEST_CASE(l1client_parse_peg_events)
+{
+    const std::string H1(64, 'a'), H2(64, 'b'), TX(64, 'c'), M6 = std::string(62, '0') + "01";
+    const std::string BLOCK = "\"blockHeaderInfo\": {\"blockHash\": {\"hex\": \"" + H1 + "\"}}";
+    const std::string DEP0 = "{\"deposit\": {\"sequenceNumber\": \"0\", \"outpoint\": {\"txid\": {\"hex\": \"" + TX +
+        "\"}, \"vout\": 0}, \"output\": {\"address\": {\"hex\": \"616263\"}, \"valueSats\": \"100000\"}}}";
+
+    // Nothing: an empty reply, no blocks, a block with only a BMM commitment
+    BOOST_CHECK(ParsePegOK("{}").vDeposit.empty());
+    BOOST_CHECK(ParsePegOK("{\"blocks\": []}").vDeposit.empty());
+    BOOST_CHECK(ParsePegOK("{\"blocks\": [{" + BLOCK + ", \"blockInfo\": {\"bmmCommitment\": {\"hex\": \"" + H2 + "\"}}}]}").vDeposit.empty());
+
+    // The first deposit: running number 0, output 0, every field read
+    {
+        const L1PegEvents ev = ParsePegOK("{\"blocks\": [{" + BLOCK + ", \"blockInfo\": {\"events\": [" + DEP0 + "]}}]}");
+        BOOST_REQUIRE_EQUAL(ev.vDeposit.size(), 1U);
+        const L1DepositEvent& d = ev.vDeposit[0];
+        BOOST_CHECK(d.hashMainBlock == uint256S(H1));
+        BOOST_CHECK(d.outpoint == COutPoint(uint256S(TX), 0));
+        BOOST_CHECK_EQUAL(d.nSequence, 0U);
+        BOOST_CHECK_EQUAL(d.nValue, 100000);
+        BOOST_CHECK(std::string(d.vchAddress.begin(), d.vchAddress.end()) == "abc");
+    }
+    // An empty address, three ways; numbers as JSON numbers too
+    for (const std::string& strAddr : {std::string("\"address\": {\"hex\": \"\"}, "), std::string("\"address\": {}, "), std::string("")}) {
+        const L1PegEvents ev = ParsePegOK("{\"blocks\": [{" + BLOCK + ", \"blockInfo\": {\"events\": [{\"deposit\": {\"sequenceNumber\": 7, "
+            "\"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}, \"vout\": 2}, \"output\": {" + strAddr + "\"valueSats\": 5}}}]}}]}");
+        BOOST_REQUIRE_EQUAL(ev.vDeposit.size(), 1U);
+        BOOST_CHECK(ev.vDeposit[0].vchAddress.empty());
+        BOOST_CHECK_EQUAL(ev.vDeposit[0].nSequence, 7U);
+        BOOST_CHECK_EQUAL(ev.vDeposit[0].outpoint.n, 2U);
+    }
+    // Withdrawal-bundle events, in order, with a deposit between them
+    {
+        const std::string WB = "{\"withdrawalBundle\": {\"m6id\": {\"hex\": \"" + M6 + "\"}, \"event\": {\"";
+        const L1PegEvents ev = ParsePegOK("{\"blocks\": [{" + BLOCK + ", \"blockInfo\": {\"events\": [" + WB + "submitted\": {}}}}, " + DEP0 +
+            "]}}, {\"blockHeaderInfo\": {\"blockHash\": {\"hex\": \"" + H2 + "\"}}, \"blockInfo\": {\"events\": [" + WB +
+            "failed\": {}}}}, " + WB + "succeeded\": {\"sequenceNumber\": \"1\", \"transaction\": {\"hex\": \"00\"}}}}}]}}]}");
+        BOOST_REQUIRE_EQUAL(ev.vWithdrawal.size(), 3U);
+        BOOST_CHECK_EQUAL(ev.vWithdrawal[0].status, 'U');
+        BOOST_CHECK(ev.vWithdrawal[0].hashMainBlock == uint256S(H1));
+        BOOST_CHECK_EQUAL(ev.vWithdrawal[1].status, 'F');
+        BOOST_CHECK_EQUAL(ev.vWithdrawal[2].status, 'S');
+        BOOST_CHECK(ev.vWithdrawal[2].hashMainBlock == uint256S(H2));
+        // D7: a "paid" event's running number and M6
+        BOOST_CHECK(ev.vWithdrawal[2].fHaveSequence);
+        BOOST_CHECK_EQUAL(ev.vWithdrawal[2].nSequence, 1U);
+        BOOST_CHECK(ev.vWithdrawal[2].vchTx == std::vector<unsigned char>{0x00});
+        BOOST_CHECK(!ev.vWithdrawal[1].fHaveSequence && ev.vWithdrawal[1].vchTx.empty());
+        BOOST_CHECK(ev.vWithdrawal[0].m6id == Uint256FromConsensusHex(M6));
+        BOOST_CHECK_EQUAL(ev.vDeposit.size(), 1U);
+    }
+
+    // Anything not fully read fails the whole reply
+    auto One = [&](const std::string& strEvent) { return "{\"blocks\": [{" + BLOCK + ", \"blockInfo\": {\"events\": [" + DEP0 + ", " + strEvent + "]}}]}"; };
+    ParsePegFails("[]");
+    ParsePegFails("{\"blocks\": {}}");
+    ParsePegFails("{\"blocks\": [{\"blockInfo\": {}}]}");                                  // no block hash
+    ParsePegFails("{\"blocks\": [{" + BLOCK + "}]}");                                      // no blockInfo
+    ParsePegFails("{\"blocks\": [{" + BLOCK + ", \"blockInfo\": {\"events\": {}}}]}");
+    ParsePegFails(One("{}"));                                                                // an event kind we do not know
+    ParsePegFails(One("{\"sidechainProposal\": {}}"));
+    ParsePegFails(One("{\"deposit\": {\"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}, \"vout\": 0}, \"output\": {\"valueSats\": \"1\"}}}"));  // no running number
+    ParsePegFails(One("{\"deposit\": {\"sequenceNumber\": \"1\", \"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}, \"vout\": 0}, \"output\": {}}}"));  // no amount
+    ParsePegFails(One("{\"deposit\": {\"sequenceNumber\": \"1\", \"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}}, \"output\": {\"valueSats\": \"1\"}}}"));  // no output number
+    ParsePegFails(One("{\"deposit\": {\"sequenceNumber\": \"1\", \"outpoint\": {\"txid\": {\"hex\": \"abcd\"}, \"vout\": 0}, \"output\": {\"valueSats\": \"1\"}}}"));  // short txid
+    ParsePegFails(One("{\"deposit\": {\"sequenceNumber\": \"-1\", \"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}, \"vout\": 0}, \"output\": {\"valueSats\": \"1\"}}}"));
+    ParsePegFails(One("{\"deposit\": {\"sequenceNumber\": \"1\", \"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}, \"vout\": 0}, \"output\": {\"address\": {\"hex\": \"zz\"}, \"valueSats\": \"1\"}}}"));
+    ParsePegFails(One("{\"deposit\": {\"sequenceNumber\": \"1\", \"outpoint\": {\"txid\": {\"hex\": \"" + TX + "\"}, \"vout\": 0}, \"output\": {\"valueSats\": \"2100000000000001\"}}}"));
+    ParsePegFails(One("{\"withdrawalBundle\": {\"m6id\": {\"hex\": \"" + M6 + "\"}, \"event\": {}}}"));
+    ParsePegFails(One("{\"withdrawalBundle\": {\"m6id\": {\"hex\": \"" + M6 + "\"}, \"event\": {\"failed\": {}, \"succeeded\": {}}}}"));
+    ParsePegFails(One("{\"withdrawalBundle\": {\"event\": {\"failed\": {}}}}"));
+    ParsePegFails(One(DEP0.substr(0, DEP0.size() - 1) + ", \"withdrawalBundle\": {}}"));   // both kinds in one event
+}
+
+BOOST_AUTO_TEST_CASE(l1client_classify_peg_events_error)
+{
+    const std::string S(64, 'a'), E(64, 'b');
+    // The enforcer's error texts (lib/validator/dbs/block_hashes.rs), as the
+    // Connect transport and grpcurl print them
+    BOOST_CHECK(ClassifyPegEventsError("ERROR:\n  Code: Internal\n  Message: Start block `" + S +
+        "` is not an ancestor of end block `" + E + "`\n") == L1Answer::NO);
+    BOOST_CHECK(ClassifyPegEventsError("ERROR:\n  Code: Internal\n  Message: End block `" + E + "` not found\n") == L1Answer::UNKNOWN);
+    BOOST_CHECK(ClassifyPegEventsError("ERROR:\n  Code: Internal\n  Message: Previous block `" + S + "` not found for block `" + E + "`\n") == L1Answer::UNKNOWN);
+    BOOST_CHECK(ClassifyPegEventsError("ERROR:\n  Code: DeadlineExceeded\n  Message: timed out waiting for the reply\n") == L1Answer::UNKNOWN);
+    BOOST_CHECK(ClassifyPegEventsError("") == L1Answer::UNKNOWN);
+}
+
+
+// v0.2.17 D2: the enforcer's BIP300 settings against the pinned fork.
+BOOST_AUTO_TEST_CASE(l1client_enforcer_settings)
+{
+    auto Settings = [](const std::string& strJson) {
+        UniValue v;
+        BOOST_REQUIRE(v.read(strJson));
+        EnforcerSettings settings;
+        BOOST_REQUIRE_MESSAGE(ParseEnforcerChainInfo(v, settings), strJson);
+        return settings;
+    };
+    const std::string BETA = "{\"network\": \"NETWORK_MAINNET\", \"bip300Constants\": {\"withdrawalBundleMaxAge\": 26300, "
+        "\"withdrawalBundleInclusionThreshold\": 13150, \"usedSidechainSlotProposalMaxAge\": 26300, "
+        "\"usedSidechainSlotActivationThreshold\": 13150, \"unusedSidechainSlotProposalMaxAge\": 2016, "
+        "\"unusedSidechainSlotActivationThreshold\": 1008, \"activationHeight\": 967680}}";
+    BOOST_CHECK_EQUAL(CompareEnforcerSettings(967680, Settings(BETA)), "");
+    // The mainnet preset's 51% slot threshold (1815) on beta: not beta's enforcer
+    std::string strWrong = BETA;
+    strWrong.replace(strWrong.find("1008"), 4, "1815");
+    BOOST_CHECK(CompareEnforcerSettings(967680, Settings(strWrong)).find("thresholds") != std::string::npos);
+    // Beta's enforcer against an alphanet pin, and one with no activation height (omitted = 0)
+    BOOST_CHECK(CompareEnforcerSettings(963648, Settings(BETA)).find("activation height is 967680") != std::string::npos);
+    BOOST_CHECK(!CompareEnforcerSettings(967680, Settings("{\"bip300Constants\": {\"withdrawalBundleMaxAge\": 10}}")).empty());
+    // Another fork: the activation height only
+    BOOST_CHECK_EQUAL(CompareEnforcerSettings(973728, Settings("{\"bip300Constants\": {\"activationHeight\": 973728}}")), "");
+    BOOST_CHECK(!CompareEnforcerSettings(973728, Settings("{\"bip300Constants\": {\"activationHeight\": 967680}}")).empty());
+    // An enforcer with no preset for an unknown fork (eCash mainnet today) reports 0: accepted there, not on beta
+    BOOST_CHECK_EQUAL(CompareEnforcerSettings(973728, Settings("{\"bip300Constants\": {\"withdrawalBundleMaxAge\": 26300}}")), "");
+    BOOST_CHECK(!CompareEnforcerSettings(967680, Settings("{\"bip300Constants\": {\"withdrawalBundleMaxAge\": 26300}}")).empty());
+    // Not a reply we can read
+    UniValue v;
+    EnforcerSettings settings;
+    BOOST_REQUIRE(v.read("{\"network\": \"NETWORK_MAINNET\"}"));
+    BOOST_CHECK(!ParseEnforcerChainInfo(v, settings));
+    BOOST_REQUIRE(v.read("{\"bip300Constants\": {\"activationHeight\": \"x\"}}"));
+    BOOST_CHECK(!ParseEnforcerChainInfo(v, settings));
+}
+
+// v0.2.17 D6: which enforcer / eCash node addresses count as local or private.
+BOOST_AUTO_TEST_CASE(l1client_l1_address_local_or_private)
+{
+    for (const std::string& str : {"127.0.0.1:50051", "localhost:38332", "10.1.2.3:50051", "192.168.1.5:8332",
+                                   "172.16.0.9:1", "100.76.210.26:50051", "[::1]:50051", "[fd00::5]:8332"})
+        BOOST_CHECK_MESSAGE(IsLocalOrPrivateL1Address(str), str);
+    for (const std::string& str : {"167.172.84.34:50051", "8.8.8.8:8332", "[2001:db8::1]:50051", "enforcer.example.com:50051"})
+        BOOST_CHECK_MESSAGE(!IsLocalOrPrivateL1Address(str), str);
+}
+
+
+// v0.2.17 D3: a real reply. GetTwoWayPegData from the betanet enforcer
+// (73d239a) on the snapshot droplet, 2026-09-29, range (fork block 967680,
+// 970647], trimmed to its first block (a BMM commitment only) and the three
+// blocks with slot-130 events: beta's three deposits.
+BOOST_AUTO_TEST_CASE(l1client_parse_peg_events_captured_beta)
+{
+    const std::string strReply = R"JSON({"blocks":[{"blockHeaderInfo":{"blockHash":{"hex":"0000000000000000831f6494abeef0e985a284819447495c427a588a811509df"},"prevBlockHash":{"hex":"00000000000000003d9abf5fe2d19950e2c3d3051377755aa891d2b40868018e"},"height":969849,"work":{"hex":"3edea07a4bab6cee000000000000000000000000000000000000000000000000"},"timestamp":"1789932999"},"blockInfo":{"bmmCommitment":{"hex":"973da6f3eabd7a735a8f5ed5b442fffe499db8a40e8f3e30aba66b150f2a787b"}}},{"blockHeaderInfo":{"blockHash":{"hex":"0000000000000000a54bce2e596fc6a2cfc5ab0aff39b0c94fe2ca9d797d31c1"},"prevBlockHash":{"hex":"000000000000000099be0a8119781fbfff6930059b1583099c87e308c45abc2e"},"height":970432,"work":{"hex":"3edea07a4bab6cee000000000000000000000000000000000000000000000000"},"timestamp":"1790466202"},"blockInfo":{"bmmCommitment":{"hex":"712a2791fa5c26cca46c6aa28d3ca1a2a5f30296acf225f063ddff7885f267c2"},"events":[{"deposit":{"sequenceNumber":"0","outpoint":{"txid":{"hex":"9cc705f3a7ff0f7e84d255ced84dc40c157afce519f5d95a40910f20af66ccbe"},"vout":0},"output":{"address":{"hex":"733133305f5843413676357379704d434c384d564b314c75646d36377a537141685736666e476e5f653863633663"},"valueSats":"1000000000"}}}]}},{"blockHeaderInfo":{"blockHash":{"hex":"00000000000000001fb497b3875eb39aaba739094166023b259138a4ce13108f"},"prevBlockHash":{"hex":"00000000000000001735ec707372e9a47463cb8c711540c2b034779aa595a077"},"height":970436,"work":{"hex":"3edea07a4bab6cee000000000000000000000000000000000000000000000000"},"timestamp":"1790468633"},"blockInfo":{"bmmCommitment":{"hex":"d165888a17f6cdeceb07972938a6418785ed4e6adffc243ccae087452fbd0f0a"},"events":[{"deposit":{"sequenceNumber":"1","outpoint":{"txid":{"hex":"8c7832f624f3f9f57c80731a431d44353e1879b4af787452e3e9437129dcc645"},"vout":0},"output":{"address":{"hex":"5859597664543368434a4742385639505664675978675a4e357a48727a6944343661"},"valueSats":"500000000"}}}]}},{"blockHeaderInfo":{"blockHash":{"hex":"00000000000000000e5ebb5a9df7128d4daca567d545ea04ed2aa5df61805391"},"prevBlockHash":{"hex":"00000000000000008413d40a3107774550fc45d2ff2f2dc06747d433f0c48a0f"},"height":970439,"work":{"hex":"3edea07a4bab6cee000000000000000000000000000000000000000000000000"},"timestamp":"1790472240"},"blockInfo":{"bmmCommitment":{"hex":"1bf57122594f7218ba59ffca439f103f07525061a5c8c04528e3c71def01edfa"},"events":[{"deposit":{"sequenceNumber":"2","outpoint":{"txid":{"hex":"fb65cde5f4166a9e0c2556841205e9290b1f2df0868ed0824c6f5951dfc62895"},"vout":0},"output":{"address":{"hex":"58434d43544c415569537a48586650666e5851614253577638737337687279553850"},"valueSats":"500000000"}}}]}}]})JSON";
+    UniValue v;
+    BOOST_REQUIRE(v.read(strReply));
+    L1PegEvents events;
+    BOOST_REQUIRE(ParsePegEvents(v, events));
+    BOOST_REQUIRE_EQUAL(events.vDeposit.size(), 3U);
+    BOOST_CHECK(events.vWithdrawal.empty());
+    for (size_t i = 0; i < 3; i++) {
+        BOOST_CHECK_EQUAL(events.vDeposit[i].nSequence, i);
+        BOOST_CHECK_EQUAL(events.vDeposit[i].outpoint.n, 0U);
+        BOOST_CHECK(!events.vDeposit[i].vchAddress.empty());
+    }
+    BOOST_CHECK(events.vDeposit[0].outpoint.hash == uint256S("9cc705f3a7ff0f7e84d255ced84dc40c157afce519f5d95a40910f20af66ccbe"));
+    BOOST_CHECK_EQUAL(events.vDeposit[0].nValue, 1000000000);
+    BOOST_CHECK_EQUAL(std::string(events.vDeposit[0].vchAddress.begin(), events.vDeposit[0].vchAddress.begin() + 5), "s130_");
+    BOOST_CHECK_EQUAL(events.vDeposit[2].nValue, 500000000);
+}
+
+
+// v0.2.17 A5: a deposit record's L1 tx. For v1 and v2 the L1 layout is byte for
+// byte FreeBank's (so beta's existing deposit records read as before); a v3 tx
+// round-trips inside the record with its L1 txid.
+BOOST_AUTO_TEST_CASE(l1client_deposit_record_l1_tx)
+{
+    for (const int nVersion : {1, 2}) {
+        CMutableTransaction mtx;
+        mtx.nVersion = nVersion;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("a5"), 3)));
+        mtx.vout.push_back(CTxOut(7 * COIN, ScriptHex("b7018251")));
+        CDataStream ssOld(SER_NETWORK, PROTOCOL_VERSION), ssNew(SER_NETWORK, PROTOCOL_VERSION);
+        ssOld << mtx;
+        ssNew << L1MutableTransaction(mtx);
+        BOOST_CHECK_EQUAL(HexStr(ssOld.begin(), ssOld.end()), HexStr(ssNew.begin(), ssNew.end()));
+        BOOST_CHECK(L1MutableTransaction(mtx).GetHash() == mtx.GetHash());
+    }
+
+    SidechainDeposit d;
+    d.nSidechain = 130;
+    d.strDest = "s130_dest";
+    d.dtx.nVersion = 3;
+    d.dtx.vin.push_back(CTxIn(COutPoint(uint256S("a6"), 0)));
+    d.dtx.vout.push_back(CTxOut(5 * COIN, ScriptHex("b7018251")));
+    d.nBurnIndex = 0;
+    d.nTx = 4;
+    CDataStream ssDtx(SER_NETWORK, PROTOCOL_VERSION);
+    ssDtx << d.dtx;
+    const std::string strDtx = HexStr(ssDtx.begin(), ssDtx.end());
+    BOOST_CHECK_EQUAL(strDtx.substr(0, 10), "0300000001"); // nVersion 3, then one input: no replay byte
+    const std::vector<unsigned char> vchDtx = ParseHex(strDtx);
+    BOOST_CHECK(d.dtx.GetHash() == Hash(vchDtx.begin(), vchDtx.end()));
+
+    const CScript script = d.GetScript();
+    std::vector<unsigned char> vch;
+    BOOST_REQUIRE(script.IsSidechainObj(vch));
+    std::unique_ptr<SidechainObj> obj(ParseSidechainObj(vch));
+    BOOST_REQUIRE(obj && obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP);
+    const SidechainDeposit* back = static_cast<const SidechainDeposit*>(obj.get());
+    BOOST_CHECK_EQUAL(back->dtx.nVersion, 3);
+    BOOST_CHECK(back->dtx.GetHash() == d.dtx.GetHash());
+    BOOST_CHECK(back->GetID() == d.GetID());
+}
+
+
+// v0.2.17: a deposit's tx is read from its L1 block, not /rest/tx (a node
+// started from a snapshot has no tx index for recent blocks for weeks).
+BOOST_AUTO_TEST_CASE(l1client_find_l1_tx_in_block)
+{
+    std::vector<L1MutableTransaction> vtx(3);
+    for (size_t i = 0; i < vtx.size(); i++) {
+        vtx[i].nVersion = i == 2 ? 3 : 2; // the last one an eCash v3 tx
+        vtx[i].vin.push_back(CTxIn(COutPoint(ArithToUint256(arith_uint256(0xb10 + i)), 0)));
+        vtx[i].vout.push_back(CTxOut((i + 1) * COIN, ScriptHex("b7018251")));
+    }
+    std::vector<unsigned char> vchBlock(80, 0x11);        // an 80-byte header
+    CDataStream ssTxs(SER_NETWORK, PROTOCOL_VERSION);
+    WriteCompactSize(ssTxs, vtx.size());
+    for (const L1MutableTransaction& tx : vtx)
+        ssTxs << tx;
+    vchBlock.insert(vchBlock.end(), ssTxs.begin(), ssTxs.end());
+
+    CMutableTransaction tx;
+    int nTx = -1;
+    BOOST_CHECK(FindL1TxInBlock(vchBlock, vtx[2].GetHash(), tx, nTx) == L1TxFetch::OK);
+    BOOST_CHECK_EQUAL(nTx, 2);
+    BOOST_CHECK_EQUAL(tx.nVersion, 3);
+    BOOST_CHECK(L1MutableTransaction(tx).GetHash() == vtx[2].GetHash());
+    BOOST_CHECK(FindL1TxInBlock(vchBlock, vtx[0].GetHash(), tx, nTx) == L1TxFetch::OK);
+    BOOST_CHECK_EQUAL(nTx, 0);
+    BOOST_CHECK(FindL1TxInBlock(vchBlock, uint256S("99"), tx, nTx) == L1TxFetch::FAILED);
+    BOOST_CHECK_EQUAL(nTx, -1);
+    vchBlock.resize(vchBlock.size() - 5);
+    BOOST_CHECK(FindL1TxInBlock(vchBlock, vtx[2].GetHash(), tx, nTx) == L1TxFetch::UNDECODABLE);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -284,6 +284,11 @@ bool OpenWallets()
         if (!pwallet) {
             return false;
         }
+        // v0.2.17 self-audit: warn loudly (log + stderr/GUI), never refuse.
+        const std::string strEncWarning = pwallet->GetEncryptionWarning();
+        if (!strEncWarning.empty()) {
+            InitWarning(strprintf("Wallet %s: %s", walletFile, strEncWarning));
+        }
         vpwallets.push_back(pwallet);
     }
 

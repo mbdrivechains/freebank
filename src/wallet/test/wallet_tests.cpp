@@ -889,4 +889,26 @@ BOOST_AUTO_TEST_CASE(createwithdrawal_l1_destinations_and_guards)
     g_fMainchainMainFamily = fFamilySaved;
 }
 
+// v0.2.17 self-audit: a warning (never a refusal) when an unencrypted wallet holds funds
+BOOST_AUTO_TEST_CASE(wallet_encryption_warning)
+{
+    // pure rule
+    BOOST_CHECK(WalletEncryptionWarning(false, 0).empty());          // nothing held
+    BOOST_CHECK(WalletEncryptionWarning(true, 5 * COIN).empty());    // encrypted
+    const std::string strWarn = WalletEncryptionWarning(false, 5 * COIN);
+    BOOST_CHECK(!strWarn.empty());
+    BOOST_CHECK(strWarn.find("NOT encrypted") != std::string::npos);
+    BOOST_CHECK(strWarn.find("encryptwallet") != std::string::npos);
+    BOOST_CHECK(strWarn.find("5.00") != std::string::npos);
+
+    // a fresh (unencrypted, empty) wallet: no warning
+    BOOST_CHECK(!pwalletMain->IsCrypted());
+    BOOST_CHECK(pwalletMain->GetEncryptionWarning().empty());
+
+    // once encrypted, still none
+    BOOST_CHECK(pwalletMain->EncryptWallet(SecureString("test passphrase")));
+    BOOST_CHECK(pwalletMain->IsCrypted());
+    BOOST_CHECK(pwalletMain->GetEncryptionWarning().empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

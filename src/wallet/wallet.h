@@ -47,8 +47,17 @@ static const CAmount DEFAULT_TRANSACTION_FEE = 0;
 static const CAmount DEFAULT_FALLBACK_FEE = 20000;
 //! -m_discard_rate default
 static const CAmount DEFAULT_DISCARD_FEE = 10000;
-//! -mintxfee default
+//! -mintxfee default. v0.2.17 keeps 1000 sat/kvB (1 sat/vB) although the node's
+//! relay floor dropped to 100: v0.2.16 nodes relay only >= 1000, so a lower
+//! wallet floor would make transactions that part of the network drops.
 static const CAmount DEFAULT_TRANSACTION_MINFEE = 1000;
+
+/** v0.2.17 self-audit: the warning text for a wallet that is not encrypted
+ * while it holds nHeld sats, or "" when there is nothing to warn about
+ * (encrypted, or nothing held). A warning only: the node never refuses to
+ * start, because unattended signers (the seed's BMM ticker) need an
+ * unlocked wallet. */
+std::string WalletEncryptionWarning(bool fCrypted, CAmount nHeld);
 //! minimum recommended increment for BIP 125 replacement txs
 static const CAmount WALLET_INCREMENTAL_RELAY_FEE = 5000;
 //! target minimum change amount
@@ -976,6 +985,9 @@ public:
     CAmount GetImmatureWatchOnlyBalance() const;
     CAmount GetLegacyBalance(const isminefilter& filter, int minDepth, const std::string* account) const;
     CAmount GetAvailableBalance(const CCoinControl* coinControl = nullptr) const;
+    //! v0.2.17: "" unless this wallet is unencrypted and holds funds
+    //! (confirmed + unconfirmed + immature balance > 0); see WalletEncryptionWarning.
+    std::string GetEncryptionWarning() const;
 
     OutputType TransactionChangeType(OutputType change_type, const std::vector<CRecipient>& vecSend);
 

@@ -629,6 +629,67 @@ bool GetNodeStateStats(NodeId nodeid, CNodeStateStats &stats) {
     return true;
 }
 
+/** True if a block between pindex and the active chain (pindex included) is marked failed. */
+static bool BranchHasFailedBlock(const CBlockIndex* pindex)
+{
+    AssertLockHeld(cs_main);
+    for (; pindex && !chainActive.Contains(pindex); pindex = pindex->pprev) {
+        if (pindex->nStatus & BLOCK_FAILED_MASK)
+            return true;
+    }
+    return false;
+}
+
+PeerTipEvidence GetPeerTipEvidence(CConnman& connman, int64_t nRecentSeconds)
+{
+    PeerTipEvidence evidence;
+    const int64_t nNow = GetTime();
+
+    LOCK(cs_main);
+    const CBlockIndex* pindexTip = chainActive.Tip();
+    if (!pindexTip)
+        return evidence;
+    const int nTipHeight = pindexTip->nHeight;
+
+    // Lock order cs_main -> cs_vNodes, as in PeerLogicValidation::NewPoWValidBlock.
+    connman.ForEachNode([&](CNode* pnode) {
+        evidence.nPeers++;
+
+        const CNodeState* state = State(pnode->GetId());
+        const CBlockIndex* pindexKnown = state ? state->pindexBestKnownBlock : nullptr;
+        const int nKnownHeight = pindexKnown ? pindexKnown->nHeight : -1;
+
+        if (pindexKnown && nKnownHeight > evidence.nBestKnownHeight
+                && nKnownHeight > nTipHeight
+                && !BranchHasFailedBlock(pindexKnown))
+            evidence.nBestKnownHeight = nKnownHeight;
+
+        // A starting height counts until the peer's own announcements reach it.
+        const int nStart = pnode->nStartingHeight;
+        if (nStart > nTipHeight && nKnownHeight < nStart) {
+            evidence.nStartingHeight = std::max(evidence.nStartingHeight, nStart);
+            if (nNow - pnode->nTimeConnected < nRecentSeconds)
+                evidence.nRecentStartingHeight = std::max(evidence.nRecentStartingHeight, nStart);
+        }
+    });
+
+    return evidence;
+}
+
+BMMBehind JudgeBMMBehind(bool fIBD, const PeerTipEvidence& evidence, bool fHeaderBoxOpen)
+{
+    if (fIBD) {
+        if (evidence.nPeers == 0 || evidence.nBestKnownHeight >= 0 || evidence.nStartingHeight >= 0 || fHeaderBoxOpen)
+            return BMMBehind::IBD;
+        return BMMBehind::NO;
+    }
+    if (evidence.nBestKnownHeight >= 0 || evidence.nRecentStartingHeight >= 0)
+        return BMMBehind::PEER;
+    if (fHeaderBoxOpen)
+        return BMMBehind::HEADER;
+    return BMMBehind::NO;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 //
 // mapOrphanTransactions
@@ -1313,7 +1374,12 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
             // we can use this peer to download.
             UpdateBlockAvailability(pfrom->GetId(), headers.back().GetHash());
 
-            if (nodestate->nUnconnectingHeaders % MAX_UNCONNECTING_HEADERS == 0) {
+            // v0.2.17: not while this node's own L1 view lags. A header it
+            // could not check (its BMM: "can't tell") was dropped, so the
+            // peer's next ones cannot connect; an honest seed was banned
+            // after hours of an enforcer resync.
+            if (nodestate->nUnconnectingHeaders % MAX_UNCONNECTING_HEADERS == 0 &&
+                    GetTime() - g_nLastBmmUnknown > 3600) {
                 Misbehaving(pfrom->GetId(), 20);
             }
             return true;
@@ -2040,7 +2106,10 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         vRecv >> locator >> hashStop;
 
         LOCK(cs_main);
-        if (IsInitialBlockDownload() && !pfrom->fWhitelisted) {
+        // v0.2.17: with the 2 h -maxtipage a node restarted during a long stall is in
+        // initial block download at the network's tip. It still answers getheaders
+        // then, or the seed would turn every new node away until the next side block.
+        if (IsInitialBlockDownload() && !pfrom->fWhitelisted && pindexBestHeader != chainActive.Tip()) {
             LogPrint(BCLog::NET, "Ignoring getheaders from peer=%d because node is in initial block download\n", pfrom->GetId());
             return true;
         }

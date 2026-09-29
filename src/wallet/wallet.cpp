@@ -2086,6 +2086,24 @@ CAmount CWallet::GetUnconfirmedBalance() const
     return nTotal;
 }
 
+std::string WalletEncryptionWarning(bool fCrypted, CAmount nHeld)
+{
+    if (fCrypted || nHeld <= 0)
+        return "";
+    return strprintf("This wallet is NOT encrypted and holds %s %s. Anyone who can read wallet.dat can spend it. "
+                     "Encrypt it with encryptwallet \"passphrase\" (the node shuts down; restart it and use "
+                     "walletpassphrase \"passphrase\" <seconds> to sign), or keep only a small hot balance in an "
+                     "unencrypted wallet that must sign unattended.",
+                     FormatMoney(nHeld), CURRENCY_UNIT);
+}
+
+std::string CWallet::GetEncryptionWarning() const
+{
+    if (IsCrypted())
+        return "";
+    return WalletEncryptionWarning(false, GetBalance() + GetUnconfirmedBalance() + GetImmatureBalance());
+}
+
 CAmount CWallet::GetImmatureBalance() const
 {
     CAmount nTotal = 0;

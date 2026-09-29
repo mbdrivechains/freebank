@@ -49,6 +49,9 @@ public:
 
     bool HaveBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle) const;
 
+    // v0.2.17: a bundle undone by a reorg is sent again once re-created
+    void ForgetBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle);
+
     // Check if we already verified BMM for this sidechain block
     bool HaveVerifiedBMM(const uint256& hashBlock) const;
 

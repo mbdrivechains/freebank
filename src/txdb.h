@@ -9,6 +9,7 @@
 #include <coins.h>
 #include <dbwrapper.h>
 #include <chain.h>
+#include <sidechain.h>
 
 #include <map>
 #include <string>
@@ -159,20 +160,45 @@ class CSidechainTreeDB : public CDBWrapper
 public:
     CSidechainTreeDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
     bool WriteSidechainIndex(const std::vector<std::pair<uint256, const SidechainObj *> > &list);
+
+    /** v0.2.17: all of one block's sidechain effects in ONE atomic batch with
+     *  the best-block marker (as the House/Bill/Pool DBs do): the withdrawals'
+     *  new statuses (refunds, a new bundle's), the bundle marks (row and its
+     *  withdrawals), the block's objects (as WriteSidechainIndex), and the
+     *  marker = hashBlock. After a crash before the chainstate flush, the
+     *  marker shows which blocks' effects are already here (ConnectBlock skips
+     *  them instead of re-checking them against the DB they already changed). */
+    bool WriteBlockEffects(const std::vector<SidechainWithdrawal>& vWithdrawalUpdate,
+                           const std::vector<SidechainWithdrawalBundle>& vBundleMark,
+                           const std::vector<std::pair<uint256, const SidechainObj *> >& vObject,
+                           const uint256& hashBlock);
+    bool GetBestBlock(uint256& hashBlock);
+    bool WriteBestBlock(const uint256& hashBlock);
+
+    /** v0.2.17: all of one block's sidechain undo, as WriteBlockEffects wrote
+     *  it, in ONE atomic batch with the marker stepped back (hashBest): bundle
+     *  marks back to CREATED (their withdrawals to IN_BUNDLE), refunds back to
+     *  UNSPENT, a created bundle erased (B6), the block's deposits erased and
+     *  the deposit pointer restored (D-3), the block's new withdrawals erased
+     *  (C6-A). They were five separate writes: a crash between them left a
+     *  half-undone block that the marker would later take for a replay. */
+    struct BlockUndo {
+        std::vector<SidechainWithdrawalBundle> vMarkUndo;
+        std::vector<SidechainWithdrawal> vRefundUndo;
+        bool fBundleUndo = false;
+        std::vector<SidechainWithdrawal> vBundleWithdrawal;
+        SidechainWithdrawalBundle bundle;
+        uint256 hashPrevLastBundle;
+        bool fDepositUndo = false;
+        std::vector<uint256> vDepositErase;
+        uint256 hashPrevLastDeposit;
+        std::vector<uint256> vWithdrawalErase;
+        uint256 hashBest;
+    };
+    bool WriteBlockUndo(const BlockUndo& undo);
     bool WriteWithdrawalUpdate(const std::vector<SidechainWithdrawal>& vWithdrawal);
-    bool WriteWithdrawalDisconnect(const std::vector<uint256>& vEraseID);
     bool WriteWithdrawalBundleUpdate(const SidechainWithdrawalBundle& withdrawalBundle);
     bool WriteLastWithdrawalBundleHash(const uint256& hash);
-
-    /** D-3 reorg revert, one atomic batch: erase the disconnected block's
-     *  deposit rows AND restore DB_LAST_SIDECHAIN_DEPOSIT to the pre-block
-     *  baseline (null = erase the pointer: no deposits in the remaining
-     *  chain). The row erase is load-bearing, not hygiene: the template
-     *  builder skips any deposit already in the DB (miner.cpp
-     *  HaveDepositNonAmount), so a stale row would keep the orphaned
-     *  deposit out of the re-mined branch forever and stall the CTIP
-     *  chain on the next deposit. */
-    bool WriteDepositDisconnect(const std::vector<uint256>& vEraseID, const uint256& hashPrevLastDeposit);
 
     bool GetWithdrawal(const uint256 & /* Withdrawal ID */, SidechainWithdrawal &withdrawal);
     bool GetWithdrawalBundle(const uint256 & /* Withdrawal Bundle ID */, SidechainWithdrawalBundle &withdrawalBundle);

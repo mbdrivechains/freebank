@@ -328,6 +328,41 @@ bool ParseDepositAddress(const std::string& strAddressIn, std::string& strAddres
     return true;
 }
 
+bool ParseFullDepositAddress(const std::string& strDest, std::string& strAddressOut)
+{
+    // Consensus code (GetDepositPayoutOutput), so one exact grammar and nothing
+    // looser: "s130_" + address + "_" + the first 6 lowercase hex characters of
+    // SHA256("s130_" + address + "_"), exactly what GenerateDepositAddress
+    // makes. ParseDepositAddress (RPC only) also accepts "s0130_", "s+130_" and
+    // other slots, and must not be used here.
+    const std::string strPrefix = "s" + std::to_string(THIS_SIDECHAIN) + "_";
+    const size_t nCheck = 6;
+    if (strDest.size() < strPrefix.size() + 1 + 1 + nCheck)
+        return false;
+    if (strDest.compare(0, strPrefix.size(), strPrefix) != 0)
+        return false;
+    const size_t nSep = strDest.size() - nCheck - 1;
+    if (strDest[nSep] != '_')
+        return false;
+
+    const std::string strAddress = strDest.substr(strPrefix.size(), nSep - strPrefix.size());
+    if (strAddress.empty() || strAddress.find('_') != std::string::npos)
+        return false;
+    // Only an address in its one canonical spelling: base58 decoding skips
+    // spaces, so " X..." would otherwise pass.
+    const CTxDestination dest = DecodeDestination(strAddress);
+    if (!IsValidDestination(dest) || EncodeDestination(dest) != strAddress)
+        return false;
+
+    std::vector<unsigned char> vch(CSHA256::OUTPUT_SIZE);
+    CSHA256().Write((const unsigned char*)strDest.data(), nSep + 1).Finalize(vch.data());
+    if (strDest.compare(nSep + 1, nCheck, HexStr(vch.begin(), vch.end()).substr(0, nCheck)) != 0)
+        return false;
+
+    strAddressOut = strAddress;
+    return true;
+}
+
 bool GetDepositPayoutOutput(const SidechainDeposit& deposit, CTxOut& out)
 {
     // Withdrawal-bundle change return: recorded in the DB, paid to nobody.
@@ -345,7 +380,15 @@ bool GetDepositPayoutOutput(const SidechainDeposit& deposit, CTxOut& out)
     // it is untrusted input and may be anything at all. An undecodable
     // destination is a user error, not a reason to stop the chain: the deposit
     // is recorded and the value simply stays burned on the mainchain.
-    const CTxDestination dest = DecodeDestination(deposit.strDest);
+    //
+    // v0.2.17: the full deposit address s130_<address>_<checksum> pays
+    // <address>. It is what getdepositaddress returns, and the enforcer writes
+    // whatever string it is given into the OP_RETURN, so a depositor who
+    // passed it on unchanged lost the deposit (beta block 211, 10 ECX).
+    std::string strAddress;
+    if (!ParseFullDepositAddress(deposit.strDest, strAddress))
+        strAddress = deposit.strDest;
+    const CTxDestination dest = DecodeDestination(strAddress);
     if (!IsValidDestination(dest))
         return false;
 

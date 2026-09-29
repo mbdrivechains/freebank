@@ -150,6 +150,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createwithdrawal", 4, "nmainchainfee"},
     { "getaveragemainchainfees", 0, "blockcount" },
     { "getaveragemainchainfees", 1, "startheight" },
+    { "getdepositaddress", 0, "verbose" },
     { "refreshbmm", 0, "amount" },
     { "refreshbmm", 1, "createnew" },
     { "connect_block", 0, "block" },

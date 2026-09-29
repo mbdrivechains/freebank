@@ -13,6 +13,15 @@
 #include <uint256.h>
 
 static const int SERIALIZE_TRANSACTION_NO_WITNESS = 0x40000000;
+
+/**
+ * v0.2.17 A5: a stream version flag meaning "an L1 (eCash) transaction": the
+ * plain Bitcoin layout, without FreeBank's own ones. FreeBank reads a replay
+ * byte after nVersion 3 and payloads after nVersion 10-17; eCash's version 3
+ * (TRUC) has neither, so read with FreeBank's layout it was misread, and its
+ * txid came out wrong.
+ */
+static const int SERIALIZE_TRANSACTION_L1 = 0x20000000;
 static const int TRANSACTION_BITASSET_CREATE_VERSION = 10;
 static const int TRANSACTION_BILL_VERSION = 11;
 static const int TRANSACTION_HOUSE_VERSION = 12;
@@ -219,8 +228,10 @@ template<typename Stream, typename TxType>
 inline void UnserializeTransaction(TxType& tx, Stream& s) {
     const bool fAllowWitness = !(s.GetVersion() & SERIALIZE_TRANSACTION_NO_WITNESS);
 
+    const bool fL1 = s.GetVersion() & SERIALIZE_TRANSACTION_L1;
+
     s >> tx.nVersion;
-    if (tx.nVersion == 3) {
+    if (tx.nVersion == 3 && !fL1) {
         s >> tx.replayBytes;
     }
     unsigned char flags = 0;
@@ -251,6 +262,9 @@ inline void UnserializeTransaction(TxType& tx, Stream& s) {
         throw std::ios_base::failure("Unknown transaction optional data");
     }
     s >> tx.nLockTime;
+
+    if (fL1)
+        return;
 
     if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
         s >> tx.ticker;
@@ -298,8 +312,10 @@ template<typename Stream, typename TxType>
 inline void SerializeTransaction(const TxType& tx, Stream& s) {
     const bool fAllowWitness = !(s.GetVersion() & SERIALIZE_TRANSACTION_NO_WITNESS);
 
+    const bool fL1 = s.GetVersion() & SERIALIZE_TRANSACTION_L1;
+
     s << tx.nVersion;
-    if (tx.nVersion == 3) {
+    if (tx.nVersion == 3 && !fL1) {
         s << tx.replayBytes;
     }
     unsigned char flags = 0;
@@ -324,6 +340,8 @@ inline void SerializeTransaction(const TxType& tx, Stream& s) {
         }
     }
     s << tx.nLockTime;
+    if (fL1)
+        return;
     if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
         s << tx.ticker;
         s << tx.headline;
@@ -570,6 +588,45 @@ struct CMutableTransaction
         }
         return false;
     }
+};
+
+/** v0.2.17 A5: a stream that (un)serializes through `s` with
+ *  SERIALIZE_TRANSACTION_L1 set. */
+template <typename Stream>
+class L1TxStream
+{
+    Stream& s;
+public:
+    explicit L1TxStream(Stream& sIn) : s(sIn) {}
+    template <typename T> L1TxStream& operator<<(const T& obj) { ::Serialize(*this, obj); return *this; }
+    template <typename T> L1TxStream& operator>>(T& obj) { ::Unserialize(*this, obj); return *this; }
+    void write(const char* pch, size_t nSize) { s.write(pch, nSize); }
+    void read(char* pch, size_t nSize) { s.read(pch, nSize); }
+    int GetVersion() const { return s.GetVersion() | SERIALIZE_TRANSACTION_L1; }
+    int GetType() const { return s.GetType(); }
+};
+
+/** v0.2.17 A5: an L1 (eCash) transaction, as a deposit record keeps it. It
+ *  (un)serializes, and so hashes, in the plain Bitcoin layout: its GetHash()
+ *  is the txid the L1 knows, for every version (eCash v3 included). */
+struct L1MutableTransaction : public CMutableTransaction
+{
+    L1MutableTransaction() {}
+    L1MutableTransaction(const CMutableTransaction& tx) : CMutableTransaction(tx) {}
+
+    template <typename Stream>
+    inline void Serialize(Stream& s) const {
+        L1TxStream<Stream> os(s);
+        SerializeTransaction(*this, os);
+    }
+
+    template <typename Stream>
+    inline void Unserialize(Stream& s) {
+        L1TxStream<Stream> os(s);
+        UnserializeTransaction(*this, os);
+    }
+
+    uint256 GetHash() const;
 };
 
 typedef std::shared_ptr<const CTransaction> CTransactionRef;

@@ -11,6 +11,7 @@
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <deposit.h>
+#include <httpserver.h>
 #include <house.h>
 #include <netbase.h>
 #include <note.h>
@@ -625,6 +626,24 @@ BOOST_AUTO_TEST_CASE(rpc_ntx_blockfee_indexinfo)
     BOOST_CHECK_NO_THROW(r = CallRPC("getindexinfo coinstatsindex"));
     BOOST_CHECK_EQUAL(r.size(), 0U);
     fTxIndex = fTxIndexWas;
+}
+
+// v0.2.17 port guard: -rpcallowip without -rpcbind binds RPC on 0.0.0.0/::,
+// so init refuses that combination on every network but regtest.
+BOOST_AUTO_TEST_CASE(rpc_bind_exposure_guard)
+{
+    // main: -rpcallowip alone is refused, with a message naming the fix
+    const std::string strErr = RPCBindExposureError(true, false, CBaseChainParams::MAIN);
+    BOOST_CHECK(!strErr.empty());
+    BOOST_CHECK(strErr.find("-rpcbind") != std::string::npos);
+    BOOST_CHECK(strErr.find("0.0.0.0") != std::string::npos);
+    // -rpcallowip with -rpcbind, and neither, are fine
+    BOOST_CHECK(RPCBindExposureError(true, true, CBaseChainParams::MAIN).empty());
+    BOOST_CHECK(RPCBindExposureError(false, false, CBaseChainParams::MAIN).empty());
+    // -rpcbind alone is ignored by HTTPBindAddresses (loopback only): fine
+    BOOST_CHECK(RPCBindExposureError(false, true, CBaseChainParams::MAIN).empty());
+    // regtest keeps the Core behaviour (test harnesses rely on it)
+    BOOST_CHECK(RPCBindExposureError(true, false, CBaseChainParams::REGTEST).empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -78,6 +78,42 @@ struct CNodeStateStats {
 
 /** Get statistics from node state */
 bool GetNodeStateStats(NodeId nodeid, CNodeStateStats &stats);
+
+/** v0.2.17: what the connected peers say about how far our active chain is behind. */
+struct PeerTipEvidence {
+    //! Fully connected peers.
+    int nPeers = 0;
+    //! Height of the best block a peer has announced, if above our tip (side blocks carry no
+    //! work; height decides) with no failed block between it and our active chain, or -1.
+    int nBestKnownHeight = -1;
+    //! Highest version-message starting height above our tip from a peer whose announced blocks
+    //! do not reach it yet, or -1. A claim, not a proof.
+    int nStartingHeight = -1;
+    //! The same, from peers connected less than nRecentSeconds ago only, or -1.
+    int nRecentStartingHeight = -1;
+};
+
+/** Gather PeerTipEvidence. Takes cs_main, then the node list. */
+PeerTipEvidence GetPeerTipEvidence(CConnman& connman, int64_t nRecentSeconds);
+
+/** Why a BMM block template must not be handed out now. */
+enum class BMMBehind {
+    NO,     //!< at the tip as far as this node can tell
+    IBD,    //!< in initial block download (RPC -10)
+    PEER,   //!< a peer has, or claims, a better chain (RPC -40, no time box)
+    HEADER, //!< a better header that no peer vouches for, within its time box (RPC -40)
+};
+
+/** The v0.2.17 "behind" judgement for get_block_template. Pure, unit-tested.
+ *  fIBD: IsInitialBlockDownload() (import and reindex are refused before this).
+ *  fHeaderBoxOpen: a better, not-failed header than the tip is known and its time box is open.
+ *  A peer's announced better block refuses with no time box. A starting height alone refuses
+ *  only while that peer is new (nRecentStartingHeight), so a peer that lies about its height
+ *  cannot stop bidding for good. In IBD the answer is IBD unless the node has peers and none
+ *  of them has or claims anything above the tip: the whole network stalled for longer than
+ *  -maxtipage, and refusing then would stop every engine node that restarted, so no side
+ *  block could ever be made again. */
+BMMBehind JudgeBMMBehind(bool fIBD, const PeerTipEvidence& evidence, bool fHeaderBoxOpen);
 /** Increase a node's misbehavior score. */
 void Misbehaving(NodeId nodeid, int howmuch, const std::string& message="");
 

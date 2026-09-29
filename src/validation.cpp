@@ -41,6 +41,7 @@
 #include <oracle.h>
 #include <settle.h>
 #include <sidechainclient.h>
+#include <l1client.h>
 
 #include <functional>
 #include <timedata.h>
@@ -244,8 +245,12 @@ public:
 
     // Block (dis)connection on a given view:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view, bool fSideDB = true);
+    /** fSideDB=false (N2, VerifyDB level 4 only): reconnect on a throwaway
+     *  coins view without reading or writing the sidechain DB's block
+     *  effects (the refund status, the fSidechainIndex block). */
     bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
-                    CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck = false, bool fCheckBMM = true, ConnectTrace* connectTrace = nullptr);
+                    CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck = false, bool fCheckBMM = true, ConnectTrace* connectTrace = nullptr,
+                    bool fSideDB = true);
 
     // Block disconnection on our pcoinsTip:
     bool DisconnectTip(CValidationState& state, const CChainParams& chainparams, DisconnectedBlockTransactions *disconnectpool);
@@ -2658,6 +2663,11 @@ bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
 {
     return 0;
+}
+
+int64_t GetDefaultMaxTipAge(const std::string& strNetworkID)
+{
+    return strNetworkID == CBaseChainParams::REGTEST ? DEFAULT_MAX_TIP_AGE : DEFAULT_MAX_TIP_AGE_FREEBANK;
 }
 
 bool IsInitialBlockDownload()
@@ -5848,6 +5858,21 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     // neither. Require the DB to demonstrably hold this block's as-of value.
     // Also makes a repeated disconnect idempotent.
     bool fDepositUndo = false;
+    // v0.2.17: the sidechain DB's own marker (WriteBlockEffects). Its effects
+    // are undone only if it holds this block's (the marker is at this block);
+    // no marker: a DB from before v0.2.17, undone as before. Otherwise (a
+    // crash left it elsewhere) it is left alone, and the next connect stops
+    // with -reindex if it no longer fits.
+    bool fSidechainUndo = false;
+    CSidechainTreeDB::BlockUndo sidechainUndo; // written in one batch after the walk
+    if (fSideDB) {
+        uint256 hashSidechainBest;
+        const bool fHaveSidechainMarker = psidechaintree->GetBestBlock(hashSidechainBest) && !hashSidechainBest.IsNull();
+        fSidechainUndo = !fHaveSidechainMarker || hashSidechainBest == pindex->GetBlockHash();
+        if (!fSidechainUndo)
+            LogPrintf("DisconnectBlock(): sidechain DB is at block %s, not %s: its undo skipped\n",
+                      hashSidechainBest.ToString(), pindex->GetBlockHash().ToString());
+    }
     if (fSideDB) {
         uint256 hashHouseBest;
         const bool fHaveHouseMarker = phousetree->GetBestBlock(hashHouseBest) && !hashHouseBest.IsNull();
@@ -5860,8 +5885,8 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         fPoolUndo = !fHavePoolMarker || hashPoolBest == pindex->GetBlockHash();
         uint256 hashDepositLast;
         const bool fHaveDepositPtr = psidechaintree->GetLastDepositID(hashDepositLast);
-        fDepositUndo = fHaveDepositPtr ? (hashDepositLast == pindex->hashLastDeposit)
-                                       : pindex->hashLastDeposit.IsNull();
+        fDepositUndo = fSidechainUndo && (fHaveDepositPtr ? (hashDepositLast == pindex->hashLastDeposit)
+                                                          : pindex->hashLastDeposit.IsNull());
     }
 
     // D-3: sidechain deposits this block carried, collected during the walk
@@ -5869,6 +5894,12 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     // atomic batch after the loop (fSideDB only - real disconnects, never the
     // VerifyDB throwaway pass).
     std::vector<uint256> vDepositUndo;
+
+    // B6: the bundle this block created and its withdrawals, reverted in one
+    // batch after the walk below (fSideDB only).
+    bool fHaveBundleUndo = false;
+    SidechainWithdrawalBundle bundleUndo;
+    std::vector<SidechainWithdrawal> vBundleWithdrawalUndo;
 
     // C6-A high rider: withdrawal ROWS created in this block (by GetID),
     // collected during the walk below and erased after the loop. Without this a
@@ -7006,7 +7037,10 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
                 std::unique_ptr<SidechainObj> objOwner(obj);
 
-                if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
+                // N2: the sidechain-DB undos below run only on a real
+                // disconnect (fSideDB). VerifyDB's level 3 disconnects on a
+                // throwaway coins view and, below level 4, never reconnects.
+                if (fSidechainUndo && obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
                     const SidechainWithdrawalBundle *withdrawalBundle = (const SidechainWithdrawalBundle *) obj;
 
                     std::vector<SidechainWithdrawal> vWithdrawal;
@@ -7029,19 +7063,18 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     for (size_t w = 0; w < vWithdrawal.size(); w++)
                         vWithdrawal[w].status = WITHDRAWAL_UNSPENT;
 
-                    // Write to ldb
-
-                    if (!psidechaintree->WriteWithdrawalUpdate(vWithdrawal)) {
-                        error("DisconnectBlock(): Failed to write withdrawal update!");
+                    // B6: the bundle row is erased after the loop, with the
+                    // withdrawal reset and the pointer restore in one batch.
+                    // Writing it back as FAILED left a row behind that stopped
+                    // the builder re-creating the same bundle on the new
+                    // branch (CreateWithdrawalBundleTx's fCheckUnique).
+                    if (fHaveBundleUndo) {
+                        error("DisconnectBlock(): more than one withdrawal bundle in block");
                         return DISCONNECT_FAILED;
                     }
-
-                    SidechainWithdrawalBundle withdrawalBundleUpdate = *withdrawalBundle;
-                    withdrawalBundleUpdate.status = WITHDRAWAL_BUNDLE_FAILED;
-                    if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundleUpdate)) {
-                        error("DisconnectBlock(): Failed to write withdrawal bundle update!");
-                        return DISCONNECT_FAILED;
-                    }
+                    fHaveBundleUndo = true;
+                    bundleUndo = *withdrawalBundle;
+                    vBundleWithdrawalUndo = vWithdrawal;
                 }
                 else
                 if (fDepositUndo && obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
@@ -7062,8 +7095,8 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
 
             // If this output is a withdrawal bundle status update commit - undo the update
             uint256 hashWithdrawalBundle;
-            if (scriptPubKey.IsWithdrawalBundleFailCommit(hashWithdrawalBundle) ||
-                    scriptPubKey.IsWithdrawalBundleSpentCommit(hashWithdrawalBundle)) {
+            if (fSidechainUndo && (scriptPubKey.IsWithdrawalBundleFailCommit(hashWithdrawalBundle) ||
+                    scriptPubKey.IsWithdrawalBundleSpentCommit(hashWithdrawalBundle))) {
 
                 SidechainWithdrawalBundle withdrawalBundle;
                 if (!psidechaintree->GetWithdrawalBundle(hashWithdrawalBundle, withdrawalBundle)) {
@@ -7073,17 +7106,13 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
 
                 withdrawalBundle.status = WITHDRAWAL_BUNDLE_CREATED;
                 withdrawalBundle.nFailHeight = 0;
-
-                if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundle)) {
-                    error("DisconnectBlock(): Failed to write withdrawal bundle undo update!");
-                    return DISCONNECT_FAILED;
-                }
+                sidechainUndo.vMarkUndo.push_back(withdrawalBundle);
             }
 
             // If output is a Withdrawal refund request set status back to Withdrawal_UNSPENT
             uint256 id;
             std::vector<unsigned char> vchSig;
-            if (scriptPubKey.IsWithdrawalRefundRequest(id, vchSig)) {
+            if (fSidechainUndo && scriptPubKey.IsWithdrawalRefundRequest(id, vchSig)) {
                 SidechainWithdrawal withdrawal;
                 if (!psidechaintree->GetWithdrawal(id, withdrawal)) {
                     error("DisconnectBlock(): Failed to read Withdrawal for refund undo!");
@@ -7091,10 +7120,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
 
                 withdrawal.status = WITHDRAWAL_UNSPENT;
-                if (!psidechaintree->WriteWithdrawalUpdate(std::vector<SidechainWithdrawal>{ withdrawal })) {
-                    error("DisconnectBlock(): Failed to write Withdrawal refund update!");
-                    return DISCONNECT_FAILED;
-                }
+                sidechainUndo.vRefundUndo.push_back(withdrawal);
             }
         }
 
@@ -7115,37 +7141,36 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         }
     }
 
-    // Revert the current withdrawal bundle hash
-    psidechaintree->WriteLastWithdrawalBundleHash(pindex->pprev->hashWithdrawalBundle);
-
-    // D-3: revert the deposit-CTIP baseline. This block's deposits advanced
-    // DB_LAST_SIDECHAIN_DEPOSIT on connect and, unlike the bundle pointer one
-    // line up, had no revert - a reorged node kept a baseline pointing into
-    // the abandoned fork and split from every fresh sync (its own -reindex
-    // included) via invalid-deposit-input or a wrong payout delta. Restore
-    // pprev's cached baseline and erase this block's rows in one batch; the
-    // erase is what lets the template builder re-include these deposits on
-    // the new branch (miner.cpp HaveDepositNonAmount skips known rows).
-    // Only when the block actually carried deposits: a no-deposit disconnect
-    // never touched the pointer, so writing it would only propagate a null
-    // from a pre-D-3 index entry into a valid live baseline.
-    if (fDepositUndo && !vDepositUndo.empty()) {
-        if (!psidechaintree->WriteDepositDisconnect(vDepositUndo, pindex->pprev->hashLastDeposit)) {
-            error("DisconnectBlock(): Failed to revert deposit CTIP baseline!");
+    // v0.2.17: the whole sidechain undo, and the marker stepped back, in one
+    // atomic batch (CSidechainTreeDB::WriteBlockUndo):
+    // - B6: a created bundle's row erased, its withdrawals back to UNSPENT, the
+    //   bundle pointer restored to this block's own header field (the pointer
+    //   as it was before this block: CryptAxe's header check plus B8). Only a
+    //   block that created a bundle moved the pointer.
+    // - D-3: the deposit-CTIP baseline restored to pprev's cached value and
+    //   this block's deposit rows erased, only when the block carried deposits
+    //   (a no-deposit disconnect never touched the pointer).
+    // - C6-A: the withdrawal rows this block created, erased.
+    // Real disconnects only, with the DB at this block (fSidechainUndo).
+    if (fSidechainUndo && pindex->pprev) {
+        sidechainUndo.fBundleUndo = fHaveBundleUndo;
+        if (fHaveBundleUndo) {
+            sidechainUndo.vBundleWithdrawal = vBundleWithdrawalUndo;
+            sidechainUndo.bundle = bundleUndo;
+            sidechainUndo.hashPrevLastBundle = pindex->hashWithdrawalBundle;
+        }
+        sidechainUndo.fDepositUndo = fDepositUndo && !vDepositUndo.empty();
+        sidechainUndo.vDepositErase = vDepositUndo;
+        sidechainUndo.hashPrevLastDeposit = pindex->pprev->hashLastDeposit;
+        sidechainUndo.vWithdrawalErase = vWithdrawalUndo;
+        sidechainUndo.hashBest = pindex->pprev->GetBlockHash();
+        if (!psidechaintree->WriteBlockUndo(sidechainUndo)) {
+            error("DisconnectBlock(): Failed to undo the block's sidechain effects!");
             return DISCONNECT_FAILED;
         }
-    }
-
-    // C6-A high rider: erase withdrawal rows created in this block. Real
-    // disconnects only (fSideDB) - the VerifyDB throwaway pass must not mutate
-    // the DB. Idempotent: erasing an already-erased GetID is a no-op, so a
-    // repeated disconnect is safe and no fDepositUndo-style pointer guard is
-    // needed (withdrawals carry no DB_LAST baseline to drag back).
-    if (fSideDB && !vWithdrawalUndo.empty()) {
-        if (!psidechaintree->WriteWithdrawalDisconnect(vWithdrawalUndo)) {
-            error("DisconnectBlock(): Failed to erase disconnected withdrawal rows!");
-            return DISCONNECT_FAILED;
-        }
+        // Once re-created on the new branch a bundle must be sent to the L1 again
+        if (fHaveBundleUndo)
+            bmmCache.ForgetBroadcastedWithdrawalBundle(bundleUndo.tx.GetHash());
     }
 
     // Step the side-DB markers back with the undo (only where the undo ran)
@@ -7361,8 +7386,165 @@ static int64_t nBlocksTotal = 0;
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
+/** v0.2.17 A1 + A4: is deposit record d what the L1 recorded? Asked of the
+ *  enforcer's peg events of exactly the deposit's own L1 block (it lists only
+ *  deposits it checked by the eCash drivechain rules). A deposit: an event
+ *  with the same outpoint, the same address, and an amount equal to what the
+ *  record's treasury output adds to the previous one (amountPrev); the first
+ *  record ever must be the treasury's first change (running number 0). The
+ *  treasury outputs form one chain and each record must spend the previous
+ *  one's (ConnectBlock), so none can be skipped or repeated. A withdrawal
+ *  return: the L1 paid a bundle in that block with this very tx. And the L1
+ *  block must be on the L1's main chain, at or below the block's own (A4).
+ *  YES / NO; UNKNOWN when the L1 cannot answer. Before, VerifyDeposit only
+ *  checked the tx was in the named L1 block: an unrelated tx there was
+ *  credited as a deposit (money from nothing), and nothing compared the
+ *  address (a deposit redirected). */
+static L1Answer CheckDepositWithL1(const SidechainDeposit& d, CAmount amountPrev, bool fFirst,
+                                   const uint256& hashBlockMain, std::string& strWhy)
+{
+    // Our list's positions (GetMainchainBlockHeight is off by one, the same for both)
+    const int nOwn = bmmCache.GetMainchainBlockHeight(hashBlockMain);
+    if (nOwn < 0) {
+        strWhy = "this block's own L1 block is not in our list of L1 blocks";
+        return L1Answer::UNKNOWN;
+    }
+    const int nDeposit = bmmCache.GetMainchainBlockHeight(d.hashMainchainBlock);
+    if (nDeposit < 0 || nDeposit > nOwn) {
+        strWhy = strprintf("its L1 block %s is not on the L1's main chain at or below this block's", d.hashMainchainBlock.ToString());
+        return L1Answer::NO;
+    }
+
+    L1PegEvents events;
+    if (GetL1Oracle().EventsInWindow(d.hashMainchainBlock, d.hashMainchainBlock, events) != L1Answer::YES) {
+        strWhy = strprintf("the L1 cannot answer for block %s yet", d.hashMainchainBlock.ToString());
+        return L1Answer::UNKNOWN;
+    }
+
+    if (d.nBurnIndex >= d.dtx.vout.size()) {
+        strWhy = "its treasury output index is out of range";
+        return L1Answer::NO;
+    }
+    const CAmount nTreasury = d.dtx.vout[d.nBurnIndex].nValue;
+
+    // A deposit if the enforcer lists this outpoint as one, whatever its
+    // address says (a deposit to the address "D" is a deposit, not a return)
+    const COutPoint outpoint(d.dtx.GetHash(), d.nBurnIndex);
+    for (const L1DepositEvent& ev : events.vDeposit) {
+        if (ev.outpoint != outpoint)
+            continue;
+        if (std::string(ev.vchAddress.begin(), ev.vchAddress.end()) != d.strDest) {
+            strWhy = "its address is not the one the depositor wrote";
+            return L1Answer::NO;
+        }
+        if (ev.nValue != nTreasury - amountPrev) {
+            strWhy = strprintf("the L1 recorded %s deposited, the record's treasury output adds %s", FormatMoney(ev.nValue),
+                               FormatMoney(nTreasury - amountPrev));
+            return L1Answer::NO;
+        }
+        if (fFirst && ev.nSequence != 0) {
+            strWhy = strprintf("the first deposit recorded is the treasury's change number %u, not its first", ev.nSequence);
+            return L1Answer::NO;
+        }
+        return L1Answer::YES;
+    }
+
+    // Else a withdrawal return: the L1 paid a bundle in that block with this
+    // very tx, whose treasury change is its output 0 (into_m6)
+    if (d.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST) {
+        uint256 m6id;
+        if (d.nBurnIndex != 0 || !ComputeM6id(d.dtx, amountPrev, THIS_SIDECHAIN, m6id)) {
+            strWhy = "a withdrawal return that is not a bundle payout with its treasury change at output 0";
+            return L1Answer::NO;
+        }
+        for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
+            if (ev.status != 'S' || ev.m6id != m6id)
+                continue;
+            // The very M6 the L1 carries, not a copy with other inputs (the
+            // m6id ignores them): the event sends the M6 itself (D7)
+            if (ev.vchTx.empty()) {
+                strWhy = strprintf("the L1's \"paid\" event for %s carries no transaction", m6id.ToString());
+                return L1Answer::UNKNOWN;
+            }
+            L1MutableTransaction mtxPaid;
+            try {
+                CDataStream ss(ev.vchTx, SER_NETWORK, PROTOCOL_VERSION);
+                ss >> mtxPaid;
+            } catch (const std::exception&) {
+                strWhy = strprintf("the L1's \"paid\" event for %s carries a transaction that does not decode", m6id.ToString());
+                return L1Answer::UNKNOWN;
+            }
+            if (mtxPaid.GetHash() != d.dtx.GetHash()) {
+                strWhy = strprintf("the return's tx %s is not the M6 %s the L1 paid", d.dtx.GetHash().ToString(),
+                                   mtxPaid.GetHash().ToString());
+                return L1Answer::NO;
+            }
+            return L1Answer::YES;
+        }
+        strWhy = strprintf("the L1 paid no bundle %s in block %s", m6id.ToString(), d.hashMainchainBlock.ToString());
+        return L1Answer::NO;
+    }
+
+    strWhy = strprintf("the L1 lists no deposit %s:%u in block %s", outpoint.hash.ToString(), outpoint.n,
+                       d.hashMainchainBlock.ToString());
+    return L1Answer::NO;
+}
+
+/** v0.2.17 B3 + D1: the outcome on the L1 ('S' paid, 'F' failed, 'U' or 0
+ *  neither) of the pending bundle, as of L1 block hashMainBlock, for a block
+ *  built on pindexPrev. The events asked for are those after the L1 block of
+ *  the FreeBank block that created the bundle (nothing about the bundle can be
+ *  on the L1 before it), up to and including hashMainBlock; if that L1 block
+ *  is not an ancestor of hashMainBlock (a FreeBank reorg across an L1 reorg),
+ *  the whole L1 history is asked instead. The outcome rule is BundleOutcome:
+ *  a payment is final, else the last event. ConnectBlock's mark check and the
+ *  block builder both decide here. UNKNOWN when the L1 cannot answer. */
+L1Answer GetBundleOutcomeOnL1(const SidechainWithdrawalBundle& bundle, const CBlockIndex* pindexPrev,
+                              const uint256& hashMainBlock, char& cOutcome)
+{
+    cOutcome = 0;
+    const CBlockIndex* pindexCreate = pindexPrev ? pindexPrev->GetAncestor(bundle.nHeight) : nullptr;
+    if (!pindexCreate) {
+        LogPrintf("%s: bundle %s: its block (height %d) is not on this chain\n", __func__,
+                  bundle.tx.GetHash().ToString(), bundle.nHeight);
+        return L1Answer::UNKNOWN;
+    }
+
+    L1PegEvents events;
+    L1Answer answer = GetL1Oracle().EventsInWindow(pindexCreate->hashMainBlock, hashMainBlock, events);
+    if (answer == L1Answer::NO) {
+        LogPrintf("%s: bundle %s: its L1 block %s is not an ancestor of %s; asking the whole L1 history\n", __func__,
+                  bundle.tx.GetHash().ToString(), pindexCreate->hashMainBlock.ToString(), hashMainBlock.ToString());
+        answer = GetL1Oracle().EventsInWindow(uint256(), hashMainBlock, events);
+    }
+    if (answer != L1Answer::YES) {
+        LogPrintf("%s: bundle %s: the L1 cannot answer as of %s (waiting)\n", __func__, bundle.tx.GetHash().ToString(),
+                  hashMainBlock.ToString());
+        return L1Answer::UNKNOWN;
+    }
+
+    const uint256 m6id = BundleM6id(bundle.tx);
+    bool fFailed = false;
+    for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
+        if (ev.m6id == m6id) {
+            if (ev.status == 'F')
+                fFailed = true;
+            else if (ev.status == 'S' && fFailed)
+                LogPrintf("WARNING: the L1 paid withdrawal bundle %s (m6id %s) after it had failed (L1 block %s)\n",
+                          bundle.tx.GetHash().ToString(), m6id.ToString(), ev.hashMainBlock.ToString());
+        } else if (ev.status == 'S') {
+            // Only FreeBank's pending bundle may be paid from slot 130
+            LogPrintf("WARNING: the L1 paid withdrawal bundle m6id %s, which is not the pending bundle %s (L1 block %s)\n",
+                      ev.m6id.ToString(), bundle.tx.GetHash().ToString(), ev.hashMainBlock.ToString());
+        }
+    }
+    cOutcome = BundleOutcome(events.vWithdrawal, m6id);
+    return L1Answer::YES;
+}
+
 bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
-                  CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck, bool fCheckBMM, ConnectTrace* connectTrace)
+                  CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck, bool fCheckBMM, ConnectTrace* connectTrace,
+                  bool fSideDB)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -7468,6 +7650,12 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     std::vector<PrecomputedTransactionData> txdata;
     txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
     CAmount nDepositPayout = 0;
+    // v0.2.17 A3: coinbase outputs already claimed as a deposit or refund
+    // payout. vout[0] is the block maker's own and never counts as one. Before,
+    // a refund was matched without claiming, so one output could settle a
+    // refund and a deposit payout (the maker kept the other), and a payout
+    // could be vout[0] itself.
+    std::set<size_t> setClaimedPayouts{0};
     CAmount nRefundPayout = 0;
     std::multimap<std::pair<CScript, CAmount>, uint256> mapRefundOutputs;
     std::vector<SidechainWithdrawal> vRefundedWithdrawal;
@@ -7511,6 +7699,13 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     bool fHouseDBReplay = false;
     bool fBillDBReplay = false;
     bool fPoolDBReplay = false;
+    // v0.2.17: the same for the sidechain DB (deposits, withdrawals, bundles),
+    // whose marker WriteBlockEffects writes with each block's effects. On a
+    // replay its checks would read the DB this very block already changed (the
+    // bundle is not new, the refund is spent, the deposit pointer has moved) and
+    // reject this node's own valid block for good; so they are skipped, and the
+    // block's effects are not written again.
+    bool fSidechainDBReplay = false;
     if (!fJustCheck) {
         const auto SideDBReplayStatus = [&](const uint256& hashSideBest, bool& fReplayOut) {
             fReplayOut = false;
@@ -7540,6 +7735,15 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         ppooltree->GetBestBlock(hashPoolBest);
         if (!SideDBReplayStatus(hashPoolBest, fPoolDBReplay))
             return AbortNode(state, "PoolDB is out of sync with the chain (crash damage?) - restart with -reindex");
+        if (fSideDB) {
+            uint256 hashSidechainBest;
+            psidechaintree->GetBestBlock(hashSidechainBest);
+            if (!SideDBReplayStatus(hashSidechainBest, fSidechainDBReplay))
+                return AbortNode(state, "SidechainDB is out of sync with the chain (crash damage?) - restart with -reindex");
+            if (fSidechainDBReplay)
+                LogPrintf("%s: block %s: its sidechain effects are already in the DB (replay after an unclean stop)\n",
+                          __func__, pindex->GetBlockHash().ToString());
+        }
     }
 
     for (unsigned int i = 0; i < block.vtx.size(); i++)
@@ -7561,8 +7765,12 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                             REJECT_INVALID, "verify-withdrawal-refund-no-script");
             }
 
+            // N2: VerifyDB's level-4 reconnect (fSideDB=false) runs against a
+            // sidechain DB that level 3 no longer rolled back, so the row it
+            // refunds is already SPENT. It still checks that the row exists,
+            // the signature and the refund destination.
             SidechainWithdrawal withdrawal;
-            if (!VerifyWithdrawalRefundRequest(id, vchSig, withdrawal)) {
+            if (!VerifyWithdrawalRefundRequest(id, vchSig, withdrawal, fSideDB && !fSidechainDBReplay /* fRequireUnspent */)) {
                 return state.DoS(100, error("%s: Invalid Withdrawal refund!", __func__),
                             REJECT_INVALID, "verify-withdrawal-refund-invalid");
             }
@@ -7639,7 +7847,18 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
 
                 const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
 
-                nDepositPayout += deposit->amtUserPayout;
+                // v0.2.17 A8: only what is owed counts towards the coinbase
+                // limit. An unowed record (dust at or below the fee, an address
+                // that does not decode, the return marker "D") is recorded but
+                // paid to no one, and counting it let the block maker take it.
+                // A negative record still lowers the limit, as before.
+                CTxOut outOwed;
+                const bool fOwed = GetDepositPayoutOutput(*deposit, outOwed);
+                const CAmount nCount = fOwed ? deposit->amtUserPayout : std::min<CAmount>(deposit->amtUserPayout, 0);
+                if (!MoneyRange(std::abs(nCount)) || !MoneyRange(std::abs(nDepositPayout + nCount)))
+                    return state.DoS(100, error("%s: deposit payouts out of range", __func__),
+                                     REJECT_INVALID, "bad-deposit-amount-range");
+                nDepositPayout += nCount;
 
                 vDeposit.push_back(SidechainDeposit(deposit));
             }
@@ -7656,7 +7875,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         //
         // - Check for a coinbase payout output matching each deposit
         //
-        if (fCheckBMM && vDeposit.size()) {
+        if (fCheckBMM && vDeposit.size() && !fSidechainDBReplay) {
             SidechainDeposit prev;
             bool fPointerSet = false;
             bool fHaveDeposits = psidechaintree->GetLastDeposit(prev, &fPointerSet);
@@ -7694,12 +7913,39 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             }
 
             // Coinbase outputs already spoken for by an earlier deposit in
-            // THIS block. Without this, two identical deposits are both
-            // satisfied by one output and the miner keeps the difference (D-1).
-            std::set<size_t> setClaimedPayouts;
+            // THIS block go in setClaimedPayouts (above). Without it, two
+            // identical deposits are both satisfied by one output and the
+            // miner keeps the difference (D-1).
 
             // Check deposit payout amounts & find coinbase output
-            for (const SidechainDeposit& d : vDeposit) {
+            for (size_t nDeposit = 0; nDeposit < vDeposit.size(); nDeposit++) {
+                const SidechainDeposit& d = vDeposit[nDeposit];
+
+                // v0.2.17 A1: each record after the first spends the previous
+                // one's treasury output (the first is checked against the DB's
+                // last record above). Only the first was: a block could repeat
+                // a deposit and a payout and credit the deposit again each time.
+                if (nDeposit > 0) {
+                    const COutPoint prevTreasury(vDeposit[nDeposit - 1].dtx.GetHash(), vDeposit[nDeposit - 1].nBurnIndex);
+                    bool fSpends = false;
+                    for (const CTxIn& in : d.dtx.vin)
+                        fSpends |= in.prevout == prevTreasury;
+                    if (!fSpends)
+                        return state.DoS(90, error("%s: sidechain deposit does not spend the previous record's treasury output:\n%s",
+                                                   __func__, d.ToString()),
+                                         REJECT_INVALID, "invalid-deposit-input");
+                }
+
+                // v0.2.17 A1 + A4: the record is what the L1 recorded
+                std::string strWhy;
+                const L1Answer answer = CheckDepositWithL1(d, amountPrev, !fHaveDeposits && nDeposit == 0,
+                                                           block.hashMainchainBlock, strWhy);
+                if (answer == L1Answer::UNKNOWN)
+                    return state.Error(strprintf("%s: deposit %s: %s", __func__, d.dtx.GetHash().ToString(), strWhy));
+                if (answer == L1Answer::NO)
+                    return state.DoS(0, error("%s: sidechain deposit %s is not what the L1 recorded: %s", __func__,
+                                              d.dtx.GetHash().ToString(), strWhy),
+                                     REJECT_INVALID, "bad-deposit-l1");
 
                 CAmount burn = d.dtx.vout[d.nBurnIndex].nValue;
                 CAmount payout = burn - amountPrev;
@@ -8549,19 +8795,13 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         std::pair<std::multimap<std::pair<CScript, CAmount>, uint256>::iterator, std::multimap<std::pair<CScript, CAmount>, uint256>::iterator> range;
         range = mapRefundOutputs.equal_range(it->first);
 
-        // Count outputs that match items in the range
+        // v0.2.17 A3: each refund claims its own output, never one a deposit
+        // payout or another refund claimed, and never vout[0]
         int nOut = std::distance(range.first, range.second);
         int nFound = 0;
-        for (const CTxOut& o : block.vtx[0]->vout) {
-            if (o.scriptPubKey == it->first.first && o.nValue == it->first.second) {
-                nFound++;
-
-                // If we aren't looking for multiple outputs, stop now
-                if (nOut == 1) {
-                    break;
-                }
-            }
-        }
+        const CTxOut required(it->first.second, it->first.first);
+        while (nFound < nOut && ClaimDepositPayoutOutput(required, block.vtx[0]->vout, setClaimedPayouts))
+            nFound++;
 
         if (nFound != nOut)
             return state.DoS(100, error("%s: Invalid Withdrawal refund!", __func__),
@@ -8571,12 +8811,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         it = range.second;
     }
 
-    // Update status of refunded Withdrawal(s)
-    if (!fJustCheck && vRefundedWithdrawal.size()) {
-        // Write the updated status of withdrawals(s) in the bundle (WITHDRAW_SPENT)
-        if (!psidechaintree->WriteWithdrawalUpdate(vRefundedWithdrawal))
-            return state.Error(strprintf("%s: Failed to write refunded withdrawal status update!\n", __func__));
-    }
+    // B5: the refunded withdrawals' status (WITHDRAWAL_SPENT) is written in
+    // the sidechain section below, after every check on the block.
 
     CAmount blockReward = nFees + nDepositPayout + nRefundPayout;
     if (block.vtx[0]->GetValueOut() > blockReward)
@@ -8604,7 +8840,31 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     if (!WriteTxIndexDataForBlock(block, state, pindex))
         return false;
 
-    if (fSidechainIndex) {
+    // N2: VerifyDB's level-4 reconnect (fSideDB=false) leaves the sidechain DB
+    // alone; level 3 no longer disconnects it either.
+    if (fSidechainIndex && fSideDB && fSidechainDBReplay) {
+        // v0.2.17: only the index's deposit baseline as of this block (D-3)
+        uint256 hashLastDepositInBlock;
+        for (const CTxOut& out : block.vtx[0]->vout) {
+            std::vector<unsigned char> vch;
+            if (!out.scriptPubKey.IsSidechainObj(vch))
+                continue;
+            std::unique_ptr<SidechainObj> obj(ParseSidechainObj(vch));
+            if (obj && obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP)
+                hashLastDepositInBlock = static_cast<const SidechainDeposit*>(obj.get())->GetID();
+        }
+        pindex->hashLastDeposit = !hashLastDepositInBlock.IsNull() ? hashLastDepositInBlock
+            : (pindex->pprev ? pindex->pprev->hashLastDeposit : uint256());
+        setDirtyBlockIndex.insert(pindex);
+        // At the last replayed block (the marker's) the DB's deposit pointer
+        // must be this block's as-of value (the startup check skipped it)
+        uint256 hashSidechainBest, hashDepositPtr;
+        if (psidechaintree->GetBestBlock(hashSidechainBest) && hashSidechainBest == pindex->GetBlockHash()) {
+            const bool fPtr = psidechaintree->GetLastDepositID(hashDepositPtr);
+            if (fPtr ? hashDepositPtr != pindex->hashLastDeposit : !pindex->hashLastDeposit.IsNull())
+                return AbortNode(state, "SidechainDB deposit pointer does not match the replayed chain (crash damage?) - restart with -reindex");
+        }
+    } else if (fSidechainIndex && fSideDB) {
         SidechainClient client;
 
         // Send latest bundle to the mainchain if it hasn't been broadcasted yet
@@ -8613,7 +8873,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         psidechaintree->GetLastWithdrawalBundleHash(hashLatestWithdrawalBundle);
         if (psidechaintree->GetWithdrawalBundle(hashLatestWithdrawalBundle, withdrawalBundleLatest)) {
             // If we haven't broadcasted the latest bundle yet, do it now
-            if (!bmmCache.HaveBroadcastedWithdrawalBundle(hashLatestWithdrawalBundle)) {
+            // v0.2.17: only while it is pending. After a restart this re-sent
+            // a failed or paid bundle, proposing it on the L1 again.
+            if (withdrawalBundleLatest.status == WITHDRAWAL_BUNDLE_CREATED &&
+                    !bmmCache.HaveBroadcastedWithdrawalBundle(hashLatestWithdrawalBundle)) {
                 std::string strHex = EncodeHexTx(withdrawalBundleLatest.tx);
                 if (client.BroadcastWithdrawalBundle(strHex)) {
                     bmmCache.StoreBroadcastedWithdrawalBundle(hashLatestWithdrawalBundle);
@@ -8664,8 +8927,32 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 LogPrintf("%s: Invalid Withdrawal Bundle hash in block header!\n", __func__);
                 return state.DoS(25, false, REJECT_INVALID, "bad-header-withdrawal-bundle-commit", false, "Withdrawal Bundle hash in header is invalid!");
             }
+        } else if (!block.hashWithdrawalBundle.IsNull()) {
+            // B8 (v0.2.17): while no bundle exists the header's bundle field
+            // is empty too. With the check above, every connected block's
+            // field then equals the pointer as it was before the block, which
+            // B6's undo restores. The builder fills it only while a bundle
+            // exists. No penalty: the answer depends on our database.
+            LogPrintf("%s: Withdrawal Bundle hash %s in block header while no bundle exists\n", __func__,
+                      block.hashWithdrawalBundle.ToString());
+            return state.DoS(0, false, REJECT_INVALID, "bad-header-withdrawal-bundle-nonnull", false,
+                             "Withdrawal Bundle hash in header while no bundle exists");
         }
-        // Check for & validate Withdrawal Bundle status updates
+        // Check for & validate Withdrawal Bundle status updates. B5: the
+        // updates are written after every check on the block, below.
+        std::vector<SidechainWithdrawalBundle> vBundleMark;
+        {
+            // B1 (v0.2.17): one mark per block, checked before any L1 question
+            int nMark = 0;
+            for (const CTxOut& txout : block.vtx[0]->vout) {
+                uint256 hash;
+                if (txout.scriptPubKey.IsWithdrawalBundleFailCommit(hash) || txout.scriptPubKey.IsWithdrawalBundleSpentCommit(hash))
+                    nMark++;
+            }
+            if (nMark > 1)
+                return state.DoS(90, error("%s: more than one withdrawal bundle mark", __func__),
+                                 REJECT_INVALID, "bad-bundle-mark-duplicate");
+        }
         for (const CTxOut& txout : block.vtx[0]->vout) {
             const CScript& scriptPubKey = txout.scriptPubKey;
 
@@ -8673,51 +8960,52 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             bool fFailCommit = scriptPubKey.IsWithdrawalBundleFailCommit(hashWithdrawalBundle);
 
             if (fFailCommit || scriptPubKey.IsWithdrawalBundleSpentCommit(hashWithdrawalBundle)) {
-                // Verify with the mainchain when we are also checking BMM
+                // B1 (v0.2.17): a mark only for the bundle that is pending
+                // (the pointer's bundle, still CREATED). A mark on an older
+                // bundle rewrote its withdrawals' status while they sat in the
+                // pending bundle: paid twice.
+                if (hashLatestWithdrawalBundle.IsNull() || hashWithdrawalBundle != withdrawalBundleLatest.tx.GetHash() ||
+                        withdrawalBundleLatest.status != WITHDRAWAL_BUNDLE_CREATED)
+                    return state.DoS(0, error("%s: withdrawal bundle mark for %s, which is not the pending bundle",
+                                              __func__, hashWithdrawalBundle.ToString()),
+                                     REJECT_INVALID, "bad-bundle-mark-not-pending");
+
+                // B3 (v0.2.17): confirmed with the L1 as of this block's own
+                // L1 block. No answer: wait (state.Error: not marked invalid,
+                // no penalty, retried when the next block arrives).
                 if (fCheckBMM) {
-                    bool fVerified = fFailCommit ?
-                        client.HaveFailedWithdrawalBundle(hashWithdrawalBundle) :
-                        client.HaveSpentWithdrawalBundle(hashWithdrawalBundle);
-
-                    if (!fVerified)
-                        return state.Error(strprintf("%s: Invalid Withdrawal Bundle update : %s - %s!\n",
-                                    __func__, fFailCommit ? "Failed" : "Paid out",
-                                    hashWithdrawalBundle.ToString()));
+                    char cOutcome = 0;
+                    L1Answer answer = GetBundleOutcomeOnL1(withdrawalBundleLatest, pindex->pprev, block.hashMainchainBlock,
+                                                           cOutcome);
+                    if (answer == L1Answer::YES && cOutcome != (fFailCommit ? 'F' : 'S'))
+                        answer = L1Answer::NO;
+                    if (answer == L1Answer::UNKNOWN)
+                        return state.Error(strprintf("%s: withdrawal bundle mark %s: the L1 cannot answer yet",
+                                                     __func__, hashWithdrawalBundle.ToString()));
+                    if (answer == L1Answer::NO)
+                        return state.DoS(0, error("%s: withdrawal bundle %s is not %s on the L1 as of %s", __func__,
+                                                  hashWithdrawalBundle.ToString(), fFailCommit ? "failed" : "paid",
+                                                  block.hashMainchainBlock.ToString()),
+                                         REJECT_INVALID, "bad-bundle-mark-l1");
                 }
 
-                // Load the Withdrawal Bundle object from LDB if we need to and then write an
-                // update with the new Withdrawal Bundle status. If the commit is for the
-                // current Withdrawal Bundle (which it always should be in practice) we have
-                // already loaded it.
-                if (hashWithdrawalBundle == withdrawalBundleLatest.tx.GetHash()) {
-                    withdrawalBundleLatest.status = fFailCommit ? WITHDRAWAL_BUNDLE_FAILED : WITHDRAWAL_BUNDLE_SPENT;
+                withdrawalBundleLatest.status = fFailCommit ? WITHDRAWAL_BUNDLE_FAILED : WITHDRAWAL_BUNDLE_SPENT;
 
-                    // Keep track of the height a Withdrawal Bundle was marked failed
-                    if (fFailCommit)
-                        withdrawalBundleLatest.nFailHeight = pindex->nHeight;
+                // Keep track of the height a Withdrawal Bundle was marked failed
+                if (fFailCommit)
+                    withdrawalBundleLatest.nFailHeight = pindex->nHeight;
 
-                    if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundleLatest))
-                        return state.Error(strprintf("%s: Failed to write Withdrawal Bundle update!\n", __func__));
-
-                } else {
-                    SidechainWithdrawalBundle withdrawalBundle;
-                    if (!psidechaintree->GetWithdrawalBundle(hashWithdrawalBundle, withdrawalBundle))
-                        return state.Error(strprintf("%s: Failed to read Withdrawal Bundle for update!\n", __func__));
-
-                    withdrawalBundle.status = fFailCommit ? WITHDRAWAL_BUNDLE_FAILED : WITHDRAWAL_BUNDLE_SPENT;
-
-                    // Keep track of the height a Withdrawal Bundle was marked failed
-                    if (fFailCommit)
-                        withdrawalBundleLatest.nFailHeight = pindex->nHeight;
-
-                    if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundle))
-                        return state.Error(strprintf("%s: Failed to write Withdrawal Bundle update!\n", __func__));
-                }
+                vBundleMark.push_back(withdrawalBundleLatest);
             }
         }
 
         // Collect & verify sidechain objects
         std::vector<std::pair<uint256, const SidechainObj *> > vSidechainObjects;
+        auto FreeSidechainObjects = [&vSidechainObjects]() {
+            for (size_t i = 0; i < vSidechainObjects.size(); i++)
+                delete vSidechainObjects[i].second;
+            vSidechainObjects.clear();
+        };
         bool fFoundWithdrawalBundle = false;
         // D-3: the block's own last deposit (block order), for the pindex
         // deposit-CTIP baseline set after the DB write below.
@@ -8745,8 +9033,23 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 // between here and that delete loop still leak (block-connection
                 // only, not unauthenticated) — see NEXT.md C7(e).
                 SidechainObj *obj = ParseSidechainObj(vch);
-                if (!obj)
-                    return state.Error("Invalid sidechain obj script");
+                if (!obj) {
+                    // B4 (v0.2.17): rejected, not retried (was state.Error)
+                    FreeSidechainObjects();
+                    return state.DoS(90, error("%s: invalid sidechain obj script", __func__),
+                                     REJECT_INVALID, "invalid-sidechain-obj-script");
+                }
+                // v0.2.17 A2: deposit and bundle records only in the coinbase,
+                // where they are checked. One in an ordinary transaction was
+                // written to the database unchecked (a deposit row that broke
+                // the treasury chain for every later deposit).
+                if (tx != block.vtx[0] && (obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP ||
+                                           obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP)) {
+                    delete obj;
+                    FreeSidechainObjects();
+                    return state.DoS(90, error("%s: a deposit or bundle record outside the coinbase", __func__),
+                                     REJECT_INVALID, "bad-sidechain-obj-not-coinbase");
+                }
 
                 // TODO
                 // Refactor. We are also loading SidechainWithdrawal later when
@@ -8764,7 +9067,11 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     // output used (setClaimedBurns, per-tx) - the withdrawal twin of
                     // ClaimDepositPayoutOutput (D-1).
                     if (!ClaimWithdrawalBurn(*withdrawal, tx->vout, setClaimedBurns)) {
-                        return state.Error("Invalid Withdrawal: invalid-withdrawal-missing-or-invalid-burn");
+                        // B4 (v0.2.17): rejected, not retried (was state.Error)
+                        delete obj;
+                        FreeSidechainObjects();
+                        return state.DoS(90, error("%s: withdrawal without its burn", __func__),
+                                         REJECT_INVALID, "bad-withdrawal-burn");
                     }
                     // Poison-row guard (v0.2.13, soft fork from
                     // nWithdrawalGuardHeight): a withdrawal the mainchain can never
@@ -8774,6 +9081,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     if (WithdrawalGuardActive(pindex->nHeight, chainparams.GetConsensus().nWithdrawalGuardHeight)
                             && !CheckWithdrawalPayable(*withdrawal, strPayable)) {
                         delete obj;
+                        FreeSidechainObjects();
                         return state.DoS(100, error("ConnectBlock(): %s", strPayable), REJECT_INVALID, "bad-withdrawal-unpayable");
                     }
                 }
@@ -8793,7 +9101,25 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     // or WITHDRAWAL_BUNDLE_SPENT
                     if (!hashLatestWithdrawalBundle.IsNull()) {
                         if (withdrawalBundleLatest.status == WITHDRAWAL_BUNDLE_CREATED) {
-                            return state.Error(strprintf("%s Invalid Withdrawal Bundle - current Withdrawal Bundle still pending!\n", __func__));
+                            // B4 (v0.2.17): rejected, not retried (was state.Error)
+                            delete obj;
+                            FreeSidechainObjects();
+                            return state.DoS(0, error("%s: a new withdrawal bundle while one is pending", __func__),
+                                             REJECT_INVALID, "bad-bundle-still-pending");
+                        }
+                    }
+
+                    // B2 (v0.2.17): a bundle must be new. Only the builder
+                    // refused one whose tx hash we already hold (a failed or
+                    // paid bundle); this code overwrote the old row.
+                    {
+                        SidechainWithdrawalBundle bundleHeld;
+                        if (psidechaintree->GetWithdrawalBundle(((const SidechainWithdrawalBundle *) obj)->tx.GetHash(), bundleHeld)) {
+                            delete obj;
+                            FreeSidechainObjects();
+                            return state.DoS(0, error("%s: withdrawal bundle %s is not new", __func__,
+                                                      bundleHeld.tx.GetHash().ToString()),
+                                             REJECT_INVALID, "bad-bundle-not-new");
                         }
                     }
 
@@ -8804,6 +9130,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
 
                     // Insert block height
                     withdrawalBundle->nHeight = pindex->nHeight;
+                    // v0.2.17: a new bundle is stored as pending whatever its
+                    // record's last bytes say (see VerifyWithdrawalBundles)
+                    withdrawalBundle->status = WITHDRAWAL_BUNDLE_CREATED;
+                    withdrawalBundle->nFailHeight = 0;
 
                     id = withdrawalBundle->GetID();
                     obj = (SidechainObj *) withdrawalBundle;
@@ -8820,7 +9150,21 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             }
         }
 
+        // B5, decision 2 (v0.2.17, 2026-09-29): a block that creates a bundle
+        // carries no refund and no bundle mark (CryptAxe's builder already
+        // never adds either). The bundle is checked against the database as it
+        // was before the block, and the refunds and marks are only written
+        // after all checks, so the two must not meet in one block.
+        if (fFoundWithdrawalBundle && (!vRefundedWithdrawal.empty() || !vBundleMark.empty())) {
+            const bool fRefund = !vRefundedWithdrawal.empty();
+            FreeSidechainObjects();
+            return state.DoS(90, error("%s: a block that creates a withdrawal bundle carries a %s", __func__,
+                                       fRefund ? "withdrawal refund" : "withdrawal bundle mark"),
+                             REJECT_INVALID, fRefund ? "bad-bundle-block-refund" : "bad-bundle-block-mark");
+        }
+
         // Handle Withdrawal Bundle verification & withdrawal status update
+        std::vector<SidechainWithdrawal> vBundleWithdrawalUpdate;
         if (fFoundWithdrawalBundle) {
             std::string strFail = "";
             std::vector<SidechainWithdrawal> vWithdrawal;
@@ -8828,27 +9172,35 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             uint256 hashWithdrawalBundleID;
 
             // This will also return a list of withdrawal(s) from the Withdrawal Bundle
-            if (!VerifyWithdrawalBundles(strFail, pindex->nHeight, block.vtx, vWithdrawal, hashWithdrawalBundle, hashWithdrawalBundleID, fCheckBMM /* fReplicate */))
-                return state.Error(strprintf("%s: Invalid Withdrawal Bundle! Error: %s", __func__, strFail));
+            // B4 (v0.2.17): rejected, not retried (were state.Error)
+            if (!VerifyWithdrawalBundles(strFail, pindex->nHeight, block.vtx, vWithdrawal, hashWithdrawalBundle, hashWithdrawalBundleID, fCheckBMM /* fReplicate */)) {
+                FreeSidechainObjects();
+                return state.DoS(0, error("%s: invalid withdrawal bundle: %s", __func__, strFail),
+                                 REJECT_INVALID, "bad-bundle-invalid");
+            }
 
-            if (hashWithdrawalBundle.IsNull())
-                return state.Error(strprintf("%s: hashWithdrawalBundle shouldn't be null if VerifyWithdrawalBundles passed!\n", __func__));
+            if (hashWithdrawalBundle.IsNull()) {
+                FreeSidechainObjects();
+                return state.DoS(0, error("%s: withdrawal bundle hash null after VerifyWithdrawalBundles", __func__),
+                                 REJECT_INVALID, "bad-bundle-invalid");
+            }
 
-            // Write the updated status of withdrawals in the Withdrawal Bundle (Withdrawal_IN_WITHDRAWAL_BUNDLE)
-            if (!psidechaintree->WriteWithdrawalUpdate(vWithdrawal))
-                return state.Error(strprintf("%s: Failed to write withdrawal update!\n", __func__));
+            // The updated status of withdrawals in the Withdrawal Bundle
+            // (Withdrawal_IN_WITHDRAWAL_BUNDLE), written with the rest below
+            vBundleWithdrawalUpdate = vWithdrawal;
         }
 
-        // Write sidechain objects to db
-        if (vSidechainObjects.size()) {
-            bool ret = psidechaintree->WriteSidechainIndex(vSidechainObjects);
-            if (!ret)
-                return state.Error("Failed to write sidechain index!");
-
-            // Cleanup
-            for (size_t i = 0; i < vSidechainObjects.size(); i++)
-                delete vSidechainObjects[i].second;
-        }
+        // B5: every check on the block has passed; now all of its effects in
+        // one atomic batch with the DB's marker (v0.2.17): the refunded
+        // withdrawals and the new bundle's (refunds first, in CryptAxe's order),
+        // the bundle marks, the block's objects.
+        std::vector<SidechainWithdrawal> vWithdrawalUpdate = vRefundedWithdrawal;
+        vWithdrawalUpdate.insert(vWithdrawalUpdate.end(), vBundleWithdrawalUpdate.begin(), vBundleWithdrawalUpdate.end());
+        const bool fWritten = psidechaintree->WriteBlockEffects(vWithdrawalUpdate, vBundleMark, vSidechainObjects,
+                                                                pindex->GetBlockHash());
+        FreeSidechainObjects();
+        if (!fWritten)
+            return state.Error(strprintf("%s: Failed to write the block's sidechain effects!\n", __func__));
 
         // D-3: cache the deposit-CTIP baseline as of this block in the index -
         // the block's own last deposit if it has any, else inherited from
@@ -9862,61 +10214,14 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
             return state.DoS(100, false, REJECT_INVALID, "bad-cb-multiple", false, "more than one coinbase");
 
     // Verify BMM with mainchain
-    if (fCheckBMM && !VerifyBMM(block))
-        return state.DoS(1, false, REJECT_INVALID, "bad-bmm", true, "invalid bmm / failed to verify BMM for block");
+    if (!fGenesis && fCheckBMM && !CheckBlockBMM(block, state))
+        return false;
 
-    if (!fGenesis && fCheckBMM) {
-        // Check required PrevBlockCommit
-        bool fPrevCommitFound = false;
-        for (const CTxOut& out : block.vtx[0]->vout) {
-            uint256 hashPrevMain;
-            uint256 hashPrevSide;
-            if (out.scriptPubKey.IsPrevBlockCommit(hashPrevMain, hashPrevSide)) {
-                if (hashPrevMain != bmmCache.GetMainPrevBlockHash(block.hashMainchainBlock)) {
-                    LogPrintf("%s: Invalid mainchain prevBlock commit: %s != %s\n", __func__, hashPrevMain.ToString(), bmmCache.GetMainPrevBlockHash(block.hashMainchainBlock).ToString());
-                    return state.DoS(25, false, REJECT_INVALID, "bad-mc-prev", false, "invalid mainchin prevBlock commit");
-                }
-                if (hashPrevSide != block.hashPrevBlock) {
-                    LogPrintf("%s: Invalid sidechain prevBlock commit: %s != %s\n", __func__, hashPrevSide.ToString(), block.hashPrevBlock.ToString());
-                    return state.DoS(25, false, REJECT_INVALID, "bad-sc-prev", false, "invalid sidechain prevBlock commit");
-                }
-                fPrevCommitFound = true;
-                break;
-            }
-        }
-        if (!fPrevCommitFound) {
-            LogPrintf("%s: Missing prevBlock commit!\n", __func__);
-            return state.DoS(100, false, REJECT_INVALID, "no-prev-commit", false, "PrevBlockCommit not found!");
-        }
-    }
-
-    // Find deposits and verify that they exist with mainchain
-    if (fCheckBMM) {
-        for (const CTxOut& out : block.vtx[0]->vout) {
-            const CScript& scriptPubKey = out.scriptPubKey;
-
-            std::vector<unsigned char> vch;
-            if (!scriptPubKey.IsSidechainObj(vch))
-                continue;
-
-            SidechainObj *obj = ParseSidechainObj(vch);
-            if (!obj) {
-                return state.DoS(90, error("%s: invalid sidechain deposit obj script", __func__), REJECT_INVALID, "invalid-sidechain-obj-script");
-            }
-            // Owns obj on every exit: the non-deposit `continue` below used to
-            // skip both deletes and leak.
-            std::unique_ptr<SidechainObj> objOwner(obj);
-
-            if (obj->sidechainop != DB_SIDECHAIN_DEPOSIT_OP)
-                continue;
-
-            const SidechainDeposit* deposit = (const SidechainDeposit *) obj;
-
-            if (!VerifyDeposit(deposit->hashMainchainBlock, deposit->dtx.GetHash(), deposit->nTx)) {
-                return state.DoS(1, error("%s: invalid sidechain deposit", __func__), REJECT_INVALID, "invalid-sidechain-deposit");
-            }
-        }
-    }
+    // v0.2.17 A1 + A7: deposits are checked in ConnectBlock, against the
+    // enforcer's list of the deposit's L1 block (CheckDepositWithL1). The
+    // membership-only check here (VerifyDeposit) answered from a cache of
+    // txids already seen, which let a deposit approved under it skip any
+    // later check.
 
     // Check transactions
     for (const auto& tx : block.vtx)
@@ -9938,58 +10243,88 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
     return true;
 }
 
-bool VerifyBMM(const CBlock& block)
+std::atomic<int64_t> g_nLastBmmUnknown{0};
+
+/** v0.2.17: are this block's sidechain effects already in the sidechain DB
+ *  (its marker at the block or a descendant: a replay after an unclean stop)? */
+static bool SidechainDBHasBlock(const CBlockIndex* pindex)
 {
-    // Skip genesis block
-    if (block.GetHash() == Params().GetConsensus().hashGenesisBlock)
-        return true;
-
-    // Have we already verified BMM for this block?
-    if (bmmCache.HaveVerifiedBMM(block.GetHash()))
-        return true;
-
-    // h*
-    const uint256 hashMerkleRoot = block.hashMerkleRoot;
-
-    // TODO
-    // Return results from client to help decide on DoS score
-
-    // Verify BMM with local mainchain node
-    uint256 txid;
-    uint32_t nTime;
-    SidechainClient client;
-    if (!client.VerifyBMM(block.hashMainchainBlock, hashMerkleRoot, txid, nTime)) {
-        LogPrintf("%s: Did not find BMM h*: %s in mainchain block: %s!\n", __func__, hashMerkleRoot.ToString(), block.hashMainchainBlock.ToString());
+    uint256 hashSidechainBest;
+    if (!psidechaintree || !psidechaintree->GetBestBlock(hashSidechainBest) || hashSidechainBest.IsNull())
         return false;
-    }
-
-    // Cache that we have verified BMM for this block
-    bmmCache.CacheVerifiedBMM(block.GetHash());
-
-    return true;
+    BlockMap::iterator it = mapBlockIndex.find(hashSidechainBest);
+    if (it == mapBlockIndex.end())
+        return false;
+    return it->second->nHeight >= pindex->nHeight && it->second->GetAncestor(pindex->nHeight) == pindex;
 }
 
-bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx)
+bool CheckBlockBMM(const CBlock& block, CValidationState& state)
 {
-    if (hashMainBlock.IsNull()) {
-        return false;
+    // v0.2.17 C1: three answers. Does E carry the bid (asked of the enforcer)?
+    // Is E on the L1's main chain (our list of L1 blocks, refreshed as each
+    // block is processed)? Does the coinbase name E's parent? A "can't tell"
+    // is state.Error: the block is neither stored nor marked, the peer is not
+    // penalised, and the block is fetched again. Definite answers keep
+    // CryptAxe's scores. Before, "can't tell" cost the peer a point each time
+    // and an E missing from our list marked an honest block invalid for good.
+    const uint256& hashMain = block.hashMainchainBlock;
+
+    // During -reindex, -loadblock and replay our list of L1 blocks was filled
+    // to the enforcer's tip first (FillMainBlockCacheForReplay), so an L1 block
+    // missing from it is not on the L1's main chain: a definite no, as before
+    // v0.2.17 (the block is on a stale side branch). And the import reader
+    // stops a block file at a state.Error, so a slow enforcer is asked again
+    // instead (up to 5 minutes).
+    const bool fImport = fImporting || fReindex;
+    if (fImport && !bmmCache.HaveMainBlock(hashMain))
+        return state.DoS(0, false, REJECT_INVALID, "bad-mc-prev", false,
+                         strprintf("L1 block %s is not on the L1's main chain", hashMain.ToString()));
+
+    if (!bmmCache.HaveVerifiedBMM(block.GetHash())) {
+        L1Answer answer = GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
+        for (int nTry = 0; fImport && answer == L1Answer::UNKNOWN && nTry < 60 && !ShutdownRequested(); nTry++) {
+            MilliSleep(5000);
+            answer = GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
+        }
+        if (answer == L1Answer::NO)
+            return state.DoS(1, false, REJECT_INVALID, "bad-bmm", false,
+                             strprintf("L1 block %s does not carry this block's BMM bid", hashMain.ToString()));
+        if (answer != L1Answer::YES) {
+            g_nLastBmmUnknown = GetTime();
+            return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet whether block %s carries this block's BMM bid",
+                                         hashMain.ToString()));
+        }
     }
-    if (txid.IsNull()) {
-        return false;
+    const uint256 hashMainPrev = bmmCache.GetMainPrevBlockHash(hashMain);
+    if (!bmmCache.HaveMainBlock(hashMain) || hashMainPrev.IsNull()) {
+        g_nLastBmmUnknown = GetTime();
+        return state.Error(strprintf("bmm-unknown: L1 block %s is not in our list of L1 main-chain blocks (yet)",
+                                     hashMain.ToString()));
     }
+    bmmCache.CacheVerifiedBMM(block.GetHash());
 
-    // Have we already verified the deposit?
-    if (bmmCache.HaveVerifiedDeposit(txid))
-        return true;
-
-    SidechainClient client;
-    if (!client.VerifyDeposit(hashMainBlock, txid, nTx)) {
-        return false;
+    // Check required PrevBlockCommit
+    bool fPrevCommitFound = false;
+    for (const CTxOut& out : block.vtx[0]->vout) {
+        uint256 hashPrevMain;
+        uint256 hashPrevSide;
+        if (out.scriptPubKey.IsPrevBlockCommit(hashPrevMain, hashPrevSide)) {
+            if (hashPrevMain != hashMainPrev) {
+                LogPrintf("%s: Invalid mainchain prevBlock commit: %s != %s\n", __func__, hashPrevMain.ToString(), hashMainPrev.ToString());
+                return state.DoS(25, false, REJECT_INVALID, "bad-mc-prev", false, "invalid mainchin prevBlock commit");
+            }
+            if (hashPrevSide != block.hashPrevBlock) {
+                LogPrintf("%s: Invalid sidechain prevBlock commit: %s != %s\n", __func__, hashPrevSide.ToString(), block.hashPrevBlock.ToString());
+                return state.DoS(25, false, REJECT_INVALID, "bad-sc-prev", false, "invalid sidechain prevBlock commit");
+            }
+            fPrevCommitFound = true;
+            break;
+        }
     }
-
-    // Cache that we have verified the deposit
-    bmmCache.CacheVerifiedDeposit(txid);
-
+    if (!fPrevCommitFound) {
+        LogPrintf("%s: Missing prevBlock commit!\n", __func__);
+        return state.DoS(100, false, REJECT_INVALID, "no-prev-commit", false, "PrevBlockCommit not found!");
+    }
     return true;
 }
 
@@ -10194,7 +10529,7 @@ CScript GenerateBlockVersionCommit(const int32_t nVersion)
     return scriptPubKey;
 }
 
-bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig, SidechainWithdrawal& withdrawal)
+bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig, SidechainWithdrawal& withdrawal, bool fRequireUnspent)
 {
     if (id.IsNull()) {
         LogPrintf("%s: Null Withdrawal ID!\n", __func__);
@@ -10224,7 +10559,7 @@ bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned
         return false;
     }
     // Check status of Withdrawal
-    if (withdrawal.status != WITHDRAWAL_UNSPENT) {
+    if (fRequireUnspent && withdrawal.status != WITHDRAWAL_UNSPENT) {
         LogPrintf("%s: Withdrawal status != Withdrawal_UNSPENT\n", __func__);
         return false;
     }
@@ -10397,8 +10732,6 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
             return true;
         }
 
-        if (!VerifyBMM(block))
-            return state.DoS(1, false, REJECT_INVALID, "bad-bmm", true, "Invalid BMM in block header!");
 
         // Get prev block index
         CBlockIndex* pindexPrev = nullptr;
@@ -10408,6 +10741,23 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
         pindexPrev = (*mi).second;
         if (pindexPrev->nStatus & BLOCK_FAILED_MASK)
             return state.DoS(100, error("%s: prev block invalid", __func__), REJECT_INVALID, "bad-prevblk");
+
+        // v0.2.17 C1: three answers, the bid only (our list of L1 blocks is
+        // refreshed as blocks, not headers, are processed), asked once the
+        // parent is known: a header on no known parent costs its peer and no
+        // L1 call. A "can't tell" is state.Error: the header is not accepted,
+        // the peer not penalised.
+        if (!bmmCache.HaveVerifiedBMM(hash)) {
+            const L1Answer answer = GetL1Oracle().BmmCommitment(block.hashMainchainBlock, block.hashMerkleRoot);
+            if (answer == L1Answer::NO)
+                return state.DoS(1, false, REJECT_INVALID, "bad-bmm", false, "Invalid BMM in block header!");
+            if (answer != L1Answer::YES) {
+                g_nLastBmmUnknown = GetTime();
+                return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet whether block %s carries the BMM bid of header %s",
+                                             block.hashMainchainBlock.ToString(), hash.ToString()));
+            }
+            bmmCache.CacheVerifiedBMM(hash);
+        }
         if (!ContextualCheckBlockHeader(block, state, chainparams, pindexPrev, GetAdjustedTime()))
             return error("%s: Consensus::ContextualCheckBlockHeader: %s, %s", __func__, hash.ToString(), FormatStateMessage(state));
 
@@ -10541,7 +10891,11 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CVali
 
     bool fNewTip = (chainActive.Tip() == pindex->pprev);
     bool fVerifyWithdrawalBundleAcceptBlock = gArgs.GetBoolArg("-verifywithdrawalbundleacceptblock", DEFAULT_VERIFY_WITHDRAWAL_BUNDLE_ACCEPT_BLOCK);
-    if (fVerifyWithdrawalBundleAcceptBlock && fNewTip && !fInitialBlockDownload) {
+    // v0.2.17: not for a block whose sidechain effects are already in the DB
+    // (a replay after an unclean stop, see ConnectBlock): its bundle's
+    // withdrawals are in the bundle already, and the check would refuse the
+    // block for good ("Invalid withdrawal - spent"). The crash_replay gate found it.
+    if (fVerifyWithdrawalBundleAcceptBlock && fNewTip && !fInitialBlockDownload && !SidechainDBHasBlock(pindex)) {
         // Note that here we call VerifyWithdrawalBundles with fReplicate set so that we
         // replicate the Withdrawal Bundle on our own and verify that it matches the Withdrawal Bundle in
         // this new block if there are any.
@@ -10592,6 +10946,7 @@ bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<cons
     }
     if (fReorg)
         HandleMainchainReorg(vOrphan);
+    ReconsiderSideBlocksOfReturnedL1Blocks();
 
     AssertLockNotHeld(cs_main);
 
@@ -11111,7 +11466,8 @@ bool CVerifyDB::VerifyDB(const CChainParams& chainparams, CCoinsView *coinsview,
             if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus()))
                 return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
             if (!g_chainstate.ConnectBlock(block, state, pindex, coins,
-                        chainparams, false /* fJustCheck */, false /* fCheckBMM */))
+                        chainparams, false /* fJustCheck */, false /* fCheckBMM */, nullptr /* connectTrace */,
+                        false /* fSideDB (N2) */))
                 return error("VerifyDB(): *** found unconnectable block at %d, hash=%s.\n Error: %s\n", pindex->nHeight, pindex->GetBlockHash().ToString(), FormatStateMessage(state));
         }
     }
@@ -11547,8 +11903,16 @@ bool LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, CDiskB
                     CValidationState state;
                     if (g_chainstate.AcceptBlock(pblock, state, chainparams, nullptr, true, dbp, nullptr))
                         nLoaded++;
-                    if (state.IsError())
+                    if (state.IsError()) {
+                        // v0.2.17: the L1 could not answer the BMM check even
+                        // after waiting. Skipping the rest of this file would
+                        // leave the chain short without a word: stop instead;
+                        // the import runs again on the next start.
+                        if (state.GetRejectReason().compare(0, 11, "bmm-unknown") == 0)
+                            AbortNode(state, "The L1 (enforcer) did not answer during the block import: " +
+                                      state.GetRejectReason() + ". Start again once it answers.");
                         break;
+                    }
                 } else if (hash != chainparams.GetConsensus().hashGenesisBlock && mapBlockIndex[hash]->nHeight % 1000 == 0) {
                     LogPrint(BCLog::REINDEX, "Block Import: already had block %s at height %d\n", hash.ToString(), mapBlockIndex[hash]->nHeight);
                 }
@@ -12591,6 +12955,29 @@ bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vecto
                     strFail = "Invalid Withdrawal Bundle - replicated Withdrawal Bundle does not match!\n";
                     return false;
                 }
+                // v0.2.17 (decision 2026-09-29): the record, not only its tx,
+                // must be the one this node builds: the same withdrawal list
+                // (no repeats, none left out). A record listing one withdrawal
+                // twice and leaving out another that the tx pays left that one
+                // spendable here after the L1 paid it. Compared by GetID, which
+                // covers the sidechain, the tx and the list and zeroes status and
+                // heights: producers before v0.2.15 wrote junk there, and beta's
+                // history must still connect (ConnectBlock stores those as
+                // "created", no fail height).
+                bool fRecordMatches = false;
+                for (const CTxOut& out : withdrawalBundleDataTx->vout) {
+                    std::vector<unsigned char> vchRep;
+                    if (!out.scriptPubKey.IsSidechainObj(vchRep))
+                        continue;
+                    std::unique_ptr<SidechainObj> objRep(ParseSidechainObj(vchRep));
+                    if (objRep && objRep->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP &&
+                            static_cast<const SidechainWithdrawalBundle*>(objRep.get())->GetID() == withdrawalBundle->GetID())
+                        fRecordMatches = true;
+                }
+                if (!fRecordMatches) {
+                    strFail = "Invalid Withdrawal Bundle - the record is not the replicated record!\n";
+                    return false;
+                }
             }
 
             hashWithdrawalBundle = withdrawalBundle->tx.GetHash();
@@ -12853,6 +13240,27 @@ static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& v
     // else. If it isn't we will continue to update / reorg handling.
     int nCachedBlocks = bmmCache.GetCachedBlockCount();
     if (!fFresh && nMainBlocks + 1 == nCachedBlocks && hashCachedTip == hashMainTip) {
+        if (pWalk)
+            pWalk->deqHash.clear();
+        return true;
+    }
+
+    // v0.2.17 C2: a tip below the cached one that is itself a cached block at
+    // that height is the L1 (a restored or resyncing enforcer) behind on the
+    // same chain, not a reorg: a reorg replaces blocks, it does not make the tip
+    // an older block of the same chain. Keep the cache. Treated as a reorg it
+    // popped the cached blocks above, and HandleMainchainReorg threw away the
+    // FreeBank blocks anchored in them.
+    std::vector<uint256> vCachedAtTipHeight;
+    if (!fFresh && nMainBlocks + 1 < nCachedBlocks &&
+            bmmCache.GetMainBlockHashesFrom(nMainBlocks, 1, vCachedAtTipHeight) &&
+            vCachedAtTipHeight.size() == 1 && vCachedAtTipHeight[0] == hashMainTip) {
+        static uint256 hashLogged;
+        if (hashLogged != hashMainTip) {
+            LogPrintf("%s: the mainchain reports tip %s at height %d, below the %d blocks cached and on the same chain: "
+                      "waiting for it to catch up, not a reorg\n", __func__, hashMainTip.ToString(), nMainBlocks, nCachedBlocks - 1);
+            hashLogged = hashMainTip;
+        }
         if (pWalk)
             pWalk->deqHash.clear();
         return true;
@@ -13164,6 +13572,30 @@ bool VerifyMainBlockCache(std::string& strError, MainBlockCacheCheck* pCheck)
     return Finish(true);
 }
 
+/** v0.2.17 C4: side blocks HandleMainchainReorg marked failed because their
+ *  L1 block was orphaned, by that L1 block. If the L1 block returns to the L1's
+ *  main chain (the L1 flipped back), the mark is cleared. Memory only: after a
+ *  restart such a mark stays (reconsiderblock clears it). Guarded by cs_main. */
+static std::map<uint256, uint256> mapFailedForOrphanedL1;
+
+void ReconsiderSideBlocksOfReturnedL1Blocks()
+{
+    LOCK(cs_main);
+    for (auto it = mapFailedForOrphanedL1.begin(); it != mapFailedForOrphanedL1.end(); ) {
+        if (!bmmCache.HaveMainBlock(it->first)) {
+            ++it;
+            continue;
+        }
+        BlockMap::iterator mi = mapBlockIndex.find(it->second);
+        if (mi != mapBlockIndex.end()) {
+            LogPrintf("%s: L1 block %s is on the L1's main chain again; clearing the mark on block %s\n", __func__,
+                      it->first.ToString(), it->second.ToString());
+            ResetBlockFailureFlags(mi->second);
+        }
+        it = mapFailedForOrphanedL1.erase(it);
+    }
+}
+
 void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
 {
     // During a block import or replay, hold the orphans for ThreadImport
@@ -13231,10 +13663,16 @@ void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
                 continue;
 
             CBlockIndex* pindex = mapBlockMainHashIndex[u];
-            if (!chainActive.Contains(pindex))
+            // v0.2.17 C4: stored or header-only blocks too, not only the
+            // active chain's. Left alone, a stored block anchored in the
+            // orphaned L1 block stayed a candidate that CheckBlockBMM can never
+            // answer for (its L1 block is off our list), and the node kept
+            // retrying it instead of its siblings.
+            if (pindex->nStatus & BLOCK_FAILED_MASK)
                 continue;
 
             InvalidateBlock(state, Params(), pindex);
+            mapFailedForOrphanedL1[u] = pindex->GetBlockHash();
 
             LogPrintf("%s: Invalidated block: %s because mainchain block: %s was orphaned!\n",
                     __func__, pindex->GetBlockHash().ToString(), u.ToString());

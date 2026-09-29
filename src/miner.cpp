@@ -16,6 +16,7 @@
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <hash.h>
+#include <l1client.h>
 #include <validation.h>
 #include <net.h>
 #include <policy/feerate.h>
@@ -226,15 +227,20 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     psidechaintree->GetLastWithdrawalBundleHash(hashCurrentWithdrawalBundle);
     if (psidechaintree->GetWithdrawalBundle(hashCurrentWithdrawalBundle, withdrawalBundle)) {
         if (withdrawalBundle.status == WITHDRAWAL_BUNDLE_CREATED) {
-            // Check if the Withdrawal Bundle has been paid out or failed
-            if (client.HaveFailedWithdrawalBundle(hashCurrentWithdrawalBundle)) {
-                CScript script = GenerateWithdrawalBundleFailCommit(hashCurrentWithdrawalBundle);
-                coinbaseTx.vout.push_back(CTxOut(0, script));
-            }
-            else
-            if (client.HaveSpentWithdrawalBundle(hashCurrentWithdrawalBundle)) {
-                CScript script = GenerateWithdrawalBundleSpentCommit(hashCurrentWithdrawalBundle);
-                coinbaseTx.vout.push_back(CTxOut(0, script));
+            // Check if the Withdrawal Bundle has been paid out or failed.
+            // v0.2.17: decided exactly as ConnectBlock checks the mark
+            // (GetBundleOutcomeOnL1), as of the L1 tip this block's bid builds
+            // on; the check asks as of the L1 block that carries the bid, its
+            // child. Before, the builder marked "failed" on any failed event
+            // in the whole L1 history, and ConnectBlock could then reject every
+            // block it built.
+            const uint256 hashMainForMark = hashMainTip.IsNull() ? bmmCache.GetLastMainBlockHash() : hashMainTip;
+            char cOutcome = 0;
+            if (GetBundleOutcomeOnL1(withdrawalBundle, pindexPrev, hashMainForMark, cOutcome) == L1Answer::YES) {
+                if (cOutcome == 'F')
+                    coinbaseTx.vout.push_back(CTxOut(0, GenerateWithdrawalBundleFailCommit(hashCurrentWithdrawalBundle)));
+                else if (cOutcome == 'S')
+                    coinbaseTx.vout.push_back(CTxOut(0, GenerateWithdrawalBundleSpentCommit(hashCurrentWithdrawalBundle)));
             }
         }
     }
@@ -327,19 +333,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         }
     }
 
+    // v0.2.17 A9: a problem with the new deposits leaves them out of this
+    // block; it no longer stops block making (each of these returned no
+    // template, so one bad deposit halted the chain).
+    bool fSkipDeposits = false;
+
     // Check deposit burn index
     for (const SidechainDeposit& d : vDepositNew) {
         if (d.nBurnIndex >= d.dtx.vout.size()) {
             LogPrintf("%s: Error: new deposit has invalid burn index:\n%s\n", __func__, d.ToString());
-            return nullptr;
+            fSkipDeposits = true;
+            break;
         }
     }
 
     // Sort the deposits into CTIP UTXO spend order
     std::vector<SidechainDeposit> vDepositSorted;
-    if (!SortDeposits(vDepositNew, vDepositSorted)) {
+    if (!fSkipDeposits && !SortDeposits(vDepositNew, vDepositSorted)) {
         LogPrintf("%s: Error: Failed to sort deposits!\n", __func__);
-        return nullptr;
+        fSkipDeposits = true;
     }
 
     // Create deposit payout output(s)
@@ -390,7 +402,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             }
             if (!fFound) {
                 LogPrintf("%s: Error: No CTIP found for first deposit in sorted list: %s (mainchain txid)\n", __func__, first.dtx.GetHash().ToString());
-                return nullptr;
+                fSkipDeposits = true;
             }
         } else {
             // This is the very first deposit for this sidechain so we don't
@@ -407,7 +419,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // deposits in the list.
     //
     // Calculate payout for remaining deposits
-    if (vDepositSorted.size() > 1) {
+    if (!fSkipDeposits && vDepositSorted.size() > 1) {
         std::vector<SidechainDeposit>::iterator it = vDepositSorted.begin() + 1;
         for (; it != vDepositSorted.end(); it++) {
             // Points to the previous deposit in the sorted list
@@ -435,9 +447,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             }
             if (!fFound) {
                 LogPrintf("%s: Error: Failed to calculate payout amount - no CTIP found for deposit: %s (mainchain txid)\n", __func__, it->dtx.GetHash().ToString());
-                return nullptr;
+                fSkipDeposits = true;
+                break;
             }
         }
+    }
+    if (fSkipDeposits) {
+        LogPrintf("%s: building this block without new deposits\n", __func__);
+        vDepositSorted.clear();
     }
 
     // Create the deposit outputs.
@@ -705,14 +722,16 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
     std::set<uint256> setRefund;
     while (mi != mempool.mapTx.get<ancestor_score>().end() || !mapModifiedTx.empty())
     {
-        // Skip refunds if we don't want to include them
-        if (!fIncludeRefunds && mi->IsWithdrawalRefund()) {
+        // Skip refunds if we don't want to include them. (v0.2.17: mi may be
+        // at the end while mapModifiedTx still has entries: never read it then.)
+        const bool fMapTxLeft = mi != mempool.mapTx.get<ancestor_score>().end();
+        if (fMapTxLeft && !fIncludeRefunds && mi->IsWithdrawalRefund()) {
             ++mi;
             continue;
         }
 
         // Very refund in the mempool again before adding it to a block
-        if (mi->IsWithdrawalRefund()) {
+        if (fMapTxLeft && mi->IsWithdrawalRefund()) {
             CTransactionRef tx = mi->GetSharedTx();
             if (tx == nullptr) {
                 ++mi;
@@ -728,13 +747,16 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
                     continue;
                 break;
             }
-            if (id.IsNull())
+            if (id.IsNull()) {
+                ++mi;
                 continue;
+            }
 
             // Double check that we haven't already added another refund request
             // txn for this same withdrawal ID (that would be invalid).
             if (setRefund.count(id)) {
                 LogPrintf("%s: Invalid (duplicate withdrawal ID) refund in mempool!\n", __func__);
+                ++mi;
                 continue;
             }
 
@@ -827,6 +849,26 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
 
         onlyUnconfirmed(ancestors);
         ancestors.insert(iter);
+
+        // v0.2.17: a refund goes into a block only when the loop above has met
+        // and checked it on its own, and never into a block that creates a
+        // bundle. A child's package must not pull one in as an ancestor: in a
+        // bundle block the coinbase has no refund payout for it, so the
+        // template failed its own check and no block could be built.
+        bool fRefundUnchecked = false;
+        for (CTxMemPool::txiter it : ancestors) {
+            if (it->IsWithdrawalRefund() && (it != iter || fUsingModified || !fIncludeRefunds)) {
+                fRefundUnchecked = true;
+                break;
+            }
+        }
+        if (fRefundUnchecked) {
+            if (fUsingModified) {
+                mapModifiedTx.get<ancestor_score>().erase(modit);
+                failedTx.insert(iter);
+            }
+            continue;
+        }
 
         // Test if all tx's are Final
         if (!TestPackageTransactions(ancestors)) {

@@ -7,12 +7,14 @@
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <core_io.h>
+#include <enforcerconnect.h>
 #include <sidechain.h>
 #include <uint256.h>
 #include <univalue.h>
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
 #include <hash.h>
+#include <netbase.h>
 #include <primitives/block.h>
 #include <streams.h>
 #include <txdb.h>
@@ -22,14 +24,23 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <climits>
+#include <limits>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
 
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
@@ -69,8 +80,10 @@ private:
 };
 
 //
-// EnforcerL1Client - the CUSF bip300301_enforcer transport, by shelling out to
-// grpcurl: mainchain state and withdrawal-bundle events from ValidatorService,
+// EnforcerL1Client - the CUSF bip300301_enforcer transport, over the Connect
+// protocol (HTTP/1.1 + JSON, enforcerconnect.h; the v0.2.17 default) or by
+// shelling out to grpcurl (-enforcertransport=grpcurl): mainchain state and
+// withdrawal-bundle events from ValidatorService,
 // BMM requests from WalletService (SendBMMRequest needs the enforcer wallet),
 // withdrawal bundles to BlockProducerService/ProposeWithdrawalBundle (with a
 // fallback to WalletService/BroadcastWithdrawalBundle for enforcers older than
@@ -96,34 +109,51 @@ public:
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
     Commitment ReadBmmCommitment(const uint256& hashMainBlock, uint256& hashCommitment) override;
+    L1Answer GetPegEvents(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events) override;
+    bool IsBehindItsNode(std::string& strWhy) override;
 
     /* The init-time REST reachability probe borrows the private RestGet. */
     friend bool ::ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch);
     friend EnforcerIdentity (::ProbeEnforcerIdentity)(std::string& strError, bool* pfStale);
+    friend EnforcerSettingsCheck (::CheckEnforcerSettings)(std::string& strError);
 
 private:
     /*
-     * Invoke a ValidatorService method through grpcurl and parse the JSON
-     * reply. The enforcer is only ever invoked at runtime by service name -
-     * nothing of it is vendored or linked.
+     * Invoke a ValidatorService method and parse the JSON reply. The enforcer
+     * is only ever invoked at runtime by service name - nothing of it is
+     * vendored or linked.
      */
     bool CallValidator(const std::string& strMethod, const std::string& strRequest, UniValue& result);
 
-    /* Invoke a WalletService method (write-path). Same grpcurl shell-out. */
+    /* Invoke a WalletService method (write-path). */
     bool CallWallet(const std::string& strMethod, const std::string& strRequest, UniValue& result);
 
-    /* Shared grpcurl shell-out for any enforcer service. */
+    /* Shared call for any enforcer service. */
     bool CallEnforcer(const std::string& strService, const std::string& strMethod, const std::string& strRequest, UniValue& result);
 
-    /* The same shell-out for a call whose reply is not needed. Returns grpcurl's
-     * exit status (-1 if it could not be run) and its stderr in strError, so the
-     * caller can tell a method the enforcer lacks from a transient failure
-     * (ClassifyGrpcurlFailure). */
+    /* The same call when the reply is not needed. Returns the call's status in
+     * grpcurl's exit convention (-1 if it could not be run) and its error text
+     * in strError, so the caller can tell a method the enforcer lacks from a
+     * transient failure (ClassifyGrpcurlFailure). */
     int CallEnforcerStatus(const std::string& strService, const std::string& strMethod, const std::string& strRequest, std::string& strError);
+
+    /* v0.2.17: run one enforcer call on the transport -enforcertransport
+     * selects. The reply (or, if fStderr, the error text too) goes to
+     * strOutput. Returns the status in grpcurl's exit convention (0 ok, 64 +
+     * gRPC code for an enforcer error, 1 client side, -1 could not run), which
+     * the Connect client reports as well (enforcerconnect.h). fRetrySafe=false
+     * for a call with a side effect a repeat could double (the BMM bid).
+     * nTimeoutSecs bounds the call (default 15 s, at most 60 s). */
+    int RunEnforcerCall(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput,
+                        bool fRetrySafe = true, int nTimeoutSecs = enforcerconnect::DEFAULT_CALL_TIMEOUT);
 
     /* Run one grpcurl call; stdout (with stderr merged in if fStderr) goes to
      * strOutput. Returns the exit status, or -1 if it could not be run. */
-    int RunGrpcurl(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput);
+    int RunGrpcurl(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput,
+                   int nTimeoutSecs = enforcerconnect::DEFAULT_CALL_TIMEOUT);
+
+    /* The persistent Connect-protocol client (-enforcertransport=connect) */
+    enforcerconnect::Client connectClient;
 
     /* One enforcer method that takes a withdrawal bundle (D7) */
     struct BundleMethod {
@@ -145,9 +175,12 @@ private:
      * ordering + cumulative CTIP amount) and the tx-index-in-block (nTx), so we
      * fetch them from the mainchain node's REST interface. */
     bool RestGet(const std::string& strPath, std::string& strBody);
-    L1TxFetch RestFetchRawTx(const uint256& txid, CMutableTransaction& tx);
-    bool RestGetRawTx(const uint256& txid, CMutableTransaction& tx) { return RestFetchRawTx(txid, tx) == L1TxFetch::OK; }
     bool RestGetBlockTxids(const uint256& hashBlock, std::vector<uint256>& vTxid);
+    /* v0.2.17: tx txid of L1 block hashBlock, and its index there, read from
+     * the block itself (/rest/block/<hash>.hex). No -txindex needed: on a node
+     * started from an assumeutxo snapshot the tx index covers only the
+     * background chainstate, and /rest/tx answers 404 for weeks. */
+    L1TxFetch RestGetTxFromBlock(const uint256& hashBlock, const uint256& txid, CMutableTransaction& tx, int& nTx);
 
     /* Fetch all withdrawal-bundle events for THIS_SIDECHAIN via GetTwoWayPegData. */
     bool FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents);
@@ -167,12 +200,6 @@ private:
      * never by a transient failure. */
     std::atomic<bool> fBundleViaWallet{false};
 
-    /* Located M6s by (L1 block hash, m6id) -> (index in block, tx). UpdateDeposits
-     * re-reads every Succeeded event of the full L1 history on each template;
-     * without this cache each one re-fetches every non-deposit tx of its block
-     * over REST. Entries are immutable facts about a block hash. */
-    std::mutex mutexM6Cache;
-    std::map<std::pair<uint256, uint256>, std::pair<int, CMutableTransaction>> mapM6Cache;
 };
 
 //
@@ -411,6 +438,152 @@ bool ParseEnforcerWithdrawalEvents(const UniValue& response, std::vector<L1Withd
     return true;
 }
 
+/** A proto3 JSON uint64 (a decimal string) or uint32 (a number). */
+static bool GetUInt64Field(const UniValue& v, uint64_t& n)
+{
+    if (v.isNum()) {
+        const std::string str = v.getValStr();
+        return !str.empty() && str.find_first_not_of("0123456789") == std::string::npos && ParseUInt64(str, &n);
+    }
+    if (v.isStr()) {
+        const std::string& str = v.get_str();
+        return !str.empty() && str.find_first_not_of("0123456789") == std::string::npos && ParseUInt64(str, &n);
+    }
+    return false;
+}
+
+/** A 32-byte hash field ({"hex": <64 hex chars>}). */
+static bool GetHash32Field(const UniValue& obj, std::string& strHex)
+{
+    return GetHexField(obj, strHex) && strHex.size() == 64;
+}
+
+static bool ParsePegEventsInner(const UniValue& response, L1PegEvents& events)
+{
+    if (!response.isObject())
+        return false;
+
+    const UniValue& blocks = find_value(response, "blocks");
+    if (blocks.isNull())
+        return true;
+    if (!blocks.isArray())
+        return false;
+
+    for (size_t b = 0; b < blocks.size(); b++) {
+        std::string strBlockHash;
+        if (!GetHash32Field(find_value(find_value(blocks[b], "blockHeaderInfo"), "blockHash"), strBlockHash))
+            return false;
+        const uint256 hashBlock = uint256S(strBlockHash);
+
+        const UniValue& info = find_value(blocks[b], "blockInfo");
+        if (!info.isObject())
+            return false;
+        const UniValue& vEvent = find_value(info, "events");
+        if (vEvent.isNull())
+            continue; // a block listed for its BMM commitment only
+        if (!vEvent.isArray())
+            return false;
+
+        for (size_t e = 0; e < vEvent.size(); e++) {
+            if (!vEvent[e].isObject())
+                return false;
+            const UniValue& dep = find_value(vEvent[e], "deposit");
+            const UniValue& wb = find_value(vEvent[e], "withdrawalBundle");
+            if (dep.isObject() == wb.isObject())
+                return false; // neither (an event kind we do not know) or both
+
+            if (dep.isObject()) {
+                L1DepositEvent d;
+                d.hashMainBlock = hashBlock;
+                if (!GetUInt64Field(find_value(dep, "sequenceNumber"), d.nSequence))
+                    return false;
+                const UniValue& outpoint = find_value(dep, "outpoint");
+                std::string strTxid;
+                uint64_t nVout;
+                if (!GetHash32Field(find_value(outpoint, "txid"), strTxid) ||
+                        !GetUInt64Field(find_value(outpoint, "vout"), nVout) || nVout > std::numeric_limits<uint32_t>::max())
+                    return false;
+                d.outpoint = COutPoint(uint256S(strTxid), (uint32_t)nVout);
+                const UniValue& output = find_value(dep, "output");
+                if (!output.isObject())
+                    return false;
+                uint64_t nValue;
+                if (!GetUInt64Field(find_value(output, "valueSats"), nValue) || !MoneyRange((CAmount)nValue))
+                    return false;
+                d.nValue = (CAmount)nValue;
+                // The address may be empty: absent, {} or {"hex": ""}
+                const UniValue& address = find_value(output, "address");
+                if (!address.isNull()) {
+                    if (!address.isObject())
+                        return false;
+                    const UniValue& hex = find_value(address, "hex");
+                    if (!hex.isNull()) {
+                        if (!hex.isStr() || (!hex.get_str().empty() && !IsHex(hex.get_str())))
+                            return false;
+                        d.vchAddress = ParseHex(hex.get_str());
+                    }
+                }
+                events.vDeposit.push_back(d);
+            } else {
+                L1WithdrawalEvent ev;
+                ev.hashMainBlock = hashBlock;
+                std::string strM6;
+                if (!GetHash32Field(find_value(wb, "m6id"), strM6))
+                    return false;
+                ev.m6id = Uint256FromConsensusHex(strM6);
+                const UniValue& event = find_value(wb, "event");
+                const bool fSucceeded = find_value(event, "succeeded").isObject();
+                const bool fFailed = find_value(event, "failed").isObject();
+                const bool fSubmitted = find_value(event, "submitted").isObject();
+                if (fSucceeded + fFailed + fSubmitted != 1)
+                    return false;
+                ev.status = fSucceeded ? 'S' : fFailed ? 'F' : 'U';
+                if (fSucceeded) {
+                    // D7: the running number and the M6, when sent
+                    const UniValue& succeeded = find_value(event, "succeeded");
+                    const UniValue& seq = find_value(succeeded, "sequenceNumber");
+                    if (!seq.isNull()) {
+                        if (!GetUInt64Field(seq, ev.nSequence))
+                            return false;
+                        ev.fHaveSequence = true;
+                    }
+                    const UniValue& tx = find_value(succeeded, "transaction");
+                    if (!tx.isNull()) {
+                        std::string strTx;
+                        if (!GetHexField(tx, strTx))
+                            return false;
+                        ev.vchTx = ParseHex(strTx);
+                    }
+                }
+                events.vWithdrawal.push_back(ev);
+            }
+        }
+    }
+    return true;
+}
+
+bool ParsePegEvents(const UniValue& response, L1PegEvents& events)
+{
+    events = L1PegEvents();
+    if (ParsePegEventsInner(response, events))
+        return true;
+    events = L1PegEvents(); // never half a reply
+    return false;
+}
+
+L1Answer ClassifyPegEventsError(const std::string& strError)
+{
+    if (strError.find("is not an ancestor of end block") != std::string::npos)
+        return L1Answer::NO;
+    return L1Answer::UNKNOWN;
+}
+
+L1Answer L1Client::GetPegEvents(const uint256&, const uint256&, L1PegEvents& events)
+{
+    events = L1PegEvents();
+    return L1Answer::UNKNOWN;
+}
+
 std::vector<uint256> PendingM6idsFromEvents(const std::vector<L1WithdrawalEvent>& vEvents)
 {
     std::vector<uint256> vPending;
@@ -471,28 +644,31 @@ bool ComputeM6id(const CMutableTransaction& mtx, CAmount nPrevTreasury, unsigned
     CMutableTransaction mtxBlind(mtx);
     mtxBlind.vin.clear();
     mtxBlind.vout[0] = CTxOut(0, EncodeWithdrawalFeesCUSF(nFee));
-    m6id = CTransaction(mtxBlind).GetHash();
+    m6id = L1MutableTransaction(mtxBlind).GetHash(); // the L1 layout (A5), as the enforcer hashes it
     return true;
 }
 
-int LocateM6(const std::vector<M6Candidate>& vCandidate, const uint256& m6id, unsigned int nSidechain, int& nMatches)
+
+L1TxFetch FindL1TxInBlock(const std::vector<unsigned char>& vchBlock, const uint256& txid, CMutableTransaction& tx, int& nTx)
 {
-    nMatches = 0;
-    int nIndex = -1;
-    for (size_t i = 0; i < vCandidate.size(); i++) {
-        const M6Candidate& c = vCandidate[i];
-        // The M6 spends the CTIP: a treasury output under the same script
-        if (c.mtx.vout.empty() || !IsTreasuryScript(c.scriptPrev, nSidechain) || c.scriptPrev != c.mtx.vout[0].scriptPubKey)
-            continue;
-        uint256 m6idCandidate;
-        if (!ComputeM6id(c.mtx, c.nPrevValue, nSidechain, m6idCandidate) || m6idCandidate != m6id)
-            continue;
-        nMatches++;
-        nIndex = (int)i;
+    nTx = -1;
+    try {
+        CDataStream ss(vchBlock, SER_NETWORK, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_L1);
+        ss.ignore(80); // the L1 block header
+        const uint64_t nTxs = ReadCompactSize(ss);
+        for (uint64_t i = 0; i < nTxs; i++) {
+            L1MutableTransaction txL1;
+            ss >> txL1;
+            if (txL1.GetHash() == txid) {
+                tx = txL1;
+                nTx = (int)i;
+                return L1TxFetch::OK;
+            }
+        }
+    } catch (const std::exception&) {
+        return L1TxFetch::UNDECODABLE;
     }
-    if (nMatches > 1)
-        return -2;
-    return nIndex;
+    return L1TxFetch::FAILED; // not in that block
 }
 
 L1TxFetch ClassifyRawTxBody(std::string body, CMutableTransaction& tx)
@@ -504,68 +680,46 @@ L1TxFetch ClassifyRawTxBody(std::string body, CMutableTransaction& tx)
     if (body.empty() || !IsHex(body))
         return L1TxFetch::FAILED;
 
-    return DecodeHexTx(tx, body) ? L1TxFetch::OK : L1TxFetch::UNDECODABLE;
-}
-
-// An L1 tx the M6 scan can read as-is: it decoded, and it is v1 or v2. FreeBank's
-// decoder gives v3 and v10-17 its own layouts, so it misreads such L1 txs.
-static bool IsPlainL1Tx(L1TxFetch r, const CMutableTransaction& mtx)
-{
-    return r == L1TxFetch::OK && (mtx.nVersion == 1 || mtx.nVersion == 2);
-}
-
-bool BuildM6Candidates(const std::vector<uint256>& vBlockTxid, const std::set<uint256>& setDepositTxid,
-                       unsigned int nSidechain,
-                       const std::function<L1TxFetch(const uint256&, CMutableTransaction&)>& fetch,
-                       std::vector<M6Candidate>& vCandidate, int& nSkipped, std::string& strError)
-{
-    vCandidate.clear();
-    nSkipped = 0;
-    // Candidates: non-coinbase, non-deposit txs with one input and a
-    // treasury-shaped vout[0] (any upgradable NOP), plus the output their
-    // input spends.
-    for (size_t j = 1; j < vBlockTxid.size(); j++) {
-        if (setDepositTxid.count(vBlockTxid[j]))
-            continue;
-
-        CMutableTransaction mtx;
-        const L1TxFetch r = fetch(vBlockTxid[j], mtx);
-        if (r == L1TxFetch::FAILED) {
-            strError = strprintf("REST raw-tx fetch failed for %s", vBlockTxid[j].ToString());
-            return false;
+    // v0.2.17 A5: an L1 tx, read in the plain Bitcoin layout (with witness
+    // if it has one, as DecodeHexTx tries), never FreeBank's own layouts
+    const std::vector<unsigned char> vch = ParseHex(body);
+    for (const int nVersionFlags : {PROTOCOL_VERSION, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS}) {
+        CDataStream ss(vch, SER_NETWORK, nVersionFlags | SERIALIZE_TRANSACTION_L1);
+        try {
+            L1MutableTransaction txL1;
+            ss >> txL1;
+            if (ss.empty()) {
+                tx = txL1;
+                return L1TxFetch::OK;
+            }
+        } catch (const std::exception&) {
         }
-        if (!IsPlainL1Tx(r, mtx)) {
-            nSkipped++;
-            continue;
-        }
-        if (mtx.vin.size() != 1 || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, nSidechain))
-            continue;
-
-        CMutableTransaction mtxPrev;
-        const L1TxFetch rPrev = fetch(mtx.vin[0].prevout.hash, mtxPrev);
-        if (rPrev != L1TxFetch::FAILED && !IsPlainL1Tx(rPrev, mtxPrev)) {
-            nSkipped++;
-            continue;
-        }
-        if (rPrev != L1TxFetch::OK || mtx.vin[0].prevout.n >= mtxPrev.vout.size()) {
-            strError = strprintf("REST fetch of the output spent by %s failed", vBlockTxid[j].ToString());
-            return false;
-        }
-        M6Candidate c;
-        c.nTx = (int)j;
-        c.mtx = mtx;
-        c.nPrevValue = mtxPrev.vout[mtx.vin[0].prevout.n].nValue;
-        c.scriptPrev = mtxPrev.vout[mtx.vin[0].prevout.n].scriptPubKey;
-        vCandidate.push_back(c);
     }
-    return true;
+    return L1TxFetch::UNDECODABLE;
 }
+
 
 //
 // EnforcerL1Client
 //
 
-int EnforcerL1Client::RunGrpcurl(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput)
+int EnforcerL1Client::RunEnforcerCall(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput,
+                                      bool fRetrySafe, int nTimeoutSecs)
+{
+    if (GetEnforcerTransport() == EnforcerTransport::GRPCURL)
+        return RunGrpcurl(strService, strMethod, strRequest, fStderr, strOutput, nTimeoutSecs);
+
+    const std::string strAddr = gArgs.GetArg("-enforceraddr", "127.0.0.1:50051");
+    std::string strReply;
+    int nStatus = connectClient.Call(strAddr, strService, strMethod, strRequest, nTimeoutSecs, fRetrySafe, strReply);
+    // grpcurl sent its error text to stderr: into the output only if fStderr
+    if (nStatus == 0 || fStderr)
+        strOutput += strReply;
+    return nStatus;
+}
+
+int EnforcerL1Client::RunGrpcurl(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput,
+                                 int nTimeoutSecs)
 {
     // Requests are built internally from hex strings and integers only; the
     // binary and address come from the node operator's own configuration.
@@ -574,10 +728,10 @@ int EnforcerL1Client::RunGrpcurl(const std::string& strService, const std::strin
     if (strRequest.find('\'') != std::string::npos)
         return -1;
 
-    std::string strBin = gArgs.GetArg("-grpcurlbin", "grpcurl");
+    std::string strBin = GetGrpcurlLocation().strPath;
     std::string strAddr = gArgs.GetArg("-enforceraddr", "127.0.0.1:50051");
 
-    std::string strCommand = BuildGrpcurlCommand(strBin, strRequest, strAddr, strService, strMethod, fStderr);
+    std::string strCommand = BuildGrpcurlCommand(strBin, strRequest, strAddr, strService, strMethod, fStderr, nTimeoutSecs);
     if (strCommand.empty()) {
         LogOnce("grpcurl-badpath", "ERROR Enforcer client: -grpcurlbin path '" + strBin +
             "' contains a double quote and cannot be run; set -grpcurlbin to a plain path\n");
@@ -603,7 +757,8 @@ int EnforcerL1Client::RunGrpcurl(const std::string& strService, const std::strin
     // misconfiguration, not a routine failure, so say so once
     if (WEXITSTATUS(status) == 127)
         LogOnce("grpcurl-missing", "ERROR Enforcer client: grpcurl binary '" + strBin +
-            "' not found - the enforcer transport cannot work; set -grpcurlbin\n");
+            "' not found - the enforcer transport cannot work; install grpcurl, set -grpcurlbin, or drop "
+            "-enforcertransport=grpcurl (getmainchaininfo shows where it was looked for)\n");
 
     return WEXITSTATUS(status);
 }
@@ -613,7 +768,7 @@ int EnforcerL1Client::CallEnforcerStatus(const std::string& strService, const st
     // stderr is merged into the output: on success the reply is not needed, and
     // on failure grpcurl prints nothing to stdout, so the output is its stderr
     std::string strOutput;
-    int nExit = RunGrpcurl(strService, strMethod, strRequest, true, strOutput);
+    int nExit = RunEnforcerCall(strService, strMethod, strRequest, true, strOutput);
     if (nExit != 0)
         strError = strOutput;
     return nExit;
@@ -622,7 +777,7 @@ int EnforcerL1Client::CallEnforcerStatus(const std::string& strService, const st
 bool EnforcerL1Client::CallEnforcer(const std::string& strService, const std::string& strMethod, const std::string& strRequest, UniValue& result)
 {
     std::string strOutput;
-    if (RunGrpcurl(strService, strMethod, strRequest, false, strOutput) != 0) {
+    if (RunEnforcerCall(strService, strMethod, strRequest, false, strOutput) != 0) {
         // Can be enabled for debug -- too noisy (includes routine "block not
         // found" gRPC errors)
         // LogPrintf("ERROR Enforcer client %s failed\n", strMethod);
@@ -695,7 +850,7 @@ void EnforcerL1Client::LogBundleFailure(const BundleMethod& method, int nExit, c
     std::string strMethod = std::string(method.pszService) + "/" + method.pszMethod;
     LogOnce("bundle-fail:" + strMethod + ":" + std::to_string(nExit),
         "ERROR Enforcer client: withdrawal bundle not accepted by " + strMethod +
-        " (grpcurl exit " + std::to_string(nExit) + ": " + strDetail + ")" + strHint +
+        " (" + EnforcerStatusLabel() + " " + std::to_string(nExit) + ": " + strDetail + ")" + strHint +
         "; retried on every block, logged once per method and exit status\n");
 }
 
@@ -973,6 +1128,84 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
     return true;
 }
 
+bool ParseEnforcerChainInfo(const UniValue& response, EnforcerSettings& settings)
+{
+    settings = EnforcerSettings();
+    if (!response.isObject())
+        return false;
+    const UniValue& c = find_value(response, "bip300Constants");
+    if (!c.isObject())
+        return false;
+    const std::pair<const char*, uint32_t*> fields[] = {
+        {"withdrawalBundleMaxAge", &settings.nBundleMaxAge},
+        {"withdrawalBundleInclusionThreshold", &settings.nBundleThreshold},
+        {"usedSidechainSlotProposalMaxAge", &settings.nUsedSlotMaxAge},
+        {"usedSidechainSlotActivationThreshold", &settings.nUsedSlotThreshold},
+        {"unusedSidechainSlotProposalMaxAge", &settings.nUnusedSlotMaxAge},
+        {"unusedSidechainSlotActivationThreshold", &settings.nUnusedSlotThreshold},
+        {"activationHeight", &settings.nActivationHeight},
+    };
+    for (const auto& f : fields) {
+        const UniValue& v = find_value(c, f.first);
+        if (v.isNull())
+            continue; // proto3: zero
+        if (!v.isNum() || v.get_int64() < 0 || v.get_int64() > std::numeric_limits<uint32_t>::max())
+            return false;
+        *f.second = (uint32_t)v.get_int64();
+    }
+    return true;
+}
+
+std::string CompareEnforcerSettings(int nForkHeight, const EnforcerSettings& got)
+{
+    // An enforcer with no preset for this network reports 0 (the eCash mainnet
+    // preset is not published yet): nothing to compare then.
+    if (got.nActivationHeight != 0 && (int64_t)got.nActivationHeight != nForkHeight)
+        return strprintf("its BIP300/301 activation height is %u, not the pinned fork height %d", got.nActivationHeight, nForkHeight);
+    if (got.nActivationHeight == 0 && (nForkHeight == 967680 || nForkHeight == 963648))
+        return strprintf("it reports no BIP300/301 activation height; this network's is %d (--network-preset)", nForkHeight);
+
+    // The enforcer's presets (lib/types.rs Thresholds, 73d239a)
+    EnforcerSettings want;
+    const auto Want = [&](uint32_t nMaxAge, uint32_t nThreshold, uint32_t nUnusedMaxAge, uint32_t nUnusedThreshold) {
+        want.nBundleMaxAge = want.nUsedSlotMaxAge = nMaxAge;
+        want.nBundleThreshold = want.nUsedSlotThreshold = nThreshold;
+        want.nUnusedSlotMaxAge = nUnusedMaxAge;
+        want.nUnusedSlotThreshold = nUnusedThreshold;
+    };
+    if (nForkHeight == 967680)      // betanet: mainnet's, unused slots at 51%
+        Want(26300, 13150, 2016, 1008);
+    else if (nForkHeight == 963648) // alphanet: hours-scale
+        Want(144, 72, 36, 30);
+    else
+        return "";
+    if (got.nBundleMaxAge != want.nBundleMaxAge || got.nBundleThreshold != want.nBundleThreshold ||
+            got.nUsedSlotMaxAge != want.nUsedSlotMaxAge || got.nUsedSlotThreshold != want.nUsedSlotThreshold ||
+            got.nUnusedSlotMaxAge != want.nUnusedSlotMaxAge || got.nUnusedSlotThreshold != want.nUnusedSlotThreshold)
+        return strprintf("its BIP300 thresholds (bundle %u of %u, used slot %u of %u, unused slot %u of %u) are not "
+                         "this network's (bundle %u of %u, used slot %u of %u, unused slot %u of %u)",
+                         got.nBundleThreshold, got.nBundleMaxAge, got.nUsedSlotThreshold, got.nUsedSlotMaxAge,
+                         got.nUnusedSlotThreshold, got.nUnusedSlotMaxAge, want.nBundleThreshold, want.nBundleMaxAge,
+                         want.nUsedSlotThreshold, want.nUsedSlotMaxAge, want.nUnusedSlotThreshold, want.nUnusedSlotMaxAge);
+    return "";
+}
+
+bool IsLocalOrPrivateL1Address(const std::string& strHostPort)
+{
+    std::string strHost = strHostPort;
+    const size_t nColon = strHost.rfind(':');
+    if (nColon != std::string::npos && strHost.find(']') == std::string::npos && strHost.find(':') == nColon)
+        strHost = strHost.substr(0, nColon);          // v4:port
+    else if (!strHost.empty() && strHost[0] == '[' && strHost.find(']') != std::string::npos)
+        strHost = strHost.substr(1, strHost.find(']') - 1); // [v6]:port
+    if (strHost == "localhost")
+        return true;
+    CNetAddr addr;
+    if (!LookupHost(strHost.c_str(), addr, false /* fAllowLookup */))
+        return false;
+    return addr.IsLocal() || addr.IsRFC1918() || addr.IsRFC6598() || addr.IsRFC4193();
+}
+
 bool ParseMainchainBlockPin(const std::string& strPin, int& nHeight, uint256& hashBlock)
 {
     const size_t nColon = strPin.find(':');
@@ -1005,7 +1238,7 @@ EnforcerIdentity ClassifyEnforcerIdentity(bool fEnfTipOK, int nEnfTipHeight,
     // a mismatch refuses startup, so it must be a POSITIVE disagreement, never
     // the absence of an answer.
     if (!fEnfTipOK) {
-        strDetail = "enforcer GetChainTip unavailable (down, grpcurl missing, or unsynced)";
+        strDetail = "enforcer GetChainTip unavailable (down, unreachable at -enforceraddr, grpcurl missing, or unsynced)";
         return ENFORCER_IDENTITY_NOTREADY;
     }
     if (nEnfTipHeight < 1) {
@@ -1107,12 +1340,17 @@ EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale)
     return r;
 }
 
-L1TxFetch EnforcerL1Client::RestFetchRawTx(const uint256& txid, CMutableTransaction& tx)
+L1TxFetch EnforcerL1Client::RestGetTxFromBlock(const uint256& hashBlock, const uint256& txid, CMutableTransaction& tx, int& nTx)
 {
+    nTx = -1;
     std::string body;
-    if (!RestGet("/rest/tx/" + txid.ToString() + ".hex", body))
+    if (!RestGet("/rest/block/" + hashBlock.ToString() + ".hex", body))
         return L1TxFetch::FAILED;
-    return ClassifyRawTxBody(body, tx);
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
+        body.pop_back();
+    if (body.empty() || !IsHex(body))
+        return L1TxFetch::FAILED;
+    return FindL1TxInBlock(ParseHex(body), txid, tx, nTx);
 }
 
 bool EnforcerL1Client::RestGetBlockTxids(const uint256& hashBlock, std::vector<uint256>& vTxid)
@@ -1144,67 +1382,6 @@ bool EnforcerL1Client::RestGetBlockTxids(const uint256& hashBlock, std::vector<u
 // live), so we decode it back to the string. value_sats is deliberately NOT
 // kept: it is the deposit INCREMENT, whereas the chassis needs the cumulative
 // CTIP value (read from the raw tx's burn output) and computes the delta itself.
-struct EnfDep {
-    uint64_t seq;
-    uint256 txid;
-    uint32_t vout;
-    std::string strDest;
-    uint256 hashBlock;
-};
-
-static bool ParseEnforcerDeposits(const UniValue& response, std::vector<EnfDep>& vDeposits)
-{
-    vDeposits.clear();
-
-    if (!response.isObject())
-        return false;
-
-    const UniValue& blocks = find_value(response, "blocks");
-    if (!blocks.isArray())
-        return true; // no peg data is a valid empty result
-
-    for (size_t b = 0; b < blocks.size(); b++) {
-        std::string strBlockHash;
-        if (!GetHexField(find_value(find_value(blocks[b], "blockHeaderInfo"), "blockHash"), strBlockHash))
-            continue;
-        uint256 hashBlock = uint256S(strBlockHash);
-
-        const UniValue& events = find_value(find_value(blocks[b], "blockInfo"), "events");
-        if (!events.isArray())
-            continue;
-
-        for (size_t e = 0; e < events.size(); e++) {
-            const UniValue& dep = find_value(events[e], "deposit");
-            if (!dep.isObject())
-                continue;
-
-            EnfDep d;
-            d.hashBlock = hashBlock;
-
-            const UniValue& seq = find_value(dep, "sequenceNumber");
-            d.seq = seq.isNull() ? 0 : (uint64_t)atoi64(seq.getValStr());
-
-            const UniValue& outpoint = find_value(dep, "outpoint");
-            std::string strTxid;
-            if (!GetHexField(find_value(outpoint, "txid"), strTxid))
-                continue;
-            d.txid = uint256S(strTxid);
-
-            const UniValue& vout = find_value(outpoint, "vout");
-            d.vout = vout.isNum() ? (uint32_t)vout.get_int() : 0;
-
-            std::string strAddrHex;
-            if (!GetHexField(find_value(find_value(dep, "output"), "address"), strAddrHex))
-                continue;
-            std::vector<unsigned char> vch = ParseHex(strAddrHex);
-            d.strDest = std::string(vch.begin(), vch.end());
-
-            vDeposits.push_back(d);
-        }
-    }
-    return true;
-}
-
 std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex)
 {
     std::vector<SidechainDeposit> incoming;
@@ -1214,185 +1391,113 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         return incoming;
     }
 
-    // Enforcer deposit events (across the full range up to the tip). This is a
-    // full rescan each call (O(all deposits)) - a cursor optimisation is a known
-    // follow-up; the downstream HaveDepositNonAmount dedup is the correctness
-    // backstop.
+    // The treasury's changes over the whole L1 history (a full rescan each
+    // call; the caller dedups with HaveDepositNonAmount). A start block is a
+    // follow-up: the caller passes the last record's txid, not its L1 block.
     L1BlockHeader tip;
     if (!GetChainTip(tip))
         return incoming;
-
-    std::string strRequest = "{\"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) +
-        ", \"end_block_hash\": {\"hex\": \"" + tip.hashBlock.ToString() + "\"}}";
-
-    UniValue result(UniValue::VOBJ);
-    if (!CallValidator("GetTwoWayPegData", strRequest, result))
+    L1PegEvents events;
+    if (GetPegEvents(uint256(), tip.hashBlock, events) != L1Answer::YES) {
+        LogPrintf("Enforcer client: UpdateDeposits: no answer for the peg events up to %s; no new deposits this time\n",
+                  tip.hashBlock.ToString());
         return incoming;
+    }
 
-    std::vector<EnfDep> vDep;
-    if (!ParseEnforcerDeposits(result, vDep))
-        return incoming;
+    // v0.2.17 A9 + D7: every change to the treasury in running-number order,
+    // deposits and bundle payouts together (they share the counter). A payout's
+    // M6 is the tx the enforcer sends with its "paid" event; freebankd searched
+    // the L1 block for it (BuildM6Candidates). A6: a deposit with an empty
+    // address is kept (the parser used to drop it, leaving a gap in the
+    // treasury chain that stopped every later deposit); it is recorded and paid
+    // to no one.
+    struct Change {
+        uint64_t nSequence;
+        const L1DepositEvent* pDeposit;
+        const L1WithdrawalEvent* pPaid;
+    };
+    std::vector<Change> vChange;
+    for (const L1DepositEvent& ev : events.vDeposit)
+        vChange.push_back({ev.nSequence, &ev, nullptr});
+    for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
+        if (ev.status != 'S')
+            continue;
+        if (!ev.fHaveSequence || ev.vchTx.empty()) {
+            LogPrintf("ERROR Enforcer client: a \"paid\" event for m6id %s without its running number or M6 (batch failed closed)\n",
+                      ev.m6id.ToString());
+            return incoming;
+        }
+        vChange.push_back({ev.nSequence, nullptr, &ev});
+    }
+    std::sort(vChange.begin(), vChange.end(), [](const Change& a, const Change& b) { return a.nSequence < b.nSequence; });
 
-    // CTIP order = sequence-number ascending (each deposit spends the prior CTIP)
-    std::sort(vDep.begin(), vDep.end(), [](const EnfDep& a, const EnfDep& b) { return a.seq < b.seq; });
+    // Each change as a record (without its tx yet): the outpoint from the
+    // event, a payout's txid from the M6 the event carries
+    std::vector<SidechainDeposit> vRecord;
+    std::vector<uint256> vTxid;
+    for (const Change& c : vChange) {
+        SidechainDeposit deposit;
+        deposit.nSidechain = THIS_SIDECHAIN;
+        if (c.pDeposit) {
+            deposit.strDest = std::string(c.pDeposit->vchAddress.begin(), c.pDeposit->vchAddress.end());
+            deposit.nBurnIndex = c.pDeposit->outpoint.n;
+            deposit.hashMainchainBlock = c.pDeposit->hashMainBlock;
+            vTxid.push_back(c.pDeposit->outpoint.hash);
+        } else {
+            L1MutableTransaction mtxM6;
+            try {
+                CDataStream ss(c.pPaid->vchTx, SER_NETWORK, PROTOCOL_VERSION);
+                ss >> mtxM6;
+            } catch (const std::exception&) {
+                LogPrintf("ERROR Enforcer client: the M6 of m6id %s does not decode (batch failed closed)\n", c.pPaid->m6id.ToString());
+                return incoming;
+            }
+            deposit.strDest = SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST;
+            deposit.nBurnIndex = 0; // into_m6 puts the treasury change at vout[0]
+            deposit.hashMainchainBlock = c.pPaid->hashMainBlock;
+            vTxid.push_back(mtxM6.GetHash());
+        }
+        vRecord.push_back(deposit);
+    }
 
-    // Skip everything up to and including the caller's last-processed deposit
-    size_t startIdx = 0;
+    // Skip everything up to and including the caller's last record
+    size_t nStart = 0;
     if (!hashLastDeposit.IsNull()) {
-        for (size_t i = 0; i < vDep.size(); i++) {
-            if (vDep[i].txid == hashLastDeposit && vDep[i].vout == nLastBurnIndex) {
-                startIdx = i + 1;
+        for (size_t i = 0; i < vRecord.size(); i++) {
+            if (vTxid[i] == hashLastDeposit && vRecord[i].nBurnIndex == nLastBurnIndex) {
+                nStart = i + 1;
                 break;
             }
         }
     }
 
-    // Reconstruct each SidechainDeposit byte-identically to the jsonrpc path.
-    // All-or-nothing: a single REST failure fails the whole batch closed, so
-    // SortDeposits never sees a gap in the CTIP chain (which would credit 0).
-    for (size_t i = startIdx; i < vDep.size(); i++) {
-        const EnfDep& d = vDep[i];
-        SidechainDeposit deposit;
-        deposit.nSidechain = THIS_SIDECHAIN;
-        deposit.strDest = d.strDest;
-        deposit.nBurnIndex = d.vout;
-        deposit.hashMainchainBlock = d.hashBlock;
-
-        if (!RestGetRawTx(d.txid, deposit.dtx)) {
-            LogPrintf("ERROR Enforcer client: REST raw-tx fetch failed for deposit %s (batch failed closed)\n", d.txid.ToString());
-            return std::vector<SidechainDeposit>();
-        }
-
-        std::vector<uint256> vBlockTxid;
-        if (!RestGetBlockTxids(d.hashBlock, vBlockTxid)) {
-            LogPrintf("ERROR Enforcer client: REST block fetch failed for %s (batch failed closed)\n", d.hashBlock.ToString());
-            return std::vector<SidechainDeposit>();
-        }
+    // The new ones, each tx read from its own L1 block (which also shows it is
+    // there). All or nothing: one failure gives no new deposits this time, and
+    // the builder builds without them.
+    for (size_t i = nStart; i < vRecord.size(); i++) {
+        SidechainDeposit& deposit = vRecord[i];
         int nTx = -1;
-        for (size_t j = 0; j < vBlockTxid.size(); j++) {
-            if (vBlockTxid[j] == d.txid) { nTx = (int)j; break; }
-        }
-        if (nTx < 0) {
-            LogPrintf("ERROR Enforcer client: deposit %s not found in block %s (batch failed closed)\n", d.txid.ToString(), d.hashBlock.ToString());
+        if (RestGetTxFromBlock(deposit.hashMainchainBlock, vTxid[i], deposit.dtx, nTx) != L1TxFetch::OK) {
+            LogPrintf("ERROR Enforcer client: treasury change %s (number %u): could not read it from its L1 block %s (batch failed closed)\n",
+                      vTxid[i].ToString(), vChange[i].nSequence, deposit.hashMainchainBlock.ToString());
             return std::vector<SidechainDeposit>();
         }
         deposit.nTx = nTx;
-
+        // The record needs the tx's id and outputs, not its witness (the txid
+        // does not cover it): a depositor could pad the witness until the
+        // record no longer fits a block, stopping every later deposit.
+        for (CTxIn& in : deposit.dtx.vin)
+            in.scriptWitness.SetNull();
         if (deposit.nBurnIndex >= deposit.dtx.vout.size()) {
-            LogPrintf("%s: invalid deposit output index (batch failed closed)\n", __func__);
+            LogPrintf("ERROR Enforcer client: treasury change %s: output %u out of range (batch failed closed)\n",
+                      vTxid[i].ToString(), deposit.nBurnIndex);
             return std::vector<SidechainDeposit>();
         }
-        // Cumulative CTIP value at this deposit (the chassis subtracts the prior
-        // CTIP itself). NOT the enforcer event's value_sats increment.
+        // The treasury's value after this change; the builder subtracts the
+        // one before (a payout's "D" record is clamped to 0 there)
         deposit.amtUserPayout = deposit.dtx.vout[deposit.nBurnIndex].nValue;
-
         incoming.push_back(deposit);
     }
-
-    // M6 payout treasury returns. When a withdrawal bundle succeeds, the M6
-    // spends the CTIP and pays the remaining treasury to vout[0]
-    // (bip300301_enforcer lib/types.rs into_m6). The legacy mainchain wallet
-    // reports that change back as a "D" pseudo-deposit and the chassis CTIP
-    // chain REQUIRES it - the miner refuses to build blocks over a gap - so
-    // synthesize the equivalent entry from Succeeded withdrawal events. Like
-    // the deposits above this re-emits every event each call; the miner's
-    // HaveDepositNonAmount dedup is the backstop. Fail the batch closed on
-    // any error, except that other L1 txs in the M6's block which FreeBank
-    // cannot decode are skipped (BuildM6Candidates, v0.2.15).
-    std::vector<L1WithdrawalEvent> vEvent;
-    if (!ParseEnforcerWithdrawalEvents(result, vEvent)) {
-        LogPrintf("ERROR Enforcer client: failed to parse withdrawal events (batch failed closed)\n");
-        return std::vector<SidechainDeposit>();
-    }
-
-    // All deposit-event txids (not just new): used to exclude deposit txs
-    // when locating the M6 inside its block.
-    std::set<uint256> setDepositTxid;
-    for (const EnfDep& d : vDep)
-        setDepositTxid.insert(d.txid);
-
-    // An M6 pays the sidechain treasury script `OP_DRIVECHAIN 0x01 <slot> OP_TRUE`
-    // at vout[0], and OP_DRIVECHAIN is per-L1 (OP_NOP5 alphanet/regtest, OP_NOP8
-    // betanet). v0.2.12 matched OP_NOP5 only, so the first beta M6 halted
-    // deposit crediting for good (item 1). The M6 is now identified by the
-    // event's m6id, recomputed from the L1 tx exactly as the enforcer does
-    // (ComputeM6id), so no opcode has to be known: a treasury-shaped lookalike
-    // cannot match, and a second (e.g. foreign) M6 in the same block has its
-    // own m6id and its own event.
-    for (const L1WithdrawalEvent& ev : vEvent) {
-        if (ev.status != 'S')
-            continue;
-
-        if (ev.hashMainBlock.IsNull()) {
-            LogPrintf("ERROR Enforcer client: Succeeded withdrawal event without block hash (batch failed closed)\n");
-            return std::vector<SidechainDeposit>();
-        }
-
-        int nTxM6 = -1;
-        CMutableTransaction mtxM6;
-        bool fCached = false;
-        {
-            std::lock_guard<std::mutex> lock(mutexM6Cache);
-            const auto it = mapM6Cache.find(std::make_pair(ev.hashMainBlock, ev.m6id));
-            if (it != mapM6Cache.end()) {
-                nTxM6 = it->second.first;
-                mtxM6 = it->second.second;
-                fCached = true;
-            }
-        }
-
-        if (!fCached) {
-            std::vector<uint256> vBlockTxid;
-            if (!RestGetBlockTxids(ev.hashMainBlock, vBlockTxid)) {
-                LogPrintf("ERROR Enforcer client: REST block fetch failed for %s (batch failed closed)\n", ev.hashMainBlock.ToString());
-                return std::vector<SidechainDeposit>();
-            }
-
-            std::vector<M6Candidate> vCandidate;
-            int nSkipped = 0;
-            std::string strCandidateError;
-            auto fetch = [this](const uint256& txid, CMutableTransaction& mtx) { return RestFetchRawTx(txid, mtx); };
-            if (!BuildM6Candidates(vBlockTxid, setDepositTxid, THIS_SIDECHAIN, fetch, vCandidate, nSkipped, strCandidateError)) {
-                LogPrintf("ERROR Enforcer client: %s (batch failed closed)\n", strCandidateError);
-                return std::vector<SidechainDeposit>();
-            }
-            if (nSkipped)
-                LogPrintf("Enforcer client: skipped %d L1 tx(s) FreeBank cannot decode (e.g. v3/TRUC) while locating M6 %s in block %s\n",
-                          nSkipped, ev.m6id.ToString(), ev.hashMainBlock.ToString());
-
-            int nMatches = 0;
-            const int nIndex = LocateM6(vCandidate, ev.m6id, THIS_SIDECHAIN, nMatches);
-            if (nIndex < 0) {
-                LogPrintf("ERROR Enforcer client: expected exactly 1 M6 with m6id %s in block %s, found %d "
-                          "(%u treasury-shaped candidates: OP_NOPx 0x01 <slot> OP_TRUE at vout[0]; %d undecodable txs skipped) (batch failed closed)\n",
-                          ev.m6id.ToString(), ev.hashMainBlock.ToString(), nMatches, vCandidate.size(), nSkipped);
-                return std::vector<SidechainDeposit>();
-            }
-            nTxM6 = vCandidate[nIndex].nTx;
-            mtxM6 = vCandidate[nIndex].mtx;
-
-            std::lock_guard<std::mutex> lock(mutexM6Cache);
-            mapM6Cache[std::make_pair(ev.hashMainBlock, ev.m6id)] = std::make_pair(nTxM6, mtxM6);
-        }
-
-        SidechainDeposit deposit;
-        deposit.nSidechain = THIS_SIDECHAIN;
-        deposit.strDest = SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST;
-        deposit.dtx = mtxM6;
-        deposit.nBurnIndex = 0; // into_m6 puts the treasury change at vout[0]
-        deposit.nTx = nTxM6;
-        deposit.hashMainchainBlock = ev.hashMainBlock;
-        // Cumulative treasury remaining after the payout; the miner's delta
-        // arithmetic clamps a "D" entry to 0 user payout itself (miner.cpp).
-        deposit.amtUserPayout = mtxM6.vout[0].nValue;
-
-        incoming.push_back(deposit);
-    }
-
-    // Deposits are oldest-first (seq ascending); the jsonrpc path reverses
-    // because the RPC returns newest-first - we do not need to. Synthesized
-    // "D" entries ride at the end: SortDeposits reconstructs true CTIP spend
-    // order from the vin chain before the miner uses the batch.
     return incoming;
 }
 
@@ -1493,7 +1598,7 @@ uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& 
         ", \"critical_hash\": {\"hex\": \"" + ConsensusHexFromUint256(hashBMM) + "\"}" +
         ", \"prev_bytes\": {\"hex\": \"" + hashBlockMain.ToString() + "\"}}";
 
-    // Fails (non-zero grpcurl exit) on: stale prev_bytes (not the tip),
+    // Fails (non-zero status) on: stale prev_bytes (not the tip),
     // inactive sidechain, or a wallet / broadcast error (e.g. unfunded).
     // The enforcer has no AlreadyExists for a second bid on the same tip:
     // one bid per tip is freebankd's own rule (RefreshBMM's
@@ -1504,12 +1609,14 @@ uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& 
     // fNotSent is set only for a refusal (GrpcurlBMMRequestNotSent).
     // stderr is merged into the output, for that classification.
     std::string strOutput;
-    int nExit = RunGrpcurl("cusf.mainchain.v1.WalletService", "CreateBmmCriticalDataTransaction", strRequest, true, strOutput);
+    // Not retry-safe: a resent request could place a second bid
+    int nExit = RunEnforcerCall("cusf.mainchain.v1.WalletService", "CreateBmmCriticalDataTransaction", strRequest, true, strOutput,
+                                /*fRetrySafe=*/false);
     if (nExit != 0) {
         fNotSent = GrpcurlBMMRequestNotSent(nExit, strOutput);
         std::string strDetail = strOutput.substr(0, 300);
         std::replace(strDetail.begin(), strDetail.end(), '\n', ' ');
-        LogPrintf("ERROR Enforcer client: BMM request failed (grpcurl exit %d: %s); %s\n", nExit, strDetail,
+        LogPrintf("ERROR Enforcer client: BMM request failed (%s %d: %s); %s\n", EnforcerStatusLabel(), nExit, strDetail,
             fNotSent ? "no bid was sent" : "the bid may have gone out");
         return uint256();
     }
@@ -1668,6 +1775,69 @@ bool EnforcerL1Client::GetAncestorHashes(const uint256& hashBlock, int nHeight, 
     return !vHash.empty();
 }
 
+L1Answer EnforcerL1Client::GetPegEvents(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events)
+{
+    events = L1PegEvents();
+    const std::string strRequest = "{\"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) +
+        ", \"start_block_hash\": {\"hex\": \"" + hashStart.ToString() + "\"}" +
+        ", \"end_block_hash\": {\"hex\": \"" + hashEnd.ToString() + "\"}}";
+
+    std::string strOutput;
+    const int nTimeout = hashStart.IsNull() ? 60 : enforcerconnect::DEFAULT_CALL_TIMEOUT; // null: the whole history
+    if (RunEnforcerCall("cusf.mainchain.v1.ValidatorService", "GetTwoWayPegData", strRequest, true, strOutput,
+                        true /* fRetrySafe */, nTimeout) != 0) {
+        const L1Answer answer = ClassifyPegEventsError(strOutput);
+        LogPrint(BCLog::NET, "Enforcer client: GetTwoWayPegData (%s, %s] %s: %s\n", hashStart.ToString(), hashEnd.ToString(),
+                 answer == L1Answer::NO ? "no" : "can't tell", strOutput);
+        return answer;
+    }
+
+    UniValue result(UniValue::VOBJ);
+    if (!result.read(strOutput) || !ParsePegEvents(result, events)) {
+        events = L1PegEvents();
+        LogPrintf("Enforcer client: GetTwoWayPegData (%s, %s]: a reply we cannot fully read (can't tell)\n",
+                  hashStart.ToString(), hashEnd.ToString());
+        return L1Answer::UNKNOWN;
+    }
+    return L1Answer::YES;
+}
+
+EnforcerSettingsCheck CheckEnforcerSettings(std::string& strError)
+{
+    int nForkHeight = 0;
+    uint256 hashPin;
+    if (!ParseMainchainBlockPin(gArgs.GetArg("-mainchainblockpin", ""), nForkHeight, hashPin))
+        return EnforcerSettingsCheck::OK;
+    EnforcerL1Client client;
+    UniValue result(UniValue::VOBJ);
+    EnforcerSettings settings;
+    if (!client.CallValidator("GetChainInfo", "{}", result) || !ParseEnforcerChainInfo(result, settings)) {
+        strError = "the enforcer did not answer GetChainInfo";
+        return EnforcerSettingsCheck::NOTREADY;
+    }
+    strError = CompareEnforcerSettings(nForkHeight, settings);
+    return strError.empty() ? EnforcerSettingsCheck::OK : EnforcerSettingsCheck::MISMATCH;
+}
+
+bool EnforcerL1Client::IsBehindItsNode(std::string& strWhy)
+{
+    if (gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST).empty())
+        return false;
+    L1BlockHeader tip;
+    if (!GetChainTip(tip))
+        return false;
+    std::string strBody;
+    UniValue info;
+    if (!RestGet("/rest/chaininfo.json", strBody) || !info.read(strBody) || !info.isObject())
+        return false;
+    const UniValue& blocks = find_value(info, "blocks");
+    if (!blocks.isNum() || blocks.get_int() <= (int)tip.nHeight)
+        return false;
+    strWhy = strprintf("the enforcer's eCash tip (%d) is behind its eCash node's (%d); no bid until it catches up",
+                       tip.nHeight, blocks.get_int());
+    return true;
+}
+
 bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents)
 {
     L1BlockHeader tip;
@@ -1690,6 +1860,26 @@ bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEv
 // The enforcer's compute_m6id is compute_txid() of the zero-input BlindedM6
 // (bip300301_enforcer lib/types.rs), and a txid is the hash of the
 // no-witness serialization on both sides, so stripping vin is the whole map.
+char BundleOutcome(const std::vector<L1WithdrawalEvent>& vEvents, const uint256& m6id)
+{
+    char cLast = 0;
+    for (const L1WithdrawalEvent& ev : vEvents) {
+        if (ev.m6id != m6id)
+            continue;
+        if (ev.status == 'S')
+            return 'S';
+        cLast = ev.status;
+    }
+    return cLast;
+}
+
+uint256 BundleM6id(const CTransaction& txBundle)
+{
+    CMutableTransaction mtx(txBundle);
+    mtx.vin.clear();
+    return L1MutableTransaction(mtx).GetHash(); // the L1 layout (A5), as the enforcer hashes it
+}
+
 static bool BlindedM6IdForBundle(const uint256& hashBundle, uint256& m6id)
 {
     if (!psidechaintree)
@@ -1699,9 +1889,7 @@ static bool BlindedM6IdForBundle(const uint256& hashBundle, uint256& m6id)
     if (!psidechaintree->GetWithdrawalBundle(hashBundle, bundle))
         return false;
 
-    CMutableTransaction mtx(bundle.tx);
-    mtx.vin.clear();
-    m6id = CTransaction(mtx).GetHash();
+    m6id = BundleM6id(bundle.tx);
     return true;
 }
 
@@ -1752,12 +1940,159 @@ bool IsValidL1Transport(const std::string& strTransport)
     return strTransport == "jsonrpc" || strTransport == "enforcer";
 }
 
-std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod, bool fStderr)
+bool IsValidEnforcerTransport(const std::string& strTransport)
+{
+    return strTransport == "connect" || strTransport == "grpcurl";
+}
+
+EnforcerTransport GetEnforcerTransport()
+{
+    // Read per call (a string compare next to a network round trip), so the
+    // unit tests can switch transports with ForceSetArg
+    return gArgs.GetArg("-enforcertransport", DEFAULT_ENFORCER_TRANSPORT) == "grpcurl" ?
+        EnforcerTransport::GRPCURL : EnforcerTransport::CONNECT;
+}
+
+std::string EnforcerStatusLabel()
+{
+    return GetEnforcerTransport() == EnforcerTransport::GRPCURL ? "grpcurl exit" : "connect status";
+}
+
+std::string BuildGrpcurlCommand(const std::string& strBin, const std::string& strRequest, const std::string& strAddr, const std::string& strService, const std::string& strMethod, bool fStderr, int nMaxTime)
 {
     if (strBin.find('"') != std::string::npos)
         return "";
-    return "\"" + strBin + "\" -plaintext -max-time 15 -d '" + strRequest + "' " +
+    return "\"" + strBin + "\" -plaintext -max-time " + std::to_string(nMaxTime) + " -d '" + strRequest + "' " +
         strAddr + " " + strService + "/" + strMethod + (fStderr ? " 2>&1" : " 2>/dev/null");
+}
+
+static const char* const GRPCURL_EXTRA_DIRS[] = {"/opt/homebrew/bin", "/usr/local/bin"};
+
+/** PATH's entries in order. An empty entry means the current directory to the shell; it is
+ *  dropped here, as a daemon's working directory means nothing. */
+static std::vector<std::string> SplitPathEnv(const std::string& strPathEnv)
+{
+    std::vector<std::string> vDir;
+    size_t nStart = 0;
+    while (nStart <= strPathEnv.size()) {
+        size_t nEnd = strPathEnv.find(':', nStart);
+        if (nEnd == std::string::npos)
+            nEnd = strPathEnv.size();
+        if (nEnd > nStart)
+            vDir.push_back(strPathEnv.substr(nStart, nEnd - nStart));
+        nStart = nEnd + 1;
+    }
+    return vDir;
+}
+
+static std::string JoinPath(const std::string& strDir, const std::string& strName)
+{
+    return strDir + (strDir.back() == '/' ? "" : "/") + strName;
+}
+
+GrpcurlLocation FindGrpcurl(const std::string& strPathEnv, const std::string& strExeDir,
+                            const std::function<bool(const std::string&)>& fnIsExecutable)
+{
+    GrpcurlLocation loc;
+    loc.strPath = "grpcurl";
+
+    auto tryDir = [&](const std::string& strDir, const std::string& strSource) {
+        if (loc.fFound || strDir.empty())
+            return;
+        const std::string strCandidate = JoinPath(strDir, "grpcurl");
+        if (fnIsExecutable(strCandidate)) {
+            loc.strPath = strCandidate;
+            loc.strSource = strSource;
+            loc.fFound = true;
+        }
+    };
+
+    for (const std::string& strDir : SplitPathEnv(strPathEnv))
+        tryDir(strDir, "PATH");
+    // Next to freebankd (a bundle can ship it there), then where Homebrew puts
+    // it: a macOS GUI launch has PATH=/usr/bin:/bin:/usr/sbin:/sbin only.
+    tryDir(strExeDir, "next to freebankd");
+    for (const char* pszDir : GRPCURL_EXTRA_DIRS)
+        tryDir(pszDir, pszDir);
+
+    return loc;
+}
+
+static bool IsExecutableFile(const std::string& strPath)
+{
+    struct stat st;
+    return stat(strPath.c_str(), &st) == 0 && S_ISREG(st.st_mode) && access(strPath.c_str(), X_OK) == 0;
+}
+
+/** The directory holding the running executable, or "" if unknown. */
+static std::string ExecutableDir()
+{
+    std::string strExe;
+#ifdef __APPLE__
+    char buf[PATH_MAX];
+    uint32_t nSize = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &nSize) == 0) {
+        char bufReal[PATH_MAX];
+        strExe = realpath(buf, bufReal) ? bufReal : buf;
+    }
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0)
+        strExe = std::string(buf, n);
+#endif
+    size_t nSlash = strExe.rfind('/');
+    return nSlash == std::string::npos ? "" : strExe.substr(0, nSlash);
+}
+
+// How long a failed lookup is kept before the next call looks again, so a
+// grpcurl installed after startup is picked up without a restart.
+static const int64_t GRPCURL_MISS_RETRY_SECONDS = 30;
+
+GrpcurlLocation GetGrpcurlLocation()
+{
+    static std::mutex mutexCache;
+    static GrpcurlLocation cache;
+    static int64_t nCacheTime = 0;
+    static std::string strLogged;
+
+    std::lock_guard<std::mutex> lock(mutexCache);
+
+    GrpcurlLocation loc;
+    if (gArgs.IsArgSet("-grpcurlbin")) {
+        // The operator's choice is used as given; only "found" is judged here.
+        loc.strPath = gArgs.GetArg("-grpcurlbin", "grpcurl");
+        loc.strSource = "-grpcurlbin";
+        if (loc.strPath.find('/') != std::string::npos) {
+            loc.fFound = IsExecutableFile(loc.strPath);
+        } else {
+            // A bare name: the shell looks it up in PATH
+            const char* pszPath = getenv("PATH");
+            for (const std::string& strDir : SplitPathEnv(pszPath ? pszPath : ""))
+                loc.fFound = loc.fFound || IsExecutableFile(JoinPath(strDir, loc.strPath));
+        }
+    } else {
+        const int64_t nNow = GetTime();
+        if (nCacheTime != 0 && (cache.fFound || nNow - nCacheTime < GRPCURL_MISS_RETRY_SECONDS))
+            return cache;
+        const char* pszPath = getenv("PATH");
+        loc = FindGrpcurl(pszPath ? pszPath : "", ExecutableDir(), IsExecutableFile);
+        cache = loc;
+        nCacheTime = nNow;
+    }
+
+    const std::string strKey = loc.strPath + "|" + loc.strSource + "|" + (loc.fFound ? "1" : "0");
+    if (strKey != strLogged) {
+        strLogged = strKey;
+        if (loc.fFound)
+            LogPrintf("Enforcer client: using grpcurl %s (%s)\n", loc.strPath, loc.strSource);
+        else
+            LogPrintf("ERROR Enforcer client: grpcurl not found (%s); the enforcer transport cannot work. "
+                      "Install grpcurl or set -grpcurlbin=<path>\n",
+                      loc.strSource == "-grpcurlbin" ? "-grpcurlbin=" + loc.strPath
+                                                     : std::string("looked in PATH, next to freebankd, /opt/homebrew/bin, /usr/local/bin"));
+    }
+    return loc;
 }
 
 GrpcurlFailure ClassifyGrpcurlFailure(int nExit, const std::string& strError)
@@ -1816,14 +2151,65 @@ L1Client& GetEnforcerL1Client()
     return clientEnforcer;
 }
 
+static std::atomic<L1Client*> g_pL1ClientForTest{nullptr};
+
+void SetL1ClientForTest(L1Client* pClient)
+{
+    g_pL1ClientForTest.store(pClient);
+}
+
 L1Client& GetL1Client()
 {
     static JsonRpcL1Client clientJsonRpc;
+
+    if (L1Client* pClient = g_pL1ClientForTest.load())
+        return *pClient;
 
     if (GetL1Transport() == L1Transport::ENFORCER)
         return GetEnforcerL1Client();
 
     return clientJsonRpc;
+}
+
+namespace {
+/** The production oracle: asks the selected transport (the JSON-RPC mainchain
+ *  cannot answer the range question: UNKNOWN). */
+class TransportL1Oracle : public L1Oracle
+{
+public:
+    L1Answer EventsInWindow(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events) override
+    {
+        return GetL1Client().GetPegEvents(hashStart, hashEnd, events);
+    }
+    L1Answer BmmCommitment(const uint256& hashMainBlock, const uint256& hashBMM) override
+    {
+        uint256 hashCommitment;
+        switch (GetL1Client().ReadBmmCommitment(hashMainBlock, hashCommitment)) {
+        case L1Client::Commitment::COMMITTED: return hashCommitment == hashBMM ? L1Answer::YES : L1Answer::NO;
+        case L1Client::Commitment::NONE: return L1Answer::NO;
+        case L1Client::Commitment::NOT_FOUND: return L1Answer::UNKNOWN;
+        case L1Client::Commitment::UNKNOWN: break;
+        }
+        // The JSON-RPC mainchain has no reader: its verifybmm, true = yes
+        uint256 txid;
+        uint32_t nTime = 0;
+        return GetL1Client().VerifyBMM(hashMainBlock, hashBMM, txid, nTime) ? L1Answer::YES : L1Answer::UNKNOWN;
+    }
+};
+
+std::atomic<L1Oracle*> g_pL1OracleForTest{nullptr};
+} // namespace
+
+L1Oracle& GetL1Oracle()
+{
+    static TransportL1Oracle oracleTransport;
+    L1Oracle* pOracle = g_pL1OracleForTest.load();
+    return pOracle ? *pOracle : oracleTransport;
+}
+
+void SetL1OracleForTest(L1Oracle* pOracle)
+{
+    g_pL1OracleForTest.store(pOracle);
 }
 
 //

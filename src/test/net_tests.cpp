@@ -9,6 +9,7 @@
 #include <serialize.h>
 #include <streams.h>
 #include <net.h>
+#include <net_processing.h>
 #include <netbase.h>
 #include <chainparams.h>
 #include <util.h>
@@ -216,6 +217,44 @@ BOOST_AUTO_TEST_CASE(mainnet_fixed_seed_is_the_live_seed)
 BOOST_AUTO_TEST_CASE(regtest_has_no_fixed_seeds)
 {
     BOOST_CHECK(CreateChainParams("regtest")->FixedSeeds().empty());
+}
+
+// v0.2.17: get_block_template never answers while the node is behind.
+BOOST_AUTO_TEST_CASE(bmm_behind_judgement)
+{
+    PeerTipEvidence none;
+    none.nPeers = 2;
+
+    // At the tip: nothing ahead.
+    BOOST_CHECK(JudgeBMMBehind(false, none, false) == BMMBehind::NO);
+
+    // A peer announced a better block: refused however long it takes to connect.
+    PeerTipEvidence known = none;
+    known.nBestKnownHeight = 318;
+    BOOST_CHECK(JudgeBMMBehind(false, known, false) == BMMBehind::PEER);
+
+    // A new peer's starting height alone refuses; an old one's (never backed by
+    // headers) does not, so a peer lying about its height cannot stop bidding.
+    PeerTipEvidence start = none;
+    start.nStartingHeight = 318;
+    start.nRecentStartingHeight = 318;
+    BOOST_CHECK(JudgeBMMBehind(false, start, false) == BMMBehind::PEER);
+    start.nRecentStartingHeight = -1;
+    BOOST_CHECK(JudgeBMMBehind(false, start, false) == BMMBehind::NO);
+
+    // A better header no peer vouches for: refused only while its box is open.
+    BOOST_CHECK(JudgeBMMBehind(false, none, true) == BMMBehind::HEADER);
+
+    // IBD: refused with anything ahead, any starting height, or no peers at all.
+    BOOST_CHECK(JudgeBMMBehind(true, known, false) == BMMBehind::IBD);
+    BOOST_CHECK(JudgeBMMBehind(true, start, false) == BMMBehind::IBD);
+    BOOST_CHECK(JudgeBMMBehind(true, none, true) == BMMBehind::IBD);
+    PeerTipEvidence alone;
+    BOOST_CHECK(JudgeBMMBehind(true, alone, false) == BMMBehind::IBD);
+
+    // IBD only because the whole network stalled for longer than -maxtipage:
+    // peers, none ahead. Refusing would stop every restarted engine node.
+    BOOST_CHECK(JudgeBMMBehind(true, none, false) == BMMBehind::NO);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

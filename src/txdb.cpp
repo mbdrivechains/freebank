@@ -410,45 +410,125 @@ bool CSidechainTreeDB::WriteSidechainIndex(const std::vector<std::pair<uint256, 
     return WriteBatch(batch, true);
 }
 
-bool CSidechainTreeDB::WriteDepositDisconnect(const std::vector<uint256>& vEraseID, const uint256& hashPrevLastDeposit)
+bool CSidechainTreeDB::WriteBlockEffects(const std::vector<SidechainWithdrawal>& vWithdrawalUpdate,
+                                         const std::vector<SidechainWithdrawalBundle>& vBundleMark,
+                                         const std::vector<std::pair<uint256, const SidechainObj *> >& vObject,
+                                         const uint256& hashBlock)
 {
     CDBBatch batch(*this);
 
-    for (const uint256& id : vEraseID) {
-        // NEVER erase the row the restored baseline points at. Rows are keyed
-        // by GetID() (the non-amount hash) and nothing stops the same deposit
-        // object appearing in a disconnected block AND being pprev's baseline,
-        // so an unfiltered erase can leave DB_LAST_SIDECHAIN_DEPOSIT dangling.
-        // That fails OPEN: GetLastDeposit finds no row, ConnectBlock takes its
-        // "no deposits yet" branch (no CTIP-input check, amountPrev = 0) and
-        // authorises a payout of the entire cumulative CTIP.
-        if (id == hashPrevLastDeposit)
-            continue;
-        batch.Erase(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, id));
+    for (const SidechainWithdrawal& wt : vWithdrawalUpdate)
+        batch.Write(std::make_pair(wt.sidechainop, wt.GetID()), wt);
+
+    // As WriteWithdrawalBundleUpdate, into this batch
+    for (const SidechainWithdrawalBundle& bundle : vBundleMark) {
+        batch.Write(std::make_pair(bundle.sidechainop, bundle.GetID()), bundle);
+        batch.Write(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP, bundle.tx.GetHash()), bundle);
+        for (const uint256& id : bundle.vWithdrawalID) {
+            SidechainWithdrawal withdrawal;
+            if (!GetWithdrawal(id, withdrawal)) {
+                LogPrintf("%s: Failed to read withdrawal of WithdrawalBundle from LDB!\n", __func__);
+                return false;
+            }
+            if (bundle.status == WITHDRAWAL_BUNDLE_FAILED)
+                withdrawal.status = WITHDRAWAL_UNSPENT;
+            else if (bundle.status == WITHDRAWAL_BUNDLE_SPENT)
+                withdrawal.status = WITHDRAWAL_SPENT;
+            else if (bundle.status == WITHDRAWAL_BUNDLE_CREATED)
+                withdrawal.status = WITHDRAWAL_IN_BUNDLE;
+            batch.Write(std::make_pair(withdrawal.sidechainop, withdrawal.GetID()), withdrawal);
+        }
     }
 
-    if (hashPrevLastDeposit.IsNull())
-        batch.Erase(DB_LAST_SIDECHAIN_DEPOSIT);
-    else
-        batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, hashPrevLastDeposit);
+    // As WriteSidechainIndex, into this batch
+    for (const auto& item : vObject) {
+        const uint256& objid = item.first;
+        const SidechainObj* obj = item.second;
+        const std::pair<char, uint256> key = std::make_pair(obj->sidechainop, objid);
+        if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
+            batch.Write(key, *(const SidechainWithdrawal*)obj);
+        } else if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
+            const SidechainWithdrawalBundle* ptr = (const SidechainWithdrawalBundle*)obj;
+            batch.Write(key, *ptr);
+            batch.Write(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP, ptr->tx.GetHash()), *ptr);
+            batch.Write(DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE, ptr->tx.GetHash());
+            LogPrintf("%s: Writing new WithdrawalBundle and updating DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE to: %s\n",
+                      __func__, ptr->tx.GetHash().ToString());
+        } else if (obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
+            const SidechainDeposit* ptr = (const SidechainDeposit*)obj;
+            batch.Write(key, *ptr);
+            batch.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, ptr->GetID()), *ptr);
+            batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, ptr->GetID());
+        }
+    }
 
+    batch.Write(DB_SIDE_BEST_BLOCK, hashBlock);
     return WriteBatch(batch, true);
 }
 
-bool CSidechainTreeDB::WriteWithdrawalDisconnect(const std::vector<uint256>& vEraseID)
+bool CSidechainTreeDB::WriteBlockUndo(const BlockUndo& undo)
 {
-    // C6-A high rider: erase the withdrawal rows a disconnected block created.
-    // Rows are keyed (DB_SIDECHAIN_WITHDRAWAL_OP, GetID()) - the same key
-    // WriteSidechainIndex/WriteWithdrawalUpdate/GetWithdrawal use. Unlike the
-    // deposit disconnect there is no DB_LAST baseline pointer to revert, so this
-    // is a straight erase; leveldb makes an erase of an absent key a no-op, so a
-    // repeated disconnect is idempotent.
     CDBBatch batch(*this);
 
-    for (const uint256& id : vEraseID)
+    // Marks back to CREATED, as WriteWithdrawalBundleUpdate
+    for (const SidechainWithdrawalBundle& bundle : undo.vMarkUndo) {
+        batch.Write(std::make_pair(bundle.sidechainop, bundle.GetID()), bundle);
+        batch.Write(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP, bundle.tx.GetHash()), bundle);
+        for (const uint256& id : bundle.vWithdrawalID) {
+            SidechainWithdrawal withdrawal;
+            if (!GetWithdrawal(id, withdrawal)) {
+                LogPrintf("%s: Failed to read withdrawal of WithdrawalBundle from LDB!\n", __func__);
+                return false;
+            }
+            withdrawal.status = WITHDRAWAL_IN_BUNDLE;
+            batch.Write(std::make_pair(withdrawal.sidechainop, withdrawal.GetID()), withdrawal);
+        }
+    }
+
+    // Refunds back to UNSPENT
+    for (const SidechainWithdrawal& wt : undo.vRefundUndo)
+        batch.Write(std::make_pair(wt.sidechainop, wt.GetID()), wt);
+
+    // B6: a created bundle, as WriteWithdrawalBundleDisconnect
+    if (undo.fBundleUndo) {
+        for (const SidechainWithdrawal& wt : undo.vBundleWithdrawal)
+            batch.Write(std::make_pair(wt.sidechainop, wt.GetID()), wt);
+        batch.Erase(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP, undo.bundle.GetID()));
+        batch.Erase(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP, undo.bundle.tx.GetHash()));
+        if (undo.hashPrevLastBundle.IsNull())
+            batch.Erase(DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE);
+        else
+            batch.Write(DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE, undo.hashPrevLastBundle);
+    }
+
+    // D-3: the block's deposits, as WriteDepositDisconnect (never the row the
+    // restored baseline points at)
+    if (undo.fDepositUndo) {
+        for (const uint256& id : undo.vDepositErase)
+            if (id != undo.hashPrevLastDeposit)
+                batch.Erase(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, id));
+        if (undo.hashPrevLastDeposit.IsNull())
+            batch.Erase(DB_LAST_SIDECHAIN_DEPOSIT);
+        else
+            batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, undo.hashPrevLastDeposit);
+    }
+
+    // C6-A: the block's new withdrawals
+    for (const uint256& id : undo.vWithdrawalErase)
         batch.Erase(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_OP, id));
 
+    batch.Write(DB_SIDE_BEST_BLOCK, undo.hashBest);
     return WriteBatch(batch, true);
+}
+
+bool CSidechainTreeDB::GetBestBlock(uint256& hashBlock)
+{
+    return Read(DB_SIDE_BEST_BLOCK, hashBlock);
+}
+
+bool CSidechainTreeDB::WriteBestBlock(const uint256& hashBlock)
+{
+    return Write(DB_SIDE_BEST_BLOCK, hashBlock, true);
 }
 
 bool CSidechainTreeDB::WriteWithdrawalUpdate(const std::vector<SidechainWithdrawal>& vWithdrawal)

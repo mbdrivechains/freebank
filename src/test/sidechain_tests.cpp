@@ -8,6 +8,8 @@
 #include "chainparams.h"
 #include "consensus/merkle.h"
 #include "consensus/validation.h"
+#include "crypto/sha256.h"
+#include "key.h"
 #include "core_io.h"
 #include "mainchainaddress.h"
 #include "arith_uint256.h"
@@ -29,11 +31,13 @@
 #include "validationinterface.h"
 
 #include "test/test_bitcoin.h"
+#include "test/sidechain_test_util.h"
 
 #include <boost/test/unit_test.hpp>
 
-extern bool g_fMainchainMainFamily; // base58.cpp (A9)
 void EvictUnpayableWithdrawals();    // validation.cpp (withdrawal poison-row guard sweep)
+
+using namespace sidechain_test;
 
 static CFeeRate blockMinFeeRate = CFeeRate(DEFAULT_BLOCK_MIN_TX_FEE);
 
@@ -764,6 +768,100 @@ BOOST_AUTO_TEST_CASE(deposit_payout_owed_nothing)
     BOOST_CHECK(!GetDepositPayoutOutput(junk, out));
 }
 
+// v0.2.17: a deposit made out to the full deposit address s130_<address>_<checksum>
+// (what getdepositaddress returns, and what the enforcer writes into the
+// OP_RETURN unchanged when it is given that string) is paid to <address>. Up to
+// v0.2.16 it was recorded and paid to no one: beta's first deposit (10 ECX,
+// 2026-09-27) was lost that way. Only the exact form GenerateDepositAddress
+// makes is accepted; anything else stays unpaid.
+BOOST_AUTO_TEST_CASE(deposit_payout_full_deposit_address)
+{
+    CKey key;
+    key.MakeNewKey(true);
+    const std::string strAddr = EncodeDestination(CTxDestination(key.GetPubKey().GetID()));
+    const std::string strFull = GenerateDepositAddress(strAddr);
+    const std::string strCheck = strFull.substr(strFull.size() - 6);
+
+    auto payout = [](const std::string& strDest, CTxOut& out) {
+        SidechainDeposit d;
+        d.strDest = strDest;
+        d.amtUserPayout = CAmount(500000);
+        return GetDepositPayoutOutput(d, out);
+    };
+    auto chk = [](const std::string& s) {
+        std::vector<unsigned char> vch(CSHA256::OUTPUT_SIZE);
+        CSHA256().Write((const unsigned char*)s.data(), s.size()).Finalize(vch.data());
+        return HexStr(vch.begin(), vch.end()).substr(0, 6);
+    };
+
+    // The bare address, as before.
+    CTxOut outBare;
+    BOOST_REQUIRE(payout(strAddr, outBare));
+
+    // The full form pays exactly the same output.
+    CTxOut outFull;
+    BOOST_CHECK(payout(strFull, outFull));
+    BOOST_CHECK(outFull == outBare);
+
+    // Beta's lost deposit (block 211): paid to the seed's address itself.
+    CTxOut outBeta;
+    BOOST_CHECK(payout("s130_XCA6v5sypMCL8MVK1Ludm67zSqAhW6fnGn_e8cc6c", outBeta));
+    BOOST_CHECK(outBeta.scriptPubKey == GetScriptForDestination(DecodeDestination("XCA6v5sypMCL8MVK1Ludm67zSqAhW6fnGn")));
+    BOOST_CHECK_EQUAL(outBeta.nValue, CAmount(500000) - SIDECHAIN_DEPOSIT_FEE);
+
+    // Other address types in the full form are paid to themselves too.
+    const std::vector<CTxDestination> vOther = {
+        CTxDestination(CScriptID(GetScriptForDestination(CTxDestination(key.GetPubKey().GetID())))),
+        CTxDestination(WitnessV0KeyHash(key.GetPubKey().GetID())),
+    };
+    for (const CTxDestination& d : vOther) {
+        const std::string s = EncodeDestination(d);
+        CTxOut o;
+        BOOST_CHECK_MESSAGE(payout(GenerateDepositAddress(s), o), "not paid: " + s);
+        BOOST_CHECK(o.scriptPubKey == GetScriptForDestination(d));
+    }
+    // A bech32 address in capitals decodes, but is not its one spelling.
+    std::string strBech32Upper = EncodeDestination(vOther[1]);
+    for (char& c : strBech32Upper) c = toupper(c);
+    const std::string strNul(1, '\0');
+    const std::string strLong(100000, 'X');
+
+    // Anything that is not exactly that form stays unpaid, even with a checksum
+    // that is right for the string given.
+    std::string strBadCheck = strCheck;
+    strBadCheck[5] = strBadCheck[5] == '0' ? '1' : '0';
+    std::string strUpper = strCheck;
+    for (char& c : strUpper) c = toupper(c);
+    std::vector<std::string> vBad = {
+        "s130_" + strAddr + "_" + strBadCheck,                      // wrong checksum
+        "s130_" + strAddr + "_" + strCheck.substr(0, 5),            // short checksum
+        "s130_" + strAddr + "_" + strCheck + "0",                   // long checksum
+        "s129_" + strAddr + "_" + chk("s129_" + strAddr + "_"),     // another slot
+        "s0130_" + strAddr + "_" + chk("s0130_" + strAddr + "_"),   // leading zero
+        "s+130_" + strAddr + "_" + chk("s+130_" + strAddr + "_"),   // sign
+        "S130_" + strAddr + "_" + chk("S130_" + strAddr + "_"),     // capital S
+        "s130__" + chk("s130__"),                                   // no address
+        "s130_" + strAddr + "_x_" + chk("s130_" + strAddr + "_x_"), // extra field
+        "s130_" + strAddr + "_" + strCheck + " ",                   // trailing space
+        " " + strFull,                                              // leading space
+        "s130_ " + strAddr + "_" + chk("s130_ " + strAddr + "_"),   // space inside
+        "s130_D_" + chk("s130_D_"),                                 // the return marker, wrapped
+        "s130_" + strFull + "_" + chk("s130_" + strFull + "_"),     // wrapped twice
+        "s130_notanaddress_" + chk("s130_notanaddress_"),           // valid form, undecodable address
+        "s130_" + strBech32Upper + "_" + chk("s130_" + strBech32Upper + "_"),       // not its one spelling
+        "s130_" + strAddr + strNul + "_" + chk("s130_" + strAddr + strNul + "_"),   // NUL after the address
+        "s130_" + strAddr + "_" + strCheck.substr(0, 5) + strNul,                  // NUL in the checksum
+        strFull + strNul,                                                          // NUL after it all
+        "s130_" + strLong + "_" + chk("s130_" + strLong + "_"),                    // very long
+    };
+    if (strUpper != strCheck)
+        vBad.push_back("s130_" + strAddr + "_" + strUpper);         // capital hex
+    for (const std::string& s : vBad) {
+        CTxOut out;
+        BOOST_CHECK_MESSAGE(!payout(s, out), "paid: '" + s + "'");
+    }
+}
+
 // C6-A: the withdrawal burn must be CONSUMED - one OP_RETURN cannot back two
 // withdrawal rows. Before the fix one 100-burn satisfied every 100-amount
 // withdrawal object in a tx, each then paid (N* escrow draw on the bundle path,
@@ -851,30 +949,11 @@ SidechainWithdrawal MakeWithdrawalRow(const std::string& strDest, CAmount nPayou
     return wt;
 }
 
-/** The L1 family matching this fixture's (regtest) params: -regtest on, so
- *  mainchain P2PKH uses prefix 111, and carriers use the regtest HRP fbkrt. */
-struct RegtestFamilyScope {
-    std::string strRegtest;
-    bool fMain;
-    RegtestFamilyScope() : strRegtest(gArgs.GetArg("-regtest", "0")), fMain(g_fMainchainMainFamily)
-    {
-        gArgs.ForceSetArg("-regtest", "1");
-        g_fMainchainMainFamily = false;
-    }
-    ~RegtestFamilyScope()
-    {
-        gArgs.ForceSetArg("-regtest", strRegtest);
-        g_fMainchainMainFamily = fMain;
-    }
-};
-
 CScript ScriptFromHex(const std::string& h)
 {
     const std::vector<unsigned char> v = ParseHex(h);
     return CScript(v.begin(), v.end());
 }
-
-const std::string L1_P2PKH_REGTEST = "mfcHP2WMCVLsVZA8yrovmhMgxNFW9r98xw"; // 76a914<01..14>88ac
 
 /** Moves the consensus nWithdrawalGuardHeight for one test (the test params
  *  override - it is never a CLI knob) and restores it however the test exits,
@@ -1084,37 +1163,6 @@ BOOST_AUTO_TEST_CASE(withdrawal_guard_payable_rule)
 }
 
 namespace {
-/** A spendable coin in the chainstate, as a deposit would leave one: this
- *  chain's coinbases pay only fees, so TestChain100Setup has no funded coins. */
-COutPoint FundCoinForTest(int n, CAmount nValue)
-{
-    const COutPoint out(ArithToUint256(arith_uint256(0xfb0000 + n)), 0);
-    LOCK(cs_main);
-    pcoinsTip->AddCoin(out, Coin(CTxOut(nValue, CScript() << OP_TRUE), 1, false, false, false, 0), false);
-    return out;
-}
-
-/** A withdrawal transaction as CWallet::CreateWithdrawal lays it out: change
- *  (here OP_TRUE, so a child can spend it), the burn, the withdrawal object. */
-CTransactionRef MakeWithdrawalTx(const COutPoint& in, CAmount nIn, const std::string& strDest,
-                                 CAmount nPayout, CAmount nMainchainFee)
-{
-    const CAmount nTxFee = 20000;
-    CMutableTransaction mtx;
-    mtx.vin.push_back(CTxIn(in));
-    mtx.vout.push_back(CTxOut(nIn - nPayout - nMainchainFee - nTxFee, CScript() << OP_TRUE));
-    mtx.vout.push_back(CTxOut(nPayout + nMainchainFee, CScript() << OP_RETURN));
-    SidechainWithdrawal wt;
-    wt.nSidechain = THIS_SIDECHAIN;
-    wt.strDestination = strDest;
-    wt.strRefundDestination = "";
-    wt.amount = nPayout + nMainchainFee;
-    wt.mainchainFee = nMainchainFee;
-    wt.hashBlindTx = CTransaction(mtx).GetHash();
-    mtx.vout.push_back(CTxOut(0, wt.GetScript()));
-    return MakeTransactionRef(std::move(mtx));
-}
-
 /** An ordinary spend of an OP_TRUE output to a fresh OP_TRUE output. */
 CTransactionRef MakeSpendTx(const COutPoint& in, CAmount nIn)
 {
@@ -1272,131 +1320,6 @@ BOOST_AUTO_TEST_CASE(withdrawal_guard_crossing_mempool)
     }
     BOOST_CHECK(InMempool(txDust));
 }
-
-namespace {
-/** What the node reports through CMainSignals::BlockChecked, per block hash
- *  ("" = valid). ConnectTip calls it synchronously with ConnectBlock's verdict. */
-struct BlockCheckedRecorder : public CValidationInterface {
-    std::map<uint256, std::string> mapReason;
-    BlockCheckedRecorder() { RegisterValidationInterface(this); }
-    ~BlockCheckedRecorder()
-    {
-        UnregisterValidationInterface(this);
-        SyncWithValidationInterfaceQueue(); // no in-flight callback outlives this object
-    }
-    std::string Reason(const uint256& hash) const
-    {
-        const auto it = mapReason.find(hash);
-        return it == mapReason.end() ? "(never checked)" : it->second;
-    }
-protected:
-    void BlockChecked(const CBlock& block, const CValidationState& state) override
-    {
-        mapReason[block.GetHash()] = state.IsValid() ? "" : state.GetRejectReason();
-    }
-};
-
-/** In-memory house/bill/pool/asset DBs for one test. A real connect reads
- *  their best-block markers and flushes them; TestingSetup, under which no
- *  block ever connects, does not create them. */
-struct SideDBScope {
-    std::unique_ptr<BitAssetDB> asset;
-    std::unique_ptr<BillDB> bill;
-    std::unique_ptr<HouseDB> house;
-    std::unique_ptr<PoolDB> pool;
-    SideDBScope()
-    {
-        asset.swap(passettree);
-        bill.swap(pbilltree);
-        house.swap(phousetree);
-        pool.swap(ppooltree);
-        passettree.reset(new BitAssetDB(1 << 20, true /* fMemory */));
-        pbilltree.reset(new BillDB(1 << 20, true /* fMemory */));
-        phousetree.reset(new HouseDB(1 << 20, true /* fMemory */));
-        ppooltree.reset(new PoolDB(1 << 20, true /* fMemory */));
-    }
-    ~SideDBScope()
-    {
-        passettree.swap(asset);
-        pbilltree.swap(bill);
-        phousetree.swap(house);
-        ppooltree.swap(pool);
-    }
-};
-
-/** The miner's own block on the current tip (coinbase with the height,
- *  prev-block and version commits, from GenerateBMMBlock), with `tx`
- *  appended by hand - past the template's skip of unpayable withdrawals. */
-std::shared_ptr<const CBlock> BlockWithTx(const CTransactionRef& tx, const CScript& scriptCoinbase)
-{
-    CBlock block;
-    std::string strError;
-    BOOST_REQUIRE_MESSAGE(BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
-        std::vector<CMutableTransaction>(), uint256(), scriptCoinbase), strError);
-    BOOST_REQUIRE_EQUAL(block.vtx.size(), 1U); // empty mempool: coinbase only
-    {
-        // The earliest valid timestamp: a current one would latch
-        // IsInitialBlockDownload() to false for every later test in the process
-        LOCK(cs_main);
-        block.nTime = chainActive.Tip()->GetMedianTimePast() + 1;
-    }
-    block.vtx.push_back(tx);
-    block.hashMerkleRoot = BlockMerkleRoot(block);
-    return std::make_shared<const CBlock>(block);
-}
-
-/** Feeds a block to the node's own entry point, ProcessNewBlock -> AcceptBlock
- *  -> ActivateBestChain -> ConnectTip -> ConnectBlock(fJustCheck=false): the
- *  path every mined or relayed block takes. Returns ProcessNewBlock's result
- *  (true = stored and handed to ActivateBestChain; ConnectBlock's verdict
- *  arrives through BlockChecked).
- *
- *  There is no mainchain here. CheckBlock and AcceptBlockHeader open an L1
- *  RPC (CheckMainchainConnection) and verify BMM for every block except the
- *  genesis, and ConnectTip always passes fCheckBMM, which is why no block
- *  ever connects in this fixture (TestChain100Setup's tip stays at genesis).
- *  Both of those read the genesis hash from the global Params(), while
- *  ConnectBlock's genesis shortcut reads the chainparams the node is handed.
- *  So for this one call the global names THIS block as the genesis, which
- *  skips its L1, BMM and header checks and nothing else, and the node is
- *  handed an unmodified copy of the params (genesis intact, the test's H), so
- *  ConnectBlock runs in full: every tx, the sidechain-object loop with the
- *  poison-row guard, and the index writes. */
-bool ProcessBlockWithoutMainchain(const std::shared_ptr<const CBlock>& pblock)
-{
-    const CChainParams paramsConnect(Params());
-    struct GenesisScope {
-        Consensus::Params& consensus;
-        const uint256 hashSaved;
-        explicit GenesisScope(const uint256& hash)
-            : consensus(const_cast<Consensus::Params&>(Params().GetConsensus())),
-              hashSaved(consensus.hashGenesisBlock)
-        {
-            consensus.hashGenesisBlock = hash;
-        }
-        ~GenesisScope() { consensus.hashGenesisBlock = hashSaved; }
-    } genesis(pblock->GetHash());
-    return ProcessNewBlock(paramsConnect, pblock, true /* fForceProcessing */, nullptr, true /* fUnitTest */);
-}
-
-const CBlockIndex* TipForTest()
-{
-    LOCK(cs_main);
-    return chainActive.Tip();
-}
-
-bool BlockFailedForTest(const uint256& hash)
-{
-    LOCK(cs_main);
-    const BlockMap::const_iterator it = mapBlockIndex.find(hash);
-    return it != mapBlockIndex.end() && (it->second->nStatus & BLOCK_FAILED_VALID);
-}
-
-std::vector<SidechainWithdrawal> WithdrawalRows()
-{
-    return psidechaintree->GetWithdrawals(THIS_SIDECHAIN);
-}
-} // namespace
 
 // Card 2's consensus half: from nWithdrawalGuardHeight, ConnectBlock refuses a
 // block carrying a withdrawal the mainchain can never pay (validation.cpp,
@@ -1647,6 +1570,16 @@ BOOST_AUTO_TEST_CASE(loose_tx_sidechain_obj_policy)
     BOOST_CHECK(BlockHasTx(block, txWallet));
     for (const CTransactionRef& tx : {txShared, txDeposit, txBundle})
         BOOST_CHECK(!BlockHasTx(block, tx));
+}
+
+// v0.2.17: -maxtipage defaults to 2 h on FreeBank's network (side blocks every
+// ~20 min; 24 h left IBD ~70 blocks behind) and keeps Core's 24 h on regtest.
+BOOST_AUTO_TEST_CASE(default_max_tip_age)
+{
+    BOOST_CHECK_EQUAL(GetDefaultMaxTipAge(CBaseChainParams::MAIN), 2 * 60 * 60);
+    BOOST_CHECK_EQUAL(GetDefaultMaxTipAge(CBaseChainParams::REGTEST), 24 * 60 * 60);
+    BOOST_CHECK_EQUAL(DEFAULT_MAX_TIP_AGE_FREEBANK, 2 * 60 * 60);
+    BOOST_CHECK(DEFAULT_MAX_TIP_AGE_FREEBANK < MAX_FEE_ESTIMATION_TIP_AGE);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
