@@ -75,8 +75,9 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
 - **Clearing pools**: on-chain AMM pools between a house's notes and the base coin —
   swaps, LP shares, and orderly pool retirement. RPCs: `createpool`, `listpools`,
   `swapnote`, `addpoolliquidity`, `removepoolliquidity`, `listmylp`, `retirepool`.
-- **Metric denomination (display)**: RPCs report values in grams alongside base units at
-  a fixed launch scale (`getgramrate`). Presentation-only — no consensus rule reads it.
+- **Gram display (being removed)**: RPCs report values in grams alongside base units at
+  a fixed launch scale that tracks no market (`getgramrate`). Presentation-only, removed in
+  v0.2.17. The unit is ECX; gold notes backed by wrapped gold are planned for a later release.
 
 ## Robustness
 
