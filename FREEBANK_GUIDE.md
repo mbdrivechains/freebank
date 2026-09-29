@@ -68,6 +68,11 @@ no premine, no subsidy**: the only money inside it is mainchain coin that was de
 through the two-way peg. Everything a house issues is a liability denominated in — and
 redeemable for — that pegged coin.
 
+The unit is ECX, the chain's own coin, which moves one-for-one with ECX on the eCash mainchain
+through the drivechain peg. Notes, bills and reserves are all counted and redeemed in ECX.
+**Later: a gold unit (☉).** Notes in grams of gold, backed by wrapped gold and kept apart from
+ECX notes, are planned for a later release. They open only once ECX markets are deep enough.
+
 ### The instruments, in one screen
 
 | Instrument | What it is | Built? |
@@ -80,8 +85,8 @@ redeemable for — that pegged coin.
 | **Clearing pool** | One constant-product AMM per house between its notes and the base coin — the secondary market that prices stressed paper. | Yes |
 | **Bilateral settlement** | Two houses present each other's notes and settle the net at par ±0.5% in one co-signed transaction. | Yes (bilateral only) |
 | **Gold oracle** | Bonded submitters post a gold price; the fix is a braked lower median. **Consensus-inert**: nothing in consensus reads it yet. | Yes, inert |
-| **Gram display** | RPCs show a `_grams` companion beside amounts at a fixed launch scale. Presentation only — notes redeem for base coin, not gold. | Display only |
-| Two-wallet bill issuance tooling, multi-house clearing, Chaumian bearer layer, enforced gold redemption, cash-credit lines | — | **Not built** (section 8 says which are designed) |
+| **Gram display** | RPCs show a `_grams` companion beside amounts at a fixed launch scale that tracks no market. Presentation only — notes redeem for ECX, not gold. Removed in v0.2.17. | Display only (being removed) |
+| Two-wallet bill issuance tooling, multi-house clearing, Chaumian bearer layer, gold notes, cash-credit lines | — | **Not built** (section 8 says which are designed) |
 
 ---
 
@@ -1635,7 +1640,7 @@ touches it.
 | Bilateral settlement-to-par | Built |
 | Multi-house clearing sweeps / par-attractor | **Not built** (designed) |
 | Gold oracle | Built, **consensus-inert** |
-| Enforced gold redemption; gram-denominated notes | **Not built** (designed) — notes redeem 1:1 for base coin; grams are display only |
+| Gold notes (grams of gold, backed by wrapped gold, kept apart from ECX notes) | **Planned** for a later release; they open only once ECX markets are deep enough. Today notes redeem 1:1 for ECX; grams are display only |
 | Chaumian bearer layer over notes | **Not built** (designed; op codes reserved) |
 | Cash-credit lines | **Not built** (designed) |
 | Strict-DER / low-S payload signatures; L1 identity pin | Built |
@@ -1755,7 +1760,7 @@ removed"; the read-only `listassets` / `listmyassets` remain callable.
 | Term | Meaning |
 |---|---|
 | **ECX** | The base coin as it exists inside the sidechain — mainchain coin deposited through the peg. 1 ECX = 10⁸ sats. Not a new token. Appears as `btx` in some RPC field names (`btx_reserve`, `btxfornote`) — same thing. |
-| **unit / sat / gram** | A note unit is a claim on exactly 1 sat at par. A gram is a display companion at a fixed scale. |
+| **unit / sat / gram** | A note unit is a claim on exactly 1 sat at par. A gram is a display companion at a fixed scale, removed in v0.2.17; a gold unit is planned for a later release. |
 | **BIP 300 / 301** | The drivechain proposals: 300 = sidechain escrow, deposits and withdrawal voting on the mainchain; 301 = blind merged mining. |
 | **CUSF / enforcer** | The drivechain rules running as a separate process (`bip300301_enforcer`) beside a Bitcoin node. FreeBank drives it over gRPC. |
 | **BMM** | Blind merged mining: a mainchain miner commits the next sidechain block's hash in a coinbase for a fee. `refreshbmm` posts the request. |
