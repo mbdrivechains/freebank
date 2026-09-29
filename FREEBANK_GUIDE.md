@@ -443,7 +443,7 @@ redeemed it. Every step is a consensus-validated transaction on your sidechain.
 
 ```bash
 $BC createwallet wd >/dev/null 2>&1 || $BC loadwallet wd >/dev/null 2>&1
-DEST=$($BC -rpcwallet=wd getnewaddress '' legacy)        # destination must be a legacy P2PKH address
+DEST=$($BC -rpcwallet=wd getnewaddress '' legacy)        # any P2PKH, P2SH, P2WPKH, P2WSH or P2TR mainchain address works
 $FB createwithdrawal "$DEST" "$($FB getnewaddress '' legacy)" 1 0.01 0.01   # <mainchain dest> <sidechain refund addr> <amount> <sidechain fee> <mainchain fee>
 bmm 4
 # each round: 2 mainchain blocks (the enforcer votes on the bundle by itself) + 2 sidechain blocks;
@@ -761,8 +761,8 @@ Rises track immediately; falls are braked. Nothing in consensus reads the fix.
 See 3.8. `createwithdrawal <mainchain address> <sidechain refund address> <amount> <sidechain fee> <mainchain fee>`;
 `listmywithdrawals`; `getwithdrawal <id>` (status walks `Unspent` → `Pending - in WithdrawalBundle` → `Spent`);
 `createwithdrawalrefundrequest <id>` to cancel a still-Unspent withdrawal;
-`refundallwithdrawals` for all of them. Destinations must be legacy P2PKH — a chassis
-limitation.
+`refundallwithdrawals` for all of them. The mainchain destination can be P2PKH, P2SH, P2WPKH, P2WSH or P2TR;
+only the refund address (on FreeBank) must be a legacy P2PKH address.
 
 ---
 
