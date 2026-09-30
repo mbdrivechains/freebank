@@ -33,6 +33,8 @@ jobs:
       - name: Guix build (Docker)
         env:
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          # Guix's main repository (same history as savannah, which is flaky from hosted runners).
+          GUIX_URL: https://codeberg.org/guix/guix.git
         run: |
           VER="${TAG#v}"
           JOBS=$(nproc) FORCE_VERSION="$VER" contrib/guix/docker/run.sh
