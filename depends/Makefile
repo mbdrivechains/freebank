@@ -178,4 +178,8 @@ download-win:
 	@$(MAKE) -s HOST=x86_64-w64-mingw32 download-one
 download: download-osx download-linux download-win
 
+# Print a variable (contrib/guix reads SOURCES_PATH, BASE_CACHE, SDK_PATH this way), as in Bitcoin Core
+print-%:
+	@echo $*=$($*)
+
 .PHONY: install cached download-one download-osx download-linux download-win download check-packages check-sources
