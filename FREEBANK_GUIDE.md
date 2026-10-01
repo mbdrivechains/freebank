@@ -941,7 +941,8 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   the datadir before the first start cuts that to seconds; the node only extends it to the tip. And the
   initial sidechain sync verifies every block's BMM commitment through the enforcer — roughly 7 s per
   header plus ~15 s per block with the enforcer reached across a network, faster on localhost — so a
-  few hundred blocks is minutes, and RPC calls block while it runs. Both are on the list to fix.
+  few hundred blocks is minutes (measured 2026-09-29: about 400 blocks took 17.5 minutes from one peer), and RPC calls
+  block while it runs. Both are on the list to fix.
 - **Name your blocks (`coinbasetag=`, v0.2.14 or later).** When your `refreshbmm` bid wins, the
   FreeBank block is yours: your `freebankd` built it and earns its fees. Add one line to
   `freebank.conf` (or pass `-coinbasetag=` on the command line) and restart, so explorers can credit
