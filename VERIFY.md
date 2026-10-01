@@ -16,7 +16,7 @@ proves.
 | The source at the tag is what you reviewed | `git checkout <tag>` | every release |
 | The Linux binary was built from that source | rebuild with Guix, compare the sha256 (step 3) | v0.2.18 and later |
 | The Linux binary is the one GitHub built from the public tag | GitHub attestation (step 4) | v0.2.18 and later |
-| The macOS binary is the one GitHub built from the public tag | GitHub attestation (step 4) | releases whose notes say it is attested |
+| The macOS binary is the one GitHub built from the public tag | GitHub attestation (step 4) | releases built by the `macos-arm64` workflow (check with step 4) |
 | The files are the ones the maintainer published | signed `SHA256SUMS` (step 4) | every release since signing began |
 | The code is free of exploits | nobody can prove this; review reduces the risk (step 2) | |
 
@@ -29,7 +29,7 @@ guarantee.
 git clone https://github.com/mbdrivechains/freebank
 cd freebank
 git checkout v0.2.18            # the release you are checking
-git rev-parse HEAD              # note the commit; the binaries report it (freebankd -version)
+git rev-parse HEAD              # note the commit; from v0.2.18 the binaries report it (freebankd -version)
 ```
 
 ## Step 2: review the source
@@ -38,9 +38,11 @@ FreeBank is a fork of LayerTwo-Labs' **BitAssets** sidechain (MIT, commit `ce409
 which sits on **Bitcoin Core 0.16-era** code. Most of the tree is inherited. A review is far more useful when it
 concentrates on what FreeBank changed:
 
-- [`doc/SOURCE_REVIEW_V0216.md`](doc/SOURCE_REVIEW_V0216.md), section 2.2, maps every FreeBank change by area and
-  file. Section 6.1 gives the commands to diff this tree against the BitAssets commit. Section 6.4 lists greps for
-  specific claims (network endpoints, process spawning, coinbase and fees, the deposit checks).
+- [`doc/SOURCE_REVIEW_V0216.md`](doc/SOURCE_REVIEW_V0216.md), section 2.2, maps FreeBank's changes up to v0.2.16
+  by area and file; for later changes, `git diff v0.2.16 <tag>`. Section 6.1 gives the commands to diff this tree
+  against the BitAssets commit (from v0.2.18 that diff also shows `depends/packages/zeromq.mk`, which drops
+  libtool `.la` files, and the new `contrib/guix/`). Section 6.4 lists greps for specific claims (network
+  endpoints, process spawning, coinbase and fees, the deposit checks).
 - The areas that matter most: the mainchain client (`src/l1client.*`), deposits and withdrawals (`src/sidechain.*`,
   `src/validation.cpp`), the miner and coinbase (`src/miner.cpp`), the credit layer (`src/bill.*`, `src/house.*`,
   `src/note.*`, `src/deposit.*`, `src/pool.*`, `src/settle.*`, `src/oracle.*`), and the wallet
@@ -48,8 +50,8 @@ concentrates on what FreeBank changed:
 - **Third-party libraries** are built from source tarballs pinned by sha256 in `depends/packages/*.mk` (at
   v0.2.17: Boost 1.64.0, OpenSSL 1.0.1k, Berkeley DB 4.8.30, libevent 2.1.12, ZeroMQ 4.2.2; the `.mk` files at
   your tag are authoritative). They are compiled into the binary
-  as published upstream. Review them or trust their upstreams. Several are old; check the release notes for
-  known issues (ZeroMQ is off unless you pass a `-zmqpub*` option).
+  as published upstream. Review them or trust their upstreams. Several are old; see findings M3 (ZeroMQ; it is off
+  unless you pass a `-zmqpub*` option) and L8-L10 (build pins) in the source review, and the release notes.
 - Earlier reviews and their findings are in `doc/`. The [`SECURITY.md`](SECURITY.md) file says how to report a
   problem.
 
@@ -71,8 +73,10 @@ Give your assistant the checked-out tree and something like this:
 
 ## Step 3: rebuild the Linux binary and compare (v0.2.18 and later)
 
-You need Linux x86_64, Docker, about 15 GB of disk and a network connection. The first run builds a pinned
-toolchain and can take hours; it is cached for later runs.
+You need Linux x86_64, Docker, about 25 GB free under Docker's data directory and a network connection. The first
+run builds a pinned toolchain and can take hours; it is cached for later runs. Note that `run.sh` runs the tree's
+own build scripts inside a `docker run --privileged` container (Guix needs it to create its build sandbox), so
+read `contrib/guix/docker/` first if that matters to you.
 
 ```sh
 contrib/guix/docker/run.sh                         # or JOBS=8 contrib/guix/docker/run.sh
@@ -81,17 +85,24 @@ sha256sum guix-build-*/output/x86_64-linux-gnu/freebank-*-x86_64-linux-gnu.tar.g
 
 The hash must equal the `x86_64-linux-gnu` line in the release's `SHA256SUMS`. If it does, the published Linux
 binary was built from exactly the source you checked out: same compiler, same libraries, same bytes. If it does
-not, please open an issue with your hash, the commit and your Docker and OS versions.
+not, please open an issue with your hash, the commit and your Docker and OS versions. If cloning Guix fails, set
+`GUIX_URL=https://codeberg.org/guix/guix.git` (the same history as the default savannah URL).
 
 How this works: [`contrib/guix`](contrib/guix/README.md) (adapted from Bitcoin Core's) builds inside
 [Guix](https://guix.gnu.org), pinned to one Guix commit, so every builder uses the same compiler and libraries,
-themselves built from pinned, hashed sources. The Docker image only runs Guix; it does not change the output.
-By default Guix downloads already-built toolchain packages from its own servers, after checking their signatures.
-To trust no one's prebuilt packages, build them all from source (this takes a day or more):
+themselves built from pinned, hashed sources. The Docker image is designed not to change the output: it runs only
+the Guix daemon and `guix time-machine`, and the build uses the Guix commit pinned in
+`contrib/guix/libexec/prelude.bash`. By default Guix downloads already-built toolchain packages from its own
+servers, after checking their signatures. To use none of them, start from fresh volumes and build everything
+from source (this takes a day or more):
 
 ```sh
+docker volume rm freebank-guix-1.5.0-gnu freebank-guix-1.5.0-var freebank-guix-cache   # if they exist
 ADDITIONAL_GUIX_COMMON_FLAGS=--no-substitutes contrib/guix/docker/run.sh
 ```
+
+You then still trust the Guix 1.5.0 release binary that starts the build (its sha256 is pinned in the Dockerfile)
+and Guix's own bootstrap seeds.
 
 ## Step 4: check the signature and GitHub's attestation
 
@@ -99,21 +110,25 @@ ADDITIONAL_GUIX_COMMON_FLAGS=--no-substitutes contrib/guix/docker/run.sh
   README under [Verify your download](README.md#verify-your-download).
 - **GitHub attestation:** this repository's `guix-linux` (Linux) and `macos-arm64` (macOS) workflows build each
   release tag on GitHub, and GitHub records a signed attestation naming the workflow, the commit and the file's
-  hash. With GitHub CLI 2.49 or later:
+  hash. With GitHub CLI 2.49 or later, logged in (`gh auth login`; without a login, use the `--bundle` route in
+  the README's Verify your download section):
 
   ```sh
-  gh attestation verify freebank-<version>-x86_64-linux-gnu.tar.gz --repo mbdrivechains/freebank
+  gh attestation verify freebank-<version>-x86_64-linux-gnu.tar.gz --repo mbdrivechains/freebank \
+    --signer-workflow mbdrivechains/freebank/.github/workflows/guix.yml
   gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank
   ```
 
-  The Linux release is published only when GitHub's build and the maintainer's own build give the same hash, so
-  for Linux there are at least two independent builds behind every release, and yours makes three.
+  Every Linux release is built on two different machines, GitHub's runner and the maintainer's, with the same
+  scripts. If the attestation verifies and the hash matches `SHA256SUMS`, GitHub built exactly these bytes from
+  the tag. Your own build is the independent one.
 
 ## What this does not cover
 
 - **Releases before v0.2.18** were built by the maintainer and cannot be rebuilt byte for byte. Their source can
   still be reviewed, or built yourself (doc/SOURCE_REVIEW_V0216.md section 6.3).
-- **macOS** builds are attested by GitHub but not yet reproducible: you trust GitHub's macOS runner for them.
+- **macOS** builds come from GitHub's workflow (step 4) but are not yet reproducible: you trust GitHub's macOS
+  runner for them.
 - **Other software you run with FreeBank** (the eCash node, the CUSF enforcer, BitWindow, `grpcurl`) is not
   covered here.
 - **Review limits:** inherited Bitcoin Core 0.16 and BitAssets code has not been fully re-audited, and security
