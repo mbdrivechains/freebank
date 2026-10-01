@@ -1,4 +1,4 @@
-name: macos-arm64
+name: macos
 
 on:
   push:
@@ -6,7 +6,19 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # One job per Mac CPU: a separate tarball for each, not a universal binary, because BitWindow
+    # picks its download by CPU name. macos-15-intel is GitHub's Intel image.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            dbbuild: arm-apple-darwin
+          - runner: macos-15-intel
+            arch: x86_64
+            dbbuild: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       id-token: write      # signed build provenance (attestation) for tagged releases
@@ -24,10 +36,10 @@ jobs:
         # brew's berkeley-db ships no static archive, and 18.1 diverges from
         # the wallet format Core's depends builds. install_db4.sh builds
         # db-4.8.30.NC statically with the clang patch. --build overrides the
-        # 2009-era config.guess that predates Apple Silicon.
+        # 2009-era config.guess that predates Apple Silicon (set on Intel too, for symmetry).
         run: |
           CFLAGS="-Wno-error=implicit-function-declaration" \
-            ./contrib/install_db4.sh "$PWD" --build=arm-apple-darwin
+            ./contrib/install_db4.sh "$PWD" --build=${{ matrix.dbbuild }}
           ls db4/lib/
 
       - name: Stage static archives
@@ -93,9 +105,9 @@ jobs:
           strip -S dist/freebank/bin/*
           cp COPYING README.md dist/freebank/
           gtar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
-            --mtime='2026-07-20 10:00' -cf "freebank-${VER}-arm64-apple-darwin.tar" freebank
-          gzip -n "freebank-${VER}-arm64-apple-darwin.tar"
-          shasum -a 256 freebank-${VER}-arm64-apple-darwin.tar.gz
+            --mtime='2026-07-20 10:00' -cf "freebank-${VER}-${{ matrix.arch }}-apple-darwin.tar" freebank
+          gzip -n "freebank-${VER}-${{ matrix.arch }}-apple-darwin.tar"
+          shasum -a 256 freebank-${VER}-${{ matrix.arch }}-apple-darwin.tar.gz
 
       - name: Portability gate (no external dylib references)
         # Runs against the PACKAGED tarball, not the build tree. Only
@@ -103,7 +115,7 @@ jobs:
         # else (brew, /usr/local) means the artifact only runs on the builder.
         run: |
           mkdir -p /tmp/porttest
-          tar -xzf freebank-*-arm64-apple-darwin.tar.gz -C /tmp/porttest
+          tar -xzf freebank-*-${{ matrix.arch }}-apple-darwin.tar.gz -C /tmp/porttest
           FAIL=0
           for b in freebankd freebank-cli freebank-tx; do
             echo "== $b"
@@ -118,8 +130,11 @@ jobs:
         # asset: binaries that only run where brew's kegs exist. Hide brew
         # entirely and run the extracted artifact.
         run: |
-          sudo mv /opt/homebrew /opt/homebrew.hidden
-          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          # Homebrew lives in /opt/homebrew on Apple Silicon; on Intel its kegs are in /usr/local/Cellar
+          # (with /usr/local/opt links into it), so hiding the Cellar breaks every brew library path.
+          HB=$( [ -d /opt/homebrew ] && echo /opt/homebrew || echo /usr/local/Cellar )
+          sudo mv "$HB" "$HB.hidden"
+          trap 'sudo mv "$HB.hidden" "$HB"' EXIT
           B=/tmp/porttest/freebank/bin
           "$B/freebankd" --version | head -2
           "$B/freebank-cli" --version | head -1
@@ -140,10 +155,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: freebank-*-arm64-apple-darwin.tar.gz
+          subject-path: freebank-*-${{ matrix.arch }}-apple-darwin.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: freebank-arm64-apple-darwin
-          path: freebank-*-arm64-apple-darwin.tar.gz
+          name: freebank-${{ matrix.arch }}-apple-darwin
+          path: freebank-*-${{ matrix.arch }}-apple-darwin.tar.gz

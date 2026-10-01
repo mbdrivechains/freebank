@@ -296,7 +296,7 @@ Binaries land in `src/`: `freebankd`, `freebank-cli`, `freebank-tx`.
 > **These native binaries are NOT portable.** They link against your system's
 > libraries and run only on the machine/distro that built them. The published
 > release binaries are built statically (Linux via `depends`, ldd-gated to base
-> libraries only; macOS via the repo's `macos-arm64` workflow) — use those, or a
+> libraries only; macOS via the repo's `macos` workflow, Apple Silicon and Intel) — use those, or a
 > `depends` static build, for anything you intend to run on another host.
 
 ### Reproducible build (Guix)
