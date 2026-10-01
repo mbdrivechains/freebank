@@ -1,5 +1,7 @@
 # FreeBank
 
+[![guix-linux](https://github.com/mbdrivechains/freebank/actions/workflows/guix.yml/badge.svg)](https://github.com/mbdrivechains/freebank/actions/workflows/guix.yml)
+
 **Credit creation on a BIP 300/301 drivechain.** FreeBank is a Bitcoin sidechain for
 free banking — *discount houses* issuing redeemable credit notes against attested
 reserves, and *bills of exchange* backed by an escrow bond — in the lineage of Scottish
@@ -297,6 +299,20 @@ Binaries land in `src/`: `freebankd`, `freebank-cli`, `freebank-tx`.
 > libraries only; macOS via the repo's `macos-arm64` workflow) — use those, or a
 > `depends` static build, for anything you intend to run on another host.
 
+### Reproducible build (Guix)
+
+The Linux release tarball can be rebuilt byte for byte from the source with
+[Guix](https://guix.gnu.org) (`contrib/guix`, derived from Bitcoin Core's). With Docker and no local Guix:
+
+```sh
+contrib/guix/docker/run.sh        # JOBS=8 contrib/guix/docker/run.sh to use more cores
+```
+
+This builds the committed `HEAD` and writes `guix-build-<version>/output/x86_64-linux-gnu/freebank-<version>-x86_64-linux-gnu.tar.gz`
+and its `SHA256SUMS.part`. The first run builds Guix's pinned toolchain and can take hours; later runs take minutes.
+The container runs `--privileged`, because Guix builds in its own isolated container. See
+[`contrib/guix/README.md`](contrib/guix/README.md).
+
 Run the unit tests:
 
 ```sh
@@ -384,11 +400,18 @@ gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdriv
   --bundle freebank.sigstore.json
 ```
 
-The Linux tarball is built by the maintainer. Its binaries report the maintainer's private commit
-(v0.2.16: `2afa30c`), whose `src/` and `depends/` trees are identical to the public tag. Building Linux
-from the public tag in CI, with an attestation, and reproducible builds so that anyone can rebuild it
-byte for byte, are planned. Linux release binaries are static except for glibc and libgcc (glibc
-2.38+); the macOS binaries use the system's libc++ and libSystem.
+**Linux, from v0.2.18:** the tarball is the [Guix build](#reproducible-build-guix) of the public tag. This
+repository's `guix-linux` workflow builds the same tag on GitHub, and a release is published only when its
+hash matches the maintainer's own build. GitHub records a signed attestation for that tarball, checked the
+same way as the macOS one (`gh attestation verify freebank-<version>-x86_64-linux-gnu.tar.gz --repo
+mbdrivechains/freebank`). To check it yourself, check out the tag, run `contrib/guix/docker/run.sh`, and
+compare your hash with `SHA256SUMS`. These binaries need glibc 2.27 or later.
+
+**Linux, v0.2.17 and earlier:** the tarball was built by the maintainer (`depends`, static except for
+glibc and libgcc, glibc 2.38+). Its binaries report the maintainer's private commit (v0.2.16: `2afa30c`),
+whose `src/` and `depends/` trees are identical to the public tag.
+
+The macOS binaries use the system's libc++ and libSystem.
 
 ## Feedback
 
