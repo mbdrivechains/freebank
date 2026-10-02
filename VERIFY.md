@@ -48,10 +48,10 @@ concentrates on what FreeBank changed:
   `src/note.*`, `src/deposit.*`, `src/pool.*`, `src/settle.*`, `src/oracle.*`), and the wallet
   (`src/wallet/wallet.cpp`, `src/wallet/rpcwallet.cpp`).
 - **Third-party libraries** are built from source tarballs pinned by sha256 in `depends/packages/*.mk` (at
-  v0.2.17: Boost 1.64.0, OpenSSL 1.0.1k, Berkeley DB 4.8.30, libevent 2.1.12, ZeroMQ 4.2.2; the `.mk` files at
+  v0.2.18: Boost 1.64.0, OpenSSL 1.0.1k, Berkeley DB 4.8.30, libevent 2.1.13, ZeroMQ 4.3.5; the `.mk` files at
   your tag are authoritative). They are compiled into the binary
-  as published upstream. Review them or trust their upstreams. Several are old; see findings M3 (ZeroMQ; it is off
-  unless you pass a `-zmqpub*` option) and L8-L10 (build pins) in the source review, and the release notes.
+  as published upstream. Review them or trust their upstreams. Several are old; see findings L8-L10 (build pins) in
+  the source review, and the release notes. Finding M3 (ZeroMQ 4.2.2) is fixed in v0.2.18 by the move to 4.3.5.
 - Earlier reviews and their findings are in `doc/`. The [`SECURITY.md`](SECURITY.md) file says how to report a
   problem.
 
