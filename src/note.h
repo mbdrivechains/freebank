@@ -6,6 +6,7 @@
 #define BITCOIN_NOTE_H
 
 #include <amount.h>
+#include <consensus/params.h>
 #include <house.h>            // AttestProof (the rho-at-mint reserve proof, R-i7)
 #include <pubkey.h>
 #include <primitives/transaction.h>
@@ -77,7 +78,24 @@ static const uint32_t NOTE_DEMAND_PREAUTH_BIT = 0x80000000;
 // is idempotence-rejected for free. Same no-format-bump class as the pre-auth
 // bit (D-i); plain heights stay safe below 2^30 (~20k years at 10 minutes).
 static const uint32_t NOTE_DEMAND_PROTESTED_BIT = 0x40000000;
-static const uint32_t NOTE_DEMAND_TAG_BITS = NOTE_DEMAND_PREAUTH_BIT | NOTE_DEMAND_PROTESTED_BIT;
+// v0.2.18 (D-2026-10-02-1, Q8 follow-up "a+b"): the QUEUE marker. A pre-auth
+// demand normally starts accruing at window LAPSE (B3 D-iii: "pay in a week and
+// it costs you par"). A pre-auth demand filed while the house is SUSPENDED is
+// the option clause's queue instead - the holder is forced to wait - so it
+// accrues from the demand itself, like a plain demand. The house record keeps
+// only the latest episode's heights, so at payment time consensus cannot tell
+// whether an old demand was filed during a suspension: the coin carries it.
+// Set by AddCoins from the payload (NOTE_DEMAND_MODE_PREAUTH_QUEUE), preserved
+// by every re-issue that copies the tag. Plain demands never carry it: they
+// only exist at Deferred, so a plain tag is a queue tag by construction.
+// Same no-format-bump class as the bits above; heights stay safe below 2^29.
+static const uint32_t NOTE_DEMAND_QUEUE_BIT = 0x20000000;
+static const uint32_t NOTE_DEMAND_TAG_BITS = NOTE_DEMAND_PREAUTH_BIT | NOTE_DEMAND_PROTESTED_BIT |
+                                             NOTE_DEMAND_QUEUE_BIT;
+// NoteDemand::fPreAuth values (the byte was 0/1 before v0.2.18).
+static const uint8_t NOTE_DEMAND_MODE_PLAIN = 0;          // Deferred only; holder-signed redeem only
+static const uint8_t NOTE_DEMAND_MODE_PREAUTH = 1;        // B3 formal demand, Open/Stressed only
+static const uint8_t NOTE_DEMAND_MODE_PREAUTH_QUEUE = 2;  // pre-auth filed at Deferred, or a Δ1b upgrade
 // T-b3 CONSENSUS CUSTODY (build-level resolution of a contradiction inside the
 // signed sheet, queued for ratification in SIGNOFF_QUEUE.md). The sheet
 // requires the house to discharge UNILATERALLY, but note coins are real P2PKH:
@@ -95,10 +113,22 @@ static const uint32_t NOTE_DEMAND_TAG_BITS = NOTE_DEMAND_PREAUTH_BIT | NOTE_DEMA
 // all exercised through payload signatures, which never needed the scriptSig.
 inline bool NoteDemandIsPreAuth(uint32_t nTag) { return (nTag & NOTE_DEMAND_PREAUTH_BIT) != 0; }
 inline bool NoteDemandIsProtested(uint32_t nTag) { return (nTag & NOTE_DEMAND_PROTESTED_BIT) != 0; }
+inline bool NoteDemandIsQueue(uint32_t nTag) { return (nTag & NOTE_DEMAND_QUEUE_BIT) != 0; }
 inline uint32_t NoteDemandHeightOf(uint32_t nTag) { return nTag & ~NOTE_DEMAND_TAG_BITS; }
-inline uint32_t NoteDemandTag(uint32_t nHeight, bool fPreAuth)
+// True when interest runs from the demand height (the option clause's queue):
+// every plain demand, and a pre-auth demand carrying the queue marker. Only a
+// B3 formal demand (pre-auth, filed at Open/Stressed) starts at window lapse.
+inline bool NoteDemandAccruesFromDemand(uint32_t nTag)
 {
-    return fPreAuth ? (nHeight | NOTE_DEMAND_PREAUTH_BIT) : nHeight;
+    return !NoteDemandIsPreAuth(nTag) || NoteDemandIsQueue(nTag);
+}
+inline uint32_t NoteDemandTag(uint32_t nHeight, uint8_t nMode)
+{
+    if (nMode == NOTE_DEMAND_MODE_PREAUTH)
+        return nHeight | NOTE_DEMAND_PREAUTH_BIT;
+    if (nMode == NOTE_DEMAND_MODE_PREAUTH_QUEUE)
+        return nHeight | NOTE_DEMAND_PREAUTH_BIT | NOTE_DEMAND_QUEUE_BIT;
+    return nHeight;
 }
 
 // Dust base-value each note UTXO carries (it holds the claim, not value).
@@ -194,11 +224,15 @@ struct NoteDemand {
     std::vector<unsigned char> vchHolderPubKey;           // must hash to every spent note input
     std::vector<unsigned char> vchHolderSig;
     // ---- B3 (Phase 3.5b): the PRE-AUTHORISED mode -------------------------
-    // 1 => this demand carries a standing redemption authorisation so the house
-    // can discharge it ALONE. REQUIRED at Open/Stressed (the states B3 opens
-    // DEMAND to), FORBIDDEN at Deferred - where the option clause governs and
-    // today's semantics are preserved byte-for-byte. One op, two modes, no
-    // ambiguity.
+    // Non-zero => this demand carries a standing redemption authorisation so the
+    // house can discharge it ALONE. Values (NOTE_DEMAND_MODE_*):
+    //   0 plain        - Deferred only; only the holder can redeem it.
+    //   1 pre-auth     - the B3 formal demand; Open/Stressed only, accrues from
+    //                    window lapse.
+    //   2 pre-auth queue - v0.2.18 (D-2026-10-02-1 "a+b"): a pre-auth demand filed
+    //                    at Deferred, or a Δ1b upgrade of a plain one; accrues
+    //                    from the demand, and the house can pay it alone, so it
+    //                    can always end the interest by paying.
     uint8_t fPreAuth;
     // Δ1b UPGRADE ONLY: the height the spent notes already carry, so the clock
     // is PRESERVED rather than reset. 0 on a fresh demand (AddCoins then stamps
@@ -393,12 +427,49 @@ uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
                            const std::vector<unsigned char>& vchPayoutScript);
 uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
 
-/** Deferral interest (Phase 3.5 D6): nUnits held demanded for nBlocks, at
- * HOUSE_DEFER_INTEREST_BPS per year, pro-rated by block. Simple (not
- * compounding) - the Scottish clause was 5% flat. 128-bit intermediate:
- * nUnits <= 3*MAX_MONEY and nBlocks is unbounded in principle, so the product
- * overflows uint64. Returns the INTEREST only, not principal + interest. */
-CAmount NoteDeferralInterest(uint64_t nUnits, uint32_t nBlocks);
+/** The scheduled suspension-interest rate (bps/yr) at block nHeight: the last
+ * step with nHeight <= the block (v0.2.18). 0 for an empty schedule. */
+uint32_t DeferInterestBpsAt(const std::vector<Consensus::DeferInterestStep>& vSchedule, uint32_t nHeight);
+
+/** Deferral interest (Phase 3.5 D6; v0.2.18 rate schedule): nUnits demanded,
+ * accruing over the blocks b in [nFrom, nTo), each block at the scheduled rate
+ * for b, per year of BLOCKS_PER_YEAR blocks. Simple (not compounding), per
+ * block. PIECEWISE but floored ONCE: the bps*blocks products of every schedule
+ * segment are summed first and the division happens at the end, so a one-step
+ * schedule gives exactly the old units*bps*blocks/(10000*BLOCKS_PER_YEAR).
+ * 128-bit intermediate; clamped to MAX_MONEY. Returns the INTEREST only. */
+CAmount NoteDeferralInterest(uint64_t nUnits, uint32_t nFrom, uint32_t nTo,
+                             const std::vector<Consensus::DeferInterestStep>& vSchedule);
+
+/** The accrual window [nStartOut, nEndOut) a DEMANDED note owes interest over
+ * when it is paid (redeemed) at nPayHeight (v0.2.18, operator Q8 "on-off fix").
+ *
+ *   start = D            for a plain (suspension-queue) demand, D = demand height
+ *         = D + W        for a B3 pre-auth demand (D-iii: from window lapse)
+ *   end   = E            if ALL of: the house is NOT suspended at payment
+ *                        (nDeferInvokedHeight == 0), its latest reopen E =
+ *                        nDeferEndedHeight is set and E >= D (the reopen came
+ *                        after the demand), and nPayHeight <= E + W (paid within
+ *                        the demand window after that reopen);
+ *         = nPayHeight   otherwise - the note accrues until it is PAID.
+ *   W = nDemandWindow. Interest is owed on max(0, end - start) blocks.
+ *
+ * Why this is robust across repeated episodes although nDeferEndedHeight is
+ * overwritten by every reopen: the cap uses only the LATEST reopen, and only
+ * when the house is open and paying within W of it. A note demanded in
+ * episode 1 and paid during episode 2 (house suspended) accrues to payment; a
+ * note paid more than W after the latest reopen accrues to payment; a note
+ * paid within W of the latest reopen accrues to that reopen. The accrual is
+ * therefore continuous from start to the point the house last made payment
+ * possible-and-timely: a reopen-then-resuspend can never freeze it. No new
+ * state - derived from stored, undo-restored heights only. */
+void NoteDemandAccrualWindow(const CHouse& house, uint32_t nDemandTag, uint32_t nPayHeight,
+                             uint32_t nDemandWindow, uint32_t& nStartOut, uint32_t& nEndOut);
+
+/** Interest owed on nUnits of a demanded note (tag nDemandTag; 0 = not
+ * demanded -> 0) paid at nPayHeight: NoteDemandAccrualWindow + the schedule. */
+CAmount NoteDemandInterest(const CHouse& house, uint32_t nDemandTag, uint64_t nUnits,
+                           uint32_t nPayHeight, const Consensus::Params& consensus);
 
 /** The pro-rata waterfall entitlement: burning nUnits against the insolvency
  * snapshot (amountPot escrow backing nSnapshotUnits claims) entitles the

@@ -4,6 +4,7 @@
 
 #include <house.h>
 
+#include <chainparams.h>
 #include <consensus/validation.h>
 #include <hash.h>
 #include <pubkey.h>
@@ -11,10 +12,11 @@
 #include <streams.h>
 #include <version.h>
 
+#include <limits>
+
 // Consensus defaults; regtest-only init.cpp overrides (integration gates).
 uint32_t HOUSE_ATTEST_CADENCE = 144;
 uint32_t HOUSE_STRESSED_WINDOW = 1008;
-uint32_t HOUSE_DEFER_WINDOW = 12960;   // 90 days (R-1, sim D2)
 
 uint256 HouseDeclarationDigest(const HouseRegister& reg)
 {
@@ -237,15 +239,15 @@ uint32_t HouseStressOrigin(const CHouse& house, int nHeight)
     // there). Reserves are not redemption.
     if (house.ProtestLive()) {
         uint32_t nProtest = house.nProtestHeight;
-        // Option-clause overlap: discharge is impossible while DEFERRED
-        // (bad-note-redeem-deferred) and an episode (HOUSE_DEFER_WINDOW,
-        // 90d) dwarfs the fuse (HOUSE_STRESSED_WINDOW, 1wk), so a protest
-        // that rode through a LAWFUL suspension re-arms at the recovery
-        // stamp instead of surfacing pre-burnt - the teeth are only just
-        // if the house can always discharge alone (sheet Delta-2). An
-        // episode that ended before the protest existed extends nothing
-        // (max), and stacking episodes to push the fuse is already capped
-        // by confidence death.
+        // Option-clause overlap: a protest that rode through a LAWFUL
+        // suspension re-arms at the recovery stamp instead of surfacing
+        // pre-burnt (sheet Delta-2). An episode that ended before the
+        // protest existed extends nothing (max). v0.2.18 note: this was
+        // written when discharge was impossible while DEFERRED and
+        // confidence death capped episode-stacking; now a suspended house
+        // MAY discharge and may suspend again, but the re-arm is kept
+        // unchanged - each re-suspension costs the house a till lock and
+        // the lapsed demand keeps accruing interest throughout.
         if (house.nDeferEndedHeight > nProtest)
             nProtest = house.nDeferEndedHeight;
         if (nProtest != 0 && (nStress == 0 || nProtest < nStress))
@@ -260,14 +262,15 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
     if (house.status == HOUSE_STATUS_INSOLVENT) return HOUSE_STATUS_INSOLVENT; // materialized
 
     // Option clause (3.5): an invoked deferral REPLACES the ordinary stress
-    // clock with the deferral window - the whole point is to stop the par
-    // drain and buy time for reflux and recovery capital. Still fully lazy:
-    // 'd' and the post-expiry 'i' are derived from the stored invocation
-    // height, so invoking writes once and nothing sweeps thereafter.
+    // clock - the whole point is to stop the par drain and buy time for reflux
+    // and recovery capital. v0.2.18 (operator Q4/Q5): the suspension has NO end
+    // date; the house turns Insolvent only by SILENCE - missing MISS_N
+    // attestation cadences starts nDeferSilenceWindow (~4 weeks), and when that
+    // runs out it is Insolvent. Attesting before then keeps it Deferred (the
+    // deadline is derived from nLastAttestHeight). Still fully lazy.
     if (house.nDeferInvokedHeight != 0) {
-        const uint32_t nEnd = house.DeferEndHeight();
-        if (nHeight >= 0 && (uint32_t)nHeight >= nEnd)
-            return HOUSE_STATUS_INSOLVENT;   // window ran out without recovery (ARCH s7 step 6)
+        if (nHeight >= 0 && (uint32_t)nHeight >= HouseDeferSilenceInsolventHeight(house))
+            return HOUSE_STATUS_INSOLVENT;   // went silent while suspended
         return HOUSE_STATUS_DEFERRED;
     }
 
@@ -279,16 +282,16 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
     return HOUSE_STATUS_STRESSED;
 }
 
-bool HouseConfidenceDead(const CHouse& house, int nHeight)
+uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house)
 {
-    // Cumulative suspension beyond the cap (counting any episode running now)
-    if (house.DeferSuspendedBlocks(nHeight) >= HOUSE_CD_MAX_SUSPENDED)
-        return true;
-    // A second activation inside the CD window
-    if (house.nDeferActivations > 0 && nHeight >= 0 &&
-            (uint32_t)nHeight < house.nDeferLastActivation + HOUSE_CD_WINDOW_BLOCKS)
-        return true;
-    return false;
+    if (house.nDeferInvokedHeight == 0)
+        return 0;
+    // 64-bit sum, saturated: every operand is a u32 and a pathological
+    // regtest cadence must not wrap the deadline into the past.
+    const uint64_t n = (uint64_t)house.nLastAttestHeight
+                     + (uint64_t)HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1
+                     + (uint64_t)Params().GetConsensus().nDeferSilenceWindow;
+    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
 }
 
 uint64_t HouseCapitalCapUnits(const CHouse& house)
@@ -689,12 +692,10 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
     }
     else
     if (tx.nHouseOp == HOUSE_OP_RENEW) {
-        HouseRenew ren;
-        if (!DecodeHousePayload(tx.vchHousePayload, ren))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-payload");
-
-        if (!CheckApproverShape(ren.vApproverIndex, ren.vApproverSig) || ren.vApproverIndex.empty())
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-approvers");
+        // v0.2.18 (operator Q4): RENEW is retired from block 0 - a suspension
+        // has no end date, so there is nothing to extend. Rejected here,
+        // context-free, so it never reaches the mempool or a block.
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-retired");
     }
     else
     if (tx.nHouseOp == HOUSE_OP_RELEASE) {

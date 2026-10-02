@@ -82,6 +82,11 @@ public:
 
     int GetMainchainBlockHeight(const uint256& hash) const;
 
+    // v0.2.18: positions of two blocks in the list, read under ONE lock (the
+    // list changes under refreshbmm between separate calls). False unless both
+    // are in the list.
+    bool GetMainBlockPositions(const uint256& hashA, const uint256& hashB, size_t& nA, size_t& nB) const;
+
     bool HaveMainBlock(const uint256& hash) const;
 
     bool HaveBMMRequestForPrevBlock(const uint256& hashPrevBlock) const;
@@ -116,6 +121,12 @@ private:
     // v0.2.16: guards mapMainBlock and vMainBlockHash (a leaf lock). The other
     // members are guarded by their callers, as before.
     mutable std::mutex csMainBlockCache;
+
+    // v0.2.18 (layer-B review BMM M3): guards setBMMVerified and
+    // setDepositVerified (a leaf lock). CheckBlockBMM reads and writes them
+    // outside cs_main (ProcessNewBlock), while AcceptBlockHeader and the
+    // block-submit RPC write them from other threads.
+    mutable std::mutex csVerified;
 
     // BMM blocks that we have created with the intention of connecting to the
     // side blockchain once the BMM h* hash is included on the mainchain

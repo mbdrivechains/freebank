@@ -92,7 +92,8 @@ std::string CtxReject(const CMutableTransaction& mtx, int nHeight, uint64_t nUni
 // build order, because both digests are checked at connect.
 CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey& keyHolder,
                                  bool fPreAuth, const std::vector<unsigned char>& vchPayoutScript,
-                                 bool fCustodyOutputs = true, bool fValidPreAuthSig = true)
+                                 bool fCustodyOutputs = true, bool fValidPreAuthSig = true,
+                                 bool fQueue = false)
 {
     const CPubKey pub = keyHolder.GetPubKey();
     const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
@@ -101,7 +102,8 @@ CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey&
     d.nHouseID = nHouseID;
     d.vUnits.push_back(nUnits);
     d.vchHolderPubKey = vchKey;
-    d.fPreAuth = fPreAuth ? 1 : 0;
+    d.fPreAuth = fPreAuth ? (fQueue ? NOTE_DEMAND_MODE_PREAUTH_QUEUE : NOTE_DEMAND_MODE_PREAUTH)
+                          : NOTE_DEMAND_MODE_PLAIN;
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
@@ -215,10 +217,42 @@ std::function<bool(const COutPoint&, Coin&)> ServeCoin(uint32_t nHouseID, uint64
                                                        uint32_t nTag, const CScript& script)
 {
     return [=](const COutPoint&, Coin& coin) {
-        coin = Coin(CTxOut(NOTE_DUST_VALUE, script), 100, false, false, false, 0);
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, script), 100, false, false, false, uint256());
         coin.SetNote(nHouseID, nUnits, nTag);
         return true;
     };
+}
+
+// Interest over k blocks at the network's schedule (one 10%/yr step from 0 on
+// every network, so any k-block range gives the same amount).
+CAmount Interest(uint64_t nUnits, uint32_t k)
+{
+    return NoteDeferralInterest(nUnits, 0, k, Params().GetConsensus().vDeferInterestSchedule);
+}
+
+// A PLAIN (holder-signed) redeem with an optional brassage output at vout[1].
+CMutableTransaction MakePlainRedeemSpreadTx(uint32_t nHouseID, uint64_t nUnits, const CKey& keyHolder,
+                                            CAmount amountPayout, CAmount amountSpread,
+                                            const uint256& houseID256)
+{
+    const CPubKey pub = keyHolder.GetPubKey();
+    NoteRedeem redeem;
+    redeem.nHouseID = nHouseID;
+    redeem.fBrassage = amountSpread > 0 ? 1 : 0;
+    redeem.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_REDEEM;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("p1a2"), 0)));
+    mtx.vout.push_back(CTxOut(amountPayout, NoteScriptForPubKey(redeem.vchHolderPubKey)));
+    if (amountSpread > 0)
+        mtx.vout.push_back(CTxOut(amountSpread, HouseEscrowScript(houseID256)));
+
+    keyHolder.Sign(NoteRedeemSigHash(nHouseID, nUnits, BillHashOutputs(mtx)), redeem.vchHolderSig);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
 }
 
 } // namespace
@@ -231,14 +265,17 @@ BOOST_AUTO_TEST_CASE(demand_status_matrix)
     CKey key; key.MakeNewKey(true);
     const std::vector<unsigned char> payout = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
 
-    // DEFERRED: plain accepted (today's semantics), pre-auth FORBIDDEN.
+    // DEFERRED (v0.2.18 "a"): plain accepted, PRE-AUTH QUEUE accepted (the
+    // house can pay it alone), the B3 lapse-start mode 1 refused.
     {
         CHouse house = MakeOpenHouse(1, H, 2 * U);
         house.nDeferInvokedHeight = (uint32_t)H - 10;
         BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
         BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, false, {}), H, U, house, fnNoCoin), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, payout, true, true, true), H, U, house,
+                                    fnNoCoin), "");
         BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, payout), H, U, house, fnNoCoin),
-                          "bad-note-demand-preauth-forbidden");
+                          "bad-note-demand-preauth-queue-required");
     }
     // OPEN: pre-auth REQUIRED - a plain demand is the old "interest clock the
     // house never agreed to"; the pre-auth demand IS the B3 formal demand.
@@ -247,6 +284,9 @@ BOOST_AUTO_TEST_CASE(demand_status_matrix)
         BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
         BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, false, {}), H, U, house, fnNoCoin),
                           "bad-note-demand-preauth-required");
+        // a fresh queue-mode demand is only for a suspended house
+        BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, payout, true, true, true), H, U, house,
+                                    fnNoCoin), "bad-note-demand-queue-not-deferred");
         bool fChanged = true;
         BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, payout), H, U, house,
                                     fnNoCoin, nullptr, &fChanged), "");
@@ -351,7 +391,7 @@ BOOST_AUTO_TEST_CASE(discharge_floor_and_diii_boundary)
         const uint32_t k = 5256;   // 0.1yr at mainnet cadence
         const int H = (int)(D + W + k);
         CHouse house = MakeOpenHouse(1, H, 2 * U);
-        const CAmount amountInterest = NoteDeferralInterest(U, k);
+        const CAmount amountInterest = Interest(U, k);
         BOOST_REQUIRE(amountInterest > 0);
         BOOST_CHECK_EQUAL(CtxReject(MakeDischargeTx(1, U, key, payout, (CAmount)U + amountInterest, 0, house.houseID),
                                     H, U, house, fnCoin), "");
@@ -365,7 +405,7 @@ BOOST_AUTO_TEST_CASE(discharge_floor_and_diii_boundary)
         const int H = (int)(D + k);
         CHouse house = MakeOpenHouse(1, H, 2 * U);
         const auto fnPlain = ServeCoin(1, U, D, NoteScriptForPubKey(vchKey));
-        const CAmount amountInterest = NoteDeferralInterest(U, k);
+        const CAmount amountInterest = Interest(U, k);
         BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + amountInterest),
                                     H, U, house, fnPlain), "");
         BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + amountInterest - 1),
@@ -761,15 +801,18 @@ BOOST_AUTO_TEST_CASE(b4_stress_origin_derivation_table)
         BOOST_CHECK_EQUAL(HouseStressOrigin(house, H), (uint32_t)H - 100);
     }
     // (h) a RUNNING episode masks the protest (the clause governs; PROTEST
-    // itself is rejected at Deferred) and expiry-without-recovery is
-    // INSOLVENT regardless of the queue.
+    // itself is rejected at Deferred). v0.2.18: there is no expiry - only
+    // silence (missed cadences + nDeferSilenceWindow) turns it INSOLVENT,
+    // regardless of the queue.
     {
         CHouse house = MakeOpenHouse(1, H, 2 * U);
         house.nProtestOpen = 1;
         house.nProtestHeight = (uint32_t)H - 5000;
         house.nDeferInvokedHeight = (uint32_t)H - 10;
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
-        BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)house.DeferEndHeight()),
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)HouseDeferSilenceInsolventHeight(house) - 1),
+                          HOUSE_STATUS_DEFERRED);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)HouseDeferSilenceInsolventHeight(house)),
                           HOUSE_STATUS_INSOLVENT);
     }
 }
@@ -806,6 +849,273 @@ BOOST_AUTO_TEST_CASE(b6_attest_displacement_whitelist)
     CMutableTransaction mtxBill;
     mtxBill.nVersion = TRANSACTION_BILL_VERSION;      // drawee-built HRETIRE: forced
     BOOST_CHECK(IsAttestDisplaceable(CTransaction(mtxBill)));
+}
+
+// ------------------------------------------- v0.2.18 SUSPENSION (Q6/Q7/Q8)
+// A suspended house may pay DEMANDED notes (from new money; the till stays
+// locked - a redeem cannot spend escrow, tx_verify), at least principal +
+// interest at the scheduled 10%/yr less the brassage the RUNNER bears.
+// Undemanded notes still cannot redeem while suspended.
+
+// A house suspended at S, attesting on cadence (so not silent), ratio as given.
+static CHouse MakeSuspendedHouse(uint32_t nHouseID, int nHeight, uint64_t nMinted, CAmount amountReserves, uint32_t S)
+{
+    CHouse house = MakeOpenHouse(nHouseID, nHeight, nMinted);
+    house.amountLastAttestReserves = amountReserves;
+    house.nStressSinceHeight = S - 1;
+    house.nDeferInvokedHeight = S;
+    house.nDeferActivations = 1;
+    house.nDeferLastActivation = S;
+    return house;
+}
+
+BOOST_AUTO_TEST_CASE(suspended_redeem_demanded_only_at_floor)
+{
+    const uint32_t S = 9000, D = 10000;
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint64_t U = 1000000;
+    const int H = (int)(D + 26280);                 // half a year after the demand
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+
+    // Fully reserved suspended house -> no spread; the floor is U + interest.
+    CHouse house = MakeSuspendedHouse(1, H, 2 * U, (CAmount)(2 * U), S);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
+    BOOST_REQUIRE_EQUAL(HouseBrassageBps(house), 0u);
+
+    // Rate check: 10%/yr on 1e6 units for exactly half a year = 50,000 sats.
+    const CAmount I = Interest(U, (uint32_t)H - D);
+    BOOST_CHECK_EQUAL(I, 50000);
+
+    // A plain (suspension-queue) demanded note: paid at the floor - accepted,
+    // the units retire; one sat short - rejected.
+    const auto fnDemanded = ServeCoin(1, U, D, NoteScriptForPubKey(vchKey));
+    {
+        CHouse houseOut; bool fChanged = false;
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + I), H, U, house, fnDemanded,
+                                    &houseOut, &fChanged), "");
+        BOOST_CHECK(fChanged);
+        BOOST_CHECK_EQUAL(houseOut.nMintedUnits, U);
+        BOOST_CHECK_EQUAL(houseOut.nDeferInvokedHeight, S);       // still suspended
+        BOOST_CHECK(houseOut.vOutReserveLock == house.vOutReserveLock);   // the till is untouched
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + I - 1), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+        // Par (the pre-v0.2.18 Open-house habit) is far short.
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+    }
+    // An UNDEMANDED note cannot redeem while suspended - at any payout.
+    {
+        const auto fnPlain = ServeCoin(1, U, 0, NoteScriptForPubKey(vchKey));
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + I), H, U, house, fnPlain),
+                          "bad-note-redeem-deferred");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, 10 * (CAmount)U), H, U, house, fnPlain),
+                          "bad-note-redeem-deferred");
+    }
+    // A B3 pre-auth demand lodged BEFORE the suspension (at Open) can be
+    // DISCHARGED by the suspended house, its clock from window lapse (D-iii).
+    {
+        const uint32_t D0 = S - 500;
+        const std::vector<unsigned char> payout = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
+        const auto fnPreAuth = ServeCoin(1, U, NoteDemandTag(D0, true), NotePreAuthScript(vchKey));
+        const CAmount I0 = Interest(U, (uint32_t)H - (D0 + W));
+        BOOST_CHECK_EQUAL(CtxReject(MakeDischargeTx(1, U, key, payout, (CAmount)U + I0, 0, house.houseID),
+                                    H, U, house, fnPreAuth), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakeDischargeTx(1, U, key, payout, (CAmount)U + I0 - 1, 0, house.houseID),
+                                    H, U, house, fnPreAuth), "bad-note-redeem-interest-short");
+    }
+    // Once SILENT past the clock the house is Insolvent: no redemption at all.
+    {
+        CHouse hSilent = house;
+        hSilent.nLastAttestHeight = (uint32_t)H - HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE - 1
+                                  - Params().GetConsensus().nDeferSilenceWindow;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(hSilent, H), HOUSE_STATUS_INSOLVENT);
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + I), H, U, hSilent, fnDemanded),
+                          "bad-note-redeem-house-closed");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(suspended_redeem_runner_bears_brassage)
+{
+    // Q7: brassage unchanged, and BOTH redeem paths put it on the runner: the
+    // holder-signed floor is U + interest - spread, exactly the discharge
+    // floor (until v0.2.17 it was U + interest with the spread on top).
+    const uint32_t S = 9000, D = 10000;
+    const uint64_t U = 1000000;
+    const int H = (int)(D + 5256);
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+
+    CHouse house = MakeSuspendedHouse(1, H, 2 * U, (CAmount)(U / 10), S);   // 500 bps < rho
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
+    const CAmount amountSpread = HouseBrassageAmount(U, HouseBrassageBps(house));
+    BOOST_REQUIRE(amountSpread > 0);
+    const CAmount I = Interest(U, (uint32_t)H - D);
+    BOOST_REQUIRE(I > 0);
+    const auto fnDemanded = ServeCoin(1, U, D, NoteScriptForPubKey(vchKey));
+
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemSpreadTx(1, U, key, (CAmount)U + I - amountSpread, amountSpread, house.houseID),
+                                H, U, house, fnDemanded), "");
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemSpreadTx(1, U, key, (CAmount)U + I - amountSpread - 1, amountSpread, house.houseID),
+                                H, U, house, fnDemanded), "bad-note-redeem-interest-short");
+    // The house may still pay the full U + interest with the spread on top
+    // (what the v0.2.17 wallet builds) - the floor is a minimum.
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemSpreadTx(1, U, key, (CAmount)U + I, amountSpread, house.houseID),
+                                H, U, house, fnDemanded), "");
+    // The spread itself is not optional.
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemSpreadTx(1, U, key, (CAmount)U + I, 0, house.houseID),
+                                H, U, house, fnDemanded), "bad-note-redeem-brassage-missing");
+}
+
+BOOST_AUTO_TEST_CASE(demand_accrual_reopen_rule)
+{
+    // Q8: a demanded note accrues until PAID; it stops at the reopen height E
+    // only if paid while the house is open AND within W of E.
+    const uint32_t D = 10000, E = 15256;
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint64_t U = 1000000;
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const auto fnDemanded = ServeCoin(1, U, D, NoteScriptForPubKey(vchKey));
+    const CAmount ICapped = Interest(U, E - D);
+    BOOST_REQUIRE_EQUAL(ICapped, 10000);    // 10%/yr x 0.1yr
+
+    auto Reopened = [&](int H) {
+        CHouse house = MakeOpenHouse(1, H, 2 * U);
+        house.nDeferEndedHeight = E;
+        house.nDeferActivations = 1;
+        house.nDeferLastActivation = D - 100;
+        return house;
+    };
+    // Paid AT the last in-window height E + W (inclusive): stops at E.
+    {
+        const int H = (int)(E + W);
+        CHouse house = Reopened(H);
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ICapped), H, U, house, fnDemanded), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ICapped - 1), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+        uint32_t a = 0, b = 0;
+        NoteDemandAccrualWindow(house, D, (uint32_t)H, W, a, b);
+        BOOST_CHECK_EQUAL(a, D);
+        BOOST_CHECK_EQUAL(b, E);
+    }
+    // Paid later (this is a PLAIN demand): v0.2.18 "b" - the clock stopped at
+    // E + W, the end of the holder's week to cash in. More than the in-time
+    // amount, and nothing for the holder's own delay after E + W.
+    {
+        const int H = (int)(E + W + 50);
+        CHouse house = Reopened(H);
+        const CAmount ICap = Interest(U, E + W - D);
+        BOOST_REQUIRE(ICap > ICapped);
+        BOOST_REQUIRE(Interest(U, (uint32_t)H - D) > ICap);
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ICap), H, U, house, fnDemanded), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ICap - 1), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ICapped), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+    }
+    // THE TRICK Q8 CLOSES: reopen at E, re-suspend at E + 5, pay while
+    // suspended at E + 10 (well inside the window). Interest runs D -> payment.
+    {
+        const int H = (int)(E + 10);
+        CHouse house = Reopened(H);
+        house.nDeferInvokedHeight = E + 5;
+        house.nDeferActivations = 2;
+        house.nDeferLastActivation = E + 5;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
+        const CAmount IFull = Interest(U, (uint32_t)H - D);
+        BOOST_REQUIRE(IFull > ICapped);
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + IFull), H, U, house, fnDemanded), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ICapped), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+    }
+    // ...and when that second episode reopens at E2 (overwriting E) and the
+    // note is paid within W of E2, it has accrued continuously D -> E2 (both
+    // episodes AND the gap between them), not just from the second episode.
+    {
+        const uint32_t E2 = E + 20000;
+        const int H = (int)(E2 + 3);
+        CHouse house = MakeOpenHouse(1, H, 2 * U);
+        house.nDeferEndedHeight = E2;
+        house.nDeferActivations = 2;
+        house.nDeferLastActivation = E + 5;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+        const CAmount ITo2 = Interest(U, E2 - D);
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ITo2), H, U, house, fnDemanded), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + ITo2 - 1), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+    }
+    // A demand in the SAME block as the reopen (D == E): zero window, par.
+    {
+        const int H = (int)(D + 5);
+        CHouse house = MakeOpenHouse(1, H, 2 * U);
+        house.nDeferEndedHeight = D;
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U), H, U, house, fnDemanded), "");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U - 1), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+    }
+    // A reopen BEFORE the demand caps nothing: accrual from D to payment.
+    {
+        const int H = (int)(D + 500);
+        CHouse house = MakeOpenHouse(1, H, 2 * U);
+        house.nDeferEndedHeight = D - 1;
+        const CAmount I = Interest(U, (uint32_t)H - D);
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + I - 1), H, U, house, fnDemanded),
+                          "bad-note-redeem-interest-short");
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U, key, (CAmount)U + I), H, U, house, fnDemanded), "");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(protest_queue_demand_window_starts_at_reopen)
+{
+    // v0.2.18: a QUEUE demand (filed while suspended) gets its week to be paid
+    // from the REOPEN, not from the demand - otherwise every queue holder could
+    // protest the block the house recovers.
+    const uint32_t D = 10000, E = 15000;
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint64_t U = 1000000;
+    CKey key; key.MakeNewKey(true);
+    const uint32_t tagQueueOut = NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH_QUEUE) | NOTE_DEMAND_PROTESTED_BIT;
+    const uint32_t tagB3Out = NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH) | NOTE_DEMAND_PROTESTED_BIT;
+
+    CHouse house = MakeOpenHouse(1, (int)(E + W), 2 * U);
+    house.nDeferEndedHeight = E;                       // reopened at E
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)(E + W)), HOUSE_STATUS_OPEN);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    auto fnCoinAt = [&](uint32_t nCoinHeight) {
+        return [=](const COutPoint&, Coin& coin) {
+            coin = Coin(CTxOut(NOTE_DUST_VALUE, NotePreAuthScript(vchKey)), (int)nCoinHeight, false, false, false, uint256());
+            coin.SetNote(1, U, NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH_QUEUE));
+            return true;
+        };
+    };
+    // Long past D + W, but inside the week after the reopen: early.
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, house), (int)(E + W - 1), U,
+                                house, fnCoinAt(D)), "bad-note-protest-early");
+    // The week after the reopen has run: accepted.
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, house), (int)(E + W), U,
+                                house, fnCoinAt(D)), "");
+    // A Δ1b UPGRADE at U2 > E (the tag keeps D, the coin is created at U2): the
+    // house could not pay alone before U2, so the week starts there.
+    const uint32_t U2 = E + 3 * W;
+    CHouse houseLate = house;
+    houseLate.nLastAttestHeight = U2 + W - 2;          // still attesting: Open at these heights
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(houseLate, (int)(U2 + W)), HOUSE_STATUS_OPEN);
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, houseLate), (int)(U2 + W - 1), U,
+                                houseLate, fnCoinAt(U2)), "bad-note-protest-early");
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, houseLate), (int)(U2 + W), U,
+                                houseLate, fnCoinAt(U2)), "");
+    // Fail closed: an unresolvable input cannot shorten a queue window.
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, houseLate), (int)(U2 + W), U,
+                                houseLate, fnNoCoin), "bad-note-protest-coin");
+    // A B3 formal demand keeps its own window from the demand.
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagB3Out, house), (int)(E + W - 1), U,
+                                house, fnNoCoin), "");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

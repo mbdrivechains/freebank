@@ -35,6 +35,9 @@
 #include <string>
 
 #include <sys/stat.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <cerrno>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -316,10 +319,17 @@ bool ParseEnforcerBmmCommitment(const UniValue& response, bool& fBlockFound, boo
 
     fBlockFound = true;
 
-    // Block known, but no h* committed for this sidechain
-    std::string strHex;
-    if (!GetHexField(find_value(commitment, "commitment"), strHex))
+    // Block known, but no h* committed for this sidechain: proto3 JSON omits
+    // the field.
+    const UniValue& field = find_value(commitment, "commitment");
+    if (field.isNull())
         return true;
+
+    // Present but unreadable is "can't tell", never "no" (layer-B review BMM
+    // L2): a "no" marks the side block invalid for good.
+    std::string strHex;
+    if (!GetHexField(field, strHex) || strHex.size() != 64)
+        return false;
 
     // BlockInfo.bmm_commitment is ConsensusHex (internal byte order)
     hashCommitment = Uint256FromConsensusHex(strHex);
@@ -932,6 +942,11 @@ bool EnforcerL1Client::BroadcastWithdrawalBundle(const std::string& hex)
 // Mainchain REST client + deposit parsing (enforcer transport deposit path)
 //
 
+// v0.2.18: RestGet's limits. A block's hex is at most ~8 MB (4 MWU); 64 MB
+// leaves room for anything the L1 REST interface serves us.
+static const int64_t L1_REST_TIMEOUT_MS = 60 * 1000;
+static const size_t L1_REST_MAX_REPLY = 64 * 1024 * 1024;
+
 bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
 {
     std::string strHostPort = gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST);
@@ -953,13 +968,67 @@ bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
         tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
         tcp::resolver::iterator end;
 
+        // One deadline for the whole call, connect included (v0.2.18, layer-B
+        // review wallet M3): a black-holed path otherwise blocks ~2 min per
+        // connect in SYN retries, under cs_main.
+        const int64_t nDeadline = GetTimeMillis() + L1_REST_TIMEOUT_MS;
         tcp::socket socket(io_service);
         boost::system::error_code error = boost::asio::error::host_not_found;
         while (error && endpoint_iterator != end) {
             socket.close();
-            socket.connect(*endpoint_iterator++, error);
+            const tcp::endpoint ep = *endpoint_iterator++;
+            socket.open(ep.protocol(), error);
+            if (error)
+                continue;
+            socket.non_blocking(true, error);
+            if (error)
+                continue;
+            // The system call, not socket.connect(): boost 1.64's sync connect
+            // ignores the non-blocking flag and waits in poll(-1) itself.
+            if (::connect(socket.native_handle(), ep.data(), ep.size()) == 0) {
+                error = boost::system::error_code();
+                break;
+            }
+            if (errno != EINPROGRESS && errno != EINTR) {
+                error = boost::system::error_code(errno, boost::system::system_category());
+                continue;
+            }
+            for (;;) {
+                const int64_t nLeft = nDeadline - GetTimeMillis();
+                if (nLeft <= 0) {
+                    error = boost::asio::error::timed_out;
+                    break;
+                }
+                struct pollfd pfd;
+                pfd.fd = socket.native_handle();
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                const int r = ::poll(&pfd, 1, (int)std::min<int64_t>(nLeft, 1000));
+                if (r < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    error = boost::system::error_code(errno, boost::system::system_category());
+                    break;
+                }
+                if (r == 0)
+                    continue;
+                int nSoError = 0;
+                socklen_t nLen = sizeof(nSoError);
+                if (::getsockopt(socket.native_handle(), SOL_SOCKET, SO_ERROR, &nSoError, &nLen) < 0)
+                    nSoError = errno;
+                error = nSoError ? boost::system::error_code(nSoError, boost::system::system_category())
+                                 : boost::system::error_code();
+                break;
+            }
         }
-        if (error) throw boost::system::system_error(error);
+        if (error) {
+            if (error == boost::asio::error::timed_out)
+                LogPrintf("L1 REST %s: no connection within %ds; treating the L1 as unreachable\n",
+                          strPath, L1_REST_TIMEOUT_MS / 1000);
+            throw boost::system::system_error(error);
+        }
+        // The request is tiny: write it blocking, then read non-blocking.
+        socket.non_blocking(false);
 
         // HTTP/1.0 + Connection: close -> a simple close-delimited body (no
         // chunked-encoding parsing needed)
@@ -970,12 +1039,38 @@ bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
         os << "Connection: close\r\n\r\n";
         boost::asio::write(socket, output);
 
+        // v0.2.18 (layer-B review wallet M3): a deadline and a size cap. These
+        // calls run under cs_main (block checks, CreateNewBlock), so an L1 that
+        // accepts the connection and then stops answering - a tailnet path
+        // dropping packets - used to hold the lock for hours. Non-blocking reads
+        // with our own poll(): boost's blocking read_some waits forever in its
+        // own poll() whatever SO_RCVTIMEO says.
+        socket.non_blocking(true);
         std::string data;
         for (;;) {
             boost::array<char, 8192> buf;
             boost::system::error_code e;
             size_t sz = socket.read_some(boost::asio::buffer(buf), e);
+            if (e == boost::asio::error::would_block || e == boost::asio::error::try_again) {
+                const int64_t nLeft = nDeadline - GetTimeMillis();
+                if (nLeft <= 0) {
+                    LogPrintf("L1 REST %s: no complete reply within %ds; treating the L1 as unreachable\n",
+                              strPath, L1_REST_TIMEOUT_MS / 1000);
+                    return false;
+                }
+                struct pollfd pfd;
+                pfd.fd = socket.native_handle();
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (::poll(&pfd, 1, (int)std::min<int64_t>(nLeft, 1000)) < 0 && errno != EINTR)
+                    throw boost::system::system_error(boost::system::error_code(errno, boost::system::system_category()));
+                continue;
+            }
             data.insert(data.size(), buf.data(), sz);
+            if (data.size() > L1_REST_MAX_REPLY) {
+                LogPrintf("L1 REST %s: reply over %u bytes; refused\n", strPath, (unsigned)L1_REST_MAX_REPLY);
+                return false;
+            }
             if (e == boost::asio::error::eof)
                 break;
             else if (e)

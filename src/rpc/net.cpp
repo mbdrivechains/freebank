@@ -619,6 +619,9 @@ UniValue setnetworkactive(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, "Error: Peer-to-peer functionality missing or disabled");
     }
 
+    // The operator's choice wins over an earlier mainchain-failure disable:
+    // nothing switches P2P back on behind their back (layer-B review wallet L3).
+    g_fNetworkDisabledByMainchain = false;
     g_connman->SetNetworkActive(request.params[0].get_bool());
 
     return g_connman->GetNetworkActive();

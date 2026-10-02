@@ -201,7 +201,7 @@ BOOST_AUTO_TEST_CASE(deposit_coin_tag_roundtrip)
 {
     // A receipt coin's fDeposit tag + terms survive coin serialization AND the
     // undo-record serialization (or a reorg-restored receipt loses its terms).
-    Coin coin(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(FreshPubKey())), 500, false, false, false, 0);
+    Coin coin(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(FreshPubKey())), 500, false, false, false, uint256());
     coin.SetDeposit(7, 250000, 450, 120000, 480);
 
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
@@ -240,7 +240,7 @@ BOOST_AUTO_TEST_CASE(deposit_addcoins_self_tags_receipts)
 
     CCoinsView base;
     CCoinsViewCache cache(&base);
-    AddCoins(cache, tx, nHeight, 0, 0, 0, 0, 0, 0);
+    AddCoins(cache, tx, nHeight);
 
     const Coin& c0 = cache.AccessCoin(COutPoint(tx.GetHash(), 0));
     const Coin& c1 = cache.AccessCoin(COutPoint(tx.GetHash(), 1));
@@ -263,7 +263,7 @@ BOOST_AUTO_TEST_CASE(deposit_addcoins_self_tags_receipts)
 static COutPoint AddReceipt(CCoinsViewCache& cache, uint32_t h, const std::vector<unsigned char>& holderPub,
                            uint64_t principal, const uint256& txid, uint32_t n = 0)
 {
-    Coin coin(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 100, false, false, false, 0);
+    Coin coin(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 100, false, false, false, uint256());
     coin.SetDeposit(h, principal, 500, 120000, 50);
     COutPoint op(txid, n);
     cache.AddCoin(op, std::move(coin), false);
@@ -418,7 +418,7 @@ BOOST_AUTO_TEST_CASE(deposit_transfer_gate)
     };
 
     // The receipt being transferred carries the REAL terms.
-    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(senderPub)), 100, false, false, false, 0);
+    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(senderPub)), 100, false, false, false, uint256());
     receipt.SetDeposit(H, P, R, M, O);
     auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
         if (o == COutPoint(uint256S("de"), 0)) { c = receipt; return true; } return false;
@@ -463,7 +463,7 @@ BOOST_AUTO_TEST_CASE(deposit_withdraw_gate)
     const uint32_t H = 5; const uint64_t P = 100000; const uint32_t R = 500, MAT = 1000, ORIG = 50;
 
     // The matured receipt being withdrawn.
-    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 60, false, false, false, 0);
+    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 60, false, false, false, uint256());
     receipt.SetDeposit(H, P, R, MAT, ORIG);
     auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
         if (o == COutPoint(uint256S("wd"), 0)) { c = receipt; return true; } return false;
@@ -544,12 +544,12 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
     const uint256 houseID = uint256S("f00d");
 
     // The receipt being claimed, and an escrow-pot coin to pay from.
-    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 60, false, false, false, 0);
+    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 60, false, false, false, uint256());
     receipt.SetDeposit(H, P, R, MAT, ORIG);
     const COutPoint rOut(uint256S("cl"), 0);
     const COutPoint eOut(uint256S("es"), 0);
     auto makeEscrow = [&](CAmount v) {
-        Coin c(CTxOut(v, HouseEscrowScript(houseID)), 40, false, false, false, 0);
+        Coin c(CTxOut(v, HouseEscrowScript(houseID)), 40, false, false, false, uint256());
         c.SetHouseEscrow(H);
         return c;
     };

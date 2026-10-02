@@ -6,6 +6,7 @@
 #include <validation.h>
 
 #include <arith_uint256.h>
+#include <asset.h>
 #include <base58.h>
 #include <bmmcache.h>
 #include <chain.h>
@@ -232,7 +233,6 @@ private:
 public:
     CChain chainActive;
     BlockMap mapBlockIndex;
-    std::map<uint256, CBlockIndex*> mapBlockMainHashIndex;
     std::multimap<CBlockIndex*, CBlockIndex*> mapBlocksUnlinked;
     CBlockIndex *pindexBestInvalid = nullptr;
 
@@ -259,6 +259,11 @@ public:
     bool PreciousBlock(CValidationState& state, const CChainParams& params, CBlockIndex *pindex);
     bool InvalidateBlock(CValidationState& state, const CChainParams& chainparams, CBlockIndex *pindex);
     bool ResetBlockFailureFlags(CBlockIndex *pindex);
+    /** v0.2.18: O(1) fail / un-fail of a side block that is NOT on the active
+     *  chain, anchored in an L1 block that was orphaned (HandleMainchainReorg). */
+    void MarkSideBlockFailed(CBlockIndex *pindex);
+    /** ResetBlockFailureFlags for a set of blocks in one index pass. */
+    void ResetBlockFailureFlagsBatch(const std::set<CBlockIndex*>& setReset);
 
     bool ReplayBlocks(const CChainParams& params, CCoinsView* view);
     bool RewindBlockIndex(const CChainParams& params);
@@ -290,7 +295,6 @@ CCriticalSection cs_main;
 BMMCache bmmCache;
 
 BlockMap& mapBlockIndex = g_chainstate.mapBlockIndex;
-std::map<uint256, CBlockIndex*>& mapBlockMainHashIndex = g_chainstate.mapBlockMainHashIndex;
 CChain& chainActive = g_chainstate.chainActive;
 CBlockIndex *pindexBestHeader = nullptr;
 CWaitableCriticalSection csBestBlock;
@@ -462,7 +466,7 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
         // coins, but a P2PKH LP-share / deposit-receipt dust coin would slip
         // through and inflate the proven liquid till - so reject every tag
         // here rather than rely on the script coincidence (3.7 review).
-        if (coin.fBitAsset || coin.fBitAssetControl || coin.fBill ||
+        if (coin.IsAssetColoured() || coin.fBill ||
                 coin.fBillEscrow || coin.fHouseEscrow || coin.fNote ||
                 coin.fDeposit || coin.fPoolEscrow || coin.fLpShare ||
                 coin.fOracleBond)
@@ -1137,16 +1141,29 @@ void EvictUnpayableWithdrawals()
     AssertLockHeld(cs_main);
     if (!chainActive.Tip())
         return;
-    if (!WithdrawalGuardActive(chainActive.Height() + 1, Params().GetConsensus().nWithdrawalGuardHeight))
-        return;
+    const bool fGuard = WithdrawalGuardActive(chainActive.Height() + 1, Params().GetConsensus().nWithdrawalGuardHeight);
 
     std::vector<std::pair<CTransactionRef, std::string>> vEvict;
     {
         LOCK(mempool.cs);
         for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
             std::string strReason;
-            if (TxHasUnpayableWithdrawal(mi->GetTx(), strReason))
+            if (fGuard && TxHasUnpayableWithdrawal(mi->GetTx(), strReason)) {
                 vEvict.push_back(std::make_pair(mi->GetSharedTx(), strReason));
+                continue;
+            }
+            // v0.2.18: a withdrawal whose id a block has since stored can never
+            // be mined (bad-withdrawal-not-new); the template skips it, and this
+            // takes it out of the pool and the owner's pending list.
+            std::vector<uint256> vWID;
+            GetTxWithdrawalIDs(mi->GetTx(), vWID);
+            for (const uint256& wid : vWID) {
+                SidechainWithdrawal held;
+                if (psidechaintree->GetWithdrawal(wid, held)) {
+                    vEvict.push_back(std::make_pair(mi->GetSharedTx(), "withdrawal id " + wid.ToString() + " already stored"));
+                    break;
+                }
+            }
         }
     }
     for (const std::pair<CTransactionRef, std::string>& e : vEvict) {
@@ -1190,6 +1207,27 @@ void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool f
     // UpdateTransactionsFromBlock finds descendants of any transactions in
     // the disconnectpool that were added back and cleans up the mempool state.
     mempool.UpdateTransactionsFromBlock(vHashUpdate);
+
+    // BitAssets (v0.2.18, review of ed7d51d finding 1): a tx that stayed in the
+    // pool may now spend an output of a re-added asset tx (accepted while that
+    // parent was confirmed). Its outputs' colour is not knowable in the pool,
+    // so drop it and its descendants - the rule ATMP applies to new txs.
+    {
+        std::vector<CTransactionRef> vDrop;
+        {
+            LOCK(mempool.cs);
+            for (const CTxMemPoolEntry& e : mempool.mapTx) {
+                for (const CTxIn& txin : e.GetTx().vin) {
+                    if (mempool.IsAssetTx(txin.prevout.hash)) {
+                        vDrop.push_back(e.GetSharedTx());
+                        break;
+                    }
+                }
+            }
+        }
+        for (const CTransactionRef& ptx : vDrop)
+            mempool.removeRecursive(*ptx, MemPoolRemovalReason::REORG);
+    }
 
     // We also need to remove any now-immature transactions
     mempool.removeForReorg(pcoinsTip.get(), chainActive.Tip()->nHeight + 1, STANDARD_LOCKTIME_VERIFY_FLAGS);
@@ -1243,6 +1281,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                               bool* pfMissingInputs, int64_t nAcceptTime, std::list<CTransactionRef>* plTxnReplaced,
                               bool bypass_limits, const CAmount& nAbsurdFee, std::vector<COutPoint>& coins_to_uncache)
 {
+    bool fMovesAsset = false;   // v0.2.18: set with the inputs in view, used at addUnchecked
     const CTransaction& tx = *ptx;
     const uint256 hash = tx.GetHash();
     AssertLockHeld(cs_main);
@@ -1292,6 +1331,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
     // through here. The height-dependent poison-row guard has its own sweep
     // and template skip. Node policy only (v0.2.13); consensus is unchanged.
     std::set<size_t> setClaimedBurns; // C6-A: burns already claimed in this tx
+    std::set<uint256> setTxWithdrawalIDs; // v0.2.18: withdrawal ids created by this tx
     for (const CTxOut& txout : tx.vout) {
         const CScript& scriptPubKey = txout.scriptPubKey;
         std::vector<unsigned char> vch;
@@ -1347,6 +1387,31 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             return state.DoS(0, false, REJECT_INVALID, "invalid-withdrawal-burn-already-claimed", false,
                              "every matching burn is already claimed by an earlier withdrawal in this tx");
         }
+        // v0.2.18 (layer-B review money R-2): the block rule refuses a withdrawal
+        // whose id exists (bad-withdrawal-not-new) - and TestBlockValidity does
+        // not reach that check, so a pooled copy would stall production. Not
+        // stored, not twice in this tx, not in another pooled tx.
+        {
+            const uint256 wid = withdrawal->GetID();
+            SidechainWithdrawal held;
+            if (setTxWithdrawalIDs.count(wid) || psidechaintree->GetWithdrawal(wid, held))
+                return state.DoS(0, false, REJECT_INVALID, "withdrawal-not-new", false, "a withdrawal with this id already exists");
+            for (const CTxMemPoolEntry& e : pool.mapTx) {
+                // A tx this one replaces (it spends one of the same coins) is
+                // not a rival: RBF removes it on acceptance.
+                bool fConflict = false;
+                for (const CTxIn& txin : tx.vin) {
+                    auto itNext = pool.mapNextTx.find(txin.prevout);
+                    if (itNext != pool.mapNextTx.end() && itNext->second->GetHash() == e.GetTx().GetHash()) { fConflict = true; break; }
+                }
+                if (fConflict) continue;
+                std::vector<uint256> vPooled;
+                GetTxWithdrawalIDs(e.GetTx(), vPooled);
+                if (std::find(vPooled.begin(), vPooled.end(), wid) != vPooled.end())
+                    return state.DoS(0, false, REJECT_INVALID, "withdrawal-not-new", false, "a pooled tx already creates this withdrawal");
+            }
+            setTxWithdrawalIDs.insert(wid);
+        }
         // Poison-row guard (v0.2.13): no withdrawal the mainchain
         // could never pay. Checked for the next block's height, like the
         // block rule in ConnectBlock. DoS 0: a not-yet-upgraded node may
@@ -1359,12 +1424,24 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
     }
 
     // If this transaction is a withdrawal refund request, verify it.
+    // Policy (v0.2.18, layer-B review money R-1): at most ONE refund request
+    // per tx. The pool entry, the block assembler and the coinbase builder
+    // all handle one refund per tx, while ConnectBlock demands a payout for
+    // every refund output - so a tx with two made every template fail
+    // TestBlockValidity and halted block production while it sat in the pool.
+    // DoS 0: such a tx is still consensus-valid in a block that pays both.
+    int nRefundRequests = 0;
     for (const CTxOut& o : tx.vout) {
         const CScript& scriptPubKey = o.scriptPubKey;
         uint256 id;
         std::vector<unsigned char> vchSig;
         if (!scriptPubKey.IsWithdrawalRefundRequest(id, vchSig))
             continue;
+
+        if (++nRefundRequests > 1) {
+            return state.DoS(0, false, REJECT_NONSTANDARD, "withdrawal-refund-multiple", false,
+                             "at most one withdrawal refund request per transaction");
+        }
 
         if (id.IsNull()) {
             return state.DoS(100, error("%s: Invalid withdrawal refund!", __func__),
@@ -1454,6 +1531,30 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 }
                 return false; // fMissingInputs and !state.IsInvalid() is used to detect this condition, don't set state.Invalid()
             }
+        }
+
+        // BitAssets (v0.2.18, layer-B review B5): no spending an output of an
+        // UNCONFIRMED asset tx. Its outputs' colour depends on its inputs'
+        // colour, which the mempool view does not carry - so mempool acceptance
+        // would see them as plain while ConnectBlock does not, and a template
+        // would fail. Asset transfers chain one confirmation per hop.
+        // The parent's flag was decided at ITS acceptance (from the coins it
+        // spent), so a reorg that drops its inputs back into the pool cannot
+        // make it look plain (review of ed7d51d, finding 1).
+        for (const CTxIn& txin : tx.vin) {
+            if (pool.IsAssetTx(txin.prevout.hash))
+                return state.DoS(0, false, REJECT_NONSTANDARD, "asset-unconfirmed-parent", false,
+                                 "spends an output of an unconfirmed asset transaction; wait for it to confirm");
+        }
+        // This tx moves an asset if it is a genesis or spends a coloured coin.
+        // Its inputs are confirmed coins or outputs of plain pooled txs (the
+        // rule above), so the view's colours are exact.
+        fMovesAsset = tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION;
+        for (const CTxIn& txin : tx.vin) {
+            if (fMovesAsset) break;
+            const Coin& coin = view.AccessCoin(txin.prevout);
+            if (!coin.IsSpent() && coin.IsAssetColoured())
+                fMovesAsset = true;
         }
 
         // Bring the best block into scope
@@ -2491,6 +2592,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
 
         // Store transaction in memory
         pool.addUnchecked(hash, entry, setAncestors, validForFeeEstimation);
+        if (fMovesAsset)
+            pool.SetAssetTx(hash);
 
         // trim mempool and check if tx was trimmed
         if (!bypass_limits) {
@@ -2806,11 +2909,8 @@ void CChainState::InvalidBlockFound(CBlockIndex *pindex, const CValidationState 
     }
 }
 
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, CAmount& amountAssetInOut, int& nControlNOut, uint32_t& nAssetIDOut, uint32_t nNewAssetIDIn, uint32_t nNewBillIDIn, uint32_t nNewHouseIDIn)
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, AssetTags* pAssetTagsOut, uint32_t nNewBillIDIn, uint32_t nNewHouseIDIn)
 {
-    amountAssetInOut = CAmount(0); // Track asset inputs
-    nControlNOut = -1; // Track asset controller outputs
-    nAssetIDOut = 0; // Track asset ID
     uint32_t nBillIDSpent = 0; // Track a spent bill title (endorsement)
     uint32_t nHouseIDSpent = 0; // Track a spent house pledge (reclaim)
     if (!tx.IsCoinBase()) {
@@ -2818,22 +2918,8 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
         // mark inputs spent
         for (size_t x = 0; x < tx.vin.size(); x++) {
             txundo.vprevout.emplace_back();
-            bool fBitAsset = false;
-            bool fBitAssetControl = false;
-            uint32_t nAssetID = 0;
-            bool is_spent = inputs.SpendCoin(tx.vin[x].prevout, fBitAsset, fBitAssetControl, nAssetID, &txundo.vprevout.back());
-
-            // Update nAssetIDOut if SpendCoin returns a non-zero asset ID
-            if (nAssetID)
-                nAssetIDOut = nAssetID;
-
+            bool is_spent = inputs.SpendCoin(tx.vin[x].prevout, &txundo.vprevout.back());
             assert(is_spent);
-
-            if (fBitAsset)
-                amountAssetInOut += txundo.vprevout.back().out.nValue;
-
-            if (fBitAssetControl)
-                nControlNOut = x;
 
             if (txundo.vprevout.back().fBill)
                 nBillIDSpent = txundo.vprevout.back().nBillID;
@@ -2843,10 +2929,29 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
         }
     }
 
+    // Asset colour from the spent coins, by the same rule CheckTxInputs
+    // enforced (v0.2.18): no counter, nothing threaded from the caller.
+    AssetTags tags;
+    {
+        std::vector<const Coin*> vSpent;
+        vSpent.reserve(txundo.vprevout.size());
+        for (const Coin& c : txundo.vprevout)
+            vSpent.push_back(&c);
+        if (tx.IsCoinBase())
+            vSpent.assign(tx.vin.size(), nullptr);
+        std::string strReason;
+        const bool fOK = ComputeAssetTags(tx, vSpent, tags, strReason);
+        if (!fOK)
+            LogPrintf("ERROR: %s: %s breaks an asset rule after validation (%s)\n", __func__, tx.GetHash().ToString(), strReason);
+        assert(fOK);
+    }
+    if (pAssetTagsOut)
+        *pAssetTagsOut = tags;
+
     // add outputs
     const uint32_t nBillID = nNewBillIDIn ? nNewBillIDIn : nBillIDSpent;
     const uint32_t nHouseID = nNewHouseIDIn ? nNewHouseIDIn : nHouseIDSpent;
-    AddCoins(inputs, tx, nHeight, nAssetIDOut, amountAssetInOut, nControlNOut, nNewAssetIDIn, nBillID, nHouseID);
+    AddCoins(inputs, tx, nHeight, tags, nBillID, nHouseID);
 }
 
 static bool VerifyHouseApprovers(const CHouse& house, const std::vector<uint32_t>& vIndex,
@@ -3972,17 +4077,17 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // Option clause (3.5, ARCH s7 step 5): a RECOVERY attestation - one that
         // clears the stress origin, i.e. reaches floor + restoration buffer -
         // LIFTS an invoked deferral. The episode closes and its length is added
-        // to the confidence-death ledger. An attestation that does NOT recover
-        // leaves the clause running: the window keeps counting down.
+        // to the published suspension ledger. An attestation that does NOT
+        // recover leaves the clause running - and, v0.2.18, resets the silence
+        // clock (it moves nLastAttestHeight below).
         if (house.nDeferInvokedHeight != 0 && nNewStress == 0) {
             house.nDeferCumBlocks += (uint32_t)nHeight > house.nDeferInvokedHeight
                                    ? (uint32_t)nHeight - house.nDeferInvokedHeight : 0;
             house.nDeferInvokedHeight = 0;
             house.nDeferRenewals = 0;
-            // DR-2: stamp the episode end. Deferral interest on a demanded note
-            // accrues from the date of demand TO THIS HEIGHT, not to the eventual
-            // redemption - once the house is paying at par again the forced wait
-            // is over and the note stops being an interest-bearing bond.
+            // DR-2: stamp the episode end. v0.2.18 (Q8): a demanded note paid
+            // within nDemandWindow of THIS height stops accruing here; one paid
+            // later accrues until paid (NoteDemandAccrualWindow).
             house.nDeferEndedHeight = (uint32_t)nHeight;
         }
 
@@ -4019,17 +4124,17 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         // The clause is a STRESSED-state tool. Not at Open (nothing to defer -
         // and suspending a healthy house would be pure expropriation), not at
-        // Deferred (already invoked - RENEW is the extension path), and never
-        // at Insolvent: sim-D1's "insolvency -> resolution, never suspension"
-        // is exactly this rejection (D12 - solvency is the effective status).
+        // Deferred (already invoked, and it has no end date to extend), and
+        // never at Insolvent: sim-D1's "insolvency -> resolution, never
+        // suspension" is exactly this rejection (D12 - solvency is the
+        // effective status).
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_STRESSED)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-not-stressed");
 
-        // Confidence death (D13): the guard, not a kill switch. A house that
-        // has spent its credibility loses the crisis tool and falls back to the
-        // ordinary stress clock - which is what actually kills it.
-        if (HouseConfidenceDead(house, nHeight))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-confidence-dead");
+        // v0.2.18 (operator Q4): the confidence-death guard (sim D15) is gone -
+        // repeat suspensions are allowed. What limits them now is the price:
+        // the till is locked again, queued notes earn the scheduled rate, and
+        // nDeferActivations / defer_suspended_blocks stay published.
 
         // Undo prior (ATTEST pattern): restoring from the payload alone is then
         // byte-exact, and a replayed invocation always fails.
@@ -4128,33 +4233,9 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
     }
 
     if (tx.nHouseOp == HOUSE_OP_RENEW) {
-        HouseRenew ren;
-        if (!DecodeHousePayload(tx.vchHousePayload, ren))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-payload");
-
-        CHouse house;
-        if (!fnGetHouse(ren.nHouseID, house))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
-
-        // Only while the clause is actually running (a renewal after expiry
-        // would be a resurrection - the house is insolvent by then).
-        if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_DEFERRED)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-not-deferred");
-        if (house.nDeferRenewals >= HOUSE_DEFER_MAX_RENEWALS)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-exhausted");
-        // A renewal that would carry the house past the cumulative-suspension
-        // cap is refused up front rather than granted and then voided.
-        if (house.DeferSuspendedBlocks(nHeight) >= HOUSE_CD_MAX_SUSPENDED)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-confidence-dead");
-
-        const uint256 sighash = HouseRenewSigHash(house.houseID, house.nDeferRenewals, NoteHashPrevouts(tx), BillHashOutputs(tx));
-        if (!VerifyHouseApprovers(house, ren.vApproverIndex, ren.vApproverSig, sighash,
-                house.nThresholdM, state, "bad-house-renew-approver"))
-            return false;
-
-        house.nDeferRenewals++;
-        houseOut = house;
-        return true;
+        // v0.2.18: retired (the shape check rejects it first; belt here so no
+        // path can ever connect one).
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-retired");
     }
 
     return state.DoS(100, false, REJECT_INVALID, "bad-house-op");
@@ -4298,17 +4379,17 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // wind-down.
         //
         // At DEFERRED the option clause has been invoked: par redemption stops
-        // and the holder QUEUES instead, accruing interest from the date of
-        // demand (R-i3 lands NOTE_OP_DEMAND and the paid-out-with-interest
-        // path; until then a suspension simply halts redemption, which is the
-        // conservative half of the mechanic).
-        {
-            const char chEff = HouseEffectiveStatus(house, nHeight);
-            if (chEff == HOUSE_STATUS_DEFERRED)
-                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-deferred");
-            if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
-                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-house-closed");
-        }
+        // and the holder QUEUES instead (NOTE_OP_DEMAND), accruing interest
+        // from the date of demand. v0.2.18 (operator Q6): the suspended house
+        // MAY pay DEMANDED notes - from new money (a redeem never spends
+        // escrow, so the locked till stays locked until reopen) and at least
+        // the consensus floor below. UNDEMANDED notes still cannot redeem while
+        // suspended. The demanded/undemanded test needs the input coins, so
+        // the Deferred arm is decided after the tag scan (fDeferredHouse).
+        const char chEffRedeem = HouseEffectiveStatus(house, nHeight);
+        const bool fDeferredHouse = (chEffRedeem == HOUSE_STATUS_DEFERRED);
+        if (!fDeferredHouse && chEffRedeem != HOUSE_STATUS_OPEN && chEffRedeem != HOUSE_STATUS_STRESSED)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-house-closed");
 
         // Authorization, two modes (B3 T-b3):
         // - PLAIN: the holder authorizes burning U units AND (by binding
@@ -4343,18 +4424,18 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-sig");
         }
 
-        // Brassage inputs, computed ONCE here because the discharge floor
-        // below needs the spread before the brassage block enforces it (the
-        // runner bears the spread - sheet delta-2: a discharge floor of
-        // U + interest with no spread deduction would make demand-then-
-        // discharge the universal brassage bypass below rho).
+        // Brassage inputs, computed ONCE here because the interest floors
+        // below need the spread before the brassage block enforces it (the
+        // runner bears the spread - sheet delta-2: a floor of U + interest
+        // with no spread deduction would make demand-then-redeem the
+        // universal brassage bypass below rho).
         const uint32_t nBrassageBps = HouseBrassageBps(house);
         const CAmount amountBrassageSpread = HouseBrassageAmount(nNoteUnitsIn, nBrassageBps);
 
-        // DEFERRAL INTEREST (3.5 D6). Redeeming notes that were DEMANDED during
-        // a suspension pays principal + 5%/yr accrued from the DATE OF DEMAND -
-        // and unlike ordinary redemption (notes-D5: the holder signs whatever
-        // payout they accept), this one has a consensus FLOOR. The compensation
+        // DEFERRAL INTEREST (3.5 D6; v0.2.18 rate schedule, 10%/yr from block
+        // 0). Redeeming notes that were DEMANDED pays principal + interest at
+        // the scheduled rate - and unlike ordinary redemption (notes-D5: the
+        // holder signs whatever payout they accept), this one has a FLOOR. The compensation
         // for a forced wait must not be renegotiable under duress: a holder who
         // has been queued for months is exactly the party with no bargaining
         // power left.
@@ -4378,6 +4459,11 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                     nProtestedBurned++;
             }
             const uint32_t nDemandHeight = NoteDemandHeightOf(nDemandTag);
+            // v0.2.18 (Q6): a suspended house pays DEMANDED notes only. The
+            // demand tag is uniform across a redeem's inputs (tx_verify
+            // bad-note-inputs-mixed-demand), so one tag decides for all.
+            if (fDeferredHouse && nDemandHeight == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-deferred");
             // A discharge with no demanded inputs is unreachable (tx_verify
             // rejects it before contextual runs in every acceptance path);
             // the belt exists so the floor logic below can never be skipped
@@ -4385,52 +4471,38 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             if (redeem.fPreAuthDischarge && nDemandHeight == 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-not-preauth");
             if (nDemandHeight != 0) {
-                // DR-2: the interest window is capped at the END of the deferral
-                // episode (the recovery attestation's height). The clause
-                // compensates a FORCED wait; once the house redeems at par again
-                // the holder is waiting by choice, and without the cap the
-                // permanent nDemandHeight coin tag turned "demand once, hold" into
-                // a perpetual 5%/yr bond. A note demanded in an earlier episode
-                // and redeemed after a later recovery caps at the LATER end
-                // (bounded over-pay - accepted; the alternative is per-note
-                // episode tracking). If no recovery post-dates the demand the
-                // house is still suspended (redeem is blocked at Deferred), or
-                // the record pre-dates DR-2 (v5 migration: 0 = uncapped until
-                // the next recovery stamps it).
-                // INCLUSIVE on the demand side (review finding): a demand that
-                // connects in the SAME block as the recovery attestation gets
-                // D == E - its forced wait ended the block it began, so the
-                // window is zero, NOT uncapped.
-                uint32_t nEndHeight = (uint32_t)nHeight;
-                if (house.nDeferEndedHeight >= nDemandHeight &&
-                        house.nDeferEndedHeight < nEndHeight)
-                    nEndHeight = house.nDeferEndedHeight;
-                // D-iii (operator-signed 2026-08-04): a PRE-AUTH demand's clock
-                // starts at window LAPSE, not at demand - "pay in a week and it
-                // costs you par". This is what retires the shipped objection at
-                // the DEMAND status gate ("an interest clock the house never
-                // agreed to"): inside the window the house owes principal only.
-                // A plain (Deferred-era) demand keeps from-demand accrual
-                // untouched - that clock belongs to the option clause, not B3.
-                uint32_t nAccrualStart = nDemandHeight;
-                if (NoteDemandIsPreAuth(nDemandTag))
-                    nAccrualStart += Params().GetConsensus().nDemandWindow;
-                const uint32_t nBlocks = nEndHeight > nAccrualStart
-                                       ? nEndHeight - nAccrualStart : 0;
-                const CAmount amountInterest = NoteDeferralInterest(nNoteUnitsIn, nBlocks);
+                // The accrual window and the rate schedule live in ONE helper
+                // the wallet mirrors (note.h NoteDemandAccrualWindow; v0.2.18
+                // Q8): start = D (plain, suspension-queue demand) or D + W
+                // (B3 pre-auth, D-iii: from window lapse); end = the payment
+                // height, EXCEPT that a note paid while the house is open and
+                // within W of its latest reopen (nDeferEndedHeight >= D) stops
+                // at that reopen. So the note accrues until it is PAID, a
+                // reopen-then-resuspend cannot freeze it, and a house that pays
+                // promptly after reopening owes nothing for the time since.
+                const CAmount amountInterest = NoteDemandInterest(house, nDemandTag, nNoteUnitsIn,
+                                                                  (uint32_t)nHeight, Params().GetConsensus());
+                // THE FLOOR, the same in both modes (operator Q7, 2026-10-02:
+                // "make the two redeem paths consistent on who bears the
+                // spread"): U + interest - spread to the holder's side, the
+                // spread to the pot via the ordinary brassage block below. The
+                // RUNNER bears the brassage (B3 Delta-2, signed); the house's
+                // total outlay is U + interest either way. Until v0.2.17 the
+                // holder-signed floor was U + interest with the spread ON TOP
+                // (house bears) - a looser rule now, never a tighter one, and
+                // it only differed below rho, where a demanded note was not
+                // redeemable before v0.2.18 (Deferred) except after a fresh
+                // post-recovery stress.
+                const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest - amountBrassageSpread;
                 if (redeem.fPreAuthDischarge) {
                     // The discharge pays the PRE-AUTHORISED script, not the
                     // holder-key script - that is the standing instruction the
                     // holder signed. vout[0] must BE that script (deterministic
                     // position, mirroring CLAIM), and everything paid to it
-                    // must reach the floor U + interest - spread: the RUNNER
-                    // bears the brassage (sheet delta-2), spread to the pot via
-                    // the ordinary brassage block below, so the house's total
-                    // outlay is U + interest either way.
+                    // must reach the floor.
                     const CScript scriptPayout(redeem.vchPayoutScript.begin(), redeem.vchPayoutScript.end());
                     if (tx.vout[0].scriptPubKey != scriptPayout)
                         return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-payout-script");
-                    const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest - amountBrassageSpread;
                     CAmount amountPaid = 0;
                     for (const CTxOut& out : tx.vout) {
                         if (out.scriptPubKey == scriptPayout)
@@ -4439,7 +4511,6 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                     if (amountPaid < amountDue)
                         return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-interest-short");
                 } else {
-                    const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest;
                     // Sum everything paid to the holder's own script.
                     const CScript scriptHolder = NoteScriptForPubKey(redeem.vchHolderPubKey);
                     CAmount amountPaid = 0;
@@ -4489,17 +4560,13 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         //
         // DR-2: demanded notes are NOT exempt. The old exemption keyed on the
         // permanent nDemandHeight coin tag, making a once-demanded note
-        // brassage-free forever. It also never did the job it was meant for:
-        // the queue is paid out AFTER recovery, and a recovery attestation is
-        // by definition at floor+buffer, so the attested ratio is back above
-        // rho and the spread is zero for everyone at that point. The only time
-        // a demanded note could owe a spread is a NEW below-floor stress that
-        // post-dates the recovery - a new race the exiting holder should price
-        // like every other holder. (The spec alternative - gate on effective
-        // Deferred - is equivalent: redemption is blocked at Deferred above,
-        // so the gate can never pass here.)
+        // brassage-free forever. v0.2.18 (operator Q7: brassage unchanged): a
+        // queued note paid WHILE SUSPENDED owes whatever spread the last
+        // attested ratio implies, like any other exit (usually the full ramp:
+        // most suspended houses attested below rho); the interest floor above
+        // already deducts it (runner bears).
         {
-            const CAmount amountSpread = amountBrassageSpread;   // hoisted above (the discharge floor needs it first)
+            const CAmount amountSpread = amountBrassageSpread;   // hoisted above (the interest floor needs it first)
 
             const CScript scriptEscrow = HouseEscrowScript(house.houseID);
             if (amountSpread > 0) {
@@ -4546,26 +4613,33 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!fnGetHouse(dem.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
 
-        // One op, two modes, keyed on house status (B3 T-b3):
-        // - DEFERRED: the option clause is running; today's semantics byte-for-
-        //   byte - the holder queues, plain, and a pre-auth here is FORBIDDEN
-        //   (the clause's own machinery governs; grafting a discharge path
-        //   onto it would fork the queue's payout discipline).
-        // - OPEN / STRESSED: the B3 formal demand - pre-auth REQUIRED. The old
-        //   objection ("a demand at Open starts an interest clock the house
-        //   never agreed to") is retired by D-iii: inside the window the house
-        //   owes par exactly, and the clock the house DID agree to - by being
-        //   a note issuer - starts only when it lets the demand lapse.
+        // One op, modes keyed on house status (B3 T-b3; v0.2.18 D-2026-10-02-1):
+        // - DEFERRED: the option clause is running; the holder queues, either
+        //   PLAIN (mode 0: only the holder can redeem it, and the note stays
+        //   transferable) or PRE-AUTH QUEUE (mode 2: the house can pay it alone,
+        //   so it can always end the 10% by paying). Mode 1 is refused here: it
+        //   would start the clock at window lapse, but a suspended house's
+        //   queue accrues from the demand.
+        // - OPEN / STRESSED: the B3 formal demand - pre-auth REQUIRED (mode 1).
+        //   The old objection ("a demand at Open starts an interest clock the
+        //   house never agreed to") is retired by D-iii: inside the window the
+        //   house owes par exactly, and the clock the house DID agree to - by
+        //   being a note issuer - starts only when it lets the demand lapse.
+        //   Mode 2 here only as a Δ1b UPGRADE of an earlier plain queue demand
+        //   (tx_verify pins that an upgrade is mode 2 with the original height).
         // - INSOLVENT / wound down: the waterfall (or nothing) has replaced
         //   redemption; nothing to demand.
         {
             const char chEff = HouseEffectiveStatus(house, nHeight);
+            const bool fUpgrade = dem.nPriorDemandHeight != 0;
             if (chEff == HOUSE_STATUS_DEFERRED) {
-                if (dem.fPreAuth)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-forbidden");
+                if (dem.fPreAuth == NOTE_DEMAND_MODE_PREAUTH)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-queue-required");
             } else if (chEff == HOUSE_STATUS_OPEN || chEff == HOUSE_STATUS_STRESSED) {
-                if (!dem.fPreAuth)
+                if (dem.fPreAuth == NOTE_DEMAND_MODE_PLAIN)
                     return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-required");
+                if (dem.fPreAuth == NOTE_DEMAND_MODE_PREAUTH_QUEUE && !fUpgrade)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-queue-not-deferred");
             } else {
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-house-closed");
             }
@@ -4641,7 +4715,31 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         const uint32_t nDemandH = NoteDemandHeightOf(pro.nDemandTag);
         if (nDemandH == 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-tag");
-        if ((int64_t)nHeight < (int64_t)nDemandH + (int64_t)Params().GetConsensus().nDemandWindow)
+        // v0.2.18: a QUEUE demand (filed while the house was suspended) could
+        // not be paid at par then; its week to pay starts at the reopen, not at
+        // the demand - otherwise every queue holder could protest the block the
+        // house recovers, and a recovery would trigger the stress cascade.
+        uint32_t nWindowStart = nDemandH;
+        if (NoteDemandIsQueue(pro.nDemandTag)) {
+            if (house.nDeferEndedHeight >= nDemandH)
+                nWindowStart = house.nDeferEndedHeight;
+            // ...and not before the coins became pre-auth: a Δ1b upgrade keeps
+            // the ORIGINAL demand height in the tag, but until the upgrade the
+            // house could not pay alone, so its week starts at the upgrade. An
+            // unprotested queue coin cannot be transferred, so its creation
+            // height IS its demand or upgrade height (a protest re-issue only
+            // happens after the window, and then the protested bit refuses a
+            // second protest anyway).
+            // Fail closed: an unresolvable input cannot shorten the window.
+            for (const CTxIn& in : tx.vin) {
+                Coin coin;
+                if (!fnGetCoin(in.prevout, coin) || coin.IsSpent())
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-coin");
+                if (coin.fNote && (uint32_t)coin.nHeight > nWindowStart)
+                    nWindowStart = (uint32_t)coin.nHeight;
+            }
+        }
+        if ((int64_t)nHeight < (int64_t)nWindowStart + (int64_t)Params().GetConsensus().nDemandWindow)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-early");
 
         // Undo contract (the nPrevLastActivation idiom): the payload's priors
@@ -5942,16 +6040,11 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         uint256 hash = tx.GetHash();
         bool is_coinbase = tx.IsCoinBase();
 
-        // Undo BitAssetDB updates
-        if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
-            // Undo BitAsset creation & revert asset ID #
-            uint32_t nIDLast = 0;
-            passettree->GetLastAssetID(nIDLast);
-            if (!passettree->WriteLastAssetID(nIDLast - 1)) {
-                error("DisconnectBlock(): Failed to undo BitAssetDB asset ID #!");
-                return DISCONNECT_FAILED;
-            }
-            if (!passettree->RemoveAsset(nIDLast)) {
+        // Undo the asset RPC index (v0.2.18): erase this block's geneses by
+        // txid. Gated on fSideDB like every other sidechain DB (layer-B review
+        // defect 5 / A9); idempotent, so a replay that never wrote it is fine.
+        if (fSideDB && tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
+            if (!passettree->RemoveBitAssets({hash})) {
                 error("DisconnectBlock(): Failed to remove BitAssetDB asset!");
                 return DISCONNECT_FAILED;
             }
@@ -6422,6 +6515,8 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
             }
             else if (tx.nHouseOp == HOUSE_OP_RENEW) {
+                // Unreachable since v0.2.18 (RENEW is rejected from block 0,
+                // so no block can carry one); kept as the exact inverse.
                 HouseRenew ren;
                 CHouse house;
                 if (!DecodeHousePayload(tx.vchHousePayload, ren) ||
@@ -7017,10 +7112,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
             if (!scriptPubKey.IsUnspendable()) {
                 COutPoint out(hash, o);
                 Coin coin;
-                bool fBitAsset = false;
-                bool fBitAssetControl = false;
-                uint32_t nAssetID = 0;
-                bool is_spent = view.SpendCoin(out, fBitAsset, fBitAssetControl, nAssetID, &coin);
+                bool is_spent = view.SpendCoin(out, &coin);
                 if (!is_spent || tx.vout[o] != coin.out || pindex->nHeight != coin.nHeight || is_coinbase != coin.fCoinBase) {
                     fClean = false; // transaction output mismatch
                 }
@@ -7997,53 +8089,25 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             control.Add(vChecks);
         }
 
-        // New asset created - set asset ID # and update BitAssetDB
-        uint32_t nNewAssetID = 0;
-        if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
-            if (tx.vout.size() < 2) {
-                return state.DoS(100, error("ConnectBlock(): Invalid BitAsset creation - vout too small"),
-                                 REJECT_INVALID, "bad-asset-vout-small");
-            }
-
-            uint32_t nIDLast = 0;
-            passettree->GetLastAssetID(nIDLast);
-
+        // New asset (v0.2.18): its identity is its txid; CheckTransaction has
+        // pinned the shape and metadata, ComputeAssetTags (in CheckTxInputs)
+        // the inputs. Only the RPC index record is staged here.
+        if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION && !tx.IsCoinBase()) {
             BitAsset asset;
-            asset.nID = nIDLast + 1;
+            asset.txid = tx.GetHash();
             asset.strTicker = tx.ticker;
             asset.strHeadline = tx.headline;
             asset.payload = tx.payload;
-            asset.txid = tx.GetHash();
+            asset.nDecimals = tx.nDecimals;
             asset.nSupply = tx.vout[1].nValue;
-
-            CTxDestination controllerDest;
-            if (ExtractDestination(tx.vout[0].scriptPubKey, controllerDest)) {
-                asset.strController = EncodeDestination(controllerDest);
-            }
-            else
-            if (tx.vout[0].scriptPubKey.size() && tx.vout[0].scriptPubKey[0] == OP_RETURN) {
-                asset.strController = "OP_RETURN";
-            }
-            else {
-                return state.DoS(100, error("ConnectBlock(): Invalid BitAsset creation - controller destination invalid"),
-                                 REJECT_INVALID, "bad-asset-controller-dest");
-            }
-
-            CTxDestination ownerDest;
-            if (!ExtractDestination(tx.vout[1].scriptPubKey, ownerDest)) {
-                    return state.DoS(100, error("ConnectBlock(): Invalid BitAsset creation - owner destination invalid"),
-                                     REJECT_INVALID, "bad-asset-owner-dest");
-            }
-            asset.strOwner = EncodeDestination(ownerDest);
-
+            CTxDestination dest;
+            if (ExtractDestination(tx.vout[0].scriptPubKey, dest))
+                asset.strController = EncodeDestination(dest);
+            if (ExtractDestination(tx.vout[1].scriptPubKey, dest))
+                asset.strOwner = EncodeDestination(dest);
+            asset.hashBlock = block.GetHash();
+            asset.nHeight = pindex->nHeight;
             vAsset.push_back(asset);
-
-            // Update latest BitAsset ID #
-            if (!fJustCheck && !passettree->WriteLastAssetID(asset.nID))
-                return error("%s: Failed to update last BitAsset ID #!\n", __func__);
-
-            // Copy new asset ID, we will pass it to CoinDB when we UpdateCoins
-            nNewAssetID = asset.nID;
         }
 
         // Bill operations - validate against BillDB plus bills already
@@ -8760,18 +8824,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             blockundo.vtxundo.push_back(CTxUndo());
         }
 
-        CAmount amountAssetIn = CAmount(0);
-        int nControlN = -1;
-        uint32_t nAssetID = 0;
-        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight, amountAssetIn, nControlN, nAssetID, nNewAssetID, nNewBillID, nNewHouseID);
-
-        BitAssetTransactionData data;
-        data.amountAssetIn = amountAssetIn;
-        data.nControlN = nControlN;
-        data.nAssetID = nNewAssetID ? nNewAssetID : nAssetID;
-        data.txid = tx.GetHash();
-        if (connectTrace && (amountAssetIn > 0 || tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION))
-            connectTrace->SetBitAssetData(tx.GetHash(), data);
+        // v0.2.18: asset colour is computed inside UpdateCoins from the spent
+        // coins; the wallet reads colour from the UTXO set, so nothing about
+        // assets is threaded to it through the connect trace any more.
+        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight, nullptr, nNewBillID, nNewHouseID);
     }
     int64_t nTime3 = GetTimeMicros(); nTimeConnect += nTime3 - nTime2;
     LogPrint(BCLog::BENCH, "      - Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin) [%.2fs (%.2fms/blk)]\n", (unsigned)block.vtx.size(), MILLI * (nTime3 - nTime2), MILLI * (nTime3 - nTime2) / block.vtx.size(), nInputs <= 1 ? 0 : MILLI * (nTime3 - nTime2) / (nInputs-1), nTimeConnect * MICRO, nTimeConnect * MILLI / nBlocksTotal);
@@ -8883,7 +8939,9 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 }
             }
         } else {
-            LogPrintf("%s: Failed to get latest withdrawal bundle from ldb: %s!\n", __func__, hashLatestWithdrawalBundle.ToString());
+            // Normal until the first withdrawal bundle exists, so only with -debug=coindb:
+            // printed for every block it read like an error to new users (app ask, 2026-09-30).
+            LogPrint(BCLog::COINDB, "%s: Failed to get latest withdrawal bundle from ldb: %s!\n", __func__, hashLatestWithdrawalBundle.ToString());
         }
 
         // Check version commit in coinbase
@@ -9007,6 +9065,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             vSidechainObjects.clear();
         };
         bool fFoundWithdrawalBundle = false;
+        // v0.2.18: withdrawal ids created by this block (duplicate refusal).
+        std::set<uint256> setNewWithdrawalIDs;
         // D-3: the block's own last deposit (block order), for the pindex
         // deposit-CTIP baseline set after the DB write below.
         uint256 hashLastDepositInBlock;
@@ -9084,6 +9144,24 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                         FreeSidechainObjects();
                         return state.DoS(100, error("ConnectBlock(): %s", strPayable), REJECT_INVALID, "bad-withdrawal-unpayable");
                     }
+                    // v0.2.18 (operator "yes", 2026-10-03; layer-B review money
+                    // R-2): a withdrawal must be NEW. A copy re-using an existing
+                    // id overwrote its row (status included) and, on a reorg, the
+                    // disconnect erased the victim's row by id - a split between
+                    // nodes that lived through it and fresh ones. Honest wallets
+                    // never collide: the id hashes the creating tx (hashBlindTx).
+                    const uint256 wid = withdrawal->GetID();
+                    SidechainWithdrawal held;
+                    if (setNewWithdrawalIDs.count(wid) || psidechaintree->GetWithdrawal(wid, held)) {
+                        delete obj;
+                        FreeSidechainObjects();
+                        return state.DoS(100, error("%s: withdrawal %s is not new", __func__, wid.ToString()),
+                                         REJECT_INVALID, "bad-withdrawal-not-new");
+                    }
+                    setNewWithdrawalIDs.insert(wid);
+                    // Stored as unspent whatever the record's status byte says
+                    // (the bundle precedent, v0.2.17).
+                    ((SidechainWithdrawal *) obj)->status = WITHDRAWAL_UNSPENT;
                 }
 
                 // If the object is a withdrawal we do not want the ID to change when
@@ -9212,8 +9290,9 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         setDirtyBlockIndex.insert(pindex);
     }
 
-    // Write asset objects to db
-    if (vAsset.size()) {
+    // Write asset records to the RPC index (idempotent, keyed by txid). Not on
+    // VerifyDB's reconnect (fSideDB=false): layer-B review A9.
+    if (vAsset.size() && fSideDB) {
         if (!passettree->WriteBitAssets(vAsset))
             return state.Error("Failed to write BitAsset index!");
     }
@@ -9975,11 +10054,14 @@ bool CChainState::ResetBlockFailureFlags(CBlockIndex *pindex) {
         it++;
     }
 
-    // Remove the invalidity flag from all ancestors too.
+    // Remove the invalidity flag from all ancestors too. v0.2.18: and drop
+    // them from g_failed_blocks (as later Core does) - a stale entry there
+    // trips AcceptBlockHeader's assert(BLOCK_FAILED_VALID).
     while (pindex != nullptr) {
         if (pindex->nStatus & BLOCK_FAILED_MASK) {
             pindex->nStatus &= ~BLOCK_FAILED_MASK;
             setDirtyBlockIndex.insert(pindex);
+            g_failed_blocks.erase(pindex);
         }
         pindex = pindex->pprev;
     }
@@ -9987,6 +10069,91 @@ bool CChainState::ResetBlockFailureFlags(CBlockIndex *pindex) {
 }
 bool ResetBlockFailureFlags(CBlockIndex *pindex) {
     return g_chainstate.ResetBlockFailureFlags(pindex);
+}
+
+void CChainState::MarkSideBlockFailed(CBlockIndex *pindex)
+{
+    AssertLockHeld(cs_main);
+    // Not added to g_failed_blocks: a header on top of it is refused by its
+    // own parent check (bad-prevblk), and a flood of marked copies there would
+    // make AcceptBlockHeader's walk over g_failed_blocks expensive.
+    pindex->nStatus |= BLOCK_FAILED_VALID;
+    setDirtyBlockIndex.insert(pindex);
+    setBlockIndexCandidates.erase(pindex);
+}
+
+void CChainState::ResetBlockFailureFlagsBatch(const std::set<CBlockIndex*>& setReset)
+{
+    AssertLockHeld(cs_main);
+
+    // Same effect as ResetBlockFailureFlags on each block of setReset: clear
+    // every failed block that is one of them or descends from one, then their
+    // ancestors. "Descends from one" is found by walking up to the active
+    // chain, memoised so each block is resolved once even when a header flood
+    // made a long branch (no quadratic walk).
+    std::map<const CBlockIndex*, bool> mapUnder;
+    std::set<CBlockIndex*> setCleared;
+    auto IsUnderReset = [&](const CBlockIndex* pindexStart) {
+        std::vector<const CBlockIndex*> vPath;
+        bool fResult = false;
+        for (const CBlockIndex* p = pindexStart; p != nullptr; p = p->pprev) {
+            auto itMemo = mapUnder.find(p);
+            if (itMemo != mapUnder.end()) { fResult = itMemo->second; break; }
+            if (setReset.count(const_cast<CBlockIndex*>(p))) { fResult = true; vPath.push_back(p); break; }
+            if (chainActive.Contains(p)) { fResult = false; break; }
+            // A block failed for its own reason (another orphaned anchor, an
+            // operator's invalidateblock, a genuinely invalid block) stays
+            // failed, and so does everything under it.
+            if (p->nStatus & BLOCK_FAILED_VALID) { fResult = false; vPath.push_back(p); break; }
+            vPath.push_back(p);
+        }
+        for (const CBlockIndex* p : vPath)
+            mapUnder[p] = fResult;
+        return fResult;
+    };
+    BlockMap::iterator it = mapBlockIndex.begin();
+    while (it != mapBlockIndex.end()) {
+        CBlockIndex* pindexWalk = it->second;
+        if (!pindexWalk->IsValid()) {
+            if (IsUnderReset(pindexWalk)) {
+                pindexWalk->nStatus &= ~BLOCK_FAILED_MASK;
+                setDirtyBlockIndex.insert(pindexWalk);
+                if (pindexWalk->IsValid(BLOCK_VALID_TRANSACTIONS) && pindexWalk->nChainTx &&
+                        setBlockIndexCandidates.value_comp()(chainActive.Tip(), pindexWalk)) {
+                    setBlockIndexCandidates.insert(pindexWalk);
+                }
+                if (pindexWalk == pindexBestInvalid)
+                    pindexBestInvalid = nullptr;
+                g_failed_blocks.erase(pindexWalk);
+                setCleared.insert(pindexWalk);
+            }
+        }
+        it++;
+    }
+
+    // No ancestor loop (unlike ResetBlockFailureFlags): HandleMainchainReorg
+    // never flags an ancestor, so here it could only undo a failure that
+    // still has a cause - an operator's invalidateblock included.
+
+    // A block stored while its header-only parent was flagged skipped
+    // mapBlocksUnlinked (ReceivedBlockTransactions); now that the parent is
+    // clear, link it, or its data is never connected when the parent's arrives.
+    if (!setCleared.empty()) {
+        for (const auto& item : mapBlockIndex) {
+            CBlockIndex* pindexChild = item.second;
+            CBlockIndex* pindexParent = pindexChild->pprev;
+            if (!pindexParent || !setCleared.count(pindexParent) || pindexParent->nChainTx != 0)
+                continue;
+            if (!(pindexChild->nStatus & BLOCK_HAVE_DATA) || pindexChild->nChainTx != 0)
+                continue;
+            bool fLinked = false;
+            auto range = mapBlocksUnlinked.equal_range(pindexParent);
+            for (auto itU = range.first; itU != range.second; ++itU)
+                if (itU->second == pindexChild) { fLinked = true; break; }
+            if (!fLinked)
+                mapBlocksUnlinked.insert(std::make_pair(pindexParent, pindexChild));
+        }
+    }
 }
 
 CBlockIndex* CChainState::AddToBlockIndex(const CBlockHeader& block)
@@ -10021,9 +10188,6 @@ CBlockIndex* CChainState::AddToBlockIndex(const CBlockHeader& block)
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
     if (pindexBestHeader == nullptr || pindexBestHeader->nHeight < pindexNew->nHeight)
         pindexBestHeader = pindexNew;
-
-    // Add to index of blocks tracked by their mainchain commitment block hash
-    mapBlockMainHashIndex[hashMainBlock] = pindexNew;
 
     setDirtyBlockIndex.insert(pindexNew);
 
@@ -10175,8 +10339,7 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
 
     // Check for mainchain connection
     if (!fGenesis && fCheckBMM && !CheckMainchainConnection()) {
-        g_fNetworkDisabledByMainchain = true;
-        SetNetworkActive(false, "Failed to connect to mainchain when checking block!");
+        DisableNetworkForMainchain("Failed to connect to mainchain when checking block!");
         return false;
     }
 
@@ -10626,6 +10789,25 @@ static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, c
 {
     const int nHeight = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
 
+    // v0.2.18 (operator "yes", 2026-10-03; layer-B review BMM H2): a side
+    // block's L1 anchor must be at a STRICTLY higher L1 height than its
+    // parent's. Honest chains always meet it (a child is BMM'd after its
+    // parent); it stops one public (E, h*) pair from anchoring a whole chain.
+    // A block not yet anchored (a template) has nothing to check. An anchor
+    // missing from our list of L1 main-chain blocks is "can't tell".
+    if (pindexPrev && !block.hashMainchainBlock.IsNull() && !pindexPrev->hashMainBlock.IsNull()) {
+        if (block.hashMainchainBlock == pindexPrev->hashMainBlock)
+            return state.DoS(100, false, REJECT_INVALID, "bad-mc-order", false, "same L1 anchor as the parent");
+        // Both positions under one lock: the list changes under refreshbmm.
+        size_t nL1 = 0, nL1Prev = 0;
+        if (!bmmCache.GetMainBlockPositions(block.hashMainchainBlock, pindexPrev->hashMainBlock, nL1, nL1Prev))
+            return state.Error(strprintf("bmm-unknown: L1 block %s or %s is not in our list of L1 main-chain blocks (yet)",
+                                         block.hashMainchainBlock.ToString(), pindexPrev->hashMainBlock.ToString()));
+        if (nL1 <= nL1Prev)
+            return state.DoS(100, false, REJECT_INVALID, "bad-mc-order", false,
+                             strprintf("L1 anchor at list position %u, the parent's at %u", (unsigned)nL1, (unsigned)nL1Prev));
+    }
+
     // Start enforcing BIP113 (Median Time Past) using versionbits logic.
     int nLockTimeFlags = 0;
     if (VersionBitsState(pindexPrev, consensusParams, Consensus::DEPLOYMENT_CSV, versionbitscache) == THRESHOLD_ACTIVE) {
@@ -10713,8 +10895,7 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
 
     // Check for mainchain connection
     if (!fGenesis && !CheckMainchainConnection()) {
-        g_fNetworkDisabledByMainchain = true;
-        SetNetworkActive(false, "Failed to connect to mainchain when checking block header!");
+        DisableNetworkForMainchain("Failed to connect to mainchain when checking block header!");
         return false;
     }
 
@@ -10741,6 +10922,22 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
         pindexPrev = (*mi).second;
         if (pindexPrev->nStatus & BLOCK_FAILED_MASK)
             return state.DoS(100, error("%s: prev block invalid", __func__), REJECT_INVALID, "bad-prevblk");
+
+        // v0.2.18 L1-order rule, header half (ContextualCheckBlock has the
+        // rest): a header anchored in its parent's own L1 block is invalid -
+        // decided with no L1 call, so a fake chain re-using one (E, h*) pair
+        // costs its peer the ban and us nothing. Heights, when both are in our
+        // list already, give the same definite answer; otherwise the block
+        // check decides.
+        if (!pindexPrev->hashMainBlock.IsNull()) {
+            if (block.hashMainchainBlock == pindexPrev->hashMainBlock)
+                return state.DoS(100, false, REJECT_INVALID, "bad-mc-order", false, "same L1 anchor as the parent");
+            size_t nL1 = 0, nL1Prev = 0;
+            if (bmmCache.GetMainBlockPositions(block.hashMainchainBlock, pindexPrev->hashMainBlock, nL1, nL1Prev) &&
+                    nL1 <= nL1Prev)
+                return state.DoS(100, false, REJECT_INVALID, "bad-mc-order", false,
+                                 strprintf("L1 anchor at list position %u, the parent's at %u", (unsigned)nL1, (unsigned)nL1Prev));
+        }
 
         // v0.2.17 C1: three answers, the bid only (our list of L1 blocks is
         // refreshed as blocks, not headers, are processed), asked once the
@@ -10794,8 +10991,7 @@ bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidatio
     std::vector<uint256> vOrphan;
     if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
         LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
-        g_fNetworkDisabledByMainchain = true;
-        SetNetworkActive(false, "Failed to update the mainchain block cache when processing headers (mainchain unreachable)");
+        DisableNetworkForMainchain("Failed to update the mainchain block cache when processing headers (mainchain unreachable)");
         return false;
     }
     if (fReorg)
@@ -10874,6 +11070,15 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CVali
     if (!fRequested) {  // If we didn't ask for it:
         if (pindex->nTx != 0) return true;    // This is a previously-processed block that was pruned
         if (fTooFarAhead) return true;        // Block height is too high
+        // v0.2.18 (layer-B review BMM H3): upstream's "don't process
+        // less-work chains" gate, which BitAssets deleted. With no proof of
+        // work, chain work is height, and one public (L1 block, h*) pair
+        // yields any number of nTime variants of a real block that all pass
+        // CheckBlock - each one stored to disk. So an unsolicited block must
+        // EXTEND past our tip (strictly higher): a new tip block still gets
+        // in, its copies do not once it has connected, and a real sibling
+        // we need for a reorg is fetched through headers sync (requested).
+        if (chainActive.Tip() && pindex->nHeight <= chainActive.Height()) return true;
     }
     if (fNewBlock) *fNewBlock = true;
 
@@ -11223,10 +11428,6 @@ CBlockIndex * CChainState::InsertBlockIndex(const uint256& hash, const uint256& 
     mi = mapBlockIndex.insert(std::make_pair(hash, pindexNew)).first;
     pindexNew->phashBlock = &((*mi).first);
 
-    // Also track by mainchain commitment block hash
-    if (!hashMainBlock.IsNull())
-        mapBlockMainHashIndex[hashMainBlock] = pindexNew;
-
     return pindexNew;
 }
 
@@ -11486,30 +11687,39 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
     if (!ReadBlockFromDisk(block, pindex, params.GetConsensus())) {
         return error("ReplayBlock(): ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
     }
+    CBlockUndo blockundo;
+    if (!UndoReadFromDisk(blockundo, pindex) || blockundo.vtxundo.size() + 1 != block.vtx.size()) {
+        return error("ReplayBlock(): no usable undo data at %d, hash=%s (-reindex)", pindex->nHeight, pindex->GetBlockHash().ToString());
+    }
+    size_t nTxUndo = 0;
 
     for (const CTransactionRef& tx : block.vtx) {
-        if (tx->IsCoinBase())
+        // The coinbase spends nothing but its outputs (the reward, deposit and
+        // refund payouts) must come back too: the chassis skipped it outright,
+        // so an interrupted flush lost them on the replaying node (review of
+        // ed7d51d, finding 3; upstream 0.16 adds them).
+        if (tx->IsCoinBase()) {
+            AddCoins(inputs, *tx, pindex->nHeight, AssetTags(), 0, 0, true);
             continue;
-
-        // Per-tx (NOT accumulated across the block): a stale amountAssetIn from
-        // an earlier asset tx would send a later bill/house tx's outputs down
-        // AddCoins' asset-coloring branch and drop their fBill/fHouseEscrow tag
-        // (pre-existing chassis bug; UpdateCoins resets these every call).
-        CAmount amountAssetIn = CAmount(0);
-        int nControlN = -1;
-        uint32_t nAssetID = 0;
-
-        for (size_t x = 0; x < tx->vin.size(); x++) {
-            bool fBitAsset = false;
-            bool fBitAssetControl = false;
-            Coin coin;
-            inputs.SpendCoin(tx->vin[x].prevout, fBitAsset, fBitAssetControl, nAssetID, &coin);
-
-            if (fBitAsset)
-                amountAssetIn += coin.out.nValue;
-            if (fBitAssetControl)
-                nControlN = x;
         }
+
+        // Asset colour (v0.2.18, layer-B review A4): from the block's UNDO
+        // data, never the live view. The rev file is on disk before the
+        // chainstate flush, and a partial flush may already have erased the
+        // inputs here, which would replay their outputs as plain ECX. Same
+        // rule as ConnectBlock (ComputeAssetTags), so connect == rollforward.
+        const CTxUndo& txundo = blockundo.vtxundo[nTxUndo++];
+        AssetTags assetTags;
+        {
+            std::vector<const Coin*> vSpent;
+            for (const Coin& c : txundo.vprevout)
+                vSpent.push_back(&c);
+            std::string strReason;
+            if (!ComputeAssetTags(*tx, vSpent, assetTags, strReason))
+                return error("ReplayBlock(): %s at %d breaks an asset rule (%s)", tx->GetHash().ToString(), pindex->nHeight, strReason);
+        }
+        for (size_t x = 0; x < tx->vin.size(); x++)
+            inputs.SpendCoin(tx->vin[x].prevout);
 
         // Re-tag bill title / escrow outputs. BillDB is written synchronously
         // per block in ConnectBlock, so it is already current here (only the
@@ -11560,7 +11770,7 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
         }
 
         // Pass check = true as every addition may be an overwrite.
-        AddCoins(inputs, *tx, pindex->nHeight, nAssetID, amountAssetIn, nControlN, 0, nBillID, nHouseID, true);
+        AddCoins(inputs, *tx, pindex->nHeight, assetTags, nBillID, nHouseID, true);
     }
     return true;
 }
@@ -11768,7 +11978,6 @@ void UnloadBlockIndex()
         delete entry.second;
     }
     mapBlockIndex.clear();
-    mapBlockMainHashIndex.clear();
     fHavePruned = false;
 
     g_chainstate.UnloadBlockIndex();
@@ -13149,6 +13358,18 @@ void MaybeRestoreMainchainConnection()
     SetNetworkActive(true, "mainchain connection restored (periodic re-check)");
 }
 
+void DisableNetworkForMainchain(const std::string& strReason)
+{
+    if (!g_connman)
+        return;
+    // Only a disable this code makes is one it may undo later: if the operator
+    // already switched P2P off (setnetworkactive false), the flag stays clear
+    // and no mainchain recovery turns it back on (layer-B review wallet L3).
+    if (g_connman->GetNetworkActive())
+        g_fNetworkDisabledByMainchain = true;
+    SetNetworkActive(false, strReason);
+}
+
 void SetNetworkActive(bool fActive, const std::string& strReason)
 {
     if (!g_connman)
@@ -13576,11 +13797,12 @@ bool VerifyMainBlockCache(std::string& strError, MainBlockCacheCheck* pCheck)
  *  L1 block was orphaned, by that L1 block. If the L1 block returns to the L1's
  *  main chain (the L1 flipped back), the mark is cleared. Memory only: after a
  *  restart such a mark stays (reconsiderblock clears it). Guarded by cs_main. */
-static std::map<uint256, uint256> mapFailedForOrphanedL1;
+static std::multimap<uint256, uint256> mapFailedForOrphanedL1;
 
 void ReconsiderSideBlocksOfReturnedL1Blocks()
 {
     LOCK(cs_main);
+    std::set<CBlockIndex*> setReset;
     for (auto it = mapFailedForOrphanedL1.begin(); it != mapFailedForOrphanedL1.end(); ) {
         if (!bmmCache.HaveMainBlock(it->first)) {
             ++it;
@@ -13590,10 +13812,14 @@ void ReconsiderSideBlocksOfReturnedL1Blocks()
         if (mi != mapBlockIndex.end()) {
             LogPrintf("%s: L1 block %s is on the L1's main chain again; clearing the mark on block %s\n", __func__,
                       it->first.ToString(), it->second.ToString());
-            ResetBlockFailureFlags(mi->second);
+            setReset.insert(mi->second);
         }
         it = mapFailedForOrphanedL1.erase(it);
     }
+    // v0.2.18: one pass for all of them (ResetBlockFailureFlags is a full index
+    // scan per block, and a header flood can anchor many blocks in one L1 block).
+    if (!setReset.empty())
+        g_chainstate.ResetBlockFailureFlagsBatch(setReset);
 }
 
 void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
@@ -13652,44 +13878,84 @@ void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
             vOrphanFinal.push_back(u);
     }
 
-    // Check if any BMM blocks were created from commitments in this
-    // orphaned mainchain block
-    for (const uint256& u : vOrphanFinal) {
-        CValidationState state;
-        {
-            LOCK(cs_main);
-            // Check our map of blocks based on their mainchain BMM commit block
-            if (!mapBlockMainHashIndex.count(u))
+    // Side blocks anchored in the orphaned L1 blocks: one scan of the block
+    // index (v0.2.18, layer-B review BMM H1). BMM binds only hashMerkleRoot, so
+    // one L1 block can anchor several distinct side headers (a peer can vary
+    // nTime), and the single-valued map this replaced let a copied header
+    // displace the real block - which then escaped this function and split
+    // the chain. The map also lost entries on reload (a parent created by its
+    // child's record first). This runs rarely; a scan cannot go stale.
+    std::set<uint256> setOrphan(vOrphanFinal.begin(), vOrphanFinal.end());
+    std::map<uint256, std::vector<CBlockIndex*>> mapAnchored;
+    if (!setOrphan.empty()) {
+        LOCK(cs_main);
+        for (const auto& item : mapBlockIndex) {
+            CBlockIndex* pindex = item.second;
+            if (!pindex->hashMainBlock.IsNull() && setOrphan.count(pindex->hashMainBlock))
+                mapAnchored[pindex->hashMainBlock].push_back(pindex);
+        }
+    }
+
+    if (mapAnchored.empty())
+        return;
+
+    // Mark every anchored block of every orphan first, under one lock, then
+    // activate once (layer-B review round 3): activating between orphans let
+    // ActivateBestChain try a stored block anchored in a not-yet-processed
+    // orphan, fail on bmm-unknown and return before the rest were marked.
+    CValidationState state;
+    {
+        LOCK(cs_main);
+        for (const uint256& u : vOrphanFinal) {
+            auto itAnchored = mapAnchored.find(u);
+            if (itAnchored == mapAnchored.end())
                 continue;
 
-            CBlockIndex* pindex = mapBlockMainHashIndex[u];
-            // v0.2.17 C4: stored or header-only blocks too, not only the
-            // active chain's. Left alone, a stored block anchored in the
-            // orphaned L1 block stayed a candidate that CheckBlockBMM can never
-            // answer for (its L1 block is off our list), and the node kept
-            // retrying it instead of its siblings.
-            if (pindex->nStatus & BLOCK_FAILED_MASK)
-                continue;
+            for (CBlockIndex* pindex : itAnchored->second) {
+                // v0.2.17 C4: stored or header-only blocks too, not only the
+                // active chain's. Left alone, a stored block anchored in the
+                // orphaned L1 block stayed a candidate that CheckBlockBMM can never
+                // answer for (its L1 block is off our list), and the node kept
+                // retrying it instead of its siblings. Re-read per block: an
+                // earlier InvalidateBlock may already have failed this one.
+                // FAILED_VALID already: maybe genuinely invalid - leave it, and
+                // do not record it (a later reset must not clear it). Failed
+                // only as a CHILD (an earlier InvalidateBlock here disconnected
+                // it): give it its own mark and record it, so it stays failed
+                // while its own anchor is off the L1 (layer-B review round 4).
+                if (pindex->nStatus & BLOCK_FAILED_VALID)
+                    continue;
 
-            InvalidateBlock(state, Params(), pindex);
-            mapFailedForOrphanedL1[u] = pindex->GetBlockHash();
-
-            LogPrintf("%s: Invalidated block: %s because mainchain block: %s was orphaned!\n",
-                    __func__, pindex->GetBlockHash().ToString(), u.ToString());
-
-            if (!state.IsValid()) {
-                LogPrintf("%s: Error while invalidating blocks: %s\n",
-                        __func__, FormatStateMessage(state));
-                return;
+                // Only a block on the active chain needs InvalidateBlock (a
+                // disconnect and a full index scan). Any other is marked
+                // failed in O(1): an attacker's flood of nTime copies would
+                // otherwise cost one full scan each, under cs_main.
+                // FindMostWorkChain fails the descendants of a failed block
+                // when it meets them.
+                if (chainActive.Contains(pindex)) {
+                    const bool fInvalidated = InvalidateBlock(state, Params(), pindex);
+                    if (!fInvalidated || !state.IsValid()) {
+                        LogPrintf("%s: Error while invalidating blocks: %s\n",
+                                __func__, FormatStateMessage(state));
+                        return;
+                    }
+                    LogPrintf("%s: Invalidated block: %s because mainchain block: %s was orphaned!\n",
+                            __func__, pindex->GetBlockHash().ToString(), u.ToString());
+                } else {
+                    g_chainstate.MarkSideBlockFailed(pindex);
+                }
+                mapFailedForOrphanedL1.emplace(u, pindex->GetBlockHash());
             }
+            if (itAnchored->second.size() > 1)
+                LogPrintf("%s: mainchain block %s was orphaned; %u side blocks were anchored in it\n",
+                          __func__, u.ToString(), (unsigned)itAnchored->second.size());
         }
+    }
 
-        ActivateBestChain(state, Params());
-        if (!state.IsValid()) {
-            LogPrintf("%s: Error activating best chain: %s\n",
-                    __func__, FormatStateMessage(state));
-            return;
-        }
+    ActivateBestChain(state, Params());
+    if (!state.IsValid()) {
+        LogPrintf("%s: Error activating best chain: %s\n",
+                __func__, FormatStateMessage(state));
     }
 }
 
@@ -13838,6 +14104,5 @@ public:
         for (; it1 != mapBlockIndex.end(); it1++)
             delete (*it1).second;
         mapBlockIndex.clear();
-        mapBlockMainHashIndex.clear();
     }
 } instance_of_cmaincleanup;

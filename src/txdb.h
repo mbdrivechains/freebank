@@ -229,15 +229,15 @@ class BitAssetDB : public CDBWrapper
 {
 public:
     BitAssetDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+    // v0.2.18: an RPC index keyed by genesis txid. Writes are idempotent (a
+    // replayed or reconnected block rewrites the same record); a disconnect
+    // erases its block's geneses. Consensus never reads it.
     bool WriteBitAssets(const std::vector<BitAsset>& vAsset);
+    bool RemoveBitAssets(const std::vector<uint256>& vTxid);
 
-    std::vector<BitAsset> GetAssets();
-
-    bool GetLastAssetID(uint32_t& nID);
-    bool WriteLastAssetID(const uint32_t nID);
-    bool GetAsset(const uint32_t nID, BitAsset& asset);
-
-    bool RemoveAsset(const uint32_t nID);
+    /** Up to nMax records with txid >= start, in txid order. */
+    std::vector<BitAsset> GetAssets(const uint256& start = uint256(), size_t nMax = SIZE_MAX);
+    bool GetAsset(const uint256& txid, BitAsset& asset);
 };
 
 /** Access to the house database (blocks/Houses/) */

@@ -174,7 +174,12 @@ bool PartiallyDownloadedBlock::IsTxAvailable(size_t index) const {
 }
 
 ReadStatus PartiallyDownloadedBlock::FillBlock(CBlock& block, const std::vector<CTransactionRef>& vtx_missing) {
-    assert(!header.IsNull());
+    // CVE-2024-35202: a peer could reach FillBlock a second time (blocktxn after a
+    // READ_STATUS_FAILED blocktxn) and trip an assert here. Treat a call on an
+    // already-filled (or never initialised) object as invalid peer data instead.
+    // txn_available is also checked: InitData never leaves it empty, and it does
+    // not depend on which header fields IsNull() looks at.
+    if (header.IsNull() || txn_available.empty()) return READ_STATUS_INVALID;
     uint256 hash = header.GetHash();
     block = header;
     block.vtx.resize(txn_available.size());

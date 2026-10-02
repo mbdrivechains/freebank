@@ -523,6 +523,12 @@ private:
     // refunds for the same Withdrawalinto the mempool.
     std::set<uint256> setWithdrawalRefund;
 
+    // v0.2.18: pooled txs that move an asset (a genesis, or one spending a
+    // coloured coin), decided at acceptance from the coins it spent. An
+    // outpoint's colour never changes, so the flag stays true for the entry's
+    // life. Nothing in the pool may spend such a tx's outputs.
+    std::set<uint256> setAssetTx;
+
 public:
     indirectmap<COutPoint, const CTransaction*> mapNextTx;
     std::map<uint256, CAmount> mapDeltas;
@@ -653,6 +659,19 @@ public:
     {
         LOCK(cs);
         return setWithdrawalRefund.count(wtid);
+    }
+
+    /** v0.2.18: mark a pooled tx as moving an asset (ATMP, after addUnchecked). */
+    void SetAssetTx(const uint256& hash)
+    {
+        LOCK(cs);
+        if (mapTx.count(hash))
+            setAssetTx.insert(hash);
+    }
+    bool IsAssetTx(const uint256& hash) const
+    {
+        LOCK(cs);
+        return setAssetTx.count(hash);
     }
 
     CTransactionRef get(const uint256& hash) const;

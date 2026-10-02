@@ -113,7 +113,7 @@ static Scene MakeScene()
     // One plain P2PKH reserve coin, old enough to have existed at ASOF.
     s.outReserve = COutPoint(uint256S("cafe"), 0);
     s.coinReserve = Coin(CTxOut(100 * COIN,
-            GetScriptForDestination(s.reserve.GetPubKey().GetID())), H - 500, false, false, false, 0);
+            GetScriptForDestination(s.reserve.GetPubKey().GetID())), H - 500, false, false, false, uint256());
     return s;
 }
 
@@ -1555,7 +1555,7 @@ BOOST_AUTO_TEST_CASE(bill_coin_tagger_is_the_one_decision_point)
     // the property that stops the four call sites drifting apart.
     {
         CCoinsView base; CCoinsViewCache cache(&base);
-        AddCoins(cache, tx, 100, 0, 0, -1, 0, /*nBillID=*/BILL_ID, 0);
+        AddCoins(cache, tx, 100, AssetTags(), /*nBillID=*/BILL_ID, 0);
         for (unsigned int i = 0; i < tx.vout.size(); i++) {
             Coin probe;
             ApplyBillCoinTags(tx, i, probe);

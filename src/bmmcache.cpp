@@ -139,6 +139,7 @@ bool BMMCache::HaveVerifiedBMM(const uint256& hashBlock) const
     if (hashBlock.IsNull())
         return false;
 
+    std::lock_guard<std::mutex> lock(csVerified);
     return (setBMMVerified.count(hashBlock));
 }
 
@@ -147,6 +148,7 @@ void BMMCache::CacheVerifiedBMM(const uint256& hashBlock)
     if (hashBlock.IsNull())
         return;
 
+    std::lock_guard<std::mutex> lock(csVerified);
     setBMMVerified.insert(hashBlock);
 }
 
@@ -155,6 +157,7 @@ bool BMMCache::HaveVerifiedDeposit(const uint256& txid) const
     if (txid.IsNull())
         return false;
 
+    std::lock_guard<std::mutex> lock(csVerified);
     return (setDepositVerified.count(txid));
 }
 
@@ -163,11 +166,13 @@ void BMMCache::CacheVerifiedDeposit(const uint256& txid)
     if (txid.IsNull())
         return;
 
+    std::lock_guard<std::mutex> lock(csVerified);
     setDepositVerified.insert(txid);
 }
 
 std::vector<uint256> BMMCache::GetVerifiedBMMCache() const
 {
+    std::lock_guard<std::mutex> lock(csVerified);
     std::vector<uint256> vHash;
     for (const auto& u : setBMMVerified) {
         vHash.push_back(u);
@@ -177,6 +182,7 @@ std::vector<uint256> BMMCache::GetVerifiedBMMCache() const
 
 std::vector<uint256> BMMCache::GetVerifiedDepositCache() const
 {
+    std::lock_guard<std::mutex> lock(csVerified);
     std::vector<uint256> vHash;
     for (const auto& u : setDepositVerified) {
         vHash.push_back(u);
@@ -311,6 +317,18 @@ int BMMCache::GetMainchainBlockHeight(const uint256& hash) const
     const MainBlockIndex index = mapMainBlock.at(hash);
 
     return index.index - 1;
+}
+
+bool BMMCache::GetMainBlockPositions(const uint256& hashA, const uint256& hashB, size_t& nA, size_t& nB) const
+{
+    LOCK_MAIN_CACHE;
+    auto itA = mapMainBlock.find(hashA);
+    auto itB = mapMainBlock.find(hashB);
+    if (itA == mapMainBlock.end() || itB == mapMainBlock.end())
+        return false;
+    nA = itA->second.index;
+    nB = itB->second.index;
+    return true;
 }
 
 bool BMMCache::HaveMainBlock(const uint256& hash) const

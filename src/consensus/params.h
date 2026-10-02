@@ -10,8 +10,17 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace Consensus {
+
+/** One step of the suspension-interest rate schedule (v0.2.18, operator sign-off
+ *  2026-10-02, Q1-Q3): from block nHeight onward, demanded notes accrue at nBps
+ *  basis points per year (simple, per block). */
+struct DeferInterestStep {
+    uint32_t nHeight;
+    uint32_t nBps;
+};
 
 enum DeploymentPos
 {
@@ -81,6 +90,19 @@ struct Params {
      *  holder can put it on the stress cascade. Too small punishes honest
      *  downtime; too large lets a stonewaller idle. */
     uint32_t nDemandWindow;
+    /** Suspension interest (v0.2.18, operator sign-off 2026-10-02, Q1-Q3): the
+     *  rate demanded notes earn, as a HEIGHT SCHEDULE so a later release can
+     *  change it from a future height without rewriting history. Entries are
+     *  sorted by nHeight, the first is at height 0; block b accrues at the rate
+     *  of the last entry with nHeight <= b. ONE schedule serves both clocks:
+     *  the suspension queue (from the demand) and lapsed B3 pre-auth demands
+     *  (from window lapse). Same never-a-CLI-knob rule as nSettleCadence. */
+    std::vector<DeferInterestStep> vDeferInterestSchedule;
+    /** Silence clock of a SUSPENDED house (v0.2.18, Q5): once it has missed
+     *  HOUSE_ATTEST_MISS_N attestation cadences, it has this many more blocks
+     *  to attest again before it is (lazily) Insolvent. ~4 weeks on mainnet.
+     *  Open/stressed houses keep HOUSE_STRESSED_WINDOW. Never a CLI knob. */
+    uint32_t nDeferSilenceWindow;
     /** Gold oracle (Phase G-1, consensus-inert). Same never-a-CLI-knob rule.
      *  Quorum = DISTINCT registered submitters required in one block for a
      *  new fix; brake = max fall of the braked view, ppm per elapsed block,

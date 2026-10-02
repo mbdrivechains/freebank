@@ -47,6 +47,7 @@ public:
         nVersion = 0;
         hashPrevBlock.SetNull();
         hashMerkleRoot.SetNull();
+        hashWithdrawalBundle.SetNull();
         hashMainchainBlock.SetNull();
         nTime = 0;
     }

@@ -590,7 +590,6 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-attestcadence=<n>", _("Regtest only: override the house reserve-attestation cadence in blocks (default: 144; integration-gate knob)"));
     strUsage += HelpMessageOpt("-housefailfast", _("Regtest only when disabled: set 0 to bypass the wallet's one-op-per-house fail-fast so ops reach ATMP (integration-gate knob; changes WHICH LAYER refuses, never whether it is refused - consensus is untouched; default: 1)"));
     strUsage += HelpMessageOpt("-stressedwindow=<n>", _("Regtest only: override the Stressed->Insolvent window in blocks (default: 1008; integration-gate knob)"));
-    strUsage += HelpMessageOpt("-deferwindow=<n>", _("Regtest only: override the option-clause deferral window in blocks (default: 12960 = 90 days; integration-gate knob)"));
     strUsage += HelpMessageOpt("-diskformatversion=<n>", _("Regtest only: write and demand this on-disk undo/coins record format version (default: compiled-in; exists so the format gate itself can be tested)"));
 
     return strUsage;
@@ -1186,25 +1185,26 @@ bool AppInitParameterInteraction()
     if (!gArgs.GetBoolArg("-housefailfast", true) &&
             chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-housefailfast=0 is a regtest-only integration-gate knob."));
-    if ((gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow") ||
-            gArgs.IsArgSet("-deferwindow")) &&
+    // v0.2.18: the deferral window is gone (a suspension has no end date), so
+    // its regtest knob is refused loudly rather than silently ignored - a gate
+    // that still passes it is testing a rule that no longer exists.
+    if (gArgs.IsArgSet("-deferwindow"))
+        return InitError(_("-deferwindow is retired (v0.2.18: a suspension has no end date; a suspended "
+                           "house becomes insolvent only by silence, see nDeferSilenceWindow)."));
+    if ((gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow")) &&
             chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
-        return InitError(_("-attestcadence / -stressedwindow / -deferwindow are regtest-only test "
+        return InitError(_("-attestcadence / -stressedwindow are regtest-only test "
                            "overrides; on other networks these are fixed by network consensus."));
     if (chainparams.NetworkIDString() == CBaseChainParams::REGTEST) {
         const int64_t nCadence = gArgs.GetArg("-attestcadence", (int64_t)HOUSE_ATTEST_CADENCE);
         const int64_t nWindow = gArgs.GetArg("-stressedwindow", (int64_t)HOUSE_STRESSED_WINDOW);
-        const int64_t nDefer = gArgs.GetArg("-deferwindow", (int64_t)HOUSE_DEFER_WINDOW);
-        if (nCadence < 1 || nCadence > 100000 || nWindow < 1 || nWindow > 1000000 ||
-                nDefer < 1 || nDefer > 1000000)
-            return InitError(_("-attestcadence / -stressedwindow / -deferwindow out of range."));
+        if (nCadence < 1 || nCadence > 100000 || nWindow < 1 || nWindow > 1000000)
+            return InitError(_("-attestcadence / -stressedwindow out of range."));
         HOUSE_ATTEST_CADENCE = (uint32_t)nCadence;
         HOUSE_STRESSED_WINDOW = (uint32_t)nWindow;
-        HOUSE_DEFER_WINDOW = (uint32_t)nDefer;
-        if (gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow") ||
-                gArgs.IsArgSet("-deferwindow"))
-            LogPrintf("REGTEST override: attest cadence %u, stressed window %u, defer window %u\n",
-                      HOUSE_ATTEST_CADENCE, HOUSE_STRESSED_WINDOW, HOUSE_DEFER_WINDOW);
+        if (gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow"))
+            LogPrintf("REGTEST override: attest cadence %u, stressed window %u\n",
+                      HOUSE_ATTEST_CADENCE, HOUSE_STRESSED_WINDOW);
     }
 
     // Regtest-only: lets the disk-format gate itself be exercised (bring a chain
@@ -1917,7 +1917,7 @@ bool AppInitMain()
                     uint256 hashPoolBest;
                     ppooltree->GetBestBlock(hashPoolBest);
                     if (!CheckSideDBMarker(hashHouseBest) || !CheckSideDBMarker(hashBillBest) || !CheckSideDBMarker(hashPoolBest)) {
-                        strLoadError = _("House/Bill/Pool database is out of sync with the chain state - restart with -reindex");
+                        strLoadError = _("House/Bill/Pool database is out of sync with the chain state. Restart with -reindex to rebuild it.");
                         break;
                     }
 
@@ -1965,8 +1965,8 @@ bool AppInitMain()
                         const bool fAgree = fPtr ? (hashDepositPtr == hashWant) : hashWant.IsNull();
                         if (!fAgree) {
                             strLoadError = _("Deposit database is out of sync with the chain state "
-                                             "(the deposit CTIP baseline does not match the tip) - "
-                                             "restart with -reindex");
+                                             "(the deposit CTIP baseline does not match the tip). "
+                                             "Restart with -reindex to rebuild it.");
                             break;
                         }
                     }

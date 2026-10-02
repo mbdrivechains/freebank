@@ -648,7 +648,7 @@ BOOST_AUTO_TEST_CASE(oracle_contextual_gates)
 BOOST_AUTO_TEST_CASE(oracle_bond_coin_ser_roundtrip)
 {
     CKey k1 = MakeKey(41);
-    Coin c(CTxOut(100000000, OracleBondScript(PK(k1))), 77, false, false, false, 0);
+    Coin c(CTxOut(100000000, OracleBondScript(PK(k1))), 77, false, false, false, uint256());
     c.SetOracleBond();
     CDataStream ss(SER_DISK, PROTOCOL_VERSION);
     ss << c;
@@ -672,7 +672,7 @@ BOOST_AUTO_TEST_CASE(oracle_bond_coin_ser_roundtrip)
 BOOST_AUTO_TEST_CASE(oracle_bond_coin_undo_roundtrip)
 {
     CKey k1 = MakeKey(42);
-    Coin c(CTxOut(250000000, OracleBondScript(PK(k1))), 91, false, false, false, 0);
+    Coin c(CTxOut(250000000, OracleBondScript(PK(k1))), 91, false, false, false, uint256());
     c.SetOracleBond();
     CDataStream ss(SER_DISK, PROTOCOL_VERSION);
     ss << TxInUndoSerializer(&c);
@@ -685,7 +685,7 @@ BOOST_AUTO_TEST_CASE(oracle_bond_coin_undo_roundtrip)
     BOOST_CHECK(restored.out.scriptPubKey == OracleBondScript(PK(k1)));
     BOOST_CHECK_EQUAL(restored.out.nValue, 250000000);
     // An untagged coin must stay untagged through the same path.
-    Coin plain(CTxOut(5000, CScript() << OP_TRUE), 91, false, false, false, 0);
+    Coin plain(CTxOut(5000, CScript() << OP_TRUE), 91, false, false, false, uint256());
     CDataStream ss2(SER_DISK, PROTOCOL_VERSION);
     ss2 << TxInUndoSerializer(&plain);
     Coin restored2;
@@ -731,7 +731,7 @@ BOOST_AUTO_TEST_CASE(oracle_bond_coin_gate)
     // AddCoins on a real BOND tx must tag vout[0] fOracleBond and nothing else
     // (the self-tag rule: connect == rollforward from the tx alone).
     CMutableTransaction bond1 = BuildBondTx(k1, 0, 100);
-    AddCoins(cache, CTransaction(bond1), 100, 0, 0);
+    AddCoins(cache, CTransaction(bond1), 100);
     const COutPoint bondOut(CTransaction(bond1).GetHash(), 0);
     {
         Coin c;
@@ -743,16 +743,16 @@ BOOST_AUTO_TEST_CASE(oracle_bond_coin_gate)
     {
         CGoldFix fixNull;
         CMutableTransaction sub = BuildSubmitTx(k1, 1, 100, 800000000, fixNull, 0, hashPrev);
-        AddCoins(cache, CTransaction(sub), 100, 0, 0);
+        AddCoins(cache, CTransaction(sub), 100);
         Coin c;
         BOOST_CHECK(cache.GetCoin(COutPoint(CTransaction(sub).GetHash(), 0), c));
         BOOST_CHECK(!c.fOracleBond);
     }
 
     // Plain funding coin + a note-tagged coin for the colored-input gate.
-    Coin fund(CTxOut(200000000, CScript() << OP_TRUE), 50, false, false, false, 0);
+    Coin fund(CTxOut(200000000, CScript() << OP_TRUE), 50, false, false, false, uint256());
     cache.AddCoin(COutPoint(uint256S("0xf0"), 0), std::move(fund), false);
-    Coin note(CTxOut(546, CScript() << OP_TRUE), 50, false, false, false, 0);
+    Coin note(CTxOut(546, CScript() << OP_TRUE), 50, false, false, false, uint256());
     note.SetNote(7, 1000, 0);
     cache.AddCoin(COutPoint(uint256S("0xf1"), 0), std::move(note), false);
 

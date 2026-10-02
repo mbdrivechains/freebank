@@ -5,6 +5,8 @@
 
 #include <wallet/wallet.h>
 
+#include <asset.h>
+
 #include <bill.h>
 #include <deposit.h>
 #include <oracle.h>
@@ -966,18 +968,9 @@ bool CWallet::AddToWallet(const CWalletTx& wtxIn, bool fFlushOnClose)
             fUpdated = true;
         }
 
-        if (wtxIn.amountAssetIn != wtx.amountAssetIn) {
-            wtx.amountAssetIn = wtxIn.amountAssetIn;
-            fUpdated = true;
-        }
-        if (wtxIn.nControlN != wtx.nControlN) {
-            wtx.nControlN = wtxIn.nControlN;
-            fUpdated = true;
-        }
-        if (wtxIn.nAssetID != wtx.nAssetID) {
-            wtx.nAssetID = wtxIn.nAssetID;
-            fUpdated = true;
-        }
+        // v0.2.18: no asset fields merged - the wallet reads colour from the
+        // UTXO set (IsOutputAssetColoured), so a mempool sync, a disconnect or
+        // a rescan can no longer wipe it (layer-B review A6).
     }
 
     //// debug print
@@ -1088,9 +1081,6 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const CBlockI
             }
 
             CWalletTx wtx(this, ptx);
-            wtx.amountAssetIn = amountAssetIn;
-            wtx.nControlN = nControlN;
-            wtx.nAssetID = nAssetID;
 
             // Get merkle branch if transaction was found in a block
             if (pIndex != nullptr)
@@ -1281,13 +1271,7 @@ void CWallet::BlockConnected(const std::map<uint256, BitAssetTransactionData>& m
         TransactionRemovedFromMempool(ptx);
     }
     for (size_t i = 0; i < pblock->vtx.size(); i++) {
-        std::map<uint256, BitAssetTransactionData>::const_iterator it;
-        it = mapAssetData.find(pblock->vtx[i]->GetHash());
-        if (it != mapAssetData.end()) {
-            SyncTransaction(pblock->vtx[i], pindex, i, it->second.amountAssetIn, it->second.nControlN, it->second.nAssetID);
-        } else {
-            SyncTransaction(pblock->vtx[i], pindex, i);
-        }
+        SyncTransaction(pblock->vtx[i], pindex, i);
         TransactionRemovedFromMempool(pblock->vtx[i]);
     }
 
@@ -1367,10 +1351,11 @@ isminetype CWallet::IsMine(const CTxOut& txout) const
 
 CAmount CWallet::GetCredit(const CTxOut& txout, const isminefilter& filter) const
 {
-    // TODO
-    // Skip BitAssets & re-enable
-    //if (!MoneyRange(txout.nValue))
-    //    throw std::runtime_error(std::string(__func__) + ": value out of range");
+    // Re-enabled (layer-B review wallet M1): BitAssets had commented it out for
+    // v10 supply outputs above MAX_MONEY. v10 is rejected by consensus, and
+    // CheckTransaction holds every output to MoneyRange.
+    if (!MoneyRange(txout.nValue))
+        throw std::runtime_error(std::string(__func__) + ": value out of range");
     return ((IsMine(txout) & filter) ? txout.nValue : 0);
 }
 
@@ -1871,10 +1856,15 @@ CAmount CWalletTx::GetAvailableCredit(bool fUseCache) const
 
     CAmount nCredit = 0;
     uint256 hashTx = GetHash();
+    // v0.2.18 (layer-B review A6): asset coins (units or control) are not ECX.
+    const int nDepth = GetDepthInMainChain();
+    const bool fUnconfirmedAssetTx = nDepth <= 0 && pwallet->IsUnconfirmedAssetTx(*this);
     for (unsigned int i = 0; i < tx->vout.size(); i++)
     {
         if (!pwallet->IsSpent(hashTx, i))
         {
+            if (fUnconfirmedAssetTx || pwallet->IsOutputAssetColoured(*this, i, nDepth))
+                continue;
             const CTxOut &txout = tx->vout[i];
             nCredit += pwallet->GetCredit(txout, ISMINE_SPENDABLE);
             if (!MoneyRange(nCredit))
@@ -1914,10 +1904,14 @@ CAmount CWalletTx::GetAvailableWatchOnlyCredit(const bool fUseCache) const
         return nAvailableWatchCreditCached;
 
     CAmount nCredit = 0;
+    const int nDepth = GetDepthInMainChain();
+    const bool fUnconfirmedAssetTx = nDepth <= 0 && pwallet->IsUnconfirmedAssetTx(*this);
     for (unsigned int i = 0; i < tx->vout.size(); i++)
     {
         if (!pwallet->IsSpent(GetHash(), i))
         {
+            if (fUnconfirmedAssetTx || pwallet->IsOutputAssetColoured(*this, i, nDepth))
+                continue;    // v0.2.18: asset coins are not ECX
             const CTxOut &txout = tx->vout[i];
             nCredit += pwallet->GetCredit(txout, ISMINE_WATCH_ONLY);
             if (!MoneyRange(nCredit))
@@ -2289,18 +2283,15 @@ void CWallet::AvailableCoins(std::vector<COutput> &vCoins, bool fOnlySafe, const
         if (nDepth < nMinDepth || nDepth > nMaxDepth)
             continue;
 
-        CAmount amountAssetIn = pcoin->amountAssetIn;
-        CAmount amountAssetOut = CAmount(0);
+        // v0.2.18 (layer-B review A6): an unconfirmed asset tx's outputs are
+        // never offered as ECX (its colours are not knowable before it
+        // confirms, and mempool acceptance refuses spending them anyway).
+        const bool fUnconfirmedAssetTx = nDepth <= 0 && IsUnconfirmedAssetTx(*pcoin);
 
         for (unsigned int i = 0; i < pcoin->tx->vout.size(); i++) {
-            // Skip outputs until we have accounted for BitAsset input
-            if (amountAssetIn != amountAssetOut) {
-                amountAssetOut += pcoin->tx->vout[i].nValue;
-                continue;
-            }
-
-            // Skip controller & genesis output of asset creation tx
-            if (pcoin->tx->nVersion == TRANSACTION_BITASSET_CREATE_VERSION && i < 2)
+            // Skip asset outputs (units or control) - colour from the UTXO set,
+            // the same coins consensus reads, never a per-wallet-tx record.
+            if (fUnconfirmedAssetTx || IsOutputAssetColoured(*pcoin, i, nDepth))
                 continue;
 
             // Skip bill title & escrow outputs - locked to bill operations
@@ -2421,98 +2412,6 @@ void CWallet::AvailableCoins(std::vector<COutput> &vCoins, bool fOnlySafe, const
 // TODO
 // For basic testing this will take in an optional txid
 // A better version might take in an asset ID to filter outputs
-void CWallet::AvailableAssets(std::vector<COutput> &vCoins, uint256 txid) const
-{
-    AssertLockHeld(cs_main);
-    AssertLockHeld(cs_wallet);
-
-    vCoins.clear();
-
-    for (const auto& entry : mapWallet)
-    {
-        const uint256& wtxid = entry.first;
-        const CWalletTx* wtx = &entry.second;
-
-        // Skip transactions not from optional txid
-        if (!txid.IsNull() && wtxid != txid)
-            continue;
-
-        if (wtx->amountAssetIn <= 0 && wtx->tx->nVersion != TRANSACTION_BITASSET_CREATE_VERSION)
-            continue;
-
-        if (!CheckFinalTx(*wtx->tx))
-            continue;
-
-        // Ignore unconfirmed assets
-        int nDepth = wtx->GetDepthInMainChain();
-        if (nDepth < 1)
-            continue;
-
-        bool safeTx = wtx->IsTrusted();
-        if (!safeTx)
-            continue;
-
-        if (wtx->amountAssetIn) {
-            // Need to find the asset outputs that belong to us,
-            // while adding up to the total amountassetin. Some of the outputs
-            // might not be ours.
-            CAmount amountAssetOut = CAmount(0);
-            for (unsigned int i = 0; i < wtx->tx->vout.size(); i++) {
-                if (amountAssetOut >= wtx->amountAssetIn)
-                    break;
-
-                amountAssetOut += wtx->tx->vout[i].nValue;
-
-                // Skip asset control outputs
-                if (wtx->nControlN == (int)i)
-                   continue;
-
-                if (IsLockedCoin(entry.first, i))
-                    continue;
-
-                if (IsSpent(wtxid, i))
-                    continue;
-
-                isminetype mine = IsMine(wtx->tx->vout[i]);
-
-                if (mine == ISMINE_NO) {
-                    continue;
-                }
-
-                bool fSpendableIn = ((mine & ISMINE_SPENDABLE) != ISMINE_NO);
-                bool fSolvableIn = (mine & (ISMINE_SPENDABLE | ISMINE_WATCH_SOLVABLE)) != ISMINE_NO;
-
-                vCoins.push_back(COutput(wtx, i, nDepth, fSpendableIn, fSolvableIn, true));
-            }
-        }
-        else
-        if (wtx->tx->nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
-            // Check if we have any assets from the first two outputs
-            if (wtx->tx->vout.size() < 2)
-                continue;
-
-            // Do not return the controller output
-            /*
-            if (!IsLockedCoin(entry.first, 0) && !IsSpent(wtxid, 0)) {
-                isminetype mine = IsMine(wtx->tx->vout[0]);
-                if (mine != ISMINE_NO) {
-                    bool fSpendableIn = ((mine & ISMINE_SPENDABLE) != ISMINE_NO);
-                    bool fSolvableIn = (mine & (ISMINE_SPENDABLE | ISMINE_WATCH_SOLVABLE)) != ISMINE_NO;
-                    vCoins.push_back(COutput(wtx, 0, nDepth, fSpendableIn, fSolvableIn, true));
-                }
-            }
-            */
-            if  (!IsLockedCoin(entry.first, 1) && !IsSpent(wtxid, 1)) {
-                isminetype mine = IsMine(wtx->tx->vout[1]);
-                if (mine != ISMINE_NO) {
-                    bool fSpendableIn = ((mine & ISMINE_SPENDABLE) != ISMINE_NO);
-                    bool fSolvableIn = (mine & (ISMINE_SPENDABLE | ISMINE_WATCH_SOLVABLE)) != ISMINE_NO;
-                    vCoins.push_back(COutput(wtx, 1, nDepth, fSpendableIn, fSolvableIn, true));
-                }
-            }
-        }
-    }
-}
 
 std::map<CTxDestination, std::vector<COutput>> CWallet::ListCoins() const
 {
@@ -2761,6 +2660,12 @@ bool CWallet::SelectCoins(const std::vector<COutput>& vAvailableCoins, const CAm
             const CWalletTx* pcoin = &it->second;
             // Clearly invalid input, fail
             if (pcoin->tx->vout.size() <= outpoint.n)
+                return false;
+            // v0.2.18 (layer-B review A11): a preset input skips AvailableCoins'
+            // filters, so refuse an asset coin here - spent as plain ECX it would
+            // either break the asset rules or carry units to the payee.
+            const int nDepth = pcoin->GetDepthInMainChain();
+            if ((nDepth <= 0 && IsUnconfirmedAssetTx(*pcoin)) || IsOutputAssetColoured(*pcoin, outpoint.n, nDepth))
                 return false;
             nValueFromPresetInputs += pcoin->tx->vout[outpoint.n].nValue;
             setPresetCoins.insert(CInputCoin(pcoin, outpoint.n));
@@ -3255,152 +3160,6 @@ bool CWallet::CreateTransaction(const std::vector<CRecipient>& vecSend, CWalletT
     return true;
 }
 
-bool CWallet::CreateAsset(CTransactionRef& tx, std::string& strFail, const std::string& strTicker, const std::string& strHeadline, const uint256& hashPayload, const CAmount& nFee, const int64_t nSupply, const std::string& strControllerDest, const std::string& strGenesisDest, bool fImmutable)
-{
-    strFail = "Unknown error!";
-
-    if (vpwallets.empty()) {
-        strFail = "No active wallet!\n";
-        return false;
-    }
-
-    CTxDestination destControl = DecodeDestination(strControllerDest);
-    if (!fImmutable && !IsValidDestination(destControl)) {
-        strFail = "Invalid controller destination";
-        return false;
-    }
-
-    CTxDestination destGenesis = DecodeDestination(strGenesisDest);
-    if (!IsValidDestination(destGenesis)) {
-        strFail = "Invalid genesis destination";
-        return false;
-    }
-
-    CMutableTransaction mtx;
-    mtx.nVersion = TRANSACTION_BITASSET_CREATE_VERSION;
-
-    // BitAsset info
-    mtx.ticker = strTicker;
-    mtx.headline = strHeadline;
-    mtx.payload = hashPayload;
-
-    // contoller output
-    if (fImmutable)
-        mtx.vout.push_back(CTxOut(1, CScript() << OP_RETURN));
-    else
-        mtx.vout.push_back(CTxOut(1, GetScriptForDestination(destControl)));
-
-    // genesis output
-    mtx.vout.push_back(CTxOut(nSupply, GetScriptForDestination(destGenesis)));
-
-    BlockUntilSyncedToCurrentChain();
-
-    LOCK2(cs_main, cs_wallet);
-
-    // Select coins to cover fee
-    std::vector<COutput> vCoins;
-    AvailableCoins(vCoins, true /* fOnlySafe */);
-    std::set<CInputCoin> setCoins;
-    CAmount nAmountRet = CAmount(0);
-    if (!SelectCoins(vCoins, nFee, setCoins, nAmountRet)) {
-        strFail = "Could not collect enough coins to cover fee!\n";
-        return false;
-    }
-
-    // Handle change if there is any
-    const CAmount nChange = nAmountRet - nFee;
-    CReserveKey reserveKey(this);
-    if (nChange > 0) {
-        CScript scriptChange;
-
-        // Reserve a new key pair from key pool
-        CPubKey vchPubKey;
-        if (!reserveKey.GetReservedKey(vchPubKey))
-        {
-            strFail = "Keypool ran out, please call keypoolrefill first!\n";
-            return false;
-        }
-        scriptChange = GetScriptForDestination(vchPubKey.GetID());
-
-        CTxOut out(nChange, scriptChange);
-        if (!IsDust(out, ::dustRelayFee))
-            mtx.vout.push_back(out);
-    }
-
-    // Add inputs
-    for (const auto& coin : setCoins)
-        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
-
-    // Dummy sign the transaction to calculate minimum fee
-    std::set<CInputCoin> setCoinsTemp = setCoins;
-    if (!DummySignTx(mtx, setCoinsTemp)) {
-        strFail = "Dummy signing transaction for required fee calculation failed!";
-        return false;
-    }
-
-    // Get transaction size with dummy signatures
-    unsigned int nBytes = GetVirtualTransactionSize(mtx);
-
-    // Calculate fee
-    CCoinControl coinControl;
-    FeeCalculation feeCalc;
-    CAmount nFeeNeeded = GetMinimumFee(nBytes, coinControl, ::mempool, ::feeEstimator, &feeCalc);
-
-    // Check that the fee is valid for relay
-    if (nFeeNeeded < ::minRelayTxFee.GetFee(nBytes)) {
-        strFail = "Transaction too large for fee policy";
-        return false;
-    }
-
-    // Check the user set fee
-    if (nFee < nFeeNeeded) {
-        strFail = "The fee you have set is too small!";
-        return false;
-    }
-
-    // Remove dummy signatures
-    for (auto& vin : mtx.vin) {
-        vin.scriptSig = CScript();
-        vin.scriptWitness.SetNull();
-    }
-
-    // Sign the inputs
-    const CTransaction txToSign = mtx;
-    int nIn = 0;
-    for (const auto& coin : setCoins) {
-        const CScript& scriptPubKey = coin.txout.scriptPubKey;
-        SignatureData sigdata;
-
-        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL), scriptPubKey, sigdata))
-        {
-            strFail = "Signing inputs failed!\n";
-            return false;
-        } else {
-            UpdateTransaction(mtx, nIn, sigdata);
-        }
-
-        nIn++;
-    }
-
-    // Broadcast transaction
-    CWalletTx walletTx;
-    walletTx.fTimeReceivedIsTxTime = true;
-    walletTx.fFromMe = true;
-    walletTx.BindWallet(this);
-
-    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
-
-    walletTx.nControlN = 0;
-
-    CValidationState state;
-    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
-        strFail = "Failed to commit BitAsset creation transaction! Reject reason: " + FormatStateMessage(state) + "\n";
-        return false;
-    }
-    tx = walletTx.tx;
-
-    return true;
-}
 
 bool CWallet::IssueBill(CTransactionRef& tx, std::string& strFail, const std::vector<unsigned char>& vchBody, const CAmount& nAmount, const CAmount& nAmountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const CAmount& nFee)
 {
@@ -4425,7 +4184,7 @@ void CWallet::CollectNoteHoldings(std::map<uint32_t, WalletNoteHolding>& out)
     }
 }
 
-bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptPayout)
+bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptPayout, bool fPlain, bool fUpgrade)
 {
     strFail = "Unknown error!";
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
@@ -4434,22 +4193,39 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, cs_wallet);
 
-    // One op, two modes, keyed on house status - the consensus matrix
-    // mirrored (B3 T-b3): Deferred => the 3.5 plain demand (the option
-    // clause's queue); Open/Stressed => the B3 formal demand, pre-auth
-    // REQUIRED (coins move onto consensus custody; the house can then
-    // discharge alone, and MUST within the window or face protest).
+    // Modes keyed on house status - the consensus matrix mirrored (B3 T-b3,
+    // v0.2.18 D-2026-10-02-1): Deferred => the option clause's queue, by
+    // default PRE-AUTH QUEUE (mode 2: the house can pay alone, so it can always
+    // end the interest), or plain on request (mode 0: stays transferable, only
+    // the holder can redeem); Open/Stressed => the B3 formal demand, pre-auth
+    // REQUIRED (mode 1; the house MUST discharge within the window or face
+    // protest).
     bool fPreAuth = false;
+    uint8_t nMode = NOTE_DEMAND_MODE_PLAIN;
     uint256 houseID256;
     {
         CHouse house;
         if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
         houseID256 = house.houseID;
         const char chEff = HouseEffectiveStatus(house, chainActive.Height() + 1);
-        if (chEff == HOUSE_STATUS_DEFERRED) {
-            fPreAuth = false;
-        } else if (chEff == HOUSE_STATUS_OPEN || chEff == HOUSE_STATUS_STRESSED) {
+        if (fUpgrade) {
+            // Delta-1b upgrade (v0.2.18 "a"): a PLAIN demand becomes a pre-auth
+            // QUEUE demand, keeping its original height (consensus requires
+            // mode 2), so the house can pay it alone and end the interest.
+            // Legal in every live state.
+            if (chEff != HOUSE_STATUS_DEFERRED && chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
+                strFail = "House is insolvent or wound down - the waterfall (claimnote) has replaced redemption!";
+                return false;
+            }
             fPreAuth = true;
+            nMode = NOTE_DEMAND_MODE_PREAUTH_QUEUE;
+        } else if (chEff == HOUSE_STATUS_DEFERRED) {
+            fPreAuth = !fPlain;
+            nMode = fPlain ? NOTE_DEMAND_MODE_PLAIN : NOTE_DEMAND_MODE_PREAUTH_QUEUE;
+        } else if (chEff == HOUSE_STATUS_OPEN || chEff == HOUSE_STATUS_STRESSED) {
+            if (fPlain) { strFail = "A plain demand is only possible while the house is suspended!"; return false; }
+            fPreAuth = true;
+            nMode = NOTE_DEMAND_MODE_PREAUTH;
         } else {
             strFail = "House is insolvent or wound down - the waterfall (claimnote) has replaced redemption!";
             return false;
@@ -4462,14 +4238,25 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     CollectWalletNoteCoins(this, nHouseID, mapByHolder);
     std::vector<WalletNoteCoin> spend;
     uint64_t U = 0;
+    uint32_t nPriorTag = 0;
     for (const auto& kv : mapByHolder) {
-        if (kv.first.second != 0)
+        const uint32_t tag = kv.first.second;
+        if (fUpgrade) {
+            // Only a PLAIN demand (demanded, not pre-auth) can be upgraded.
+            if (tag == 0 || NoteDemandIsPreAuth(tag))
+                continue;
+        } else if (tag != 0) {
             continue;   // already demanded
+        }
         uint64_t sum = 0;
         for (const WalletNoteCoin& nc : kv.second) sum += nc.units;
-        if (sum == nUnits) { spend = kv.second; U = sum; break; }
+        if (sum == nUnits) { spend = kv.second; U = sum; nPriorTag = tag; break; }
     }
-    if (spend.empty()) { strFail = "No undemanded holder's note coins sum exactly to that amount (transfer to consolidate first)!"; return false; }
+    if (spend.empty()) {
+        strFail = fUpgrade ? "No plain demand of this wallet sums exactly to that amount (one demand at a time; see listmynotes)!"
+                           : "No undemanded holder's note coins sum exactly to that amount (transfer to consolidate first)!";
+        return false;
+    }
 
     CKey keyHolder;
     if (!GetKey(CPubKey(spend[0].vchHolderPubKey).GetID(), keyHolder)) { strFail = "Holder key missing!"; return false; }
@@ -4489,8 +4276,11 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
         fPreAuth ? NotePreAuthScript(spend[0].vchHolderPubKey) : spend[0].script));
     dem.vUnits.push_back(U);
 
+    if (fUpgrade)
+        dem.nPriorDemandHeight = NoteDemandHeightOf(nPriorTag);   // the clock is preserved
+
     if (fPreAuth) {
-        dem.fPreAuth = 1;
+        dem.fPreAuth = nMode;
         // The script the discharge must pay: the caller's, or the holder's own
         // P2PKH by default. The house's escrow script is poison (consensus
         // rejects it at the door - the discharge would be unbuildable and the
@@ -4615,7 +4405,11 @@ bool CWallet::ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHous
         if (tag & NOTE_DEMAND_PROTESTED_BIT)
             continue;                                  // already marked (idempotence)
         const uint32_t nDH = NoteDemandHeightOf(tag);
-        if ((int64_t)nNextHeight < (int64_t)nDH + (int64_t)W)
+        // Mirrors consensus (v0.2.18): a queue demand's week starts at the reopen.
+        uint32_t nWindowStart = nDH;
+        if (NoteDemandIsQueue(tag) && house.nDeferEndedHeight >= nDH)
+            nWindowStart = house.nDeferEndedHeight;
+        if ((int64_t)nNextHeight < (int64_t)nWindowStart + (int64_t)W)
             continue;                                  // window still running
         if (spend.empty() || nDH < NoteDemandHeightOf(nTag)) { spend = kv.second; nTag = tag; }
     }
@@ -4716,12 +4510,11 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
     {
+        // v0.2.18 (Q6): a suspended (Deferred) house may discharge too - a
+        // discharge burns only pre-auth DEMANDED coins, and consensus lets a
+        // suspended house pay demanded notes at the floor.
         const char chEff = HouseEffectiveStatus(house, nNextHeight);
-        if (chEff == HOUSE_STATUS_DEFERRED) {
-            strFail = "House is deferred - discharge resumes after recovery (the clause queue pays then)!";
-            return false;
-        }
-        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
+        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED && chEff != HOUSE_STATUS_DEFERRED) {
             strFail = "House is insolvent or wound down - nothing can be discharged!";
             return false;
         }
@@ -4735,7 +4528,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     // txindex. (A Delta-1b UPGRADED demand's tx lives at the upgrade height
     // instead - not yet reachable, the upgrade has no wallet builder.)
     FlushStateToDisk();
-    struct CustodyCoin { COutPoint out; uint64_t units; uint32_t tag; CScript script; };
+    struct CustodyCoin { COutPoint out; uint64_t units; uint32_t tag; CScript script; uint32_t nCoinHeight; };
     std::vector<CustodyCoin> vCustody;
     {
         std::unique_ptr<CCoinsViewCursor> pcursor(pcoinsdbview->Cursor());
@@ -4751,6 +4544,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
                 cc.units = coin.nNoteUnits;
                 cc.tag = coin.nDemandHeight;
                 cc.script = coin.out.scriptPubKey;
+                cc.nCoinHeight = coin.nHeight;
                 vCustody.push_back(cc);
             }
             if (pcursor) pcursor->Next();
@@ -4758,11 +4552,16 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     }
     if (vCustody.empty()) { strFail = "No pre-auth demanded coins outstanding against this house!"; return false; }
 
-    // Oldest-first over demand heights; per height, each DEMAND tx in that
-    // block whose full unit vector is still collectable is dischargeable.
+    // Oldest-first over the blocks that can hold the DEMAND tx: the demand
+    // height for a fresh demand, and the coin's creation height for a Δ1b
+    // upgrade (the upgrade tx lives where the custody coin was created, while
+    // the tag keeps the ORIGINAL height). Each DEMAND tx found whose full unit
+    // vector is still collectable is dischargeable.
     std::set<uint32_t> setHeights;
-    for (const CustodyCoin& cc : vCustody)
+    for (const CustodyCoin& cc : vCustody) {
         setHeights.insert(NoteDemandHeightOf(cc.tag));
+        setHeights.insert(cc.nCoinHeight);
+    }
 
     NoteDemand demChosen;
     std::vector<CustodyCoin> vBurn;
@@ -4781,12 +4580,15 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
             if (!DecodeNotePayload(ptx->vchNotePayload, dem) || dem.nHouseID != nHouseID || !dem.fPreAuth)
                 continue;
             const CScript scriptCustody = NotePreAuthScript(dem.vchHolderPubKey);
+            // The height the coins' tag carries: the block's own for a fresh
+            // demand, the preserved original for an upgrade.
+            const uint32_t nTagHeight = dem.nPriorDemandHeight != 0 ? dem.nPriorDemandHeight : nDH;
             uint64_t nNeeded = 0;
             for (const uint64_t u : dem.vUnits) nNeeded += u;
             uint64_t nTotal = 0;
             std::vector<CustodyCoin> vGroup;
             for (const CustodyCoin& cc : vCustody) {
-                if (NoteDemandHeightOf(cc.tag) == nDH && cc.script == scriptCustody) {
+                if (NoteDemandHeightOf(cc.tag) == nTagHeight && cc.script == scriptCustody) {
                     vGroup.push_back(cc);
                     nTotal += cc.units;
                 }
@@ -4798,7 +4600,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
             if (nTotal != nNeeded || vGroup.empty())
                 continue;
             nFound++;
-            if (nFound == 1) { demChosen = dem; vBurn = vGroup; nDemandHeight = nDH; }
+            if (nFound == 1) { demChosen = dem; vBurn = vGroup; nDemandHeight = nTagHeight; }
         }
     }
     if (nFound == 0) { strFail = "No fully-collectable pre-auth demand to discharge (partial redeems or ambiguity)!"; return false; }
@@ -4807,17 +4609,19 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     uint64_t U = 0;
     for (const CustodyCoin& cc : vBurn) U += cc.units;
 
-    // The consensus floor, mirrored from RedeemNote: D-iii accrual from window
-    // LAPSE (discharge in time pays par exactly), the DR-2 episode cap, and
-    // the confirmation margin (the floor only grows with height; overpaying
-    // is safe, a shortfall is permanently unconfirmable).
+    // The consensus floor, through the SAME helper consensus uses
+    // (NoteDemandInterest: D-iii accrual from window LAPSE, the v0.2.18 Q8
+    // reopen rule, the rate schedule), priced at the confirmation margin: the
+    // floor never falls as the payment height rises while the house state is
+    // unchanged, so pricing at nNextHeight + margin covers every height up to
+    // it (overpaying is safe, a shortfall is permanently unconfirmable).
     static const uint32_t NOTE_REDEEM_INTEREST_MARGIN_BLOCKS = 6;
-    uint32_t nEndHeight = (uint32_t)nNextHeight + NOTE_REDEEM_INTEREST_MARGIN_BLOCKS;
-    if (house.nDeferEndedHeight >= nDemandHeight && house.nDeferEndedHeight < nEndHeight)
-        nEndHeight = house.nDeferEndedHeight;
-    const uint32_t nAccrualStart = nDemandHeight + Params().GetConsensus().nDemandWindow;
-    const uint32_t nBlocks = nEndHeight > nAccrualStart ? nEndHeight - nAccrualStart : 0;
-    const CAmount amountInterest = NoteDeferralInterest(U, nBlocks);
+    // The burned coins' REAL tag (a queue demand accrues from the demand, a B3
+    // formal one from lapse); the demand group is uniform (tx_verify), and the
+    // helper ignores the protested bit.
+    (void)nDemandHeight;
+    const CAmount amountInterest = NoteDemandInterest(house, vBurn[0].tag, U,
+        (uint32_t)nNextHeight + NOTE_REDEEM_INTEREST_MARGIN_BLOCKS, Params().GetConsensus());
 
     // Brassage incidence (Delta-2): the RUNNER bears the spread - it comes out
     // of the payout, and the house's out-of-pocket stays U + interest.
@@ -4912,18 +4716,17 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, cs_wallet);
 
-    // Fail-fast mirror of the 3.4 consensus gate: redemption is open through
+    // Fail-fast mirror of the consensus gate: redemption is open through
     // Stressed, blocked at effective Insolvent (the waterfall replaces it).
+    // v0.2.18 (Q6): while the house is suspended (Deferred) only DEMANDED
+    // notes may be redeemed (paid at least principal + interest).
+    bool fDeferredHouse = false;
     {
         CHouse house;
         if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
         const char chEff = HouseEffectiveStatus(house, chainActive.Height() + 1);
-        if (chEff == HOUSE_STATUS_DEFERRED) {
-            strFail = "House has invoked the option clause - par redemption is suspended for the "
-                      "deferral window (holders queue and accrue interest from the date of demand).";
-            return false;
-        }
-        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
+        fDeferredHouse = (chEff == HOUSE_STATUS_DEFERRED);
+        if (!fDeferredHouse && chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
             strFail = "House is insolvent or wound down - use the claim path, not redemption!";
             return false;
         }
@@ -4931,15 +4734,24 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
 
     // A redeem burns a SINGLE holder's coins summing EXACTLY to nUnits (v1: to
     // keep U = burned units clean, require the holder to hold coins that sum to
-    // nUnits; change is a prior transfer's job).
+    // nUnits; change is a prior transfer's job). Groups are keyed by demand
+    // tag, so each candidate group is uniform (consensus requires it).
     std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
     CollectWalletNoteCoins(this, nHouseID, mapByHolder);
     std::vector<WalletNoteCoin> spend;
     uint64_t U = 0;
     for (const auto& kv : mapByHolder) {
+        if (fDeferredHouse && NoteDemandHeightOf(kv.first.second) == 0)
+            continue;   // undemanded notes cannot redeem while suspended
         uint64_t sum = 0;
         for (const WalletNoteCoin& nc : kv.second) sum += nc.units;
         if (sum == nUnits) { spend = kv.second; U = sum; break; }
+    }
+    if (spend.empty() && fDeferredHouse) {
+        strFail = "House is suspended (option clause): par redemption is suspended. Only DEMANDED notes can be "
+                  "redeemed now (lodge a demand with demandnote; queued notes earn interest from the date of demand), "
+                  "and no demanded coins of one holder sum exactly to the redeem amount.";
+        return false;
     }
     if (spend.empty()) { strFail = "No holder's note coins sum exactly to the redeem amount (transfer to consolidate first)!"; return false; }
 
@@ -4971,29 +4783,25 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
         // the house a few sats but guarantees the redemption can confirm through a
         // realistic mempool backlog. See finding R-i6/[11].
         //
-        // DR-2 mirror: consensus caps the window at the deferral-episode END
-        // (the recovery height). Once capped the floor is FIXED - it no longer
-        // grows with height - so the margin drops out and the payout matches the
-        // consensus amount exactly.
+        // The window and rate come from the SAME helper consensus uses
+        // (NoteDemandInterest: D-iii lapse start for pre-auth coins, the v0.2.18
+        // Q8 reopen rule, the rate schedule). For a fixed house state the floor
+        // never falls as the payment height rises, so pricing at the margin
+        // height covers every confirmation height up to it.
         static const uint32_t NOTE_REDEEM_INTEREST_MARGIN_BLOCKS = 6;
-        uint32_t nEndHeight = (uint32_t)nNextHeight + NOTE_REDEEM_INTEREST_MARGIN_BLOCKS;
-        if (houseB.nDeferEndedHeight >= nDemandHeight && houseB.nDeferEndedHeight < nEndHeight)
-            nEndHeight = houseB.nDeferEndedHeight;   // >= : same-block D==E caps at zero (consensus mirror)
-        // D-iii mirror: a PRE-AUTH demand's clock starts at window lapse, not
-        // at demand (consensus branches identically on the tag's bit 31).
-        uint32_t nAccrualStart = nDemandHeight;
-        if (NoteDemandIsPreAuth(nDemandTag))
-            nAccrualStart += Params().GetConsensus().nDemandWindow;
-        const uint32_t nBlocks = nEndHeight > nAccrualStart ? nEndHeight - nAccrualStart : 0;
-        amountInterest = NoteDeferralInterest(U, nBlocks);
+        amountInterest = NoteDemandInterest(houseB, nDemandTag, U,
+            (uint32_t)nNextHeight + NOTE_REDEEM_INTEREST_MARGIN_BLOCKS, Params().GetConsensus());
     }
     const CAmount amountPayout = (CAmount)U + amountInterest;
 
     // Dynamic brassage (3.5): a redemption while the house is below the floor
-    // pays a spread into the escrow pot. DR-2: demanded notes are NOT exempt
-    // (mirror of consensus - the old permanent-tag exemption is retired; a
-    // post-recovery queue pays no spread anyway since recovery re-attests at
-    // floor+buffer).
+    // pays a spread into the escrow pot. DR-2: demanded notes are NOT exempt.
+    // Incidence: this wallet pays the holder U + interest IN FULL and funds the
+    // spread on top (the house bears it). Consensus since v0.2.18 only requires
+    // U + interest - spread to the holder on a demanded note (runner bears, the
+    // same floor as a B3 discharge), so this overpays the floor by the spread;
+    // whether the wallet should deduct it is a separate (open) monetary
+    // choice - it would also change ordinary undemanded redemptions.
     const uint32_t nBps = HouseBrassageBps(houseB);
     const CAmount amountSpread = HouseBrassageAmount(U, nBps);
 
@@ -6863,7 +6671,7 @@ bool CWallet::SignSettle(std::string& strFail, std::string& strHexTxOut,
         Coin coin;
         if (!pcoinsTip->GetCoin(out, coin) || coin.IsSpent()) { strFail = "A proposed bundle coin is missing/spent!"; return false; }
         if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
-                coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID ||
+                coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
                 coin.nHouseID != nOwn || coin.nDemandHeight != 0 ||
                 coin.out.scriptPubKey != scriptTheirs) {
             strFail = "A proposed bundle coin is not a clean presentable note of our issue!"; return false;
@@ -8652,6 +8460,11 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
 {
     CWallet* const pwallet = this;
     strFail = "Unknown error!";
+    // v0.2.18 (operator Q4): RENEW is invalid from block 0 - never build one.
+    if (fRenew) {
+        strFail = "renewdeferral is retired (v0.2.18): a suspension has no end date, so there is nothing to renew. A suspended house stays suspended until it reopens (an attestation at floor + buffer) or goes silent; keep attesting on cadence.";
+        return false;
+    }
     if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
     // A8-b fail-fast (knob-gated like TOPUP/ADMIT): this op takes the house
     // slot, so building it against a pooled house-state op makes a tx ATMP
@@ -8672,30 +8485,11 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
     // ATMP rejection to the RPC caller).
     const int nNextHeight = chainActive.Height() + 1;
     const char chEff = HouseEffectiveStatus(house, nNextHeight);
-    if (!fRenew) {
-        if (chEff != HOUSE_STATUS_STRESSED) {
-            strFail = "The option clause is a STRESSED-state tool: the house must be stressed "
-                      "(and not already deferring, wound down, or insolvent).";
-            return false;
-        }
-        if (HouseConfidenceDead(house, nNextHeight)) {
-            strFail = "Confidence death: this house has already spent its option clause "
-                      "(a second activation inside the window, or too much cumulative suspension).";
-            return false;
-        }
-    } else {
-        if (chEff != HOUSE_STATUS_DEFERRED) {
-            strFail = "The house is not currently deferring - nothing to renew.";
-            return false;
-        }
-        if (house.nDeferRenewals >= HOUSE_DEFER_MAX_RENEWALS) {
-            strFail = "The one permitted renewal has already been used.";
-            return false;
-        }
-        if (house.DeferSuspendedBlocks(nNextHeight) >= HOUSE_CD_MAX_SUSPENDED) {
-            strFail = "Renewing would carry the house past the cumulative-suspension cap.";
-            return false;
-        }
+    // v0.2.18: no confidence-death guard - a repeat suspension is allowed.
+    if (chEff != HOUSE_STATUS_STRESSED) {
+        strFail = "The option clause is a STRESSED-state tool: the house must be stressed "
+                  "(and not already deferring, wound down, or insolvent).";
+        return false;
     }
 
     CMutableTransaction mtx;
@@ -9740,208 +9534,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
     return true;
 }
 
-bool CWallet::TransferAsset(std::string& strFail, uint256& txidOut, const uint256& txid, const CTxDestination& dest, const CAmount& nFee, const CAmount& nAmount)
-{
-    strFail = "Unknown error!";
 
-    if (vpwallets.empty()) {
-        strFail = "No active wallet!\n";
-        return false;
-    }
-
-    if (txid.IsNull()) {
-        strFail = "Invalid txid";
-        return false;
-    }
-
-    if (!IsValidDestination(dest)) {
-        strFail = "Invalid destination";
-        return false;
-    }
-
-    BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, cs_wallet);
-
-    // Get our asset outputs from txid
-    std::vector<COutput> vOut;
-    AvailableAssets(vOut, txid);
-
-    if (vOut.empty()) {
-        strFail = "No BitAssets of this type available!";
-        return false;
-    }
-
-    CMutableTransaction mtx;
-
-    // Choose asset outputs to cover transfer
-    uint32_t nAssetID = vOut[0].tx->nAssetID;
-    CAmount nAmountAsset = CAmount(0);
-    std::vector<COutput> vAssetSpent;
-    for (const COutput& out : vOut) {
-        mtx.vin.push_back(CTxIn(txid, out.i, CScript()));
-        vAssetSpent.push_back(out);
-
-        // Have we found enough?
-        nAmountAsset += out.tx->tx->vout[out.i].nValue;
-        if (nAmountAsset >= nAmount)
-            break;
-    }
-
-    if (nAmountAsset < nAmount) {
-        strFail = "Insufficient asset funds!";
-        return false;
-    }
-
-    // Handle asset change
-    const CAmount nAssetChange = nAmountAsset - nAmount;
-    CReserveKey reserveKeyAsset(this);
-    if (nAssetChange > 0) {
-        CScript scriptAssetChange;
-
-        // Reserve a new key pair from key pool
-        CPubKey vchPubKey;
-        if (!reserveKeyAsset.GetReservedKey(vchPubKey))
-        {
-            strFail = "Keypool ran out, please call keypoolrefill first!\n";
-            return false;
-        }
-        scriptAssetChange = GetScriptForDestination(vchPubKey.GetID());
-
-        CTxOut out(nAssetChange, scriptAssetChange);
-        mtx.vout.push_back(out);
-    }
-
-    // Add asset transfer output
-    mtx.vout.push_back(CTxOut(nAmount, GetScriptForDestination(dest)));
-
-    // Select coins to cover fee
-    std::vector<COutput> vCoins;
-    AvailableCoins(vCoins, true /* fOnlySafe */);
-    std::set<CInputCoin> setCoins;
-    CAmount nAmountCoins = CAmount(0);
-    if (!SelectCoins(vCoins, nFee, setCoins, nAmountCoins)) {
-        strFail = "Could not collect enough coins to cover fee!\n";
-        return false;
-    }
-
-    // Handle fee input change if there is any
-    const CAmount nChange = nAmountCoins - nFee;
-    CReserveKey reserveKey(this);
-    if (nChange > 0) {
-        CScript scriptChange;
-
-        // Reserve a new key pair from key pool
-        CPubKey vchPubKey;
-        if (!reserveKey.GetReservedKey(vchPubKey))
-        {
-            strFail = "Keypool ran out, please call keypoolrefill first!\n";
-            return false;
-        }
-        scriptChange = GetScriptForDestination(vchPubKey.GetID());
-
-        CTxOut out(nChange, scriptChange);
-        if (!IsDust(out, ::dustRelayFee))
-            mtx.vout.push_back(out);
-    }
-
-    // Add inputs for fee
-    for (const auto& coin : setCoins)
-        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
-
-    // Dummy sign the transaction to calculate minimum fee
-    std::set<CInputCoin> setCoinsTemp = setCoins;
-    if (!DummySignTx(mtx, setCoinsTemp)) {
-        strFail = "Dummy signing transaction for required fee calculation failed!";
-        return false;
-    }
-
-    // Get transaction size with dummy signatures
-    unsigned int nBytes = GetVirtualTransactionSize(mtx);
-
-    // Calculate fee
-    CCoinControl coinControl;
-    FeeCalculation feeCalc;
-    CAmount nFeeNeeded = GetMinimumFee(nBytes, coinControl, ::mempool, ::feeEstimator, &feeCalc);
-
-    // Check that the fee is valid for relay
-    if (nFeeNeeded < ::minRelayTxFee.GetFee(nBytes)) {
-        strFail = "Transaction too large for fee policy";
-        return false;
-    }
-
-    // Check the user set fee
-    if (nFee < nFeeNeeded) {
-        strFail = "The fee you have set is too small!";
-        return false;
-    }
-
-    // Remove dummy signatures
-    for (auto& vin : mtx.vin) {
-        vin.scriptSig = CScript();
-        vin.scriptWitness.SetNull();
-    }
-
-    // Sign asset & fee inputs
-
-    const CTransaction txToSign = mtx;
-    int nIn = 0;
-
-    // Sign the asset inputs
-    for (const COutput& out : vAssetSpent) {
-        const CScript& scriptPubKey = out.tx->tx->vout[out.i].scriptPubKey;
-        SignatureData sigdata;
-
-        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, out.tx->tx->vout[out.i].nValue, SIGHASH_ALL), scriptPubKey, sigdata))
-        {
-            strFail = "Signing asset inputs failed!\n";
-            return false;
-        } else {
-            UpdateTransaction(mtx, nIn, sigdata);
-        }
-        nIn++;
-    }
-
-    // Sign the fee inputs
-    for (const auto& coin : setCoins) {
-        const CScript& scriptPubKey = coin.txout.scriptPubKey;
-        SignatureData sigdata;
-
-        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL), scriptPubKey, sigdata))
-        {
-            strFail = "Signing inputs failed!\n";
-            return false;
-        } else {
-            UpdateTransaction(mtx, nIn, sigdata);
-        }
-
-        nIn++;
-    }
-
-    // Broadcast transaction
-    CWalletTx walletTx;
-    walletTx.fTimeReceivedIsTxTime = true;
-    walletTx.fFromMe = true;
-    walletTx.BindWallet(this);
-
-    walletTx.amountAssetIn = nAmountAsset;
-    walletTx.nAssetID = nAssetID;
-
-    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
-    CValidationState state;
-    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
-        strFail = "Failed to commit BitAsset creation transaction! Reject reason: " + FormatStateMessage(state) + "\n";
-        return false;
-    }
-
-    txidOut = walletTx.tx->GetHash();
-
-    return true;
-}
-
-bool CWallet::TransferAssetControl(std::string& strFail, const uint256& txid, const CTxDestination& dest, const CAmount& nFee)
-{
-    return true;
-}
 
 /**
  * Call after CreateTransaction unless you want to abort
@@ -11409,4 +11002,267 @@ bool CWallet::CreateWithdrawalRefundRequest(const uint256& id, const std::vector
     txid = wtx.GetHash();
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// BitAssets (v0.2.18, D-2026-10-03-1; layer-B review A6-A8, A11)
+// ---------------------------------------------------------------------------
+
+bool CWallet::IsUnconfirmedAssetTx(const CWalletTx& wtx) const
+{
+    AssertLockHeld(cs_main);
+    if (wtx.tx->nVersion == TRANSACTION_BITASSET_CREATE_VERSION && !wtx.tx->IsCoinBase())
+        return true;
+    // In the pool: its flag was decided at acceptance from the coins it spent,
+    // and survives a reorg that drops those coins back into the pool.
+    if (mempool.exists(wtx.GetHash()))
+        return mempool.IsAssetTx(wtx.GetHash());
+    // Not in the pool: decide from the UTXO set if every input is there;
+    // otherwise its colour is unknown - never offer it as ECX (fail closed).
+    for (const CTxIn& txin : wtx.tx->vin) {
+        Coin coin;
+        if (!pcoinsTip->GetCoin(txin.prevout, coin))
+            return true;
+        if (coin.IsAssetColoured())
+            return true;
+    }
+    return false;
+}
+
+bool CWallet::IsOutputAssetColoured(const CWalletTx& wtx, unsigned int n, int nDepth) const
+{
+    AssertLockHeld(cs_main);
+    if (wtx.tx->nVersion == TRANSACTION_BITASSET_CREATE_VERSION && !wtx.tx->IsCoinBase() && n < 2)
+        return true;
+    if (nDepth <= 0)
+        return false;    // the caller tests IsUnconfirmedAssetTx for the whole tx
+    Coin coin;
+    return pcoinsTip->GetCoin(COutPoint(wtx.GetHash(), n), coin) && coin.IsAssetColoured();
+}
+
+void CWallet::AvailableAssets(std::vector<std::pair<COutPoint, Coin>>& vOut, const uint256& assetID) const
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(cs_wallet);
+    vOut.clear();
+    for (const auto& entry : mapWallet) {
+        const CWalletTx& wtx = entry.second;
+        if (wtx.GetDepthInMainChain() < 1)
+            continue;    // asset outputs are spendable only once confirmed
+        for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
+            if (IsSpent(entry.first, i) || IsLockedCoin(entry.first, i))
+                continue;
+            if ((IsMine(wtx.tx->vout[i]) & ISMINE_SPENDABLE) == ISMINE_NO)
+                continue;
+            Coin coin;
+            if (!pcoinsTip->GetCoin(COutPoint(entry.first, i), coin) || !coin.IsAssetColoured())
+                continue;
+            if (!assetID.IsNull() && coin.assetID != assetID)
+                continue;
+            vOut.emplace_back(COutPoint(entry.first, i), coin);
+        }
+    }
+}
+
+bool CWallet::FundSignCommitAssetTx(CMutableTransaction& mtx, const std::vector<std::pair<COutPoint, CTxOut>>& vAssetIn,
+                                    const CAmount& nFee, std::string& strFail, uint256& txidOut)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(cs_wallet);
+
+    // Plain inputs fund every output not covered by the asset inputs, plus the
+    // fee. AvailableCoins never offers an asset coin (IsOutputAssetColoured),
+    // so a plain input cannot carry units in by accident.
+    CAmount nOut = 0;
+    for (const CTxOut& out : mtx.vout) nOut += out.nValue;
+    CAmount nAssetValueIn = 0;
+    for (const auto& in : vAssetIn) nAssetValueIn += in.second.nValue;
+    const CAmount nPlainTarget = nOut + nFee - nAssetValueIn;
+
+    std::set<CInputCoin> setCoins;
+    CAmount nPlainIn = 0;
+    if (nPlainTarget > 0) {
+        std::vector<COutput> vCoins;
+        AvailableCoins(vCoins, true /* fOnlySafe */);
+        if (!SelectCoins(vCoins, nPlainTarget, setCoins, nPlainIn)) {
+            strFail = "Could not collect enough plain coins to cover the outputs and the fee!";
+            return false;
+        }
+    }
+
+    // Change goes LAST: the leading outputs are the asset's (control, units).
+    CReserveKey reserveKey(this);
+    const CAmount nChange = nPlainIn - std::max<CAmount>(nPlainTarget, 0);
+    if (nChange > 0) {
+        CPubKey vchPubKey;
+        if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out, please call keypoolrefill first!"; return false; }
+        CTxOut out(nChange, GetScriptForDestination(vchPubKey.GetID()));
+        if (!IsDust(out, ::dustRelayFee))
+            mtx.vout.push_back(out);
+    }
+
+    // Asset inputs first, then plain.
+    std::vector<std::pair<CScript, CAmount>> vSign;
+    for (const auto& in : vAssetIn) {
+        mtx.vin.push_back(CTxIn(in.first, CScript()));
+        vSign.emplace_back(in.second.scriptPubKey, in.second.nValue);
+    }
+    for (const auto& coin : setCoins) {
+        mtx.vin.push_back(CTxIn(coin.outpoint, CScript()));
+        vSign.emplace_back(coin.txout.scriptPubKey, coin.txout.nValue);
+    }
+
+    // Fee floor (size with real signatures is within a few bytes of this).
+    {
+        CMutableTransaction mtxDummy = mtx;
+        for (size_t nIn = 0; nIn < vSign.size(); nIn++) {
+            SignatureData sigdata;
+            if (!ProduceSignature(DummySignatureCreator(this), vSign[nIn].first, sigdata)) { strFail = "Dummy signing failed!"; return false; }
+            UpdateTransaction(mtxDummy, nIn, sigdata);
+        }
+        const unsigned int nBytes = GetVirtualTransactionSize(mtxDummy);
+        CCoinControl coinControl;
+        FeeCalculation feeCalc;
+        const CAmount nFeeNeeded = GetMinimumFee(nBytes, coinControl, ::mempool, ::feeEstimator, &feeCalc);
+        if (nFee < nFeeNeeded || nFee < ::minRelayTxFee.GetFee(nBytes)) {
+            strFail = strprintf("The fee is too small: %s needed for %u bytes", FormatMoney(nFeeNeeded), nBytes);
+            return false;
+        }
+    }
+
+    const CTransaction txToSign = mtx;
+    for (size_t nIn = 0; nIn < vSign.size(); nIn++) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, vSign[nIn].second, SIGHASH_ALL), vSign[nIn].first, sigdata)) {
+            strFail = "Signing inputs failed!";
+            return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit the asset transaction! Reject reason: " + FormatStateMessage(state);
+        return false;
+    }
+    txidOut = walletTx.GetHash();
+    // CommitTransaction records the tx even when the mempool refuses it. For
+    // an asset op that is a phantom with its inputs marked spent: abandon it
+    // and report the failure (layer-B review A8).
+    if (fBroadcastTransactions && (!state.IsValid() || !mempool.exists(txidOut))) {
+        AbandonTransaction(txidOut);
+        strFail = "The asset transaction was refused: " + FormatStateMessage(state);
+        return false;
+    }
+    return true;
+}
+
+bool CWallet::CreateAsset(std::string& strFail, uint256& txidOut, const std::string& strTicker, const std::string& strHeadline,
+                          const uint256& payload, uint8_t nDecimals, CAmount nSupply,
+                          const CTxDestination& destControl, const CTxDestination& destSupply, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    if (!IsValidDestination(destControl) || !IsValidDestination(destSupply)) { strFail = "Invalid destination!"; return false; }
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_BITASSET_CREATE_VERSION;
+    mtx.ticker = strTicker;
+    mtx.headline = strHeadline;
+    mtx.payload = payload;
+    mtx.nDecimals = nDecimals;
+    mtx.vout.push_back(CTxOut(ASSET_CONTROL_VALUE, GetScriptForDestination(destControl)));   // vout[0]: control
+    mtx.vout.push_back(CTxOut(nSupply, GetScriptForDestination(destSupply)));               // vout[1]: the supply
+
+    // The consensus rule, before anything is funded or signed.
+    std::string strReason;
+    if (!CheckAssetGenesisShape(CTransaction(mtx), strReason)) { strFail = "Invalid asset: " + strReason; return false; }
+    if (IsDust(mtx.vout[1], ::dustRelayFee)) {
+        strFail = strprintf("The supply is below the relay dust limit (%d units for this address type)", GetDustThreshold(mtx.vout[1], ::dustRelayFee));
+        return false;
+    }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    return FundSignCommitAssetTx(mtx, {}, nFee, strFail, txidOut);
+}
+
+bool CWallet::TransferAsset(std::string& strFail, uint256& txidOut, const uint256& assetID, const CTxDestination& dest,
+                            CAmount nUnits, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    if (assetID.IsNull()) { strFail = "Invalid asset id!"; return false; }
+    if (!IsValidDestination(dest)) { strFail = "Invalid destination!"; return false; }
+    if (nUnits <= 0 || !MoneyRange(nUnits)) { strFail = "Invalid amount of units!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    std::vector<std::pair<COutPoint, Coin>> vAvail;
+    AvailableAssets(vAvail, assetID);
+    std::vector<std::pair<COutPoint, CTxOut>> vIn;
+    CAmount nIn = 0;
+    for (const auto& a : vAvail) {
+        if (!a.second.fBitAsset) continue;     // units only; the control coin stays put
+        vIn.emplace_back(a.first, a.second.out);
+        nIn += a.second.out.nValue;
+        if (nIn >= nUnits) break;
+    }
+    if (nIn < nUnits) { strFail = "Insufficient units of this asset (confirmed)!"; return false; }
+
+    // The leading outputs carry EXACTLY the units spent: the payment, then the
+    // asset change back to us. Plain change (if any) follows.
+    CMutableTransaction mtx;
+    mtx.nVersion = 2;
+    mtx.vout.push_back(CTxOut(nUnits, GetScriptForDestination(dest)));
+    if (IsDust(mtx.vout[0], ::dustRelayFee)) {
+        strFail = strprintf("A transfer below the relay dust limit (%d units for this address type) cannot relay", GetDustThreshold(mtx.vout[0], ::dustRelayFee));
+        return false;
+    }
+    // The asset change goes to a new P2PKH key of ours: test that script.
+    if (nIn > nUnits && IsDust(CTxOut(nIn - nUnits, GetScriptForDestination(CKeyID())), ::dustRelayFee)) {
+        strFail = strprintf("The asset change (%d units) would be below the relay dust limit: send %d units, or fewer leaving more change",
+                            nIn - nUnits, nIn);
+        return false;
+    }
+    if (nIn > nUnits) {
+        CReserveKey keyAsset(this);
+        CPubKey vchPubKey;
+        if (!keyAsset.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out, please call keypoolrefill first!"; return false; }
+        keyAsset.KeepKey();
+        mtx.vout.push_back(CTxOut(nIn - nUnits, GetScriptForDestination(vchPubKey.GetID())));
+    }
+    return FundSignCommitAssetTx(mtx, vIn, nFee, strFail, txidOut);
+}
+
+bool CWallet::TransferAssetControl(std::string& strFail, uint256& txidOut, const uint256& assetID, const CTxDestination& dest,
+                                   const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (vpwallets.empty()) { strFail = "No active wallet!"; return false; }
+    if (assetID.IsNull()) { strFail = "Invalid asset id!"; return false; }
+    if (!IsValidDestination(dest)) { strFail = "Invalid destination!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    std::vector<std::pair<COutPoint, Coin>> vAvail;
+    AvailableAssets(vAvail, assetID);
+    std::vector<std::pair<COutPoint, CTxOut>> vIn;
+    for (const auto& a : vAvail) {
+        if (a.second.fBitAssetControl) { vIn.emplace_back(a.first, a.second.out); break; }
+    }
+    if (vIn.empty()) { strFail = "This wallet does not hold the asset's control coin (confirmed)!"; return false; }
+
+    // The control coin passes to vout[0]; it carries no units.
+    CMutableTransaction mtx;
+    mtx.nVersion = 2;
+    mtx.vout.push_back(CTxOut(std::max<CAmount>(vIn[0].second.nValue, ASSET_CONTROL_VALUE), GetScriptForDestination(dest)));
+    return FundSignCommitAssetTx(mtx, vIn, nFee, strFail, txidOut);
 }

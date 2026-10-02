@@ -69,14 +69,21 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
   from on-chain heights (inherently reorg-safe). Insolvency triggers a waterfall:
   noteholders claim pro-rata from the locked escrow pot, then a whole-house residual
   settlement.
-- **The option clause**, translated from the Scottish record: a stressed house may defer
-  redemption for a bounded window, paying interest for the privilege, with its till locked
-  into the claim pot; a consensus redemption spread (*brassage*) adds run-friction.
+- **The option clause**, translated from the Scottish record: a stressed house may suspend
+  redemption, paying 10% a year on demanded notes until it pays, with its till locked into the
+  claim pot. From v0.2.18 a suspension has no end date: it ends when the house reopens (an
+  attestation back above its floor) or when its silence makes it insolvent. Holders' demands
+  queue and the house may pay them alone. A consensus redemption spread (*brassage*) adds
+  run-friction.
 - **Term deposits**: time-locked deposits with a consensus interest floor and transferable
   receipts, subordinated to notes in the insolvency waterfall.
 - **Clearing pools**: on-chain AMM pools between a house's notes and the base coin —
   swaps, LP shares, and orderly pool retirement. RPCs: `createpool`, `listpools`,
   `swapnote`, `addpoolliquidity`, `removepoolliquidity`, `listmylp`, `retirepool`.
+- **Assets** (v0.2.18): anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in
+  the coins that carry it, for example a token for gold a custodian holds. The asset's id is the
+  txid that created it; tickers are not unique, and a token is only as good as its issuer. RPCs:
+  `createasset`, `transferasset`, `transferassetcontrol`, `listmyassets`, `listassets`.
 - **The unit is ECX.** v0.2.17 removed the gram display (`getgramrate` and the `*_grams` RPC
   fields). Gold notes backed by wrapped gold are planned for a later release.
 
@@ -93,8 +100,24 @@ v0.2.12 lets a wallet be provisioned from an external seed and ships the live fi
 v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens the node to block explorers,
 v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send,
 v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block,
-v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe, and
-v0.2.17 checks every peg step against eCash itself:
+v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe,
+v0.2.17 checks every peg step against eCash itself, and
+v0.2.18 brings ECX credit with no closure date, and assets:
+
+- **Suspension instead of closure, and assets** (v0.2.18). **This is a consensus change: every node
+  must upgrade and restart once with `-reindex`** (the coin database now carries each coin's asset).
+  The eCash beta chain is kept. A v0.2.17 node stops following the chain at the first asset
+  transaction or the first use of the new suspension rules.
+  - A suspended house pays 10% a year on demanded notes, with no end date. A holder's demand is
+    pre-authorised by default, so the house can pay it alone (`dischargedemands`); `redeemnote`
+    works for demanded notes while the house is suspended; `upgradedemand` turns a plain demand
+    into a pre-authorised one. `renewdeferral` is retired.
+  - Assets: see "What works today". Units can't be created after the genesis (only burned) and two
+    assets can't be mixed in one transaction; balances never spend asset coins as ECX.
+  - Two stricter block rules: a block's eCash anchor must be higher than its parent's, and a
+    withdrawal ID already stored is refused.
+  - Also: CVE-2024-35202 (blocktxn) fixed; ZeroMQ 4.3.5 and libevent 2.1.13 in the Linux build;
+    macOS Intel builds; the Linux release is a reproducible Guix build.
 
 - **Every peg step is checked against eCash** (v0.2.17). **This is a consensus change: every node
   must upgrade and restart once with `-reindex`.** On the eCash beta the chain is replaced from block
@@ -367,6 +390,9 @@ Two things worth knowing before you start:
   bring-up with you works well.
 
 ## Verify your download
+
+To review the source of a release and confirm the Linux binary was built from it, see
+[VERIFY.md](VERIFY.md). The quick checks:
 
 Each release lists its files' SHA-256 hashes in `SHA256SUMS`, signed with the FreeBank release key
 (`SHA256SUMS.sig`). The key's public half is below and is also published as a signing key on the

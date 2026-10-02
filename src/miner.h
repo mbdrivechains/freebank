@@ -179,6 +179,8 @@ private:
     // utility functions
     /** Clear the block's state and prepare for assembling a new block */
     void resetBlock();
+    /** v0.2.18: withdrawal ids the template already creates (bad-withdrawal-not-new) */
+    std::set<uint256> setBlockWithdrawalIDs;
     /** Add a tx to the block */
     void AddToBlock(CTxMemPool::txiter iter);
 

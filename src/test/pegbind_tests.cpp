@@ -1398,6 +1398,9 @@ PEGBIND_BOTH_LAYOUTS(b3_window_falls_back_to_whole_history)
     // S is not an ancestor of the mark's L1 block; the whole history says failed
     chain.oracle.mapWindowEvents[std::make_pair(hashS, block.hashMainchainBlock)] = std::make_pair(L1Answer::NO, L1PegEvents());
     chain.oracle.mapWindowEvents[std::make_pair(uint256(), block.hashMainchainBlock)] = std::make_pair(L1Answer::YES, events);
+    // v0.2.18 L1-order rule: the mark's L1 block must sit above S in our list
+    // of L1 main-chain blocks.
+    MainCacheScope l1({hashS, block.hashMainchainBlock});
     chain.Connect(PegChain::Reseal(block), "failed mark via the whole history");
 }
 

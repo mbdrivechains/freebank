@@ -474,7 +474,12 @@ void FindNextBlocksToDownload(NodeId nodeid, unsigned int count, std::vector<con
     // Make sure pindexBestKnownBlock is up to date, we'll need it.
     ProcessBlockAvailability(nodeid);
 
-    if (state->pindexBestKnownBlock == nullptr || state->pindexBestKnownBlock->nHeight < chainActive.Tip()->nHeight) {
+    // v0.2.18 (layer-B review BMM H3): work is height here, and an equal-height
+    // block is either our tip or a sibling that can never win first-seen - but
+    // with no proof of work, an nTime copy of our tip costs nothing to make and
+    // would be fetched and stored. Fetch only strictly higher; a sibling we
+    // really need (our tip invalidated by an L1 reorg) is higher by then.
+    if (state->pindexBestKnownBlock == nullptr || state->pindexBestKnownBlock->nHeight <= chainActive.Tip()->nHeight) {
         // This peer has nothing interesting.
         return;
     }
@@ -630,7 +635,7 @@ bool GetNodeStateStats(NodeId nodeid, CNodeStateStats &stats) {
 }
 
 /** True if a block between pindex and the active chain (pindex included) is marked failed. */
-static bool BranchHasFailedBlock(const CBlockIndex* pindex)
+bool BranchHasFailedBlock(const CBlockIndex* pindex)
 {
     AssertLockHeld(cs_main);
     for (; pindex && !chainActive.Contains(pindex); pindex = pindex->pprev) {
@@ -1291,12 +1296,18 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
         }
     } // release cs_main
 
+    // Only process one BLOCK item per call, since they're uncommon and can be
+    // expensive to process.
     if (it != pfrom->vRecvGetData.end() && !pfrom->fPauseSend) {
-        const CInv &inv = *it;
+        const CInv &inv = *it++;
         if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK || inv.type == MSG_CMPCT_BLOCK || inv.type == MSG_WITNESS_BLOCK) {
-            it++;
             ProcessGetBlockData(pfrom, consensusParams, inv, connman, interruptMsgProc);
         }
+        // else: the first item on the queue is a type we do not serve (0, 5,
+        // MSG_FILTERED_WITNESS_BLOCK, or anything unknown). It is erased below
+        // and the rest of the queue is processed on the next call. Before this
+        // (as upstream before v0.20, PR #18808) such an item was never removed:
+        // the queue never drained and the message handler spun on cs_main.
     }
 
     pfrom->vRecvGetData.erase(pfrom->vRecvGetData.begin(), it);
@@ -1484,9 +1495,10 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
         }
 
         bool fCanDirectFetch = CanDirectFetch(chainparams.GetConsensus());
-        // If this set of headers is valid and ends in a block with at least as
-        // much work as our tip, download as much as possible.
-        if (fCanDirectFetch && pindexLast->IsValid(BLOCK_VALID_TREE) && chainActive.Tip()->nHeight <= pindexLast->nHeight) {
+        // If this set of headers is valid and ends in a block with MORE work
+        // than our tip, download as much as possible. Strictly more (v0.2.18,
+        // layer-B review BMM H3): see FindNextBlocksToDownload.
+        if (fCanDirectFetch && pindexLast->IsValid(BLOCK_VALID_TREE) && chainActive.Tip()->nHeight < pindexLast->nHeight) {
             std::vector<const CBlockIndex*> vToFetch;
             const CBlockIndex *pindexWalk = pindexLast;
             // Calculate all the blocks we'd need to switch to pindexLast, up to a limit.
@@ -2599,6 +2611,11 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                 Misbehaving(pfrom->GetId(), 100, strprintf("Peer %d sent us invalid compact block/non-matching block transactions\n", pfrom->GetId()));
                 return true;
             } else if (status == READ_STATUS_FAILED) {
+                // CVE-2024-35202: FillBlock has consumed the partial block. Drop it so a
+                // further blocktxn for this hash is ignored ("weren't expecting") instead
+                // of re-entering FillBlock. The block stays in flight from this peer
+                // until the full block requested below arrives (or the request times out).
+                it->second.second->partialBlock.reset();
                 // Might have collided, fall back to getdata now :(
                 std::vector<CInv> invs;
                 invs.push_back(CInv(MSG_BLOCK | GetFetchFlags(pfrom), resp.blockhash));

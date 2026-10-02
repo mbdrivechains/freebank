@@ -66,6 +66,19 @@ void CChainParams::UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64
  * + Contains no strange transactions
  */
 
+// v0.2.18: the interest schedule must start at height 0 and be strictly
+// increasing by height - NoteDeferralInterest sums its segments, so an unsorted
+// or overlapping entry would double-count interest.
+static bool DeferScheduleIsValid(const std::vector<Consensus::DeferInterestStep>& v)
+{
+    if (v.empty() || v[0].nHeight != 0)
+        return false;
+    for (size_t i = 1; i < v.size(); i++)
+        if (v[i].nHeight <= v[i - 1].nHeight)
+            return false;
+    return true;
+}
+
 class CMainParams : public CChainParams {
 public:
     CMainParams() {
@@ -86,6 +99,12 @@ public:
         consensus.nMinerConfirmationWindow = 2016; // nPowTargetTimespan / nPowTargetSpacing
         consensus.nSettleCadence = 144; // ~1 day of settlement exclusivity per house pair
         consensus.nDemandWindow = 1008;  // B3: ~1 week at 10-min — comfortably over honest downtime
+        // v0.2.18 suspension (operator sign-off 2026-10-02): 10%/yr from block 0 on
+        // queued and lapsed-B3 demands ("needs to discourage"); a later release may
+        // APPEND a step at a future height, never edit a past one.
+        consensus.vDeferInterestSchedule = {{0, 1000}};
+        assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
+        consensus.nDeferSilenceWindow = 4032;  // ~4 weeks after 2 missed cadences
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 347;  // ~5%/day / 144 blocks
         consensus.nOracleBrakeElapsedCap = 144;   // censor-charge bounded to one day's fall
@@ -222,6 +241,9 @@ public:
         consensus.nMinerConfirmationWindow = 144; // Faster than normal for regtest (144 instead of 2016)
         consensus.nSettleCadence = 12; // fast settle windows for tests + demo-rhythm chains
         consensus.nDemandWindow = 12;  // B3: gate-testable; ~8.4h on the 30s demo signet
+        consensus.vDeferInterestSchedule = {{0, 1000}};  // same as main (10%/yr from block 0)
+        assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
+        consensus.nDeferSilenceWindow = 40;    // gate-testable silence clock (main: 4032)
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 100000; // 10%/block: brake behavior testable in few blocks
         consensus.nOracleBrakeElapsedCap = 12;

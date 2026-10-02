@@ -1132,7 +1132,7 @@ BOOST_AUTO_TEST_CASE(bill_recourse_hretire_hclaim_shape_rejections)
 static COutPoint AddBillCoin(CCoinsViewCache& cache, bool fEscrow, uint32_t nBillID,
                              const uint256& txid, uint32_t n = 0)
 {
-    Coin coin(CTxOut(BILL_TITLE_VALUE, CScript() << OP_TRUE), 100, false, false, false, 0);
+    Coin coin(CTxOut(BILL_TITLE_VALUE, CScript() << OP_TRUE), 100, false, false, false, uint256());
     coin.SetBill(fEscrow, nBillID);
     COutPoint op(txid, n);
     cache.AddCoin(op, std::move(coin), false);
@@ -1141,7 +1141,7 @@ static COutPoint AddBillCoin(CCoinsViewCache& cache, bool fEscrow, uint32_t nBil
 
 static COutPoint AddPlainCoin(CCoinsViewCache& cache, CAmount nValue, const uint256& txid, uint32_t n = 0)
 {
-    Coin coin(CTxOut(nValue, CScript() << OP_TRUE), 100, false, false, false, 0);
+    Coin coin(CTxOut(nValue, CScript() << OP_TRUE), 100, false, false, false, uint256());
     COutPoint op(txid, n);
     cache.AddCoin(op, std::move(coin), false);
     return op;
@@ -1340,7 +1340,7 @@ BOOST_AUTO_TEST_CASE(bill_b1_colored_input_classes)
         for (int op = 0; op < 3; op++) {
             CCoinsView base; CCoinsViewCache cache(&base);
             Coin coin(CTxOut(100000, CScript() << OP_TRUE), 100, false, false, false,
-                      cls.colour == COL_ASSET ? 42 : 0);
+                      cls.colour == COL_ASSET ? uint256S("2a") : uint256());
             switch (cls.colour) {
             case COL_NOTE:    coin.SetNote(3, 1000); break;
             case COL_HOUSE:   coin.SetHouseEscrow(3); break;

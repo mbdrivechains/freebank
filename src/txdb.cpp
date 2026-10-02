@@ -50,8 +50,8 @@ int nDiskFormatVersion = FREEBANK_DISK_FORMAT_VERSION;
 static const char DB_LAST_SIDECHAIN_DEPOSIT = 'x';
 static const char DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE = 'w';
 
-static const char DB_ASSET = 'A';
-static const char DB_ASSET_LAST_ID = 'I';
+// v0.2.18: asset records keyed by genesis txid ('A' / 'I' were the counter-era keys).
+static const char DB_ASSET_GENESIS = 'G';
 
 static const char DB_BILL = 'B';
 static const char DB_BILL_HASH = 'H';
@@ -777,60 +777,40 @@ BitAssetDB::BitAssetDB(size_t nCacheSize, bool fMemory, bool fWipe)
 bool BitAssetDB::WriteBitAssets(const std::vector<BitAsset>& vAsset)
 {
     CDBBatch batch(*this);
-    for (const BitAsset& asset : vAsset) {
-        std::pair<char, uint32_t> key = std::make_pair(DB_ASSET, asset.nID);
-        batch.Write(key, asset);
-    }
+    for (const BitAsset& asset : vAsset)
+        batch.Write(std::make_pair(DB_ASSET_GENESIS, asset.txid), asset);
     return WriteBatch(batch, true);
 }
 
-std::vector<BitAsset> BitAssetDB::GetAssets()
+bool BitAssetDB::RemoveBitAssets(const std::vector<uint256>& vTxid)
 {
-    std::ostringstream ss;
-    ::Serialize(ss, std::make_pair(DB_ASSET, 0));
+    CDBBatch batch(*this);
+    for (const uint256& txid : vTxid)
+        batch.Erase(std::make_pair(DB_ASSET_GENESIS, txid));
+    return WriteBatch(batch, true);
+}
 
+std::vector<BitAsset> BitAssetDB::GetAssets(const uint256& start, size_t nMax)
+{
     std::vector<BitAsset> vAsset;
-
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
-    pcursor->Seek(ss.str());
-    while (pcursor->Valid()) {
+    pcursor->Seek(std::make_pair(DB_ASSET_GENESIS, start));
+    while (pcursor->Valid() && vAsset.size() < nMax) {
         boost::this_thread::interruption_point();
-
-        std::pair<char, uint32_t> key;
+        std::pair<char, uint256> key;
+        if (!pcursor->GetKey(key) || key.first != DB_ASSET_GENESIS)
+            break;
         BitAsset asset;
-        if (pcursor->GetKey(key) && key.first == DB_ASSET) {
-            if (pcursor->GetValue(asset))
-                vAsset.push_back(asset);
-        }
-
+        if (pcursor->GetValue(asset))
+            vAsset.push_back(asset);
         pcursor->Next();
     }
     return vAsset;
 }
 
-bool BitAssetDB::GetLastAssetID(uint32_t& nID)
+bool BitAssetDB::GetAsset(const uint256& txid, BitAsset& asset)
 {
-    // Look up the last asset ID (in chronological order)
-    if (!Read(DB_ASSET_LAST_ID, nID))
-        return false;
-
-    return true;
-}
-
-bool BitAssetDB::WriteLastAssetID(const uint32_t nID)
-{
-    return Write(DB_ASSET_LAST_ID, nID);
-}
-
-bool BitAssetDB::RemoveAsset(const uint32_t nID)
-{
-    std::pair<char, uint32_t> key = std::make_pair(DB_ASSET, nID);
-    return Erase(key);
-}
-
-bool BitAssetDB::GetAsset(const uint32_t nID, BitAsset& asset)
-{
-    return Read(std::make_pair(DB_ASSET, nID), asset);
+    return Read(std::make_pair(DB_ASSET_GENESIS, txid), asset);
 }
 
 
@@ -1321,7 +1301,7 @@ bool CCoinsViewDB::Upgrade() {
             COutPoint outpoint(key.second, 0);
             for (size_t i = 0; i < old_coins.vout.size(); ++i) {
                 if (!old_coins.vout[i].IsNull() && !old_coins.vout[i].scriptPubKey.IsUnspendable()) {
-                    Coin newcoin(std::move(old_coins.vout[i]), old_coins.nHeight, old_coins.fCoinBase, false, false, 0);
+                    Coin newcoin(std::move(old_coins.vout[i]), old_coins.nHeight, old_coins.fCoinBase, false, false, uint256());
                     outpoint.n = i;
                     CoinEntry entry(&outpoint);
                     batch.Write(entry, newcoin);

@@ -6,6 +6,7 @@
 #ifndef BITCOIN_COINS_H
 #define BITCOIN_COINS_H
 
+#include <asset.h>
 #include <primitives/transaction.h>
 #include <compressor.h>
 #include <core_memusage.h>
@@ -39,7 +40,11 @@
 //! entry format change, same positional-append hazard as the records above.
 //! The forced -reindex also BACK-FILLS the new field for historical blocks,
 //! which is what makes the deposit-CTIP reorg revert correct for them.
-static const int FREEBANK_DISK_FORMAT_VERSION = 2;
+//!
+//! v3 (v0.2.18, D-2026-10-03-1): a coloured coin carries its asset's full
+//! genesis txid (uint256 assetID, written only when a colour flag is set) in
+//! both the coin and the undo record, replacing the uint32 counter id.
+static const int FREEBANK_DISK_FORMAT_VERSION = 3;
 
 /**
  * A UTXO entry.
@@ -60,15 +65,16 @@ public:
     //! at which height this containing transaction was included in the active block chain
     uint32_t nHeight : 31;
 
-    // TODO instead of tracking this, we could just check if the asset ID
-    // is > 0 (the default bitcoin asset reserves the first ID)
-    //! Is this a BitAsset?
+    //! Does this coin carry asset units (1 unit = 1 sat of its value)?
     bool fBitAsset;
 
-    //! Is this a BitAsset controller?
+    //! Is this an asset's control coin (carries no units)?
     bool fBitAssetControl;
 
-    uint32_t nAssetID;
+    //! v0.2.18 (D-2026-10-03-1): the asset's identity, its genesis txid, in
+    //! full - a truncated id can be ground to collide with a real asset's.
+    //! Null on a plain coin. Serialized only when a colour flag is set.
+    uint256 assetID;
 
     //! Is this a bill title (ownership) output?
     bool fBill;
@@ -123,8 +129,8 @@ public:
     bool fOracleBond;
 
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, uint32_t nAssetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), nAssetID(nAssetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, uint32_t nAssetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), nAssetID(nAssetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
 
     void SetBill(bool fEscrowIn, uint32_t nBillIDIn) {
         fBill = !fEscrowIn;
@@ -175,7 +181,7 @@ public:
         nHeight = 0;
         fBitAsset = false;
         fBitAssetControl = false;
-        nAssetID = 0;
+        assetID.SetNull();
         fBill = false;
         fBillEscrow = false;
         nBillID = 0;
@@ -196,7 +202,7 @@ public:
     }
 
     //! empty constructor
-    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), nAssetID(0), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) { }
+    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), assetID(), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) { }
 
     bool IsCoinBase() const {
         return fCoinBase;
@@ -210,8 +216,14 @@ public:
         return fBitAssetControl;
     }
 
-    uint32_t GetAssetID() const {
-        return nAssetID;
+    const uint256& GetAssetID() const {
+        return assetID;
+    }
+
+    //! The one colour test (layer-B review A5): any flag or a non-null id. Every
+    //! guard that keeps asset coins out of an op uses this, never one field.
+    bool IsAssetColoured() const {
+        return fBitAsset || fBitAssetControl || !assetID.IsNull();
     }
 
     template<typename Stream>
@@ -222,7 +234,8 @@ public:
         ::Serialize(s, CTxOutCompressor(REF(out)));
         ::Serialize(s, fBitAsset);
         ::Serialize(s, fBitAssetControl);
-        ::Serialize(s, nAssetID);
+        if (fBitAsset || fBitAssetControl)
+            ::Serialize(s, assetID);
         ::Serialize(s, fBill);
         ::Serialize(s, fBillEscrow);
         ::Serialize(s, nBillID);
@@ -254,7 +267,10 @@ public:
         ::Unserialize(s, REF(CTxOutCompressor(out)));
         ::Unserialize(s, fBitAsset);
         ::Unserialize(s, fBitAssetControl);
-        ::Unserialize(s, nAssetID);
+        if (fBitAsset || fBitAssetControl)
+            ::Unserialize(s, assetID);
+        else
+            assetID.SetNull();
         ::Unserialize(s, fBill);
         ::Unserialize(s, fBillEscrow);
         ::Unserialize(s, nBillID);
@@ -461,7 +477,7 @@ public:
      * If no unspent output exists for the passed outpoint, this call
      * has no effect.
      */
-    bool SpendCoin(const COutPoint &outpoint, bool& fBitAsset, bool& fBitAssetControl, uint32_t& nAssetID, Coin* moveto = nullptr);
+    bool SpendCoin(const COutPoint &outpoint, Coin* moveto = nullptr);
 
     /**
      * Push the modifications applied to this cache to its base.
@@ -505,7 +521,9 @@ private:
 // an overwrite.
 // TODO: pass in a boolean to limit these possible overwrites to known
 // (pre-BIP34) cases.
-void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, uint32_t nAssetID, const CAmount amountAssetIn, int nControlN = -1, uint32_t nNewAssetID = 0, uint32_t nBillID = 0, uint32_t nHouseID = 0, bool check = false);
+// assetTags: ComputeAssetTags's result for tx (asset.h); empty for a tx that
+// moves no asset. AddCoins only applies it - every colour decision is made there.
+void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, const AssetTags& assetTags = AssetTags(), uint32_t nBillID = 0, uint32_t nHouseID = 0, bool check = false);
 
 //! Utility function to find any unspent output with a given txid.
 // This function can be quite expensive because in the event of a transaction

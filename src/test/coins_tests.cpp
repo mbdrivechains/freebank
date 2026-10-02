@@ -17,7 +17,6 @@
 #include <boost/test/unit_test.hpp>
 
 int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out);
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight);
 
 namespace
 {
@@ -175,10 +174,7 @@ BOOST_AUTO_TEST_CASE(coins_cache_simulation_test)
             } else {
                 removed_an_entry = true;
                 coin.Clear();
-                bool fBitAsset = false;
-                bool fBitAssetControl = false;
-                uint32_t nAssetID = 0;
-                stack.back()->SpendCoin(COutPoint(txid, 0), fBitAsset, fBitAssetControl, nAssetID);
+                stack.back()->SpendCoin(COutPoint(txid, 0));
             }
         }
 
@@ -375,14 +371,11 @@ BOOST_AUTO_TEST_CASE(updatecoins_simulation_test)
             // Update the expected result to know about the new output coins
             assert(tx.vout.size() == 1);
             const COutPoint outpoint(tx.GetHash(), 0);
-            result[outpoint] = Coin(tx.vout[0], height, CTransaction(tx).IsCoinBase(), false, false, 0);
+            result[outpoint] = Coin(tx.vout[0], height, CTransaction(tx).IsCoinBase(), false, false, uint256());
 
             // Call UpdateCoins on the top cache
             CTxUndo undo;
-            CAmount amountAssetIn = CAmount(0);
-            int nControlN = -1;
-            uint32_t nAssetID = 0;
-            UpdateCoins(tx, *(stack.back()), undo, height, amountAssetIn, nControlN, nAssetID);
+            UpdateCoins(tx, *(stack.back()), undo, height);
 
             // Update the utxo set for future spends
             utxoset.insert(outpoint);
@@ -408,10 +401,7 @@ BOOST_AUTO_TEST_CASE(updatecoins_simulation_test)
             // Disconnect the tx from the current UTXO
             // See code in DisconnectBlock
             // remove outputs
-            bool fBitAsset = false;
-            bool fBitAssetControl = false;
-            uint32_t nAssetID = 0;
-            stack.back()->SpendCoin(utxod->first, fBitAsset, fBitAssetControl, nAssetID);
+            stack.back()->SpendCoin(utxod->first);
             // restore inputs
             if (!tx.IsCoinBase()) {
                 const COutPoint &out = tx.vin[0].prevout;
@@ -671,10 +661,7 @@ BOOST_AUTO_TEST_CASE(ccoins_access)
 void CheckSpendCoins(CAmount base_value, CAmount cache_value, CAmount expected_value, char cache_flags, char expected_flags)
 {
     SingleEntryCacheTest test(base_value, cache_value, cache_flags);
-    bool fBitAsset = false;
-    bool fBitAssetControl = false;
-    uint32_t nAssetID = 0;
-    test.cache.SpendCoin(OUTPOINT, fBitAsset, fBitAssetControl, nAssetID);
+    test.cache.SpendCoin(OUTPOINT);
     test.cache.SelfTest();
 
     CAmount result_value;
@@ -731,7 +718,7 @@ void CheckAddCoinBase(CAmount base_value, CAmount cache_value, CAmount modify_va
     try {
         CTxOut output;
         output.nValue = modify_value;
-        test.cache.AddCoin(OUTPOINT, Coin(std::move(output), 1, coinbase, false, false, 0), coinbase);
+        test.cache.AddCoin(OUTPOINT, Coin(std::move(output), 1, coinbase, false, false, uint256()), coinbase);
         test.cache.SelfTest();
         GetCoinsMapEntry(test.cache.map(), result_value, result_flags);
     } catch (std::logic_error& e) {
@@ -882,15 +869,17 @@ BOOST_AUTO_TEST_CASE(ccoins_write)
 //   prefix   VARINT(nHeight*2 + fCoinBase) with nHeight=1        ->  1
 //   txout    VARINT(CompressAmount(1000)=4)                      ->  1
 //            VARINT(1 + 6 special) then the 1-byte OP_RETURN     ->  2
-//   tags     fBitAsset 1 + fBitAssetControl 1 + nAssetID 4       ->  6
+//   tags     fBitAsset 1 + fBitAssetControl 1 (+ assetID 32 only
+//            when a colour flag is set, v3)                      ->  2
 //            fBill 1 + fBillEscrow 1 + nBillID 4                 ->  6
 //            fHouseEscrow 1 + nHouseID 4                         ->  5
 //            fNote 1 + nNoteUnits 8 + nDemandHeight 4            -> 13
 //            fDeposit 1 + principal 8 + rate 4 + mat 4 + orig 4  -> 21
 //            fPoolEscrow 1 + fLpShare 1 + nLpUnits 8             -> 10
 //            fOracleBond 1                                       ->  1
-//   Coin = 1 + 3 + 62 = 66. TxInUndo adds the one-byte legacy version dummy
-//   that is emitted whenever nHeight > 0, so 67.
+//   Coin = 1 + 3 + 58 = 62. TxInUndo adds the one-byte legacy version dummy
+//   that is emitted whenever nHeight > 0, so 63. A coloured coin adds the
+//   32-byte asset id: 94 / 95.
 BOOST_AUTO_TEST_CASE(disk_record_format_pin)
 {
     Coin c;
@@ -899,10 +888,32 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
     c.nHeight = 1;
     c.fCoinBase = false;
 
-    BOOST_CHECK_EQUAL(::GetSerializeSize(c, SER_DISK, CLIENT_VERSION), (size_t)66);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(c, SER_DISK, CLIENT_VERSION), (size_t)62);
 
     const TxInUndoSerializer undoser(&c);
-    BOOST_CHECK_EQUAL(::GetSerializeSize(undoser, SER_DISK, CLIENT_VERSION), (size_t)67);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(undoser, SER_DISK, CLIENT_VERSION), (size_t)63);
+
+    // v3 (v0.2.18): a coloured coin carries its full 32-byte genesis txid, in
+    // the coin and in the undo record, and round-trips it.
+    Coin a = c;
+    a.fBitAsset = true;
+    a.assetID = uint256S("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    BOOST_CHECK_EQUAL(::GetSerializeSize(a, SER_DISK, CLIENT_VERSION), (size_t)94);
+    const TxInUndoSerializer undoserA(&a);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(undoserA, SER_DISK, CLIENT_VERSION), (size_t)95);
+    {
+        CDataStream ss(SER_DISK, CLIENT_VERSION);
+        ss << a;
+        Coin b;
+        ss >> b;
+        BOOST_CHECK(b.fBitAsset && !b.fBitAssetControl && b.assetID == a.assetID);
+        CDataStream ssu(SER_DISK, CLIENT_VERSION);
+        ssu << undoserA;
+        Coin u;
+        TxInUndoDeserializer undodeser(&u);
+        ssu >> undodeser;
+        BOOST_CHECK(u.fBitAsset && u.assetID == a.assetID);
+    }
 
     // v2 evidence (D-3): the block-index entry grew hashLastDeposit. A
     // default-constructed entry (all-zero VARINTs, no file positions) pins the
@@ -914,7 +925,7 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
 
     // A bump without updating the pins above is also a mistake - the sizes are
     // the evidence for the version, so they move together.
-    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 2);
+    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 3);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

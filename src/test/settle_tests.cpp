@@ -479,15 +479,15 @@ static CMutableTransaction MakeSettleSetup(CCoinsViewCache& cache, SettleExchang
 {
     CMutableTransaction mtx = ShapeValidTx(x, pkA, pkB);
 
-    Coin noteA(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+    Coin noteA(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
     noteA.SetNote(1, 60000);
     cache.AddCoin(COutPoint(uint256S("0xa0"), 0), std::move(noteA), false);
 
-    Coin noteB(CTxOut(1000, NoteScriptForPubKey(pkB)), 100, false, false, false, 0);
+    Coin noteB(CTxOut(1000, NoteScriptForPubKey(pkB)), 100, false, false, false, uint256());
     noteB.SetNote(2, 45000);
     cache.AddCoin(COutPoint(uint256S("0xb0"), 0), std::move(noteB), false);
 
-    Coin fund(CTxOut(40000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+    Coin fund(CTxOut(40000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
     cache.AddCoin(COutPoint(uint256S("0xc0"), 0), std::move(fund), false);
 
     return mtx;
@@ -517,7 +517,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     {
         CCoinsView base; CCoinsViewCache cache(&base);
         CMutableTransaction mtx = MakeSettleSetup(cache, x, pkA, pkB);
-        Coin demanded(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+        Coin demanded(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
         demanded.SetNote(1, 60000, 55);
         cache.AddCoin(COutPoint(uint256S("0xa0"), 0), std::move(demanded), true);
         BOOST_CHECK_EQUAL(InputsReject(mtx, cache), "bad-settle-demanded-note");
@@ -526,7 +526,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     {
         CCoinsView base; CCoinsViewCache cache(&base);
         CMutableTransaction mtx = MakeSettleSetup(cache, x, pkA, pkB);
-        Coin wrong(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+        Coin wrong(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
         wrong.SetNote(3, 60000);
         cache.AddCoin(COutPoint(uint256S("0xa0"), 0), std::move(wrong), true);
         BOOST_CHECK_EQUAL(InputsReject(mtx, cache), "bad-settle-bundle-issuer");
@@ -535,7 +535,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     {
         CCoinsView base; CCoinsViewCache cache(&base);
         CMutableTransaction mtx = MakeSettleSetup(cache, x, pkA, pkB);
-        Coin offkey(CTxOut(1000, NoteScriptForPubKey(pkB)), 100, false, false, false, 0);
+        Coin offkey(CTxOut(1000, NoteScriptForPubKey(pkB)), 100, false, false, false, uint256());
         offkey.SetNote(1, 60000);
         cache.AddCoin(COutPoint(uint256S("0xa0"), 0), std::move(offkey), true);
         BOOST_CHECK_EQUAL(InputsReject(mtx, cache), "bad-settle-input-not-presenter");
@@ -544,7 +544,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     {
         CCoinsView base; CCoinsViewCache cache(&base);
         CMutableTransaction mtx = MakeSettleSetup(cache, x, pkA, pkB);
-        Coin off(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+        Coin off(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
         off.SetNote(1, 59999);
         cache.AddCoin(COutPoint(uint256S("0xa0"), 0), std::move(off), true);
         BOOST_CHECK_EQUAL(InputsReject(mtx, cache), "bad-settle-bundle-sum");
@@ -555,7 +555,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     {
         CCoinsView base; CCoinsViewCache cache(&base);
         CMutableTransaction mtx = MakeSettleSetup(cache, x, pkA, pkB);
-        Coin custody(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+        Coin custody(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
         custody.SetNote(1, 60000);
         custody.SetPoolEscrow(1);
         cache.AddCoin(COutPoint(uint256S("0xa0"), 0), std::move(custody), true);
@@ -565,7 +565,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     {
         CCoinsView base; CCoinsViewCache cache(&base);
         CMutableTransaction mtx = MakeSettleSetup(cache, x, pkA, pkB);
-        Coin extraNote(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+        Coin extraNote(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
         extraNote.SetNote(1, 500);
         cache.AddCoin(COutPoint(uint256S("0xc0"), 0), std::move(extraNote), true);
         BOOST_CHECK_EQUAL(InputsReject(mtx, cache), "bad-settle-tagged-input");
@@ -574,7 +574,7 @@ BOOST_AUTO_TEST_CASE(settle_input_vectors)
     // tx spending a note coin still rejects with the original guard.
     {
         CCoinsView base; CCoinsViewCache cache(&base);
-        Coin note(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, 0);
+        Coin note(CTxOut(1000, NoteScriptForPubKey(pkA)), 100, false, false, false, uint256());
         note.SetNote(1, 60000);
         cache.AddCoin(COutPoint(uint256S("0xd0"), 0), std::move(note), false);
         CMutableTransaction mtx;

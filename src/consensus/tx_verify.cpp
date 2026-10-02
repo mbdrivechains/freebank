@@ -4,6 +4,8 @@
 
 #include <consensus/tx_verify.h>
 
+#include <asset.h>
+
 #include <bill.h>
 #include <house.h>
 #include <note.h>
@@ -175,17 +177,19 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
         return state.DoS(100, false, REJECT_INVALID, "bad-txns-oversize");
 
 
-    // C6-A (A1): the inherited BitAsset genesis version (v10) is RETIRED. It
-    // excluded vout[0..1] from BOTH halves of value conservation (the range
-    // loop below and GetValueOut) while coins.cpp still banked their nValue into
-    // the UTXO set -> unbounded money-in inflation from a raw tx. FreeBank's
-    // money layer never used BitAssets (gold = v17 oracle, notes = v13); this is
-    // inherited 46efa91 chassis surface. Reject the version outright rather than
-    // patch the carve-out. Unconditional: no persistent chain carries a v10 (the
-    // ev chain never ran createasset; the demo chain wipes daily), so a
-    // height-gate would be 0 on every network anyway.
-    if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION)
-        return state.DoS(100, false, REJECT_INVALID, "bad-txns-version-bitasset-retired");
+    // BitAssets (v0.2.18, D-2026-10-03-1): the genesis's shape and metadata
+    // are context-free, so they are checked HERE - mempool acceptance and
+    // blocks then agree (layer-B review A3/B6). Value conservation covers every
+    // v10 output (the C6-A carve-out deletions stand): 1 asset unit = 1 sat.
+    if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
+        // A coinbase is never a genesis: its outputs are the reward and deposit
+        // payouts (review of ed7d51d, finding 2).
+        if (tx.IsCoinBase())
+            return state.DoS(100, false, REJECT_INVALID, "bad-asset-genesis-coinbase");
+        std::string strReason;
+        if (!CheckAssetGenesisShape(tx, strReason))
+            return state.DoS(100, false, REJECT_INVALID, strReason);
+    }
 
     // Bill transactions: context-free shape + payload-signature checks
     if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -393,7 +397,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         }
     }
 
-    uint32_t nAssetIDFound = 0;
+    std::vector<const Coin*> vSpentCoins;    // for ComputeAssetTags, in vin order
+    vSpentCoins.reserve(tx.vin.size());
     CAmount nValueIn = 0;
     unsigned int nBillTitleIn = 0;
     unsigned int nBillEscrowIn = 0;
@@ -445,7 +450,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (i < nBundleEnd) {
                 const bool fSideA = i < settle.nCountANotes;
                 if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
-                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID ||
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
                         coin.fOracleBond)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
                 if (coin.nHouseID != (fSideA ? settle.nHouseA : settle.nHouseB))
@@ -460,16 +465,13 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 nUnits += coin.nNoteUnits;
             } else {
                 if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
-                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.nAssetID ||
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
                         coin.fOracleBond)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
             }
         }
 
-        if (coin.nAssetID && nAssetIDFound && coin.nAssetID != nAssetIDFound)
-            return state.DoS(10, false, REJECT_INVALID, "bad-txns-inputs-mixed-assets");
-
-        nAssetIDFound = coin.nAssetID;
+        vSpentCoins.push_back(&coin);
 
         // Bill spend guard: title / escrow coins are locked to their bill's
         // v11 operations; bill transactions cannot spend asset-colored coins
@@ -486,7 +488,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             else
                 nBillEscrowIn++;
         }
-        else if (tx.nVersion == TRANSACTION_BILL_VERSION && coin.nAssetID) {
+        else if (tx.nVersion == TRANSACTION_BILL_VERSION && coin.IsAssetColoured()) {
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-asset-input");
         }
 
@@ -511,7 +513,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nHouseEscrowIn++;
         }
         else if (tx.nVersion == TRANSACTION_HOUSE_VERSION &&
-                (coin.nAssetID || coin.fBill || coin.fBillEscrow)) {
+                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow)) {
             return state.DoS(100, false, REJECT_INVALID, "bad-house-colored-input");
         }
 
@@ -588,7 +590,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // colored-input rule; keeps oracle-awareness out of the instrument
         // guards above - the s8.7 multi-tag lesson).
         if (tx.nVersion == TRANSACTION_ORACLE_VERSION &&
-                (coin.nAssetID || coin.fBill || coin.fBillEscrow || coin.fHouseEscrow ||
+                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow || coin.fHouseEscrow ||
                  coin.fNote || coin.fDeposit || coin.fPoolEscrow || coin.fLpShare))
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-colored-input");
 
@@ -667,7 +669,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nNoteUnitsIn += coin.nNoteUnits;
         }
         else if (tx.nVersion == TRANSACTION_NOTE_VERSION &&
-                (coin.nAssetID || coin.fBill || coin.fBillEscrow ||
+                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow ||
                  (coin.fHouseEscrow && tx.nNoteOp != NOTE_OP_CLAIM))) {
             return state.DoS(100, false, REJECT_INVALID, "bad-note-colored-input");
         }
@@ -677,7 +679,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // those instruments has any business inside a swap. (Notes and pool
         // coins are handled by their own branches above.)
         if (tx.nVersion == TRANSACTION_POOL_VERSION &&
-                (coin.nAssetID || coin.fBill || coin.fBillEscrow || coin.fHouseEscrow || coin.fDeposit)) {
+                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow || coin.fHouseEscrow || coin.fDeposit)) {
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-colored-input");
         }
 
@@ -700,7 +702,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nDepositIn++;
         }
         else if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
-                (coin.nAssetID || coin.fBill || coin.fBillEscrow || coin.fNote ||
+                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow || coin.fNote ||
                  (coin.fHouseEscrow && tx.nDepositOp != DEPOSIT_OP_CLAIM))) {
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-colored-input");
         }
@@ -899,6 +901,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (fUpgrade) {
                 if (d.nPriorDemandHeight != NoteDemandHeightOf(nDemandHeightIn))
                     return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-upgrade-prior");
+                // v0.2.18: a plain demand is the option clause's queue (it only
+                // exists at Deferred), so its upgrade must keep accruing from the
+                // demand: the re-issue carries the QUEUE marker. Mode 1 here would
+                // silently move the clock's start to window lapse.
+                if (d.fPreAuth != NOTE_DEMAND_MODE_PREAUTH_QUEUE)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-upgrade-mode");
             } else if (d.nPriorDemandHeight != 0) {
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-prior-unexpected");
             }
@@ -1159,6 +1167,18 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // can re-issue a unit.
         if (nSettleUnitsAIn != settle.nUnitsANotes || nSettleUnitsBIn != settle.nUnitsBNotes)
             return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-sum");
+    }
+
+    // BitAssets (v0.2.18): the one colouring rule - same identity on every
+    // coloured input (A1), genesis spends nothing coloured (B2), one control
+    // coin passed to vout[0] (B3), exact units in the leading outputs (B1),
+    // coloured coins only in plain transfers (A5). UpdateCoins and crash replay
+    // compute the outputs' colour with this same function.
+    {
+        AssetTags assetTags;
+        std::string strReason;
+        if (!ComputeAssetTags(tx, vSpentCoins, assetTags, strReason))
+            return state.DoS(100, false, REJECT_INVALID, strReason);
     }
 
     const CAmount value_out = tx.GetValueOut();

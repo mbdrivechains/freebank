@@ -57,7 +57,7 @@ inline COutPoint FundCoinForTest(int n, CAmount nValue)
 {
     const COutPoint out(ArithToUint256(arith_uint256(0xfb0000 + n)), 0);
     LOCK(cs_main);
-    pcoinsTip->AddCoin(out, Coin(CTxOut(nValue, CScript() << OP_TRUE), 1, false, false, false, 0), false);
+    pcoinsTip->AddCoin(out, Coin(CTxOut(nValue, CScript() << OP_TRUE), 1, false, false, false, uint256()), false);
     return out;
 }
 

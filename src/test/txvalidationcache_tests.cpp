@@ -109,7 +109,7 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_test, BasicTestingSetup)
     // value-bearing p2pk coin. Non-coinbase, so no maturity interaction; real
     // value, so the BIP143 amounts the witness signatures commit to are honest.
     const COutPoint fundingOutpoint(uint256S("0xc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2bc2b"), 0);
-    view.AddCoin(fundingOutpoint, Coin(CTxOut(50*CENT, p2pk_scriptPubKey), 1, false, false, false, 0), false);
+    view.AddCoin(fundingOutpoint, Coin(CTxOut(50*CENT, p2pk_scriptPubKey), 1, false, false, false, uint256()), false);
 
     // flags to test: SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY, SCRIPT_VERIFY_CHECKSEQUENCE_VERIFY, SCRIPT_VERIFY_NULLDUMMY, uncompressed pubkey thing
 
@@ -166,7 +166,7 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_test, BasicTestingSetup)
     // Make spend_tx's outputs spendable: inject them as coins (the stock suite
     // connected a block here; blocks cannot connect in a FreeBank unit test).
     // spend_tx is nVersion=1, so AddCoins takes the plain (untagged) branch.
-    AddCoins(view, CTransaction(spend_tx), 1, 0, 0, 0, 0, 0, 0);
+    AddCoins(view, CTransaction(spend_tx), 1);
 
     // Test P2SH: construct a transaction that is valid without P2SH, and
     // then test validity with P2SH.

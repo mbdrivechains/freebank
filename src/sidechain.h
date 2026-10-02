@@ -125,27 +125,33 @@ struct BitAssetObj {
  * BitAsset
  */
 struct BitAsset : public BitAssetObj {
-    uint32_t nID;
+    // v0.2.18: identified by its genesis txid (the RPC index's key; consensus
+    // never reads this record - the coins carry the id themselves).
+    uint256 txid;
     std::string strTicker;
     std::string strHeadline;
     uint256 payload;
-    uint256 txid;
-    int64_t nSupply;
-    std::string strController;
-    std::string strOwner;
+    uint8_t nDecimals = 0;
+    int64_t nSupply = 0;
+    std::string strController;   // the genesis control output's destination
+    std::string strOwner;        // the genesis supply output's destination
+    uint256 hashBlock;           // the block that confirmed the genesis
+    int nHeight = 0;
 
     ADD_SERIALIZE_METHODS
 
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
-        READWRITE(nID);
+        READWRITE(txid);
         READWRITE(strTicker);
         READWRITE(strHeadline);
         READWRITE(payload);
-        READWRITE(txid);
+        READWRITE(nDecimals);
         READWRITE(nSupply);
         READWRITE(strController);
         READWRITE(strOwner);
+        READWRITE(hashBlock);
+        READWRITE(nHeight);
     }
 };
 
@@ -402,6 +408,10 @@ bool WithdrawalGuardActive(int nHeight, int nGuardHeight);
  *  holding it would be rejected at connect, on every try). An object that
  *  does not parse is not reported: ATMP refuses those outright. Pure. */
 bool TxHasUnpayableWithdrawal(const CTransaction& tx, std::string& strReason);
+
+/** v0.2.18: the ids of the withdrawal objects tx creates (in output order). A
+ *  block may create an id only once, and never one already stored. */
+void GetTxWithdrawalIDs(const CTransaction& tx, std::vector<uint256>& vID);
 
 std::string GenerateDepositAddress(const std::string& strDestIn);
 

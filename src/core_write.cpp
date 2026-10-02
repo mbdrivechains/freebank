@@ -302,6 +302,18 @@ void TxToUniv(const CTransaction& tx, const uint256& hashBlock, UniValue& entry,
     entry.pushKV("vout", vout);
 
     CreditToUniv(tx, entry);
+    // BitAsset genesis (v0.2.18): the asset's id is this txid. Display only.
+    if (tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
+        UniValue asset(UniValue::VOBJ);
+        asset.pushKV("asset_id", tx.GetHash().GetHex());
+        asset.pushKV("ticker", tx.ticker);
+        asset.pushKV("headline", tx.headline);
+        asset.pushKV("payload", tx.payload.IsNull() ? std::string() : tx.payload.GetHex());
+        asset.pushKV("decimals", (int)tx.nDecimals);
+        if (tx.vout.size() >= 2)
+            asset.pushKV("supply", tx.vout[1].nValue);
+        entry.pushKV("asset_genesis", asset);
+    }
 
     if (!hashBlock.IsNull())
         entry.pushKV("blockhash", hashBlock.GetHex());

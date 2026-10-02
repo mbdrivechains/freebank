@@ -43,7 +43,8 @@ public:
         // endorse-undo cannot locate the prior title outpoint)
         ::Serialize(s, txout->fBitAsset);
         ::Serialize(s, txout->fBitAssetControl);
-        ::Serialize(s, txout->nAssetID);
+        if (txout->fBitAsset || txout->fBitAssetControl)
+            ::Serialize(s, txout->assetID);       // v0.2.18: the full genesis txid
         ::Serialize(s, txout->fBill);
         ::Serialize(s, txout->fBillEscrow);
         ::Serialize(s, txout->nBillID);
@@ -96,7 +97,10 @@ public:
         ::Unserialize(s, REF(CTxOutCompressor(REF(txout->out))));
         ::Unserialize(s, txout->fBitAsset);
         ::Unserialize(s, txout->fBitAssetControl);
-        ::Unserialize(s, txout->nAssetID);
+        if (txout->fBitAsset || txout->fBitAssetControl)
+            ::Unserialize(s, txout->assetID);
+        else
+            txout->assetID.SetNull();
         ::Unserialize(s, txout->fBill);
         ::Unserialize(s, txout->fBillEscrow);
         ::Unserialize(s, txout->nBillID);

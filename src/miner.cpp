@@ -114,6 +114,7 @@ BlockAssembler::Options BMMTemplateAssemblerOptions()
 void BlockAssembler::resetBlock()
 {
     inBlock.clear();
+    setBlockWithdrawalIDs.clear();
 
     // Reserve space for coinbase tx
     nBlockWeight = 4000;
@@ -606,6 +607,18 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             LogPrintf("%s: skipping unpayable withdrawal %s (%s)\n", __func__, it->GetTx().GetHash().ToString(), strUnpayable);
             return false;
         }
+        // v0.2.18: a withdrawal id already stored, or already created in this
+        // template, makes the block fail ConnectBlock (bad-withdrawal-not-new)
+        // after TestBlockValidity passed it - skip the package instead.
+        std::vector<uint256> vWID;
+        GetTxWithdrawalIDs(it->GetTx(), vWID);
+        for (const uint256& wid : vWID) {
+            SidechainWithdrawal held;
+            if (setBlockWithdrawalIDs.count(wid) || psidechaintree->GetWithdrawal(wid, held)) {
+                LogPrintf("%s: skipping withdrawal %s: id %s is not new\n", __func__, it->GetTx().GetHash().ToString(), wid.ToString());
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -613,6 +626,11 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
 void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
 {
     pblock->vtx.emplace_back(iter->GetSharedTx());
+    {
+        std::vector<uint256> vWID;
+        GetTxWithdrawalIDs(iter->GetTx(), vWID);
+        setBlockWithdrawalIDs.insert(vWID.begin(), vWID.end());
+    }
     pblocktemplate->vTxFees.push_back(iter->GetFee());
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());
     nBlockWeight += iter->GetTxWeight();

@@ -157,6 +157,17 @@ BOOST_AUTO_TEST_CASE(l1client_parse_bmm_commitment)
     BOOST_CHECK(fHaveCommitment);
     BOOST_CHECK(hashCommitment == hashBMM);
 
+    // Commitment present but unreadable -> parse failure ("can't tell"),
+    // never a "no" that would fail the side block for good
+    for (const char* bad : {"{\"commitment\": {\"commitment\": {\"hex\": \"zz\"}}}",
+                            "{\"commitment\": {\"commitment\": {\"hex\": \"0100\"}}}",
+                            "{\"commitment\": {\"commitment\": {}}}",
+                            "{\"commitment\": {\"commitment\": \"01\"}}"}) {
+        UniValue malformed(UniValue::VOBJ);
+        BOOST_REQUIRE(malformed.read(bad));
+        BOOST_CHECK_MESSAGE(!ParseEnforcerBmmCommitment(malformed, fBlockFound, fHaveCommitment, hashCommitment), bad);
+    }
+
     // Garbage -> parse failure
     UniValue garbage(UniValue::VOBJ);
     BOOST_REQUIRE(garbage.read("{\"unexpected\": 1}"));

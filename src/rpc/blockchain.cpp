@@ -1031,6 +1031,13 @@ UniValue gettxout(const JSONRPCRequest& request)
             "     ]\n"
             "  },\n"
             "  \"coinbase\" : true|false   (boolean) Coinbase or not\n"
+            "  \"asset\" : {               (json object, only for a confirmed asset coin)\n"
+            "     \"asset_id\" : \"hex\",    (string) the asset's genesis txid\n"
+            "     \"kind\" : \"units\"|\"control\",\n"
+            "     \"units\" : n            (numeric) units carried (= value in sats; 0 for the control coin)\n"
+            "  },\n"
+            "  \"asset_unconfirmed\" : true (boolean, only for an output of an unconfirmed tx that moves an asset;\n"
+            "                              its colour is known once it confirms)\n"
             "}\n"
 
             "\nExamples:\n"
@@ -1080,6 +1087,16 @@ UniValue gettxout(const JSONRPCRequest& request)
     ScriptPubKeyToUniv(coin.out.scriptPubKey, o, true);
     ret.pushKV("scriptPubKey", o);
     ret.pushKV("coinbase", (bool)coin.fCoinBase);
+    if (coin.IsAssetColoured()) {
+        UniValue asset(UniValue::VOBJ);
+        asset.pushKV("asset_id", coin.assetID.GetHex());
+        asset.pushKV("kind", coin.fBitAsset ? "units" : "control");
+        asset.pushKV("units", coin.fBitAsset ? coin.out.nValue : 0);
+        ret.pushKV("asset", asset);
+    } else if (coin.nHeight == MEMPOOL_HEIGHT && mempool.IsAssetTx(hash)) {
+        // The mempool view carries no colour (txmempool.cpp, CCoinsViewMemPool::GetCoin).
+        ret.pushKV("asset_unconfirmed", true);
+    }
 
     return ret;
 }

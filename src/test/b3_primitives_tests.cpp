@@ -64,10 +64,10 @@ std::vector<unsigned char> Bytes(const char* hex) { return ParseHex(hex); }
 BOOST_AUTO_TEST_CASE(preauth_mask_boundaries)
 {
     // plain heights round-trip and are never mistaken for pre-auth. The
-    // ceiling is 2^30 - 1 since T-b3: the PROTESTED marker took bit 30, so
-    // NoteDemandHeightOf masks BOTH tag bits (this test's first revision
-    // asserted the one-bit 2^31 ceiling and correctly failed on the widening).
-    const uint32_t plains[] = {0u, 1u, 2u, 1008u, 160000u, 0x3FFFFFFEu, 0x3FFFFFFFu};
+    // ceiling is 2^29 - 1 since v0.2.18: the PROTESTED marker took bit 30
+    // (T-b3) and the QUEUE marker bit 29, so NoteDemandHeightOf masks all three
+    // tag bits (each widening correctly failed the previous revision).
+    const uint32_t plains[] = {0u, 1u, 2u, 1008u, 160000u, 0x1FFFFFFEu, 0x1FFFFFFFu};
     for (uint32_t h : plains) {
         BOOST_CHECK(!NoteDemandIsPreAuth(h));
         BOOST_CHECK(!NoteDemandIsProtested(h));
@@ -86,7 +86,8 @@ BOOST_AUTO_TEST_CASE(preauth_mask_boundaries)
     // the bits themselves
     BOOST_CHECK_EQUAL(NOTE_DEMAND_PREAUTH_BIT, 0x80000000u);
     BOOST_CHECK_EQUAL(NOTE_DEMAND_PROTESTED_BIT, 0x40000000u);
-    BOOST_CHECK_EQUAL(NOTE_DEMAND_TAG_BITS, 0xC0000000u);
+    BOOST_CHECK_EQUAL(NOTE_DEMAND_QUEUE_BIT, 0x20000000u);
+    BOOST_CHECK_EQUAL(NOTE_DEMAND_TAG_BITS, 0xE0000000u);
     BOOST_CHECK(NoteDemandIsPreAuth(0x80000000u));
     BOOST_CHECK_EQUAL(NoteDemandHeightOf(0x80000000u), 0u);
     // UNDEMANDED must stay undemanded under both readings: 0 is the sentinel
@@ -95,8 +96,9 @@ BOOST_AUTO_TEST_CASE(preauth_mask_boundaries)
     BOOST_CHECK_EQUAL(NoteDemandTag(0, false), 0u);
     BOOST_CHECK(NoteDemandTag(0, true) != 0u);
     // the usable height range is not narrowed in any way that matters: the
-    // largest plain height is ~1.07bn blocks, ~20k years at 10 minutes.
-    BOOST_CHECK_EQUAL(NoteDemandHeightOf(NoteDemandTag(0x3FFFFFFFu, true)), 0x3FFFFFFFu);
+    // largest plain height is ~537M blocks, ~10k years at 10 minutes.
+    BOOST_CHECK_EQUAL(NoteDemandHeightOf(NoteDemandTag(0x1FFFFFFFu, true)), 0x1FFFFFFFu);
+    BOOST_CHECK_EQUAL(NoteDemandHeightOf(NoteDemandTag(0x1FFFFFFFu, NOTE_DEMAND_MODE_PREAUTH_QUEUE)), 0x1FFFFFFFu);
 }
 
 // ------------------------------------------------------------- the digests
@@ -462,14 +464,19 @@ BOOST_AUTO_TEST_CASE(shape_preauth_fields_are_all_or_nothing)
         AddNoteCustodyOutputs(mtx, 1);
         BOOST_CHECK_EQUAL(ShapeReject(mtx), "bad-note-demand-preauth-sig");
     }
-    // the flag is a BOOLEAN, not a byte: 2 is not "true"
+    // the mode byte is 0..2 (v0.2.18: 2 = pre-auth queue); 3 is rejected
     {
         NoteDemand d = BaseDemand(true);
-        d.fPreAuth = 2;
+        d.fPreAuth = NOTE_DEMAND_MODE_PREAUTH_QUEUE;
         CMutableTransaction mtx = NoteTx(NOTE_OP_DEMAND);
         SetNotePayload(mtx, d);
         AddNoteCustodyOutputs(mtx, 1);
-        BOOST_CHECK_EQUAL(ShapeReject(mtx), "bad-note-demand-flag");
+        BOOST_CHECK_EQUAL(ShapeReject(mtx), "");
+        d.fPreAuth = 3;
+        CMutableTransaction mtx3 = NoteTx(NOTE_OP_DEMAND);
+        SetNotePayload(mtx3, d);
+        AddNoteCustodyOutputs(mtx3, 1);
+        BOOST_CHECK_EQUAL(ShapeReject(mtx3), "bad-note-demand-flag");
     }
     // an unbounded payout script is a per-discharge comparison cost
     {
@@ -561,6 +568,10 @@ BOOST_AUTO_TEST_CASE(upgrade_payload_carries_the_prior_height)
     BOOST_CHECK_EQUAL(NoteDemandTag(H, true), H | NOTE_DEMAND_PREAUTH_BIT);
     BOOST_CHECK_EQUAL(NoteDemandHeightOf(NoteDemandTag(P, true)), P);
     BOOST_CHECK(NoteDemandTag(P, true) != NoteDemandTag(H, true));   // the clock did not move
+    // v0.2.18: an upgrade is mode 2, so the re-issue keeps accruing from P (queue)
+    const uint32_t up2 = NoteDemandTag(P, NOTE_DEMAND_MODE_PREAUTH_QUEUE);
+    BOOST_CHECK_EQUAL(up2, P | NOTE_DEMAND_PREAUTH_BIT | NOTE_DEMAND_QUEUE_BIT);
+    BOOST_CHECK(NoteDemandAccruesFromDemand(up2));
 }
 
 BOOST_AUTO_TEST_CASE(protest_payload_carries_the_tag_unchanged)

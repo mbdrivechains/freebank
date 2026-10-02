@@ -188,7 +188,6 @@ extern CBlockPolicyEstimator feeEstimator;
 extern CTxMemPool mempool;
 typedef std::unordered_map<uint256, CBlockIndex*, BlockHasher> BlockMap;
 extern BlockMap& mapBlockIndex;
-extern std::map<uint256, CBlockIndex*>& mapBlockMainHashIndex;
 extern uint64_t nLastBlockTx;
 extern uint64_t nLastBlockWeight;
 extern const std::string strMessageMagic;
@@ -363,7 +362,10 @@ int VersionBitsTipStateSinceHeight(const Consensus::Params& params, Consensus::D
 
 
 /** Apply the effects of this transaction on the UTXO set represented by view */
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& undo, int nHeight, CAmount& amountAssetInOut, int& nControlNOut, uint32_t& nAssetIDOut, const uint32_t nNewAssetIDIn = 0, const uint32_t nNewBillIDIn = 0, const uint32_t nNewHouseIDIn = 0);
+/** Spend tx's inputs and add its outputs. The asset colour of the outputs is
+ *  computed from the spent coins (ComputeAssetTags; the caller has validated
+ *  the tx) and returned in pAssetTagsOut when given. */
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& undo, int nHeight, AssetTags* pAssetTagsOut = nullptr, const uint32_t nNewBillIDIn = 0, const uint32_t nNewHouseIDIn = 0);
 
 /** Transaction validation functions */
 
@@ -627,6 +629,9 @@ void MaybeRestoreMainchainConnection();
 
 /** Enable or disable networking and print log message */
 void SetNetworkActive(bool fActive, const std::string& strReason = "");
+/** Switch P2P off because the mainchain is unreachable; MaybeRestoreMainchainConnection,
+ *  refreshbmm and connect_block may switch it back on (only if it was on before). */
+void DisableNetworkForMainchain(const std::string& strReason);
 
 /** Get the mainchain block hash from the BMM block's critical h* proof hex */
 uint256 GetMainBlockHash(const CBlockHeader& block);

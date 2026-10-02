@@ -4,9 +4,10 @@
 
 #include <note.h>
 
-#include <house.h>   // HOUSE_DEFER_INTEREST_BPS / BLOCKS_PER_YEAR (deferral interest)
+#include <house.h>   // BLOCKS_PER_YEAR (deferral interest)
 
 #include <consensus/validation.h>
+#include <algorithm>
 #include <hash.h>
 #include <set>
 #include <pubkey.h>
@@ -121,14 +122,39 @@ uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
     return ss.GetHash();
 }
 
-CAmount NoteDeferralInterest(uint64_t nUnits, uint32_t nBlocks)
+uint32_t DeferInterestBpsAt(const std::vector<Consensus::DeferInterestStep>& vSchedule, uint32_t nHeight)
 {
-    if (nUnits == 0 || nBlocks == 0)
+    uint32_t nBps = 0;
+    for (const Consensus::DeferInterestStep& step : vSchedule) {
+        if (step.nHeight > nHeight)
+            break;
+        nBps = step.nBps;
+    }
+    return nBps;
+}
+
+CAmount NoteDeferralInterest(uint64_t nUnits, uint32_t nFrom, uint32_t nTo,
+                             const std::vector<Consensus::DeferInterestStep>& vSchedule)
+{
+    if (nUnits == 0 || nTo <= nFrom)
         return 0;
-    // units * bps * blocks / (10000 * blocks_per_year); 128-bit intermediate
-    const unsigned __int128 num = (unsigned __int128)nUnits
-                                * (unsigned __int128)HOUSE_DEFER_INTEREST_BPS
-                                * (unsigned __int128)nBlocks;
+    // Sum bps*blocks over the schedule segments that overlap [nFrom, nTo).
+    // Segment i covers [step_i.nHeight, step_{i+1}.nHeight) (the last one is
+    // open-ended). Blocks before the first step accrue nothing (the schedule
+    // starts at 0 on every network, so that range is empty in practice).
+    unsigned __int128 bpsBlocks = 0;
+    for (size_t i = 0; i < vSchedule.size(); i++) {
+        const uint64_t nSegFrom = vSchedule[i].nHeight;
+        const uint64_t nSegTo = (i + 1 < vSchedule.size()) ? (uint64_t)vSchedule[i + 1].nHeight
+                                                            : (uint64_t)nTo;
+        const uint64_t a = std::max<uint64_t>(nSegFrom, nFrom);
+        const uint64_t b = std::min<uint64_t>(nSegTo, nTo);
+        if (b > a)
+            bpsBlocks += (unsigned __int128)vSchedule[i].nBps * (unsigned __int128)(b - a);
+    }
+    // units * sum(bps*blocks) / (10000 * blocks_per_year); 128-bit throughout
+    // (units <= 2^64, sum <= 2^32 * 2^32 -> product < 2^128).
+    const unsigned __int128 num = (unsigned __int128)nUnits * bpsBlocks;
     const unsigned __int128 den = (unsigned __int128)10000 * (unsigned __int128)BLOCKS_PER_YEAR;
     unsigned __int128 interest = num / den;
     // Never let interest alone leave the money range (a pathological block
@@ -136,6 +162,74 @@ CAmount NoteDeferralInterest(uint64_t nUnits, uint32_t nBlocks)
     if (interest > (unsigned __int128)MAX_MONEY)
         interest = (unsigned __int128)MAX_MONEY;
     return (CAmount)interest;
+}
+
+void NoteDemandAccrualWindow(const CHouse& house, uint32_t nDemandTag, uint32_t nPayHeight,
+                             uint32_t nDemandWindow, uint32_t& nStartOut, uint32_t& nEndOut)
+{
+    // THE TAG IS READ MASKED: the raw field carries the B3 marker bits (bit 31
+    // pre-auth, bit 30 protested); reading it raw made the height ~2^31 and the
+    // floor vanish on exactly the coins B3 protects.
+    const uint32_t nDemandHeight = NoteDemandHeightOf(nDemandTag);
+    // D-iii (operator-signed 2026-08-04): a B3 formal demand (pre-auth, filed at
+    // Open/Stressed) starts at window LAPSE ("pay in a week and it costs you
+    // par"). The suspension queue - every plain demand, and a pre-auth demand
+    // carrying the queue marker (v0.2.18) - accrues from the demand itself.
+    uint32_t nStart = nDemandHeight;
+    if (!NoteDemandAccruesFromDemand(nDemandTag))
+        nStart += nDemandWindow;
+    // Q8 (operator-signed 2026-10-02): accrue until PAID, except after a reopen
+    // E with the house open at payment:
+    //  - paid within W of E (INCLUSIVE: paying at E + W is in time): stop at E;
+    //  - later, a QUEUE demand (plain, or pre-auth with the queue marker) stops
+    //    at E + W (Q8 follow-up "b": no perpetual bond). For a plain demand the
+    //    house cannot pay alone, so the holder's week to cash in at par ends the
+    //    clock. For a pre-auth queue demand the holder's remedy after that week
+    //    is PROTEST (its window also starts at E), not more interest - which
+    //    also closes the side door of upgrading a plain demand long after the
+    //    reopen to restart its clock;
+    //  - later, a B3 formal demand (filed at Open) keeps accruing to payment, as
+    //    before: the house can discharge it alone at any time.
+    // A demand in the same block as the reopen (D == E) has a zero window. A
+    // payment while the house is suspended again accrues to payment: a reopen
+    // followed by re-suspension can never freeze a clock. (A queue demand from
+    // an older episode paid during a later suspension may thereby also accrue
+    // across the open gap between them; the house record keeps only the latest
+    // episode, and the error is in the holder's favour.)
+    uint32_t nEnd = nPayHeight;
+    const uint32_t E = house.nDeferEndedHeight;
+    if (house.nDeferInvokedHeight == 0 && E != 0 && E >= nDemandHeight && E < nPayHeight) {
+        const uint64_t nCap = (uint64_t)E + nDemandWindow;
+        if ((uint64_t)nPayHeight <= nCap)
+            nEnd = E;
+        else if (NoteDemandAccruesFromDemand(nDemandTag))
+            nEnd = (uint32_t)nCap;
+    }
+    nStartOut = nStart;
+    nEndOut = nEnd;
+}
+
+CAmount NoteDemandInterest(const CHouse& house, uint32_t nDemandTag, uint64_t nUnits,
+                           uint32_t nPayHeight, const Consensus::Params& consensus)
+{
+    if (NoteDemandHeightOf(nDemandTag) == 0)
+        return 0;
+    uint32_t nStart = 0, nEnd = 0;
+    NoteDemandAccrualWindow(house, nDemandTag, nPayHeight, consensus.nDemandWindow, nStart, nEnd);
+    // A QUEUE demand from an earlier episode, paid while the house is suspended
+    // AGAIN after an open gap longer than the holder's week: it accrues to the
+    // end of that week (E + W) and again from the new suspension (I) to payment,
+    // but not across the open gap - the holder could have cashed in at par there,
+    // and for a plain demand the house could not pay it alone. A re-suspension
+    // INSIDE the week (I <= E + W) accrues continuously (the window above).
+    const uint32_t E = house.nDeferEndedHeight, I = house.nDeferInvokedHeight;
+    const uint64_t nCap = (uint64_t)E + consensus.nDemandWindow;
+    if (I != 0 && E != 0 && E >= NoteDemandHeightOf(nDemandTag) && NoteDemandAccruesFromDemand(nDemandTag) &&
+            (uint64_t)I > nCap && I < nPayHeight && nStart < nCap) {
+        return NoteDeferralInterest(nUnits, nStart, (uint32_t)nCap, consensus.vDeferInterestSchedule) +
+               NoteDeferralInterest(nUnits, I, nPayHeight, consensus.vDeferInterestSchedule);
+    }
+    return NoteDeferralInterest(nUnits, nStart, nEnd, consensus.vDeferInterestSchedule);
 }
 
 CAmount NoteClaimEntitlement(uint64_t nUnits, const CAmount& amountPot, uint64_t nSnapshotUnits)
@@ -358,7 +452,7 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
         // carrying a payout script with fPreAuth clear would be a standing
         // authorisation consensus never checks, and fPreAuth set with no script
         // would be a discharge target that cannot exist.
-        if (dem.fPreAuth > 1)
+        if (dem.fPreAuth > NOTE_DEMAND_MODE_PREAUTH_QUEUE)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-flag");
         if (dem.fPreAuth) {
             // A payout script must be a plausible standard script - it is what

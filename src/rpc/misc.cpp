@@ -542,6 +542,17 @@ static std::pair<uint256, int64_t> bmmTimeBoxHeader;
 static const int64_t BMM_PEER_START_SECONDS = 120;
 static std::pair<uint256, int64_t> bmmTimeBoxPending;
 
+// v0.2.18 (layer-B review BMM M2): the PEER refusal had no time box, so an
+// inbound peer that announced one header it never served (or reconnected
+// every two minutes with a high starting height) stopped bidding for good.
+// Honest catch-up moves our tip within seconds; once the tip has stood still
+// this long while peers claim more, bid anyway (worst case: one stale bid).
+// The box is keyed on our tip and reset whenever the verdict is not PEER, so
+// a stale signal cannot pre-open it for a later, real one. Guarded by csBMMRpc (get_block_template is the only caller).
+static const int64_t BMM_PEER_STALL_SECONDS = 300;
+struct BMMPeerBox { uint256 hashTip; int64_t nStart = 0; };
+static BMMPeerBox bmmTimeBoxPeer;
+
 // How many cached eCash blocks get_bmm_inclusions scans without a pinned T: the
 // engine's 10-block connect horizon plus the tip.
 static const size_t BMM_INCLUSION_WINDOW = 11;
@@ -618,15 +629,17 @@ static void BMMRefuseWhileBehind(const std::string& strMethod)
     const bool fIBD = IsInitialBlockDownload();
 
     uint256 hashBetterHeader;
+    uint256 hashTip;
     int nTipHeight = -1;
     int nBestHeaderHeight = -1;
     {
         LOCK(cs_main);
         const CBlockIndex* pindexTip = chainActive.Tip();
         nTipHeight = pindexTip ? pindexTip->nHeight : -1;
+        if (pindexTip) hashTip = pindexTip->GetBlockHash();
         if (pindexTip && pindexBestHeader && pindexBestHeader != pindexTip
                 && pindexBestHeader->nHeight > pindexTip->nHeight
-                && !(pindexBestHeader->nStatus & BLOCK_FAILED_MASK)) {
+                && !BranchHasFailedBlock(pindexBestHeader)) {
             hashBetterHeader = pindexBestHeader->GetBlockHash();
             nBestHeaderHeight = pindexBestHeader->nHeight;
         }
@@ -647,15 +660,34 @@ static void BMMRefuseWhileBehind(const std::string& strMethod)
     // Bitcoin Core's getblocktemplate allows on regtest.
     if (Params().MineBlocksOnDemand() && evidence.nPeers == 0 && hashBetterHeader.IsNull())
         return;
-    switch (JudgeBMMBehind(fIBD, evidence, fHeaderBoxOpen)) {
+    const BMMBehind behind = JudgeBMMBehind(fIBD, evidence, fHeaderBoxOpen);
+    if (behind != BMMBehind::PEER)
+        bmmTimeBoxPeer = BMMPeerBox();
+    switch (behind) {
     case BMMBehind::NO:
         return;
     case BMMBehind::IBD:
         throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, strprintf("%s: in initial block download "
             "(side tip %d, best seen %d, %d peers); try again when synced", strMethod, nTipHeight, nAhead, evidence.nPeers));
-    case BMMBehind::PEER:
+    case BMMBehind::PEER: {
+        const int64_t nNow = GetTime();
+        const int nClaimed = std::max(evidence.nBestKnownHeight, evidence.nRecentStartingHeight);
+        // Keyed on our tip only: the claimed height comes from version
+        // messages, which a reconnecting peer can raise at will to keep
+        // restarting the box (layer-B review round 3). A stale signal cannot
+        // pre-open it: the box is reset whenever the verdict is not PEER.
+        if (bmmTimeBoxPeer.hashTip != hashTip) {
+            bmmTimeBoxPeer.hashTip = hashTip;
+            bmmTimeBoxPeer.nStart = nNow;
+        }
+        if (nNow - bmmTimeBoxPeer.nStart >= BMM_PEER_STALL_SECONDS) {
+            LogPrintf("%s: peers have claimed height %d for %ds and our tip %d has not moved; not refusing\n",
+                      strMethod, nClaimed, nNow - bmmTimeBoxPeer.nStart, nTipHeight);
+            return;
+        }
         throw JSONRPCError(RPC_BMM_RETRY, strprintf("%s: a peer has a better side chain (side tip %d, peer at %d); "
             "try again when synced", strMethod, nTipHeight, std::max(evidence.nBestKnownHeight, evidence.nRecentStartingHeight)));
+    }
     case BMMBehind::HEADER:
         throw JSONRPCError(RPC_BMM_RETRY, strprintf("%s: a better side-chain header is known but not connected yet "
             "(side tip %d, header %d); try again", strMethod, nTipHeight, nBestHeaderHeight));
@@ -1055,7 +1087,9 @@ UniValue connect_block(const JSONRPCRequest& request)
         }
     }
 
-    if (fResult)
+    // Only undo a mainchain-failure disable, never an operator's
+    // `setnetworkactive false` (layer-B review wallet L3).
+    if (fResult && g_fNetworkDisabledByMainchain)
         SetNetworkActive(true, "connect_block RPC connected a block");
 
     return fResult;
@@ -1231,7 +1265,10 @@ UniValue refreshbmm(const JSONRPCRequest& request)
     if (!CheckMainchainConnection())
         throw JSONRPCError(RPC_MISC_ERROR, "Must be connected to mainchain (not connected)!");
 
-    SetNetworkActive(true, "refreshbmm RPC command issued");
+    // The L1 answered just now: undo a mainchain-failure disable, but never an
+    // operator's `setnetworkactive false` (layer-B review wallet L3).
+    if (g_fNetworkDisabledByMainchain)
+        SetNetworkActive(true, "refreshbmm RPC command issued");
 
     SidechainClient client;
     std::string strError = "";
@@ -1581,7 +1618,9 @@ UniValue formatdepositaddress(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
             "formatdepositaddress \"address\"\n"
-            "\nTakes any string and returns the full deposit-address form s130_<address>_<checksum>.\n"
+            "\nTakes a FreeBank address and returns the full deposit-address form s130_<address>_<checksum>.\n"
+            "Refuses anything that is not a valid FreeBank address: a deposit to an address the sidechain\n"
+            "cannot decode is burned on the mainchain with no payout and no refund.\n"
             "Use this command to turn a FreeBank receiving address into the form BitWindow's deposit screen takes.\n"
             "A direct enforcer CreateDepositTransaction takes the bare address instead (see getdepositaddress).\n"
             "\nArguments:\n"
@@ -1589,14 +1628,18 @@ UniValue formatdepositaddress(const JSONRPCRequest& request)
             "\nResult:\n"
             "deposit address\n"
             "\nExamples:\n"
-            + HelpExampleCli("formatdepositaddress", "\"1PSSGeFHDnKNxiEyFrD1wcEaHr9hrQDDWc\"")
-            + HelpExampleRpc("formatdepositaddress", "\"1PSSGeFHDnKNxiEyFrD1wcEaHr9hrQDDWc\"")
+            + HelpExampleCli("formatdepositaddress", "\"XNQ36UjviZLH53j5iAySd6tPRw4TLgLaHX\"")
+            + HelpExampleRpc("formatdepositaddress", "\"XNQ36UjviZLH53j5iAySd6tPRw4TLgLaHX\"")
         );
 
     std::string strAddress = request.params[0].get_str();
     if (strAddress.empty())
         throw JSONRPCError(RPC_MISC_ERROR, "Input is blank!");
-
+    // Layer-B review wallet M4: the same decode the deposit path uses
+    // (sidechain.cpp), so whatever this returns is an address a deposit can pay.
+    if (!IsValidDestination(DecodeDestination(strAddress)))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           "Not a valid FreeBank address - a deposit to it would be burned with no payout");
 
     std::string strDepositAddress = GenerateDepositAddress(strAddress);
     std::string strAddressOut = "";
@@ -1609,33 +1652,63 @@ UniValue formatdepositaddress(const JSONRPCRequest& request)
 
 UniValue listassets(const JSONRPCRequest& request)
 {
-    if (request.fHelp || request.params.size())
+    if (request.fHelp || request.params.size() > 2)
         throw std::runtime_error(
-            "listassets\n"
-            "\nList BitAssets\n"
+            "listassets ( \"from_asset_id\" count )\n"
+            "\nAssets created on the active chain, in asset-id order. Anyone may create an asset and tickers\n"
+            "are not unique: an asset is its asset_id (its genesis txid). A token is only as good as its issuer.\n"
+            "\nArguments:\n"
+            "1. \"from_asset_id\"  (string, optional) start at this id (inclusive; default: the first)\n"
+            "2. count            (numeric, optional, default 100, max 1000)\n"
             "\nResult:\n"
-            "Array of BitAssets\n"
+            "[ { \"asset_id\": \"hex\", \"ticker\": \"..\", \"headline\": \"..\", \"payload\": \"hex\", \"decimals\": n,\n"
+            "    \"supply\": n, \"genesis_control\": \"address\", \"genesis_supply\": \"address\", \"height\": n,\n"
+            "    \"blockhash\": \"hex\" }, ... ]\n"
+            "  genesis_control / genesis_supply are where the genesis put the control coin and the supply;\n"
+            "  both may have moved since.\n"
             "\nExamples:\n"
             + HelpExampleCli("listassets", "")
             + HelpExampleRpc("listassets", "")
         );
 
-    std::vector<BitAsset> vAsset = passettree->GetAssets();
+    uint256 start;
+    if (request.params.size() >= 1 && !request.params[0].isNull() && !request.params[0].get_str().empty()) {
+        const std::string str = request.params[0].get_str();
+        if (str.size() != 64 || !IsHex(str))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "from_asset_id must be 64 hex characters");
+        start = uint256S(str);
+    }
+    int nCount = 100;
+    if (request.params.size() >= 2 && !request.params[1].isNull())
+        nCount = request.params[1].get_int();
+    if (nCount < 1 || nCount > 1000)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be 1-1000");
+
+    LOCK(cs_main);
+    // The index is keyed by txid, so a little-endian key order; read a few
+    // extra to make up for records whose block left the active chain.
+    std::vector<BitAsset> vAsset = passettree->GetAssets(start, (size_t)nCount * 2 + 16);
 
     UniValue result(UniValue::VARR);
     for (const BitAsset& b : vAsset) {
+        if ((int)result.size() >= nCount)
+            break;
+        BlockMap::iterator mi = mapBlockIndex.find(b.hashBlock);
+        if (mi == mapBlockIndex.end() || !chainActive.Contains(mi->second))
+            continue;    // a stale record (its block was disconnected before the index caught up)
         UniValue obj(UniValue::VOBJ);
-        obj.pushKV("id", (uint64_t)b.nID);
+        obj.pushKV("asset_id", b.txid.ToString());
         obj.pushKV("ticker", b.strTicker);
-        obj.pushKV("supply", b.nSupply);
         obj.pushKV("headline", b.strHeadline);
-        obj.pushKV("payload", b.payload.ToString());
-        obj.pushKV("txid", b.txid.ToString());
-        obj.pushKV("controller", b.strController);
-        obj.pushKV("owner", b.strOwner);
+        obj.pushKV("payload", b.payload.IsNull() ? std::string() : b.payload.ToString());
+        obj.pushKV("decimals", (int)b.nDecimals);
+        obj.pushKV("supply", b.nSupply);
+        obj.pushKV("genesis_control", b.strController);
+        obj.pushKV("genesis_supply", b.strOwner);
+        obj.pushKV("height", b.nHeight);
+        obj.pushKV("blockhash", b.hashBlock.ToString());
         result.push_back(obj);
     }
-
     return result;
 }
 
@@ -1894,21 +1967,28 @@ static UniValue HouseToJSON(const CHouse& house)
         }
         obj.pushKV("escrowchangeoutputs", (uint64_t)house.vOutEscrowChange.size());
         obj.pushKV("reservelockoutputs", (uint64_t)house.vOutReserveLock.size());
-        // Option-clause state (3.5). The confidence-death counters are
-        // published deliberately: CD is a guard, not a kill switch, so the
+        // Option-clause state (3.5; v0.2.18). The suspension counters stay
+        // published: there is no on-chain limit on suspending any more, so the
         // MARKET is what prices a house that keeps reaching for the clause.
+        // defer_end_height and confidence_dead are gone (no end date, no CD).
         if (house.nDeferInvokedHeight != 0) {
             obj.pushKV("defer_invoked_height", (uint64_t)house.nDeferInvokedHeight);
-            obj.pushKV("defer_end_height", (uint64_t)house.DeferEndHeight());
+            // The silence deadline: the first height at which this suspended
+            // house is Insolvent unless it attests before then (missed
+            // MISS_N cadences + nDeferSilenceWindow). Moves on every attest.
+            obj.pushKV("defer_silence_insolvent_height", (uint64_t)HouseDeferSilenceInsolventHeight(house));
         }
         obj.pushKV("defer_renewals", (uint64_t)house.nDeferRenewals);
         obj.pushKV("defer_activations", (uint64_t)house.nDeferActivations);
+        // The scheduled rate (bps/yr) on queued and lapsed-B3 demands, as the
+        // NEXT block accrues it (the schedule is per block).
+        obj.pushKV("defer_interest_bps", (uint64_t)DeferInterestBpsAt(
+            Params().GetConsensus().vDeferInterestSchedule, (uint32_t)std::max(nTipHeight + 1, 0)));
         // DR-2: the height the most recent episode ended (recovery), 0 if none.
-        // Interest on a demanded note accrues demand -> this height, not to the
-        // eventual redemption.
+        // v0.2.18 (Q8): a demanded note paid within the demand window after
+        // this height stops accruing here; otherwise it accrues until paid.
         obj.pushKV("defer_ended_height", (uint64_t)house.nDeferEndedHeight);
         obj.pushKV("defer_suspended_blocks", (uint64_t)house.DeferSuspendedBlocks(nTipHeight));
-        obj.pushKV("confidence_dead", HouseConfidenceDead(house, nTipHeight));
     }
     obj.pushKV("registeredheight", (uint64_t)house.nRegisteredHeight);
     obj.pushKV("txidregister", house.txidRegister.ToString());
@@ -2186,7 +2266,7 @@ static const CRPCCommand commands[] =
     { "oracle",             "listoraclesubmitters",         &listoraclesubmitters,          {}},
 
     /* BitAssets */
-    { "BitAssets",          "listassets",                   &listassets,                    {}},
+    { "BitAssets",          "listassets",                   &listassets,                    {"from_asset_id", "count"}},
 };
 
 void RegisterMiscRPCCommands(CRPCTable &t)

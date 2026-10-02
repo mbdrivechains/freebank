@@ -222,6 +222,7 @@ struct CMutableTransaction;
  * - string ticker
  * - string headline
  * - uint256 payload
+ * - uint8_t decimals (v0.2.18; display only)
  *
  */
 template<typename Stream, typename TxType>
@@ -270,6 +271,7 @@ inline void UnserializeTransaction(TxType& tx, Stream& s) {
         s >> tx.ticker;
         s >> tx.headline;
         s >> tx.payload;
+        s >> tx.nDecimals;
     }
 
     if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -346,6 +348,7 @@ inline void SerializeTransaction(const TxType& tx, Stream& s) {
         s << tx.ticker;
         s << tx.headline;
         s << tx.payload;
+        s << tx.nDecimals;
     }
 
     if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -415,6 +418,7 @@ public:
     const std::string ticker;
     const std::string headline;
     const uint256 payload;
+    const uint8_t nDecimals;
 
     const uint8_t nBillOp;
     const std::vector<unsigned char> vchBillPayload;
@@ -524,6 +528,7 @@ struct CMutableTransaction
     std::string ticker;
     std::string headline;
     uint256 payload;
+    uint8_t nDecimals = 0;
 
     uint8_t nBillOp = 0;
     std::vector<unsigned char> vchBillPayload;

@@ -114,6 +114,8 @@ enum class BMMBehind {
  *  -maxtipage, and refusing then would stop every engine node that restarted, so no side
  *  block could ever be made again. */
 BMMBehind JudgeBMMBehind(bool fIBD, const PeerTipEvidence& evidence, bool fHeaderBoxOpen);
+/** True if a block between pindex and the active chain (pindex included) is marked failed. cs_main held. */
+bool BranchHasFailedBlock(const CBlockIndex* pindex);
 /** Increase a node's misbehavior score. */
 void Misbehaving(NodeId nodeid, int howmuch, const std::string& message="");
 

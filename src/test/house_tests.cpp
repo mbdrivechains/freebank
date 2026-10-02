@@ -5,6 +5,7 @@
 #include <house.h>
 
 #include <bill.h>            // MAX_BILL_TENOR_BLOCKS, LOAN_BOOK_MAX_FACE (B1)
+#include <chainparams.h>     // SelectParams / CreateChainParams (v0.2.18 silence clock)
 #include <coins.h>
 #include <consensus/validation.h>
 #include <deposit.h>         // MAX_DEPOSIT_TERM_BLOCKS (B1 max-magnitude vectors)
@@ -759,8 +760,9 @@ BOOST_AUTO_TEST_CASE(house_brassage_schedule)
 
 BOOST_AUTO_TEST_CASE(house_deferral_derivation)
 {
-    // 3.5: the option clause folds into the LAZY machine - 'd' and the
-    // post-expiry 'i' are derived from the stored invocation height alone.
+    // 3.5: the option clause folds into the LAZY machine - 'd' is derived from
+    // the stored invocation height alone. v0.2.18 (operator Q4/Q5): there is NO
+    // end date; the only way from 'd' to 'i' is silence (next test).
     CHouse house;
     house.status = HOUSE_STATUS_OPEN;
     house.nRegisteredHeight = 1000;
@@ -768,27 +770,24 @@ BOOST_AUTO_TEST_CASE(house_deferral_derivation)
     house.nStressSinceHeight = 1100;          // stressed by a ratio breach
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1200), HOUSE_STATUS_STRESSED);
 
-    // Invoking at 1200 REPLACES the ordinary stress clock with the window
+    // Invoking at 1200 REPLACES the ordinary stress clock
     house.nDeferInvokedHeight = 1200;
     house.nDeferActivations = 1;
     house.nDeferLastActivation = 1200;
-    BOOST_CHECK_EQUAL(house.DeferEndHeight(), 1200 + HOUSE_DEFER_WINDOW);
+    house.nLastAttestHeight = 1190;           // DEFER needs a fresh attestation
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1200), HOUSE_STATUS_DEFERRED);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1200 + HOUSE_DEFER_WINDOW - 1), HOUSE_STATUS_DEFERRED);
-    // ...and the 1008-block stress clock no longer bites while deferring: at a
-    // height well past stress_since + STRESSED_WINDOW the house is still 'd'.
-    BOOST_CHECK(1100 + HOUSE_STRESSED_WINDOW < 1200 + HOUSE_DEFER_WINDOW);
+    // ...and the 1008-block stress clock no longer bites while deferring.
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1100 + HOUSE_STRESSED_WINDOW + 1), HOUSE_STATUS_DEFERRED);
 
-    // Window expiry without recovery -> Insolvent (ARCH s7 step 6)
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1200 + HOUSE_DEFER_WINDOW), HOUSE_STATUS_INSOLVENT);
-
-    // One renewal buys exactly one more window
-    CHouse hRenewed = house;
-    hRenewed.nDeferRenewals = 1;
-    BOOST_CHECK_EQUAL(hRenewed.DeferEndHeight(), 1200 + 2 * HOUSE_DEFER_WINDOW);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hRenewed, 1200 + HOUSE_DEFER_WINDOW), HOUSE_STATUS_DEFERRED);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hRenewed, 1200 + 2 * HOUSE_DEFER_WINDOW), HOUSE_STATUS_INSOLVENT);
+    // NO EXPIRY: a house that keeps attesting stays suspended far past the old
+    // 90-day end (1200 + 12,960) and past the old renewed end (+ 25,920) - and
+    // indefinitely (100 years of blocks here).
+    for (const uint32_t nAt : {1200u + 12960u, 1200u + 2u * 12960u, 1200u + 100u * BLOCKS_PER_YEAR}) {
+        CHouse h = house;
+        h.nLastAttestHeight = nAt - 1;        // attesting on cadence
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, (int)nAt), HOUSE_STATUS_DEFERRED);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, (int)nAt + 100), HOUSE_STATUS_DEFERRED);
+    }
 
     // Recovery (the ATTEST effect) lifts it: cleared origin + cleared invocation
     CHouse hRecovered = house;
@@ -797,8 +796,9 @@ BOOST_AUTO_TEST_CASE(house_deferral_derivation)
     hRecovered.nStressSinceHeight = 0;
     hRecovered.nLastAttestHeight = 1500;
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(hRecovered, 1500), HOUSE_STATUS_OPEN);
+    BOOST_CHECK_EQUAL(HouseDeferSilenceInsolventHeight(hRecovered), 0u);   // not suspended
 
-    // Suspended-block accounting includes the episode running right now
+    // Suspended-block accounting (published) includes the running episode
     BOOST_CHECK_EQUAL(house.DeferSuspendedBlocks(1500), 300);   // 1500 - 1200
     BOOST_CHECK_EQUAL(house.DeferSuspendedBlocks(1200), 0);
     CHouse hClosed = house;
@@ -812,56 +812,72 @@ BOOST_AUTO_TEST_CASE(house_deferral_derivation)
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(hWound, 999999), HOUSE_STATUS_WOUNDDOWN);
 }
 
-BOOST_AUTO_TEST_CASE(house_confidence_death_guard)
+// v0.2.18 Q5: a SUSPENDED house becomes insolvent only by silence - it misses
+// HOUSE_ATTEST_MISS_N cadences, then nDeferSilenceWindow more blocks. Checked
+// at both networks' values (main 4,032; regtest small so gates can reach it).
+static void CheckSilenceClock(uint32_t nSilence)
 {
-    // D13: CD is a GUARD on invocation, not a kill switch. It never changes the
-    // status - it only makes a further DEFER invalid.
+    BOOST_REQUIRE_EQUAL(Params().GetConsensus().nDeferSilenceWindow, nSilence);
     CHouse house;
-
-    // A house that has never suspended is not confidence-dead
-    BOOST_CHECK(!HouseConfidenceDead(house, 100000));
-
-    // One activation, still inside the CD window -> a SECOND is refused
+    house.status = HOUSE_STATUS_OPEN;
+    house.nRegisteredHeight = 1000;
+    house.nStressSinceHeight = 1100;
+    house.nDeferInvokedHeight = 1200;
     house.nDeferActivations = 1;
-    house.nDeferLastActivation = 100000;
-    house.nDeferCumBlocks = 500;
-    BOOST_CHECK(HouseConfidenceDead(house, 100001));
-    BOOST_CHECK(HouseConfidenceDead(house, 100000 + HOUSE_CD_WINDOW_BLOCKS - 1));
-    // ...but once the window has passed, the clause is available again
-    BOOST_CHECK(!HouseConfidenceDead(house, 100000 + HOUSE_CD_WINDOW_BLOCKS));
+    house.nDeferLastActivation = 1200;
+    const uint32_t L = 1195;                  // last attestation
+    house.nLastAttestHeight = L;
+    const uint32_t nDeadline = L + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE;   // last height still "on cadence"
+    const uint32_t nInsolvent = nDeadline + 1 + nSilence;
+    BOOST_CHECK_EQUAL(HouseDeferSilenceInsolventHeight(house), nInsolvent);
 
-    // Cumulative suspension beyond the cap is terminal for the tool regardless
-    CHouse hLong;
-    hLong.nDeferActivations = 1;
-    hLong.nDeferLastActivation = 1;
-    hLong.nDeferCumBlocks = HOUSE_CD_MAX_SUSPENDED;
-    BOOST_CHECK(HouseConfidenceDead(hLong, 10000000));   // long past the CD window
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)nDeadline), HOUSE_STATUS_DEFERRED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)nDeadline + 1), HOUSE_STATUS_DEFERRED);  // clock started
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)nInsolvent - 1), HOUSE_STATUS_DEFERRED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)nInsolvent), HOUSE_STATUS_INSOLVENT);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, (int)nInsolvent + 1000000), HOUSE_STATUS_INSOLVENT);
 
-    // What CD actually decides is the SECOND episode, after a recovery: a house
-    // that suspended briefly and recovered may reach for the clause again once
-    // the window passes; one that spent its whole suspension budget may not,
-    // ever. (A house still INSIDE an episode cannot re-invoke regardless - DEFER
-    // requires effective 's', and it is 'd'.)
-    CHouse hJustUnder;
-    hJustUnder.nDeferActivations = 1;
-    hJustUnder.nDeferLastActivation = 1000;
-    hJustUnder.nDeferCumBlocks = HOUSE_CD_MAX_SUSPENDED - 1;   // episode closed by recovery
-    BOOST_CHECK(!HouseConfidenceDead(hJustUnder, 1000 + HOUSE_CD_WINDOW_BLOCKS));
+    // Attesting AGAIN inside the silence clock (one block before it runs out)
+    // keeps the house suspended: the deadline is derived from the new height.
+    CHouse hAttested = house;
+    hAttested.nLastAttestHeight = nInsolvent - 1;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hAttested, (int)nInsolvent), HOUSE_STATUS_DEFERRED);
+    BOOST_CHECK_EQUAL(HouseDeferSilenceInsolventHeight(hAttested),
+                      nInsolvent - 1 + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1 + nSilence);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hAttested, (int)HouseDeferSilenceInsolventHeight(hAttested)),
+                      HOUSE_STATUS_INSOLVENT);
 
-    CHouse hAtCap = hJustUnder;
-    hAtCap.nDeferCumBlocks = HOUSE_CD_MAX_SUSPENDED;
-    BOOST_CHECK(HouseConfidenceDead(hAtCap, 1000 + HOUSE_CD_WINDOW_BLOCKS));
-    BOOST_CHECK(HouseConfidenceDead(hAtCap, 10000000));        // and permanently
+    // A live protest does not shorten the suspended house's clock: while
+    // suspended the clause governs (silence is the only way out).
+    CHouse hProtest = house;
+    hProtest.nProtestOpen = 1;
+    hProtest.nProtestHeight = 1150;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hProtest, (int)nInsolvent - 1), HOUSE_STATUS_DEFERRED);
 
-    // The running episode is counted, so the budget cannot be evaded by simply
-    // never closing the suspension.
-    CHouse hRunning;
-    hRunning.nDeferActivations = 1;
-    hRunning.nDeferLastActivation = 1000;
-    hRunning.nDeferInvokedHeight = 1000;
-    BOOST_CHECK_EQUAL(hRunning.DeferSuspendedBlocks(1000 + HOUSE_CD_MAX_SUSPENDED),
-                      HOUSE_CD_MAX_SUSPENDED);
-    BOOST_CHECK(HouseConfidenceDead(hRunning, 1000 + HOUSE_CD_MAX_SUSPENDED));
+    // An OPEN/STRESSED house keeps today's clock: stress from the missed
+    // deadline + 1, insolvent HOUSE_STRESSED_WINDOW (1,008) later.
+    CHouse hOpen = house;
+    hOpen.nDeferInvokedHeight = 0;
+    hOpen.nStressSinceHeight = 0;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)nDeadline), HOUSE_STATUS_OPEN);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)nDeadline + 1), HOUSE_STATUS_STRESSED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)(nDeadline + 1 + HOUSE_STRESSED_WINDOW)), HOUSE_STATUS_INSOLVENT);
+}
+
+BOOST_AUTO_TEST_CASE(house_suspended_silence_clock)
+{
+    CheckSilenceClock(4032);                  // main: ~4 weeks (operator Q5)
+    SelectParams(CBaseChainParams::REGTEST);
+    CheckSilenceClock(40);                    // regtest: gate-testable
+    SelectParams(CBaseChainParams::MAIN);     // restore the fixture's network
+    // The schedule is the same on both networks: 10%/yr from block 0.
+    for (const std::string& net : {CBaseChainParams::MAIN, CBaseChainParams::REGTEST}) {
+        const std::unique_ptr<const CChainParams> params = CreateChainParams(net);
+        const std::vector<Consensus::DeferInterestStep>& v = params->GetConsensus().vDeferInterestSchedule;
+        BOOST_REQUIRE_EQUAL(v.size(), 1u);
+        BOOST_CHECK_EQUAL(v[0].nHeight, 0u);
+        BOOST_CHECK_EQUAL(v[0].nBps, 1000u);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(house_mint_caps_rho_at_mint)
@@ -1113,7 +1129,7 @@ static CHouse MakeGuardHouse()
 // A house-escrow coin (fHouseEscrow, this house) at value v.
 static Coin GuardEscrowCoin(uint32_t nHouseID, CAmount v)
 {
-    Coin coin(CTxOut(v, HouseEscrowScript(uint256S("f00d"))), 1000, false, false, false, 0);
+    Coin coin(CTxOut(v, HouseEscrowScript(uint256S("f00d"))), 1000, false, false, false, uint256());
     coin.SetHouseEscrow(nHouseID);
     return coin;
 }
@@ -1200,20 +1216,47 @@ BOOST_AUTO_TEST_CASE(house_op_status_guards)
         BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 1000, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-defer-not-stressed");
     }
-    // DEFER by a confidence-dead (Stressed) house is refused before the sig.
+    // v0.2.18 (Q4): a REPEAT suspension is allowed. A house that suspended
+    // recently AND has a huge cumulative suspension (both tripped the old D15
+    // guard) gets a DEFER fully ACCEPTED, signature and all.
     {
+        CKey keyPartner; keyPartner.MakeNewKey(true);
+        const CPubKey pubPartner = keyPartner.GetPubKey();
         CHouse house = MakeGuardHouse();
-        house.nLastAttestHeight = 2000; house.nStressSinceHeight = 2000; // Stressed at 2000
-        house.nDeferCumBlocks = HOUSE_CD_MAX_SUSPENDED;                  // credibility spent
+        house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
+        house.nLastAttestHeight = 2000; house.nStressSinceHeight = 2000; // Stressed at 2000, fresh attest
+        house.nDeferActivations = 3;
+        house.nDeferLastActivation = 1990;                               // inside the old 36-month window
+        house.nDeferCumBlocks = 38880;                                   // the old 9-month cap
+        house.nDeferEndedHeight = 1995;
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 2000), HOUSE_STATUS_STRESSED);
-        HouseDefer def; def.nHouseID = house.nHouseID; def.nPrevLastActivation = 0;
-        def.vApproverIndex.push_back(0); def.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
+        HouseDefer def; def.nHouseID = house.nHouseID; def.nPrevLastActivation = house.nDeferLastActivation;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+        mtx.nHouseOp = HOUSE_OP_DEFER;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(house.amountLastAttestReserves, HouseEscrowScript(house.houseID)));   // the till lock
+        mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
+        def.vApproverIndex.push_back(0);
+        std::vector<unsigned char> vchSig;
+        BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, BillHashOutputs(mtx)), vchSig));
+        def.vApproverSig.push_back(vchSig);
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << def;
-        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_DEFER, ss);
+        mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
         auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
         CValidationState state; CHouse houseOut;
-        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 2000, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-defer-confidence-dead");
+        BOOST_CHECK_MESSAGE(CheckHouseOperation(CTransaction(mtx), state, 2000, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut),
+                            state.GetRejectReason());
+        BOOST_CHECK_EQUAL(houseOut.nDeferActivations, 4u);
+        BOOST_CHECK_EQUAL(houseOut.nDeferInvokedHeight, 2000u);
+        BOOST_CHECK_EQUAL(houseOut.nDeferLastActivation, 2000u);
+        BOOST_CHECK_EQUAL(houseOut.nDeferEndedHeight, 1995u);           // untouched by DEFER
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(houseOut, 2001), HOUSE_STATUS_DEFERRED);
+        // ...and a DEFER while already suspended is still refused (nothing to extend).
+        auto fnGetHouse2 = [&](uint32_t id, CHouse& out) { if (id == houseOut.nHouseID) { out = houseOut; return true; } return false; };
+        CValidationState state2; CHouse houseOut2;
+        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state2, 2001, fnGetHouse2, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut2));
+        BOOST_CHECK_EQUAL(state2.GetRejectReason(), "bad-house-defer-not-stressed");
     }
     // RELEASE is refused while the house is not effectively Open (till stays put).
     {
@@ -1243,31 +1286,25 @@ BOOST_AUTO_TEST_CASE(house_op_status_guards)
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-reclaim-stressed");
     }
 
-    // RENEW is refused when the house is not deferring...
-    {
-        CHouse house = MakeGuardHouse();               // Open
-        HouseRenew ren; ren.nHouseID = house.nHouseID;
-        ren.vApproverIndex.push_back(0); ren.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
-        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << ren;
-        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_RENEW, ss);
-        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
-        CValidationState state; CHouse houseOut;
-        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 1000, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-renew-not-deferred");
-    }
-    // ...and refused when the one permitted renewal is already spent.
-    {
+    // v0.2.18 (Q4): RENEW is RETIRED - refused at every status, both by the
+    // context-free shape check and (belt) by the contextual check.
+    for (const bool fDeferred : {false, true}) {
         CHouse house = MakeGuardHouse();
-        house.nDeferInvokedHeight = 1500; house.nDeferRenewals = HOUSE_DEFER_MAX_RENEWALS;
-        BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1600), HOUSE_STATUS_DEFERRED);
+        if (fDeferred) {
+            house.nDeferInvokedHeight = 1500;
+            BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1001), HOUSE_STATUS_DEFERRED);
+        }
         HouseRenew ren; ren.nHouseID = house.nHouseID;
         ren.vApproverIndex.push_back(0); ren.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << ren;
         CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_RENEW, ss);
         auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
         CValidationState state; CHouse houseOut;
-        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 1600, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-renew-exhausted");
+        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 1001, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-renew-retired");
+        CValidationState stateShape;
+        BOOST_CHECK(!CheckHouseTransactionShape(CTransaction(mtx), stateShape));
+        BOOST_CHECK_EQUAL(stateShape.GetRejectReason(), "bad-house-renew-retired");
     }
 }
 

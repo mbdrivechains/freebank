@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <amount.h>
+#include <asset.h>
 #include <base58.h>
 #include <bill.h>
 #include <house.h>
@@ -4183,7 +4184,7 @@ UniValue demandnote(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 5)
         throw std::runtime_error(
             "demandnote\n"
             "\nArguments:\n"
@@ -4191,10 +4192,16 @@ UniValue demandnote(const JSONRPCRequest& request)
             "2. \"units\"    (numeric, required) note units to demand (an undemanded holder's coins must sum exactly to this)\n"
             "3. \"fee\"      (numeric or string, optional) default 0.001\n"
             "4. \"payout\"   (string, optional) address the discharge must pay (pre-auth mode; default: the holder's own key)\n"
-            "\nLodge a redemption demand. One op, two modes, keyed on house status:\n"
-            "- DEFERRED (option clause running): the 3.5 plain demand - notes are\n"
-            "  re-issued to you stamped with the demand height, interest accrues at\n"
-            "  5%/yr from that date, and the notes stay transferable.\n"
+            "5. \"plain\"    (boolean, optional, default false) DEFERRED only: lodge a plain demand instead of a pre-authorised one\n"
+            "\nLodge a redemption demand. Modes keyed on house status:\n"
+            "- DEFERRED (house suspended): you join the queue; interest accrues from\n"
+            "  the demand at the chain's rate (10%/yr). By default the demand is\n"
+            "  PRE-AUTHORISED: the notes move onto the consensus custody script and\n"
+            "  the house can pay you alone at any time (the notes can no longer be\n"
+            "  transferred). With plain=true the notes stay on your key and stay\n"
+            "  transferable, but only you can redeem them. After the house reopens\n"
+            "  you are paid up to the reopen if paid within a week; after that week\n"
+            "  queue interest stops, and a pre-authorised holder can protestnote.\n"
             "- OPEN/STRESSED: the B3 formal demand - notes move onto the consensus\n"
             "  custody script with a STANDING payout authorisation, so the house\n"
             "  can (and must) discharge unilaterally within the demand window;\n"
@@ -4218,6 +4225,7 @@ UniValue demandnote(const JSONRPCRequest& request)
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid payout address");
         scriptPayout = GetScriptForDestination(dest);
     }
+    const bool fPlain = request.params.size() >= 5 && request.params[4].get_bool();
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -4225,7 +4233,60 @@ UniValue demandnote(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->DemandNote(strFail, txid, nHouseID, nUnits, nFee, scriptPayout)) {
+    if (!pwallet->DemandNote(strFail, txid, nHouseID, nUnits, nFee, scriptPayout, fPlain)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue upgradedemand(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+        throw std::runtime_error(
+            "upgradedemand\n"
+            "\nArguments:\n"
+            "1. \"id\"       (numeric, required) the house ID number\n"
+            "2. \"units\"    (numeric, required) units of ONE plain demand you hold (its coins must sum exactly to this)\n"
+            "3. \"fee\"      (numeric or string, optional) default 0.001\n"
+            "4. \"payout\"   (string, optional) address the house's payment must go to (default: the holder's own key)\n"
+            "\nTurn a PLAIN demand (demandnote ... plain=true) into a pre-authorised one. Its interest clock\n"
+            "keeps running from the ORIGINAL demand height. The notes move onto the consensus custody script\n"
+            "(they can no longer be transferred) and the house can then pay you alone at any time; after a\n"
+            "reopen, if it has not paid within a week, you can protestnote. Allowed while the house is\n"
+            "suspended, open or stressed.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("upgradedemand", "1 25000")
+            + HelpExampleRpc("upgradedemand", "1 25000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+    CScript scriptPayout;
+    if (request.params.size() >= 4 && !request.params[3].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[3].get_str());
+        if (!IsValidDestination(dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid payout address");
+        scriptPayout = GetScriptForDestination(dest);
+    }
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->DemandNote(strFail, txid, nHouseID, nUnits, nFee, scriptPayout, false /* fPlain */, true /* fUpgrade */)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -4292,7 +4353,8 @@ UniValue dischargedemands(const JSONRPCRequest& request)
             "2. \"fee\"    (numeric or string, optional) default 0.001\n"
             "\nDischarge the OLDEST outstanding pre-auth demand against the house\n"
             "(B3): pay the pre-authorised script the consensus floor - par inside\n"
-            "the window, par + 5%/yr from window lapse after it - using the\n"
+            "the window, par + the chain rate (10%/yr) after it: from window lapse for a B3\n"
+            "demand, from the demand for a queue demand filed while suspended - using the\n"
             "holder's standing authorisation; no holder action is needed. One\n"
             "discharge per call (it takes the house slot); call again next block\n"
             "while \"remaining\" > 0. Discharging a protested demand retires its\n"
@@ -4392,7 +4454,9 @@ UniValue listmynotes(const JSONRPCRequest& request)
             "    \"demanded_units\": n,       (numeric) units stamped with a demand (option clause)\n"
             "    \"coins\": n,                (numeric) number of note UTXOs\n"
             "    \"house_status\": \"x\",       (string) effective status: o/s/d/i/w\n"
-            "    \"redeemable\": true|false,  (bool) par redemption currently open\n"
+            "    \"redeemable\": true|false,  (bool) some of these units can be redeemed now: all of them while the house\n"
+            "                                 is open or stressed; while it is suspended (d), only demanded units\n"
+            "    \"redeemable_units\": n,      (numeric) how many units can be redeemed now\n"
             "    \"demandable\": true|false   (bool) a demand can be lodged now (house suspended)\n"
             "  }, ...\n"
             "]\n"
@@ -4431,8 +4495,16 @@ UniValue listmynotes(const JSONRPCRequest& request)
         }
         obj.pushKV("coins", (uint64_t)kv.second.coins);
         obj.pushKV("house_status", std::string(1, eff));
-        // Par redemption is open through Stressed, blocked once Deferred/Insolvent.
-        obj.pushKV("redeemable", eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED);
+        // Par redemption is open through Stressed. v0.2.18 (operator Q6): while
+        // the house is suspended (Deferred), demanded notes are redeemable too -
+        // at principal + interest; undemanded ones are not. Insolvent: none.
+        uint64_t nRedeemableUnits = 0;
+        if (eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED)
+            nRedeemableUnits = kv.second.units;
+        else if (eff == HOUSE_STATUS_DEFERRED)
+            nRedeemableUnits = kv.second.demandedUnits;
+        obj.pushKV("redeemable", nRedeemableUnits > 0);
+        obj.pushKV("redeemable_units", nRedeemableUnits);
         // B3: a demand can be lodged in every live state - plain while the
         // clause runs (Deferred), pre-auth/formal at Open or Stressed.
         obj.pushKV("demandable", eff == HOUSE_STATUS_DEFERRED ||
@@ -5572,19 +5644,29 @@ static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
             "1. \"id\"   (numeric, required) the house ID number\n"
             "2. \"fee\"  (numeric or string, optional) default 0.001\n"
             + (fRenew
-                ? "\nExtend the running option-clause deferral by one further window\n"
-                  "(one renewal permitted per episode).\n"
+                ? "\nRETIRED in v0.2.18: a suspension has no end date, so there is nothing\n"
+                  "to renew. Always returns an error.\n"
                 : "\nInvoke the option clause (ARCH s7 Option (c)): a STRESSED house\n"
-                  "suspends par redemption for the deferral window. Holders queue and\n"
-                  "accrue interest from the date of demand. Recovery (an attestation at\n"
-                  "floor+buffer) lifts it; expiry without recovery goes to Insolvent.\n"
-                  "Refused at Open (nothing to defer) and at Insolvent (resolution,\n"
-                  "never suspension), and once confidence-dead.\n")
+                  "suspends par redemption, with no end date. Holders queue (demandnote)\n"
+                  "and earn the scheduled rate (gethouse defer_interest_bps) from the date\n"
+                  "of demand; the house may pay demanded notes while suspended. Recovery\n"
+                  "(an attestation at floor+buffer) lifts it. A suspended house that\n"
+                  "misses 2 attestation cadences and then stays silent until\n"
+                  "defer_silence_insolvent_height becomes Insolvent. Refused at Open\n"
+                  "(nothing to defer) and at Insolvent (resolution, never suspension).\n"
+                  "Repeat suspensions are allowed.\n")
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli(name, "1")
             + HelpExampleRpc(name, "1")
         );
+
+    // v0.2.18 (operator Q4): the op is invalid from block 0. Say so plainly,
+    // before touching the wallet, rather than "Method not found".
+    if (fRenew)
+        throw JSONRPCError(RPC_MISC_ERROR, "renewdeferral is retired (v0.2.18): a suspension has no end date, "
+                                           "so there is nothing to renew. Keep attesting on cadence; a recovery "
+                                           "attestation at floor + buffer reopens the house.");
 
     ObserveSafeMode();
     const uint32_t nHouseID = request.params[0].get_int();
@@ -5598,8 +5680,7 @@ static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
 
     uint256 txid;
     std::string strFail = "";
-    const bool ok = fRenew ? pwallet->RenewDeferral(strFail, txid, nHouseID, nFee)
-                           : pwallet->DeferHouse(strFail, txid, nHouseID, nFee);
+    const bool ok = pwallet->DeferHouse(strFail, txid, nHouseID, nFee);
     if (!ok) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
@@ -6071,161 +6152,153 @@ UniValue listmybills(const JSONRPCRequest& request)
     return ret;
 }
 
+static CTxDestination AssetDestOrNewKey(CWallet* const pwallet, const UniValue& param, const std::string& strWhat)
+{
+    if (!param.isNull() && !param.get_str().empty()) {
+        CTxDestination dest = DecodeDestination(param.get_str());
+        if (!IsValidDestination(dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid " + strWhat + " address");
+        return dest;
+    }
+    if (!pwallet->IsLocked())
+        pwallet->TopUpKeyPool();
+    CPubKey newKey;
+    if (!pwallet->GetKeyFromPool(newKey))
+        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, "Error: Keypool ran out, please call keypoolrefill first");
+    return newKey.GetID();
+}
+
+static uint256 ParseAssetID(const UniValue& param)
+{
+    const std::string str = param.get_str();
+    if (str.size() != 64 || !IsHex(str))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "asset_id must be the asset's genesis txid (64 hex characters)");
+    return uint256S(str);
+}
+
 UniValue createasset(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
-    }
 
-    if (request.fHelp || request.params.size() != 7)
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 8)
         throw std::runtime_error(
-            "createasset\n"
+            "createasset \"ticker\" \"headline\" supply ( \"payload\" decimals fee \"controladdress\" \"supplyaddress\" )\n"
+            "\nCreate an asset: a fixed batch of units, 1 unit = 1 sat of ECX locked in the coins that carry them.\n"
+            "The asset's identity is the txid of this transaction (tickers are not unique).\n"
             "\nArguments:\n"
-            "1. \"ticker\"             (string, required)\n"
-            "2. \"headline\"           (string, required)\n"
-            "3. \"payload\"            (string, required)\n"
-            "4. \"fee\"                (numeric or string, required)\n"
-            "5. \"supply\"             (numeric, required)\n"
-            "6. \"controlleraddress\"  (string, required)\n" // TODO maybe flip with gen addr & make optional for non-tokens
-            "7. \"gensisaddress\"      (string, required)\n"
-            "\nCreate a BitAsset\n"
+            "1. \"ticker\"          (string, required) 1-12 characters, A-Z and 0-9 only\n"
+            "2. \"headline\"        (string, required) up to 64 bytes of UTF-8, no control or invisible characters\n"
+            "3. supply            (numeric, required) the whole supply, in units (= sats locked)\n"
+            "4. \"payload\"         (string, optional) a 32-byte hash, e.g. of the custodian's attestation (hex; default none)\n"
+            "5. decimals          (numeric, optional, default 0) 0-8, display only\n"
+            "6. fee               (numeric or string, optional, default 0.001)\n"
+            "7. \"controladdress\"  (string, optional) receives the control coin (default: a new key of this wallet)\n"
+            "8. \"supplyaddress\"   (string, optional) receives the supply (default: a new key of this wallet)\n"
             + HelpRequiringPassphrase(pwallet) +
-            "\nResult (array):\n"
-            "\"txid\"           (string) The transaction id.\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\", \"asset_id\": \"hex\" }   (the asset id IS the txid)\n"
             "\nExamples:\n"
-            + HelpExampleCli("createasset", "")
-            + HelpExampleRpc("createasset", "")
+            + HelpExampleCli("createasset", "\"GOLD\" \"1 unit = 1 mg of gold held by X\" 1000000000")
+            + HelpExampleRpc("createasset", "\"GOLD\", \"1 unit = 1 mg of gold held by X\", 1000000000")
         );
 
-    // C6-A (A1): the BitAsset subsystem (tx v10) is retired - a v10 tx is now
-    // rejected by consensus (bad-txns-version-bitasset-retired), so a created
-    // asset could never confirm. Refuse here, BEFORE building/committing, so we
-    // don't leave a funded-but-rejected wallet entry behind (the C7 phantom-tx
-    // class). FreeBank's money layer never used BitAssets (gold = v17 oracle,
-    // notes = v13).
-    throw JSONRPCError(RPC_MISC_ERROR,
-        "createasset is retired: the BitAsset subsystem (tx v10) was removed in C6-A.");
-
     ObserveSafeMode();
-
-    // TODO check sizes
-    // Ticker
-    std::string strTicker = request.params[0].get_str();
-    if (strTicker.empty()) {
-        std::string strError = "Invalid ticker";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
+    const std::string strTicker = request.params[0].get_str();
+    if (!IsValidAssetTicker(strTicker))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid ticker: 1-12 characters, A-Z and 0-9 only");
+    const std::string strHeadline = request.params[1].get_str();
+    if (!IsValidAssetHeadline(strHeadline))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid headline: up to 64 bytes of UTF-8, no control or invisible characters");
+    const int64_t nSupply = request.params[2].get_int64();
+    if (nSupply < 1 || !MoneyRange(nSupply))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid supply");
+    uint256 payload;
+    if (request.params.size() >= 4 && !request.params[3].get_str().empty()) {
+        const std::string str = request.params[3].get_str();
+        if (str.size() != 64 || !IsHex(str))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "payload must be 32 bytes of hex");
+        payload = uint256S(str);
     }
-    // Headline
-    std::string strHeadline = request.params[1].get_str();
-    if (strHeadline.empty()) {
-        std::string strError = "Invalid headline";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-    // Payload
-    uint256 payload = uint256S(request.params[2].get_str());
-    if (payload.IsNull()) {
-        std::string strError = "Invalid - missing payload";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-    // Fee
-    CAmount nFee = AmountFromValue(request.params[3]);
-    if (nFee <= 0) {
-        std::string strError = "Invalid fee amount";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-    // Supply
-    int64_t nSupply = request.params[4].get_int64();
-    if (nSupply < 1) {
-        std::string strError = "Invalid supply";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-
-    // Controller address
-    CTxDestination destControl = DecodeDestination(request.params[5].get_str());
-    if (!IsValidDestination(destControl)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid controller address");
-    }
-
-    // Genesis address
-    CTxDestination destGenesis = DecodeDestination(request.params[6].get_str());
-    if (!IsValidDestination(destGenesis)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid genesis address");
-    }
+    int nDecimals = 0;
+    if (request.params.size() >= 5 && !request.params[4].isNull())
+        nDecimals = request.params[4].get_int();
+    if (nDecimals < 0 || nDecimals > ASSET_DECIMALS_MAX)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "decimals must be 0-8");
+    CAmount nFee = 100000;
+    if (request.params.size() >= 6 && !request.params[5].isNull())
+        nFee = AmountFromValue(request.params[5]);
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
-
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    CTransactionRef tx;
-    std::string strFail = "";
-    if (!pwallet->CreateAsset(tx, strFail, strTicker, strHeadline, payload, nFee, nSupply, request.params[5].get_str(), request.params[6].get_str()))
-    {
+    const CTxDestination destControl = AssetDestOrNewKey(pwallet, request.params.size() >= 7 ? request.params[6] : NullUniValue, "control");
+    const CTxDestination destSupply = AssetDestOrNewKey(pwallet, request.params.size() >= 8 ? request.params[7] : NullUniValue, "supply");
+
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->CreateAsset(strFail, txid, strTicker, strHeadline, payload, (uint8_t)nDecimals, nSupply, destControl, destSupply, nFee)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
-
     UniValue response(UniValue::VOBJ);
-    response.pushKV("txid", tx->GetHash().ToString());
+    response.pushKV("txid", txid.ToString());
+    response.pushKV("asset_id", txid.ToString());
     return response;
 }
 
 UniValue listmyassets(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
-    }
 
-    if (request.fHelp || request.params.size())
+    if (request.fHelp || request.params.size() > 1)
         throw std::runtime_error(
-            "listmyassets\n"
-            "\nList BitAssets owned by this wallet\n"
-            + HelpRequiringPassphrase(pwallet) +
-            "\nResult (array):\n"
-            "\"asset\"           (string)\n"
+            "listmyassets ( \"asset_id\" )\n"
+            "\nThis wallet's confirmed, unspent asset coins (units and control coins).\n"
+            "\nArguments:\n"
+            "1. \"asset_id\"   (string, optional) only this asset (its genesis txid)\n"
+            "\nResult:\n"
+            "[ { \"asset_id\": \"hex\", \"ticker\": \"..\", \"decimals\": n, \"units\": n, \"control\": true|false,\n"
+            "    \"txid\": \"hex\", \"vout\": n, \"address\": \"..\", \"confirmations\": n }, ... ]\n"
+            "  ticker/decimals come from the node's asset index and are omitted if it lacks the record.\n"
             "\nExamples:\n"
             + HelpExampleCli("listmyassets", "")
             + HelpExampleRpc("listmyassets", "")
         );
 
     ObserveSafeMode();
+    uint256 assetID;
+    if (request.params.size() >= 1 && !request.params[0].isNull())
+        assetID = ParseAssetID(request.params[0]);
 
-    EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
-
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    std::vector<COutput> vOutput;
-    pwallet->AvailableAssets(vOutput);
+    std::vector<std::pair<COutPoint, Coin>> vOut;
+    pwallet->AvailableAssets(vOut, assetID);
 
     UniValue ar(UniValue::VARR);
-    for (const COutput& o : vOutput) {
+    for (const auto& o : vOut) {
+        const Coin& coin = o.second;
         UniValue obj(UniValue::VOBJ);
-        obj.pushKV("assetamount", o.tx->tx->vout[o.i].nValue);
-        obj.pushKV("outputtxid", o.tx->GetHash().ToString());
-        obj.pushKV("outputn", o.i);
-        obj.pushKV("confirmations", o.nDepth);
-        obj.pushKV("amountassetin", o.tx->amountAssetIn);
-        obj.pushKV("ncontroln", o.tx->nControlN);
-        obj.pushKV("id", (uint64_t)o.tx->nAssetID);
-
-        // Get BitAssetDB data
+        obj.pushKV("asset_id", coin.assetID.ToString());
         BitAsset asset;
-        if (!passettree->GetAsset(o.tx->nAssetID, asset))
-            throw JSONRPCError(RPC_MISC_ERROR, "Failed to load asset data!");
-
-        obj.pushKV("ticker", asset.strTicker);
-        obj.pushKV("headline", asset.strHeadline);
-        obj.pushKV("payloadhash", asset.payload.ToString());
-        obj.pushKV("creationtxid", asset.txid.ToString());
-
+        if (passettree && passettree->GetAsset(coin.assetID, asset)) {
+            obj.pushKV("ticker", asset.strTicker);
+            obj.pushKV("decimals", (int)asset.nDecimals);
+        }
+        obj.pushKV("units", coin.fBitAsset ? coin.out.nValue : 0);
+        obj.pushKV("control", (bool)coin.fBitAssetControl);
+        obj.pushKV("txid", o.first.hash.ToString());
+        obj.pushKV("vout", (int)o.first.n);
+        CTxDestination dest;
+        if (ExtractDestination(coin.out.scriptPubKey, dest))
+            obj.pushKV("address", EncodeDestination(dest));
+        obj.pushKV("confirmations", chainActive.Height() - (int)coin.nHeight + 1);
         ar.push_back(obj);
     }
     return ar;
@@ -6234,144 +6307,97 @@ UniValue listmyassets(const JSONRPCRequest& request)
 UniValue transferasset(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
-    }
 
-    if (request.fHelp || request.params.size() != 4)
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
-            "transferasset\n"
+            "transferasset \"asset_id\" \"address\" units ( fee )\n"
+            "\nSend units of an asset. Uses this wallet's confirmed unit coins of that asset; any surplus comes\n"
+            "back as asset change. The fee is paid from plain ECX.\n"
             "\nArguments:\n"
-            "1. \"txid\"           (string, required)\n"
-            "2. \"destination\"    (string, required)\n"
-            "3. \"fee\"            (numeric or string, required)\n"
-            "4. \"amount\"         (numeric or string, required)\n"
-            "\nTransfer a BitAsset\n"
+            "1. \"asset_id\"   (string, required) the asset's genesis txid\n"
+            "2. \"address\"    (string, required) the recipient\n"
+            "3. units        (numeric, required) how many units\n"
+            "4. fee          (numeric or string, optional, default 0.001)\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nResult:\n"
-            "\"txid\"           (string) The transaction id.\n"
+            "{ \"txid\": \"hex\" }\n"
             "\nExamples:\n"
-            + HelpExampleCli("transferasset", "")
-            + HelpExampleRpc("transferasset", "")
+            + HelpExampleCli("transferasset", "\"<asset_id>\" \"<address>\" 25000")
+            + HelpExampleRpc("transferasset", "\"<asset_id>\", \"<address>\", 25000")
         );
 
-    // C6-A (A1): BitAsset subsystem retired (see createasset). No new asset can
-    // be created, so there is nothing to transfer; refuse cleanly.
-    throw JSONRPCError(RPC_MISC_ERROR,
-        "transferasset is retired: the BitAsset subsystem (tx v10) was removed in C6-A.");
-
     ObserveSafeMode();
-
-    // Txid
-    uint256 txid = uint256S(request.params[0].get_str());
-    if (txid.IsNull()) {
-        std::string strError = "Invalid txid";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-    // Destination
-    CTxDestination dest = DecodeDestination(request.params[1].get_str());
-    if (!IsValidDestination(dest)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
-    }
-    // Fee
-    CAmount nFee = AmountFromValue(request.params[2]);
-    if (nFee <= 0) {
-        std::string strError = "Invalid fee amount";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-    // Amount
-    int64_t nAmount = request.params[3].get_int64();
-    if (nAmount <= 0) {
-        std::string strError = "Invalid amount";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
+    const uint256 assetID = ParseAssetID(request.params[0]);
+    const CTxDestination dest = DecodeDestination(request.params[1].get_str());
+    if (!IsValidDestination(dest))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    const int64_t nUnits = request.params[2].get_int64();
+    if (nUnits <= 0 || !MoneyRange(nUnits))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid amount of units");
+    CAmount nFee = 100000;
+    if (request.params.size() >= 4 && !request.params[3].isNull())
+        nFee = AmountFromValue(request.params[3]);
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
-
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    uint256 txidOut;
-    std::string strFail = "";
-    if (!pwallet->TransferAsset(strFail, txidOut, txid, dest, nFee, nAmount))
-    {
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->TransferAsset(strFail, txid, assetID, dest, nUnits, nFee)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
-
     UniValue response(UniValue::VOBJ);
-    response.pushKV("txid", txidOut.ToString());
+    response.pushKV("txid", txid.ToString());
     return response;
 }
 
 UniValue transferassetcontrol(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
-    }
 
-    if (request.fHelp || request.params.size() != 4)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
         throw std::runtime_error(
-            "transferassetcontrol\n"
+            "transferassetcontrol \"asset_id\" \"address\" ( fee )\n"
+            "\nPass an asset's control coin (the issuer's on-chain badge; it carries no units) to a new holder.\n"
             "\nArguments:\n"
-            "1. \"txid\"           (string, required)\n"
-            "2. \"destination\"    (string, required)\n"
-            "3. \"fee\"            (numeric or string, required)\n"
-            "\nTransfer BitAsset controller coin\n"
+            "1. \"asset_id\"   (string, required) the asset's genesis txid\n"
+            "2. \"address\"    (string, required) the new holder\n"
+            "3. fee          (numeric or string, optional, default 0.001)\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nResult:\n"
-            "\"txid\"           (string) The transaction id.\n"
+            "{ \"txid\": \"hex\" }\n"
             "\nExamples:\n"
-            + HelpExampleCli("transferassetcontrol", "")
-            + HelpExampleRpc("transferassetcontrol", "")
+            + HelpExampleCli("transferassetcontrol", "\"<asset_id>\" \"<address>\"")
+            + HelpExampleRpc("transferassetcontrol", "\"<asset_id>\", \"<address>\"")
         );
 
-    // C6-A (A1): BitAsset subsystem retired (see createasset). Refuse cleanly.
-    throw JSONRPCError(RPC_MISC_ERROR,
-        "transferassetcontrol is retired: the BitAsset subsystem (tx v10) was removed in C6-A.");
-
     ObserveSafeMode();
-
-    // Txid
-    uint256 txid = uint256S(request.params[0].get_str());
-    if (txid.IsNull()) {
-        std::string strError = "Invalid txid";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
-    // Destination
-    CTxDestination dest = DecodeDestination(request.params[1].get_str());
-    if (!IsValidDestination(dest)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
-    }
-    // Fee
-    CAmount nFee = AmountFromValue(request.params[2]);
-    if (nFee <= 0) {
-        std::string strError = "Invalid fee amount";
-        LogPrintf("%s: %s\n", __func__, strError);
-        throw JSONRPCError(RPC_MISC_ERROR, strError);
-    }
+    const uint256 assetID = ParseAssetID(request.params[0]);
+    const CTxDestination dest = DecodeDestination(request.params[1].get_str());
+    if (!IsValidDestination(dest))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3 && !request.params[2].isNull())
+        nFee = AmountFromValue(request.params[2]);
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
-
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    // TODO return value tx / txid
-    CTransactionRef tx;
-    std::string strFail = "";
-    if (!pwallet->TransferAssetControl(strFail, txid, dest, nFee))
-    {
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->TransferAssetControl(strFail, txid, assetID, dest, nFee)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
-
     UniValue response(UniValue::VOBJ);
-    response.pushKV("txid", tx->GetHash().ToString());
+    response.pushKV("txid", txid.ToString());
     return response;
 }
 
@@ -6738,10 +6764,10 @@ static const CRPCCommand commands[] =
     { "sidechain",          "createwithdrawalrefundrequest",    &createwithdrawalrefundrequest, {"id"} },
     { "sidechain",          "refundallwithdrawals",             &refundallwithdrawals,          {} },
 
-    { "BitAssets",          "createasset",                      &createasset,                   {"ticker", "headline", "payload", "nfee", "nsupply", "controllerdest", "genesisdest"} },
-    { "BitAssets",          "listmyassets",                     &listmyassets,                  {} },
-    { "BitAssets",          "transferasset",                    &transferasset,                 {"txid", "destination", "fee", "amount"} },
-    { "BitAssets",          "transferassetcontrol",             &transferassetcontrol,          {"txid", "destination", "fee"} },
+    { "BitAssets",          "createasset",                      &createasset,                   {"ticker", "headline", "supply", "payload", "decimals", "fee", "controladdress", "supplyaddress"} },
+    { "BitAssets",          "listmyassets",                     &listmyassets,                  {"asset_id"} },
+    { "BitAssets",          "transferasset",                    &transferasset,                 {"asset_id", "address", "units", "fee"} },
+    { "BitAssets",          "transferassetcontrol",             &transferassetcontrol,          {"asset_id", "address", "fee"} },
 
     { "bills",              "issuebill",                        &issuebill,                     {"body", "amount", "escrow", "maturityheight", "graceblocks", "fee"} },
     { "bills",              "endorsebill",                      &endorsebill,                   {"id", "topubkey", "fee"} },
@@ -6757,7 +6783,8 @@ static const CRPCCommand commands[] =
     { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress"} },
     { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
     { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
-    { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout"} },
+    { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout", "plain"} },
+    { "notes",              "upgradedemand",                    &upgradedemand,                 {"id", "units", "fee", "payout"} },
     { "notes",              "protestnote",                      &protestnote,                   {"id", "fee"} },
     { "notes",              "dischargedemands",                 &dischargedemands,              {"id", "fee"} },
     { "notes",              "listmynotes",                      &listmynotes,                   {} },

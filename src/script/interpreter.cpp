@@ -1136,6 +1136,15 @@ public:
              SerializeOutput(s, nOutput);
         // Serialize nLockTime
         ::Serialize(s, txTo.nLockTime);
+        // BitAsset genesis (v0.2.18, layer-B review A2): the metadata is part
+        // of the txid - the asset's identity - so every signature binds it, or
+        // a relay could rewrite an unconfirmed genesis's ticker/headline/payload.
+        if (txTo.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
+            ::Serialize(s, txTo.ticker);
+            ::Serialize(s, txTo.headline);
+            ::Serialize(s, txTo.payload);
+            ::Serialize(s, txTo.nDecimals);
+        }
     }
 };
 
@@ -1220,6 +1229,14 @@ uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsig
         ss << hashOutputs;
         // Locktime
         ss << txTo.nLockTime;
+        // BitAsset genesis metadata (v0.2.18, layer-B review A2; see the
+        // legacy serializer above), whatever the hash type.
+        if (txTo.nVersion == TRANSACTION_BITASSET_CREATE_VERSION) {
+            ss << txTo.ticker;
+            ss << txTo.headline;
+            ss << txTo.payload;
+            ss << txTo.nDecimals;
+        }
         // Sighash type
         ss << nHashType;
 

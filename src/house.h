@@ -146,18 +146,13 @@ static const uint32_t HOUSE_RESTORE_BUFFER_PCT = 5;
 // DIALS await a v1-shaped sim run.
 //
 
-// Deferral window, blocks (90 days - the only value with survival evidence;
-// the 5%/yr rate and the one-renewal rule are calibrated against it).
-// Regtest-only -deferwindow override (integration gates cannot mine 90 days).
-extern uint32_t HOUSE_DEFER_WINDOW;
-
-// Renewals permitted per deferral episode (sim D2: "one renewal max").
-static const uint32_t HOUSE_DEFER_MAX_RENEWALS = 1;
-
-// Deferral interest on demanded notes, basis points per year, accruing from
-// the DATE OF DEMAND (the historical rule; Scottish was 5% flat). Consumed by
-// R-i3's demand queue.
-static const uint32_t HOUSE_DEFER_INTEREST_BPS = 500;
+// v0.2.18 (operator sign-off 2026-10-02, Q1-Q5): a suspension has NO END
+// DATE. The 90-day window, the one renewal (RENEW is retired - the op is
+// invalid) and the confidence-death guard are gone; repeat suspensions are
+// allowed. A suspended house becomes insolvent only by SILENCE (see
+// HouseEffectiveStatus and Consensus::Params::nDeferSilenceWindow). Queued
+// notes earn the rate in Consensus::Params::vDeferInterestSchedule (10%/yr from
+// block 0), which replaced the constant HOUSE_DEFER_INTEREST_BPS.
 static const uint32_t BLOCKS_PER_YEAR = 52560;
 
 //
@@ -192,14 +187,6 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // the spread can only ever bite once the house is publicly impaired - which
 // keeps 3.4-D6's "redemption at par" invariant intact in the Open state at
 // zero measured cost.
-
-// Confidence death (sim D15, taken as an INVOCATION GUARD not a kill switch,
-// D13): a second activation inside CD_WINDOW, or cumulative suspension beyond
-// CD_MAX_SUSPENDED, makes a further DEFER invalid. The house then simply falls
-// back to its ordinary stress clock - which is what kills it. No new terminal
-// status; the counters are published so the market can price them.
-static const uint32_t HOUSE_CD_WINDOW_BLOCKS    = 157680;  // ~36 months
-static const uint32_t HOUSE_CD_MAX_SUSPENDED    = 38880;   // ~9 months
 
 // CHouse on-disk serialization version (D10). v4 = 3.5 layout (option-clause
 // state). Any record with a different version byte is rejected at read - each
@@ -281,18 +268,15 @@ struct CHouse {
     // Option-clause state (Phase 3.5). Deferral is DERIVED from these, exactly
     // like Stressed/Insolvent - no automatic writes, nothing new to undo.
     uint32_t nDeferInvokedHeight;      // 0 = not deferring; height of the current invocation
-    uint32_t nDeferRenewals;           // renewals used on the CURRENT episode (<= MAX_RENEWALS)
-    uint32_t nDeferCumBlocks;          // cumulative suspended blocks over CLOSED episodes (CD)
-    uint32_t nDeferActivations;        // lifetime invocations (CD)
-    uint32_t nDeferLastActivation;     // height of the most recent invocation (CD window)
+    uint32_t nDeferRenewals;           // v0.2.18: always 0 (RENEW retired); kept for the layout + ATTEST priors
+    uint32_t nDeferCumBlocks;          // cumulative suspended blocks over CLOSED episodes (published)
+    uint32_t nDeferActivations;        // lifetime invocations (published)
+    uint32_t nDeferLastActivation;     // height of the most recent invocation (DEFER anti-replay prior)
     // DR-2: the height the most recent deferral episode ENDED (recovery
-    // attestation), 0 if none has ever closed. Caps the deferral-interest
-    // window on a demanded note - without it the note's nDemandHeight coin tag
-    // is forever and the interest clock runs to the eventual redemption,
-    // turning "demand once" into a perpetual 5%/yr bond. A note demanded in an
-    // EARLIER episode and redeemed after a LATER recovery accrues to the later
-    // end (bounded multi-episode over-pay - accepted; per-note episode tracking
-    // is not worth the state).
+    // attestation), 0 if none has ever closed. Overwritten by every reopen.
+    // v0.2.18 (Q8): a demanded note paid within nDemandWindow of this height,
+    // while the house is open, stops accruing here; otherwise it accrues until
+    // paid (NoteDemandAccrualWindow in note.h has the exact rule).
     uint32_t nDeferEndedHeight;
     // The TILL locked into consensus custody at DEFER (3.5 D11). Suspending is
     // not free: a house that stops paying its holders must put its liquid
@@ -515,17 +499,9 @@ struct CHouse {
     /** Is a protest live? (counter semantics - see the field comments.) */
     bool ProtestLive() const { return nProtestOpen > 0; }
 
-    /** The height at which the current deferral episode expires (0 if the house
-     * is not deferring). One renewal extends it by a second full window. */
-    uint32_t DeferEndHeight() const
-    {
-        if (nDeferInvokedHeight == 0)
-            return 0;
-        return nDeferInvokedHeight + HOUSE_DEFER_WINDOW * (1 + nDeferRenewals);
-    }
-
-    /** Cumulative suspended blocks INCLUDING the episode running at nHeight -
-     * the quantity confidence-death is measured on. */
+    /** Cumulative suspended blocks INCLUDING the episode running at nHeight
+     * (published as defer_suspended_blocks so the market can price a house
+     * that keeps reaching for the clause; no consensus rule reads it). */
     uint32_t DeferSuspendedBlocks(int nHeight) const
     {
         uint32_t n = nDeferCumBlocks;
@@ -736,16 +712,17 @@ struct HouseAttest {
 /** DEFER (ARCH s7 Option (c)): the house invokes the option clause. Valid only
  * at effective Stressed - not at Open (nothing to defer), not at Insolvent
  * (sim-D1: "insolvency -> resolution, never suspension"). Invocation REPLACES
- * the remaining stress clock with the deferral window; redemption stops being
- * paid at par and is QUEUED instead (R-i3), accruing interest from the date of
- * demand. Recovery (an attestation at floor+buffer) lifts it; window expiry
- * without recovery goes to Insolvent.
+ * the remaining stress clock; redemption stops being paid at par and is QUEUED
+ * instead (R-i3), accruing interest from the date of demand. Recovery (an
+ * attestation at floor+buffer) lifts it. v0.2.18: no end date and repeat
+ * suspensions allowed; while suspended the house may pay DEMANDED notes (at
+ * least principal + interest); it becomes insolvent only by silence.
  *
  * This does not GRANT the house a suspension power - REDEEM is dual-signed, so
  * a house can already refuse to pay, silently, for free, forever. The clause
- * makes that power LEGIBLE (declared on-chain), TIME-BOUNDED (the window),
- * COMPENSATED (interest) and PENALISED (confidence death). It disciplines a
- * power that already exists. */
+ * makes that power LEGIBLE (declared on-chain), COMPENSATED (interest on the
+ * queue) and COSTLY (the till is locked until reopen). It disciplines a power
+ * that already exists. */
 struct HouseDefer {
     uint32_t nHouseID;                     // leading - mempool-guard convention
     uint32_t nPrevLastActivation;          // undo prior (must match DB at connect)
@@ -770,8 +747,9 @@ struct HouseDefer {
     }
 };
 
-/** RENEW: extend the current deferral by one further window. At most
- * HOUSE_DEFER_MAX_RENEWALS per episode (sim D2: "one renewal max"). */
+/** RENEW: RETIRED in v0.2.18 (a suspension has no end date, so there is
+ * nothing to extend). The op number and payload stay defined so the op can be
+ * decoded and named; consensus rejects it (bad-house-renew-retired). */
 struct HouseRenew {
     uint32_t nHouseID;
     std::vector<uint32_t> vApproverIndex;
@@ -854,13 +832,6 @@ uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, 
 uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
 
-/** Confidence death (sim D15 / D13a): true when a FURTHER deferral invocation
- * must be refused - a second activation inside HOUSE_CD_WINDOW_BLOCKS, or
- * cumulative suspension already beyond HOUSE_CD_MAX_SUSPENDED. This is a GUARD,
- * not a kill switch: the house is not executed, it simply loses the crisis tool
- * and falls back to the ordinary stress clock, which is what kills it. */
-bool HouseConfidenceDead(const CHouse& house, int nHeight);
-
 /** The per-coin reserve-proof challenge: sha256d over a domain tag, the house
  * identity (cross-house replay bar), the as-of height AND that height's block
  * hash on the validating branch (recency: a reorg past nAsOfHeight invalidates
@@ -894,8 +865,9 @@ bool IsValidHouseClassID(const std::string& strClassID);
  *   - the protest origin while nProtestOpen > 0 (cleared ONLY by discharge
  *     to a zero counter - an attestation cannot touch it; reserves are not
  *     redemption). If a deferral episode overlapped the protest, this origin
- *     is max(nProtestHeight, nDeferEndedHeight): discharge is impossible
- *     while suspended, so the fuse re-arms at the recovery stamp.
+ *     is max(nProtestHeight, nDeferEndedHeight): the fuse re-arms at the
+ *     recovery stamp. (Written when discharge was impossible while suspended;
+ *     v0.2.18 allows it, but the re-arm is kept unchanged.)
  * 0 if the house is not stressed. */
 uint32_t HouseStressOrigin(const CHouse& house, int nHeight);
 
@@ -905,11 +877,23 @@ uint32_t HouseStressOrigin(const CHouse& house, int nHeight);
  *   - missed cadence:  no accepted attestation for MISS_N * CADENCE blocks
  *     past nLastAttestHeight  ->  Stressed from that deadline + 1;
  *   - window expiry:   Stressed (either origin) for HOUSE_STRESSED_WINDOW
- *     blocks  ->  Insolvent.
+ *     blocks  ->  Insolvent;
+ *   - suspended (nDeferInvokedHeight != 0): Deferred, with NO end date
+ *     (v0.2.18). The only way out to Insolvent is SILENCE: at
+ *     HouseDeferSilenceInsolventHeight (missed MISS_N cadences, then
+ *     Consensus::Params::nDeferSilenceWindow more blocks). Attesting before
+ *     then moves nLastAttestHeight and keeps the house Deferred.
  * Stored 'i' (materialized by the first waterfall claim) and 'w' short-
  * circuit. Effective 'i' is absorbing without writes because every op that
  * could change the derivation inputs is rejected at effective 'i'. */
 char HouseEffectiveStatus(const CHouse& house, int nHeight);
+
+/** For a SUSPENDED house: the first height at which it is effectively
+ * Insolvent unless it attests before then = nLastAttestHeight +
+ * HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1 + nDeferSilenceWindow
+ * (the silence clock starts the block after the missed-cadence deadline, the
+ * same origin an open house's stress clock uses). 0 if not suspended. */
+uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house);
 
 /** The nStressSinceHeight value an accepted attestation of amountReserves at
  * nHeight leaves behind (T2 below-floor / T4 recovery-with-hysteresis /

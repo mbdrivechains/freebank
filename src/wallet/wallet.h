@@ -7,6 +7,7 @@
 #define BITCOIN_WALLET_WALLET_H
 
 #include <amount.h>
+#include <coins.h>
 #include <policy/feerate.h>
 #include <streams.h>
 #include <tinyformat.h>
@@ -868,7 +869,14 @@ public:
      */
     void AvailableCoins(std::vector<COutput>& vCoins, bool fOnlySafe=true, const CCoinControl *coinControl = nullptr, const CAmount& nMinimumAmount = 1, const CAmount& nMaximumAmount = MAX_MONEY, const CAmount& nMinimumSumAmount = MAX_MONEY, const uint64_t nMaximumCount = 0, const int nMinDepth = 0, const int nMaxDepth = 9999999) const;
 
-    void AvailableAssets(std::vector<COutput>& vCoins, uint256 txid = uint256()) const;
+    /** Confirmed, unspent asset coins (units or control) this wallet can spend,
+     *  optionally of one asset; colour read from the UTXO set (v0.2.18). */
+    void AvailableAssets(std::vector<std::pair<COutPoint, Coin>>& vOut, const uint256& assetID = uint256()) const;
+    /** An unconfirmed asset tx (v10, or one spending a coloured coin): none of
+     *  its outputs is ECX until it confirms. cs_main held. */
+    bool IsUnconfirmedAssetTx(const CWalletTx& wtx) const;
+    /** Output n of wtx is an asset coin (units or control). nDepth: wtx's depth. */
+    bool IsOutputAssetColoured(const CWalletTx& wtx, unsigned int n, int nDepth) const;
 
     /**
      * Return list of available coins and locked coins grouped by non-change output address.
@@ -1005,11 +1013,19 @@ public:
      */
     bool CreateTransaction(const std::vector<CRecipient>& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, CAmount& nFeeRet, int& nChangePosInOut,
                            std::string& strFailReason, const CCoinControl& coin_control, bool sign = true);
-    bool CreateAsset(CTransactionRef& tx, std::string& strFail, const std::string& strTicker, const std::string& strHeadline, const uint256& hashPayload, const CAmount& nFee, const int64_t nSupply, const std::string& strControllerDest, const std::string& strGenesisDest, bool fImmutable = false);
+    /** Asset ops (v0.2.18, D-2026-10-03-1). Each funds from plain coins only,
+     *  puts change last, and fails (abandoning the tx) when the mempool refuses. */
+    bool CreateAsset(std::string& strFail, uint256& txidOut, const std::string& strTicker, const std::string& strHeadline,
+                     const uint256& payload, uint8_t nDecimals, CAmount nSupply,
+                     const CTxDestination& destControl, const CTxDestination& destSupply, const CAmount& nFee);
     bool CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey, CConnman* connman, CValidationState& state);
 
-    bool TransferAsset(std::string& strFail, uint256& txidOut, const uint256& txid, const CTxDestination& dest, const CAmount& nFee, const CAmount& nAmount);
-    bool TransferAssetControl(std::string& strFail, const uint256& txid, const CTxDestination& dest, const CAmount& nFee);
+    bool TransferAsset(std::string& strFail, uint256& txidOut, const uint256& assetID, const CTxDestination& dest,
+                       CAmount nUnits, const CAmount& nFee);
+    bool TransferAssetControl(std::string& strFail, uint256& txidOut, const uint256& assetID, const CTxDestination& dest,
+                              const CAmount& nFee);
+    bool FundSignCommitAssetTx(CMutableTransaction& mtx, const std::vector<std::pair<COutPoint, CTxOut>>& vAssetIn,
+                               const CAmount& nFee, std::string& strFail, uint256& txidOut);
 
     bool IssueBill(CTransactionRef& tx, std::string& strFail, const std::vector<unsigned char>& vchBody, const CAmount& nAmount, const CAmount& nAmountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const CAmount& nFee);
     bool EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const std::vector<unsigned char>& vchToPubKey, const CAmount& nFee);
@@ -1073,7 +1089,7 @@ public:
      * - Open/Stressed: the B3 formal demand - coins move onto the consensus-
      *   custody script and carry a standing pre-authorisation so the house can
      *   discharge alone. scriptPayout empty => the holder's own P2PKH. */
-    bool DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptPayout = CScript());
+    bool DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptPayout = CScript(), bool fPlain = false, bool fUpgrade = false);
     /** B3 PROTEST: mark the wallet's OLDEST lapsed (window-expired) unprotested
      * pre-auth demand against the house - starts/joins the continuous
      * insolvency clock (the D-v counter). */
@@ -1174,8 +1190,8 @@ public:
      * confirmed coins as the house's liquid till (up to MAX_ATTEST_PROOFS,
      * largest first; fee funded from coins OUTSIDE the proof set). */
     bool AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
-    /** Option clause (Phase 3.5): invoke the deferral, and extend it once.
-     * Both share BuildDeferOrRenew (same M-of-N, no-escrow, one-change shape). */
+    /** Option clause (Phase 3.5): invoke the deferral. RenewDeferral is
+     * retired in v0.2.18 (always fails: a suspension has no end date). */
     bool DeferHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
     bool RenewDeferral(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
     bool BuildDeferOrRenew(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee, bool fRenew);

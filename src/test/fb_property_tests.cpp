@@ -405,7 +405,7 @@ WHouse MakeWorldHouse(uint32_t id, int nHeight)
     wh.house.vPartner.push_back(p);
     wh.outReserve = COutPoint(uint256S(strprintf("%08x", 0xcafe0000 + id)), 0);
     wh.coinReserve = Coin(CTxOut(100 * COIN,
-            GetScriptForDestination(wh.reserve.GetPubKey().GetID())), nHeight - 500, false, false, false, 0);
+            GetScriptForDestination(wh.reserve.GetPubKey().GetID())), nHeight - 500, false, false, false, uint256());
     return wh;
 }
 
@@ -443,7 +443,7 @@ void RunGenerator(uint32_t nSeed, int nSteps, int nHouses)
             // time passes (exogenous to the bill family; see header)
             for (std::map<uint32_t, WHouse>::iterator ih = w.houses.begin(); ih != w.houses.end(); ih++) {
                 ih->second.house.nLastAttestHeight = (uint32_t)w.nHeight - 10;
-                ih->second.coinReserve = Coin(ih->second.coinReserve.out, w.nHeight - 500, false, false, false, 0);
+                ih->second.coinReserve = Coin(ih->second.coinReserve.out, w.nHeight - 500, false, false, false, uint256());
             }
             w.nAccepted[op]++;
             AssertInvariants(w, at.c_str());

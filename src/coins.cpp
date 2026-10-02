@@ -90,34 +90,11 @@ void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possi
     cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
 }
 
-void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint32_t nAssetID, const CAmount amountAssetIn, int nControlN, uint32_t nNewAssetID, uint32_t nBillID, uint32_t nHouseID, bool check) {
+void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const AssetTags& assetTags, uint32_t nBillID, uint32_t nHouseID, bool check) {
     bool fCoinbase = tx.IsCoinBase();
     const uint256& txid = tx.GetHash();
 
-    if (amountAssetIn > 0) {
-        // One of the input coins is a BitAsset, coins adding up to the asset
-        // input amount will be marked as BitAssets
-
-        // Label BitAsset outputs until we account for all BitAsset input
-        CAmount amountAssetOut = CAmount(0);
-        for (size_t i = 0; i < tx.vout.size(); ++i) {
-            bool overwrite = check ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
-            bool fAsset = amountAssetIn > amountAssetOut;
-            bool fControl = nControlN >= 0 && (int)i == nControlN;
-            uint32_t nID = nNewAssetID ? nNewAssetID : nAssetID;
-            cache.AddCoin(COutPoint(txid, i), Coin(tx.vout[i], nHeight, fCoinbase, fAsset, fControl, fAsset ? nID : 0), overwrite);
-            if (fAsset)
-                amountAssetOut += tx.vout[i].nValue;
-        }
-    }
-    else
     {
-        // The first two outputs of a BitAsset creation transaction are
-        // 0: controller output
-        // 1: genesis output
-        // The rest are normal outputs
-        bool fNewAsset = tx.nVersion == TRANSACTION_BITASSET_CREATE_VERSION;
-
         // Bill transactions tag the title / escrow outputs. Bill txs cannot
         // spend asset-colored inputs (bad-bill-asset-input), so they always
         // take this branch.
@@ -170,7 +147,7 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
                     // change, so no fleet -reindex).
                     const uint32_t nBase = d.nPriorDemandHeight != 0
                                          ? d.nPriorDemandHeight : (uint32_t)nHeight;
-                    nNoteDemandHeight = NoteDemandTag(nBase, d.fPreAuth != 0);
+                    nNoteDemandHeight = NoteDemandTag(nBase, d.fPreAuth);
                 }
             } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
                 // Re-issued UNCHANGED: same units, same tag. A protest asserts
@@ -241,11 +218,14 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
         }
 
         for (size_t i = 0; i < tx.vout.size(); ++i) {
-            bool fAsset = fNewAsset && i < 2;
-            bool fControl = fNewAsset && i == 0;
-            uint32_t nID = nNewAssetID ? nNewAssetID : nAssetID;
+            // Asset colour (v0.2.18): decided by ComputeAssetTags; an asset tx is
+            // a genesis or a plain-version transfer, so no tagger below applies
+            // to it (coloured inputs are refused in every FreeBank op version).
+            const uint8_t nAssetOut = assetTags.Get(i);
+            const bool fAsset = nAssetOut == ASSET_OUT_UNITS;
+            const bool fControl = nAssetOut == ASSET_OUT_CONTROL;
             bool overwrite = check ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
-            Coin coin(tx.vout[i], nHeight, fCoinbase, fAsset, fControl, fAsset ? nID : 0);
+            Coin coin(tx.vout[i], nHeight, fCoinbase, fAsset, fControl, (fAsset || fControl) ? assetTags.assetID : uint256());
 
             // The shared payload-pure tagger decides WHICH v11 outputs are
             // tagged and how - one decision point, so the mempool view, the
@@ -297,12 +277,9 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, uint3
     }
 }
 
-bool CCoinsViewCache::SpendCoin(const COutPoint &outpoint, bool& fBitAsset, bool& fBitAssetControl, uint32_t& nAssetID, Coin* moveout) {
+bool CCoinsViewCache::SpendCoin(const COutPoint &outpoint, Coin* moveout) {
     CCoinsMap::iterator it = FetchCoin(outpoint);
     if (it == cacheCoins.end()) return false;
-    fBitAsset = it->second.coin.fBitAsset;
-    fBitAssetControl = it->second.coin.fBitAssetControl;
-    nAssetID = it->second.coin.nAssetID;
     cachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();
     if (moveout) {
         *moveout = std::move(it->second.coin);

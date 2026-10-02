@@ -438,7 +438,7 @@ static CTxUndo UndoOf(const std::vector<CAmount>& vIn)
 {
     CTxUndo undo;
     for (CAmount n : vIn)
-        undo.vprevout.emplace_back(CTxOut(n, CScript() << OP_TRUE), 5, false, false, false, 0);
+        undo.vprevout.emplace_back(CTxOut(n, CScript() << OP_TRUE), 5, false, false, false, uint256());
     return undo;
 }
 

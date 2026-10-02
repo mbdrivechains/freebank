@@ -7,6 +7,7 @@
 
 #include <house.h>
 
+#include <chainparams.h>
 #include <coins.h>
 #include <consensus/validation.h>
 #include <key.h>
@@ -250,39 +251,91 @@ BOOST_AUTO_TEST_CASE(note_mint_sig_binding)
     BOOST_CHECK(!key.GetPubKey().Verify(NoteMintSigHash(1, u, uint256S("ee"), outs), sig));
 }
 
+// Interest over nBlocks at the network schedule (10%/yr from block 0).
+static CAmount FlatInterest(uint64_t nUnits, uint32_t nBlocks)
+{
+    return NoteDeferralInterest(nUnits, 0, nBlocks, Params().GetConsensus().vDeferInterestSchedule);
+}
+
 BOOST_AUTO_TEST_CASE(note_deferral_interest_math)
 {
-    // 3.5 D6: 5%/yr simple, pro-rated by block, from the DATE OF DEMAND.
-    // BLOCKS_PER_YEAR = 52560, HOUSE_DEFER_INTEREST_BPS = 500.
+    // 3.5 D6 / v0.2.18 Q1-Q2: simple, pro-rated by block, at the scheduled
+    // rate - 10%/yr (1000 bps) from block 0 on every network.
+    // BLOCKS_PER_YEAR = 52560.
     const uint64_t U = 100000000;   // 1 BTX-worth of units
+    BOOST_REQUIRE_EQUAL(DeferInterestBpsAt(Params().GetConsensus().vDeferInterestSchedule, 0), 1000u);
 
-    // A full year at 5%
-    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, BLOCKS_PER_YEAR), U * 5 / 100);
+    // A full year at 10%
+    BOOST_CHECK_EQUAL(FlatInterest(U, BLOCKS_PER_YEAR), U * 10 / 100);
     // Half a year -> half the interest
-    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, BLOCKS_PER_YEAR / 2), U * 5 / 200);
-    // The 90-day window (the locked deferral length) -> ~1.233%
-    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 12960), (uint64_t)U * 500 * 12960 / (10000 * BLOCKS_PER_YEAR));
+    BOOST_CHECK_EQUAL(FlatInterest(U, BLOCKS_PER_YEAR / 2), U * 10 / 200);
+    // 90 days -> ~2.466% (the formula, exactly)
+    BOOST_CHECK_EQUAL(FlatInterest(U, 12960), (uint64_t)U * 1000 * 12960 / (10000 * BLOCKS_PER_YEAR));
+    // The window position does not matter on a one-step schedule
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 700000, 700000 + 12960, Params().GetConsensus().vDeferInterestSchedule),
+                      FlatInterest(U, 12960));
 
     // Degenerate inputs pay nothing
-    BOOST_CHECK_EQUAL(NoteDeferralInterest(0, BLOCKS_PER_YEAR), 0);
-    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 0), 0);
+    BOOST_CHECK_EQUAL(FlatInterest(0, BLOCKS_PER_YEAR), 0);
+    BOOST_CHECK_EQUAL(FlatInterest(U, 0), 0);
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 5000, 4000, Params().GetConsensus().vDeferInterestSchedule), 0);  // reversed
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 0, 1000, {}), 0);                                                  // empty schedule
 
     // Monotone in time and in principal (a holder never loses by waiting)
-    BOOST_CHECK(NoteDeferralInterest(U, 1000) <= NoteDeferralInterest(U, 1001));
-    BOOST_CHECK(NoteDeferralInterest(U, 1000) <= NoteDeferralInterest(2 * U, 1000));
+    BOOST_CHECK(FlatInterest(U, 1000) <= FlatInterest(U, 1001));
+    BOOST_CHECK(FlatInterest(U, 1000) <= FlatInterest(2 * U, 1000));
 
     // Simple, NOT compounding: two years is exactly twice one year
-    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 2 * BLOCKS_PER_YEAR),
-                      2 * NoteDeferralInterest(U, BLOCKS_PER_YEAR));
+    BOOST_CHECK_EQUAL(FlatInterest(U, 2 * BLOCKS_PER_YEAR), 2 * FlatInterest(U, BLOCKS_PER_YEAR));
 
     // The 128-bit path: units near the lambda-max supply over a long wait must
     // not wrap, and interest alone is capped inside the money range.
     const uint64_t bigU = (uint64_t)MAX_MONEY * 3;
-    BOOST_CHECK(NoteDeferralInterest(bigU, BLOCKS_PER_YEAR) <= (CAmount)MAX_MONEY);
-    BOOST_CHECK(NoteDeferralInterest(bigU, 100 * BLOCKS_PER_YEAR) <= (CAmount)MAX_MONEY);
+    BOOST_CHECK(FlatInterest(bigU, BLOCKS_PER_YEAR) <= (CAmount)MAX_MONEY);
+    BOOST_CHECK(FlatInterest(bigU, 100 * BLOCKS_PER_YEAR) <= (CAmount)MAX_MONEY);
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(bigU, 0, 0xffffffffu, {{0, 0xffffffffu}}), (CAmount)MAX_MONEY);
     // ...and for a realistic principal the value is exact, not clamped
-    BOOST_CHECK_EQUAL(NoteDeferralInterest((uint64_t)MAX_MONEY, BLOCKS_PER_YEAR),
-                      (CAmount)((uint64_t)MAX_MONEY * 5 / 100));
+    BOOST_CHECK_EQUAL(FlatInterest((uint64_t)MAX_MONEY, BLOCKS_PER_YEAR),
+                      (CAmount)((uint64_t)MAX_MONEY * 10 / 100));
+}
+
+BOOST_AUTO_TEST_CASE(note_deferral_interest_schedule_piecewise)
+{
+    // v0.2.18: the rate is a HEIGHT SCHEDULE; a later release may append a
+    // step. Interest is computed piecewise, each block at its own rate.
+    const uint64_t U = 100000000;
+    const std::vector<Consensus::DeferInterestStep> v = {{0, 1000}, {100000, 500}, {200000, 2000}};
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(v, 0), 1000u);
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(v, 99999), 1000u);
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(v, 100000), 500u);
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(v, 199999), 500u);
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(v, 200000), 2000u);
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(v, 0xffffffffu), 2000u);
+
+    const auto Exact = [&](uint64_t bpsBlocks) {   // one floor over the summed bps*blocks
+        return (CAmount)(((unsigned __int128)U * bpsBlocks) / ((unsigned __int128)10000 * BLOCKS_PER_YEAR));
+    };
+    // Entirely inside one segment = the flat formula at that segment's rate
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 10, 10 + BLOCKS_PER_YEAR, v), U * 10 / 100);
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 120000, 120000 + BLOCKS_PER_YEAR, v), U * 5 / 100);
+    // Straddling one boundary: 10,000 blocks at 10% then 10,000 at 5%
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 90000, 110000, v), Exact(1000ull * 10000 + 500ull * 10000));
+    // Straddling two boundaries: 1,000 @10% + 100,000 @5% + 3,000 @20%
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 99000, 203000, v),
+                      Exact(1000ull * 1000 + 500ull * 100000 + 2000ull * 3000));
+    // Additive across a split point (up to the single final floor)
+    const CAmount a = NoteDeferralInterest(U, 90000, 150000, v);
+    const CAmount b = NoteDeferralInterest(U, 150000, 210000, v);
+    const CAmount ab = NoteDeferralInterest(U, 90000, 210000, v);
+    BOOST_CHECK(ab >= a + b && ab <= a + b + 1);
+    // A boundary exactly at the window edge
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 100000, 100000 + BLOCKS_PER_YEAR, v), U * 5 / 100);
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 100000 - BLOCKS_PER_YEAR, 100000, v), U * 10 / 100);
+    // Blocks before the first step accrue nothing (schedules start at 0 on
+    // every network, so this range is empty in practice)
+    const std::vector<Consensus::DeferInterestStep> vLate = {{1000, 1000}};
+    BOOST_CHECK_EQUAL(NoteDeferralInterest(U, 0, 2000, vLate), Exact(1000ull * 1000));
+    BOOST_CHECK_EQUAL(DeferInterestBpsAt(vLate, 999), 0u);
 }
 
 BOOST_AUTO_TEST_CASE(note_demand_shape)
@@ -510,9 +563,12 @@ BOOST_AUTO_TEST_CASE(note_mint_rejected_when_house_not_open)
 
 BOOST_AUTO_TEST_CASE(note_redeem_rejected_while_deferred)
 {
-    // Par redemption stops while the option clause is invoked - the holder queues
-    // (NOTE_OP_DEMAND) instead. This is the flagship suspension guard; assert the
-    // CONSENSUS reason, not the wallet mirror.
+    // Par redemption of UNDEMANDED notes stops while the option clause is
+    // invoked - the holder queues (NOTE_OP_DEMAND) instead. This is the
+    // flagship suspension guard; assert the CONSENSUS reason, not the wallet
+    // mirror. v0.2.18: the guard reads the input coins' demand tag (a demanded
+    // note MAY be paid while suspended), so it fires after the holder
+    // signature - the redeem here is fully signed.
     CHouse house = MakeDeferredHouse(1);
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1600), HOUSE_STATUS_DEFERRED);
     auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 1) { out = house; return true; } return false; };
@@ -524,15 +580,15 @@ BOOST_AUTO_TEST_CASE(note_redeem_rejected_while_deferred)
     CKey keyHolder; keyHolder.MakeNewKey(true);
     CPubKey pub = keyHolder.GetPubKey();
     redeem.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
-    redeem.vchHolderSig = std::vector<unsigned char>(70, 0x30);   // guard fires first
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_REDEEM;
-    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
-    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
     mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(redeem.vchHolderPubKey)));
+    BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(1, 100, BillHashOutputs(mtx)), redeem.vchHolderSig));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
 
     auto fnNoBlock = [](uint32_t, uint256&) { return false; };
     CValidationState state; CHouse houseOut; bool fChanged = false;
@@ -625,16 +681,15 @@ static CMutableTransaction MakeDemandedRedeemTx(uint32_t nHouseID, uint64_t nUni
 }
 } // namespace
 
-BOOST_AUTO_TEST_CASE(note_redeem_interest_capped_at_episode_end)
+BOOST_AUTO_TEST_CASE(note_redeem_interest_reopen_window)
 {
-    // Demand at D=10000, recovery at E=15256 (window 5256 = 0.1yr), redeem at
-    // H=60000 - long after. 5%/yr on 1M units for 0.1yr = 5000 sats. The floor
-    // must be EXACTLY that: principal+5000 accepted, principal+4999 rejected.
-    // Pre-DR-2 the floor ran D..H (50000 blocks ~ 52572 sats) - the perpetual
-    // bond this cap retires.
+    // v0.2.18 Q8 (replaces the DR-2 "capped at episode end" rule): demand at
+    // D=10000, reopen at E=15256 (0.1yr). Paid within W of E while open ->
+    // interest D..E (10%/yr x 0.1yr on 1M = 10,000 sats). Paid later -> it
+    // accrued until paid (the old cap would have frozen it at E for ever).
     const uint64_t U = 1000000;
     const uint32_t D = 10000, E = 15256;
-    const int H = 60000;
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
 
     CHouse house;
     house.nHouseID = 7;
@@ -646,61 +701,123 @@ BOOST_AUTO_TEST_CASE(note_redeem_interest_capped_at_episode_end)
     house.status = HOUSE_STATUS_OPEN;
     house.nRegisteredHeight = 1000;
     house.nMintedUnits = 2000000;
-    house.nLastAttestHeight = H - 10;                 // fresh cadence
     house.amountLastAttestReserves = 2000000;         // ratio 10000 bps -> no spread
-    house.nDeferEndedHeight = E;                      // the DR-2 stamp
-    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+    house.nDeferEndedHeight = E;                      // the reopen stamp
 
     CKey keyHolder; keyHolder.MakeNewKey(true);
     const CPubKey pubHolder = keyHolder.GetPubKey();   // named once (two GetPubKey() temporaries = garbage range)
     const std::vector<unsigned char> vchHolder(pubHolder.begin(), pubHolder.end());
     auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 7) { out = house; return true; } return false; };
     auto fnDemandedCoin = [&](const COutPoint&, Coin& coin) {
-        coin = Coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchHolder)), (int)D, false, false, false, 0);
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchHolder)), (int)D, false, false, false, uint256());
         coin.SetNote(7, U, D);                        // demanded at D
         return true;
     };
     auto fnNoBlock = [](uint32_t, uint256&) { return false; };
 
-    const CAmount amountCapped = NoteDeferralInterest(U, E - D);
-    BOOST_REQUIRE_EQUAL(amountCapped, 5000);
+    const CAmount amountCapped = FlatInterest(U, E - D);
+    BOOST_REQUIRE_EQUAL(amountCapped, 10000);
 
-    // Paying principal + interest to the EPISODE END clears the floor - the
-    // clock stopped at recovery, however long the holder sat on the note.
+    // In time (H = E + W): the floor is principal + interest to E, exactly.
     {
+        const int H = (int)(E + W);
+        house.nLastAttestHeight = H - 10;             // fresh cadence
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
         CMutableTransaction mtx = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U + amountCapped);
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut, fChanged));
         BOOST_CHECK(fChanged);
         BOOST_CHECK_EQUAL(houseOut.nMintedUnits, house.nMintedUnits - U);
-    }
-    // One sat under the capped floor is still short - the cap moved the floor,
-    // it did not remove it.
-    {
-        CMutableTransaction mtx = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U + amountCapped - 1);
-        CValidationState state; CHouse houseOut; bool fChanged = false;
-        BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut, fChanged));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-note-redeem-interest-short");
-    }
-    // BOUNDARY (review finding, the >= fix): a demand connecting in the SAME
-    // block as the recovery attestation gets D == E - the forced wait ended the
-    // block it began, so the window is ZERO (floor = principal exactly), NOT
-    // uncapped. With the pre-fix strict '>' this corner reverted to the
-    // perpetual bond (floor to the redeem height, 50000 blocks here).
-    {
-        CHouse houseEq = house;
-        houseEq.nDeferEndedHeight = D;                 // same-block demand + recovery
-        auto fnGetHouseEq = [&](uint32_t id, CHouse& out) { if (id == 7) { out = houseEq; return true; } return false; };
-        // Principal alone clears the floor (zero-block window -> zero interest).
-        CMutableTransaction mtx = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U);
-        CValidationState state; CHouse houseOut; bool fChanged = false;
-        BOOST_CHECK(CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouseEq, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut, fChanged));
-        // And the floor itself still holds: a sat under principal is short.
-        CMutableTransaction mtx2 = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U - 1);
+        CMutableTransaction mtx2 = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U + amountCapped - 1);
         CValidationState state2; CHouse houseOut2; bool fChanged2 = false;
-        BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx2), state2, H, U, fnGetHouseEq, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut2, fChanged2));
+        BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx2), state2, H, U, fnGetHouse, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut2, fChanged2));
         BOOST_CHECK_EQUAL(state2.GetRejectReason(), "bad-note-redeem-interest-short");
     }
+    // Long after (H = 60000): this is a PLAIN demand, so (Q8 follow-up "b")
+    // the clock stopped at E + W: the floor is interest D..E+W exactly - more
+    // than the in-time amount, and nothing for the blocks after E + W.
+    {
+        const int H = 60000;
+        house.nLastAttestHeight = H - 10;
+        const CAmount amountCap = FlatInterest(U, E + W - D);
+        BOOST_REQUIRE(amountCap > amountCapped);
+        BOOST_REQUIRE(FlatInterest(U, (uint32_t)H - D) > amountCap);
+        CMutableTransaction mtx = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U + amountCap);
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        BOOST_CHECK(CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut, fChanged));
+        CMutableTransaction mtx2 = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U + amountCap - 1);
+        CValidationState state2; CHouse houseOut2; bool fChanged2 = false;
+        BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx2), state2, H, U, fnGetHouse, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut2, fChanged2));
+        BOOST_CHECK_EQUAL(state2.GetRejectReason(), "bad-note-redeem-interest-short");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(note_demand_accrual_window_modes)
+{
+    // v0.2.18 Q8 follow-up "a+b" (D-2026-10-02-1): the accrual window for each
+    // kind of demand tag. D = demand, E = latest reopen, W = demand window.
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t D = 10000, E = 15000;
+    const uint32_t tagPlain = NoteDemandTag(D, NOTE_DEMAND_MODE_PLAIN);
+    const uint32_t tagB3 = NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH);
+    const uint32_t tagQueue = NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH_QUEUE);
+
+    // The tag bits: the height reads back masked; the queue marker is distinct.
+    BOOST_CHECK_EQUAL(NoteDemandHeightOf(tagQueue), D);
+    BOOST_CHECK(NoteDemandIsPreAuth(tagQueue) && NoteDemandIsQueue(tagQueue));
+    BOOST_CHECK(NoteDemandIsPreAuth(tagB3) && !NoteDemandIsQueue(tagB3));
+    BOOST_CHECK(!NoteDemandIsPreAuth(tagPlain) && !NoteDemandIsQueue(tagPlain));
+    BOOST_CHECK(NoteDemandAccruesFromDemand(tagPlain));
+    BOOST_CHECK(NoteDemandAccruesFromDemand(tagQueue));
+    BOOST_CHECK(!NoteDemandAccruesFromDemand(tagB3));
+    BOOST_CHECK_EQUAL(NoteDemandHeightOf(tagQueue | NOTE_DEMAND_PROTESTED_BIT), D);
+
+    CHouse open;
+    open.nDeferEndedHeight = E;                        // reopened at E, open now
+    CHouse never;                                      // never suspended
+    CHouse again = open;
+    again.nDeferInvokedHeight = E + 2 * W;             // suspended again later
+
+    auto win = [&](const CHouse& h, uint32_t tag, uint32_t H) {
+        uint32_t s = 0, e = 0;
+        NoteDemandAccrualWindow(h, tag, H, W, s, e);
+        return std::make_pair(s, e);
+    };
+    // Paid within W of the reopen: every kind stops at E (queue kinds from D,
+    // the B3 formal demand from its lapse D + W).
+    BOOST_CHECK(win(open, tagPlain, E + W) == std::make_pair(D, E));
+    BOOST_CHECK(win(open, tagQueue, E + W) == std::make_pair(D, E));
+    BOOST_CHECK(win(open, tagB3, E + W) == std::make_pair(D + W, E));
+    // Paid later with the house still open: queue kinds stop at E + W ("b";
+    // also closes the late-upgrade side door), the B3 formal demand runs on.
+    BOOST_CHECK(win(open, tagPlain, E + 5 * W) == std::make_pair(D, E + W));
+    BOOST_CHECK(win(open, tagQueue, E + 5 * W) == std::make_pair(D, E + W));
+    BOOST_CHECK(win(open, tagB3, E + 5 * W) == std::make_pair(D + W, E + 5 * W));
+    // Paid while suspended again: accrues to payment (no freezing a clock by
+    // reopening briefly).
+    BOOST_CHECK(win(again, tagQueue, E + 3 * W) == std::make_pair(D, E + 3 * W));
+    BOOST_CHECK(win(again, tagPlain, E + 3 * W) == std::make_pair(D, E + 3 * W));
+    // No reopen since the demand: to payment.
+    BOOST_CHECK(win(never, tagQueue, D + 100) == std::make_pair(D, D + 100));
+    BOOST_CHECK(win(never, tagB3, D + 3 * W) == std::make_pair(D + W, D + 3 * W));
+
+    // The interest itself (review fix): a queue demand paid during a LATER
+    // suspension that began after the holder's week (I = E + 2W > E + W) earns
+    // D..E+W plus I..payment - not the open gap between them.
+    const uint64_t U = 1000000;
+    const Consensus::Params& cp = Params().GetConsensus();
+    const uint32_t P = E + 3 * W;
+    for (uint32_t tag : {tagQueue, tagPlain}) {
+        BOOST_CHECK_EQUAL(NoteDemandInterest(again, tag, U, P, cp),
+                          FlatInterest(U, E + W - D) + FlatInterest(U, P - (E + 2 * W)));
+        BOOST_CHECK(NoteDemandInterest(again, tag, U, P, cp) < FlatInterest(U, P - D));
+    }
+    // Re-suspended INSIDE the week: continuous D..payment (no freezing a clock).
+    CHouse quick = open;
+    quick.nDeferInvokedHeight = E + W / 2;
+    BOOST_CHECK_EQUAL(NoteDemandInterest(quick, tagQueue, U, P, cp), FlatInterest(U, P - D));
+    // A B3 formal demand is not a queue demand: unchanged, to payment.
+    BOOST_CHECK_EQUAL(NoteDemandInterest(again, tagB3, U, P, cp), FlatInterest(U, P - (D + W)));
 }
 
 BOOST_AUTO_TEST_CASE(note_redeem_demanded_note_pays_brassage)
@@ -735,14 +852,15 @@ BOOST_AUTO_TEST_CASE(note_redeem_demanded_note_pays_brassage)
     const std::vector<unsigned char> vchHolder(pubHolder.begin(), pubHolder.end());
     auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 8) { out = house; return true; } return false; };
     auto fnDemandedCoin = [&](const COutPoint&, Coin& coin) {
-        coin = Coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchHolder)), (int)D, false, false, false, 0);
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchHolder)), (int)D, false, false, false, uint256());
         coin.SetNote(8, U, D);
         return true;
     };
     auto fnNoBlock = [](uint32_t, uint256&) { return false; };
 
-    // Clear the (capped) interest floor so the brassage guard is what fires.
-    const CAmount amountPayout = (CAmount)U + NoteDeferralInterest(U, E - D);
+    // Clear the interest floor (paid long after the reopen: accrues D..H) so
+    // the brassage guard is what fires.
+    const CAmount amountPayout = (CAmount)U + FlatInterest(U, (uint32_t)H - D);
     CMutableTransaction mtx = MakeDemandedRedeemTx(8, U, keyHolder, amountPayout);
     CValidationState state; CHouse houseOut; bool fChanged = false;
     BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnDemandedCoin, fnDemandedCoin, fnNoBlock, houseOut, fChanged));

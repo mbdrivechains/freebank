@@ -940,7 +940,7 @@ BOOST_AUTO_TEST_CASE(pool_coin_tagging)
     CTransaction tx(mtx);
     CCoinsView base;
     CCoinsViewCache cache(&base);
-    AddCoins(cache, tx, 100, 0, 0, 0, 0, 0, 0);
+    AddCoins(cache, tx, 100);
 
     const Coin& c0 = cache.AccessCoin(COutPoint(tx.GetHash(), 0));
     BOOST_CHECK(c0.fNote && c0.fPoolEscrow);                 // dual-tagged custody
@@ -984,7 +984,7 @@ BOOST_AUTO_TEST_CASE(pool_coin_tagging)
     BOOST_CHECK_EQUAL(PoolShapeReject(mtxS), "OK");
 
     CTransaction txS(mtxS);
-    AddCoins(cache, txS, 101, 0, 0, 0, 0, 0, 0);
+    AddCoins(cache, txS, 101);
     const Coin& s0 = cache.AccessCoin(COutPoint(txS.GetHash(), 0));
     BOOST_CHECK(s0.fNote && s0.fPoolEscrow);
     BOOST_CHECK_EQUAL(s0.nNoteUnits, 100000u - 987u);
@@ -1005,7 +1005,7 @@ BOOST_AUTO_TEST_CASE(pool_coin_default_ctor_clean)
     BOOST_CHECK(!fresh.fLpShare);
     BOOST_CHECK_EQUAL(fresh.nLpUnits, 0u);
 
-    Coin tagged(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(1)), 100, false, false, false, 0);
+    Coin tagged(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(1)), 100, false, false, false, uint256());
     BOOST_CHECK(!tagged.fPoolEscrow && !tagged.fLpShare);
     tagged.SetLpShare(1, 5);
     tagged.Clear();
@@ -1017,7 +1017,7 @@ BOOST_AUTO_TEST_CASE(pool_coin_undo_roundtrip)
 {
     // The pool tags must survive the undo format, or a reorg-restored escrow
     // coin re-enters the UTXO set anyone-can-spend.
-    Coin coin(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, 0);
+    Coin coin(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, uint256());
     coin.SetNote(7, 123456);
     coin.SetPoolEscrow(7);
 
@@ -1031,7 +1031,7 @@ BOOST_AUTO_TEST_CASE(pool_coin_undo_roundtrip)
     BOOST_CHECK_EQUAL(coin2.nNoteUnits, 123456u);
     BOOST_CHECK_EQUAL(coin2.nHouseID, 7);
 
-    Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(PoolFreshPubKey())), 100, false, false, false, 0);
+    Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(PoolFreshPubKey())), 100, false, false, false, uint256());
     lp.SetLpShare(9, 777);
     CDataStream ss2(SER_DISK, PROTOCOL_VERSION);
     ss2 << TxInUndoSerializer(&lp);
@@ -1070,20 +1070,20 @@ static CMutableTransaction MakeSwapSetup(CCoinsViewCache& cache, PoolSwap& swap,
     swap.vchTraderPubKey = traderPub;
     swap.vchTraderSig = DummySig();
 
-    Coin escrowNote(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, 0);
+    Coin escrowNote(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, uint256());
     escrowNote.SetNote(7, 100000);
     escrowNote.SetPoolEscrow(7);
     cache.AddCoin(COutPoint(uint256S("0xe0"), 0), std::move(escrowNote), false);
 
-    Coin escrowBtx(CTxOut(100000, PoolEscrowScript(7)), 100, false, false, false, 0);
+    Coin escrowBtx(CTxOut(100000, PoolEscrowScript(7)), 100, false, false, false, uint256());
     escrowBtx.SetPoolEscrow(7);
     cache.AddCoin(COutPoint(uint256S("0xe1"), 0), std::move(escrowBtx), false);
 
-    Coin traderNote(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+    Coin traderNote(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
     traderNote.SetNote(7, 1000, nTraderDemandHeight);
     cache.AddCoin(COutPoint(uint256S("0xf0"), 0), std::move(traderNote), false);
 
-    Coin feeCoin(CTxOut(10000, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+    Coin feeCoin(CTxOut(10000, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
     cache.AddCoin(COutPoint(uint256S("0xf1"), 0), std::move(feeCoin), false);
 
     CMutableTransaction mtx;
@@ -1136,7 +1136,7 @@ BOOST_AUTO_TEST_CASE(pool_spend_guard)
     // A plain tx cannot spend an LP coin.
     {
         CCoinsView base; CCoinsViewCache cache(&base);
-        Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+        Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
         lp.SetLpShare(7, 500);
         cache.AddCoin(COutPoint(uint256S("0xaa"), 0), std::move(lp), false);
         CMutableTransaction drain;
@@ -1198,17 +1198,17 @@ BOOST_AUTO_TEST_CASE(pool_spend_guard)
     // REMOVE_LIQ: LP conservation (burn + change == spent units).
     {
         CCoinsView base; CCoinsViewCache cache(&base);
-        Coin escrowNote(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, 0);
+        Coin escrowNote(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, uint256());
         escrowNote.SetNote(7, 100000);
         escrowNote.SetPoolEscrow(7);
         cache.AddCoin(COutPoint(uint256S("0xe0"), 0), std::move(escrowNote), false);
-        Coin escrowBtx(CTxOut(100000, PoolEscrowScript(7)), 100, false, false, false, 0);
+        Coin escrowBtx(CTxOut(100000, PoolEscrowScript(7)), 100, false, false, false, uint256());
         escrowBtx.SetPoolEscrow(7);
         cache.AddCoin(COutPoint(uint256S("0xe1"), 0), std::move(escrowBtx), false);
-        Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+        Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
         lp.SetLpShare(7, 5000);
         cache.AddCoin(COutPoint(uint256S("0xaa"), 0), std::move(lp), false);
-        Coin feeCoin(CTxOut(10000, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+        Coin feeCoin(CTxOut(10000, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
         cache.AddCoin(COutPoint(uint256S("0xac"), 0), std::move(feeCoin), false);
 
         PoolRemoveLiq rem;
@@ -1254,7 +1254,7 @@ BOOST_AUTO_TEST_CASE(pool_spend_guard)
         CCoinsView base; CCoinsViewCache cache(&base);
         PoolSwap swap;
         CMutableTransaction mtx = MakeSwapSetup(cache, swap, traderPub);
-        Coin asset(CTxOut(5000, PoolScriptForPubKey(traderPub)), 100, false, true, false, 3);
+        Coin asset(CTxOut(5000, PoolScriptForPubKey(traderPub)), 100, false, true, false, uint256S("03"));
         cache.AddCoin(COutPoint(uint256S("0xab"), 0), std::move(asset), false);
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("0xab"), 0)));
         BOOST_CHECK_EQUAL(PoolInputsReject(mtx, cache), "bad-pool-colored-input");
@@ -1264,14 +1264,14 @@ BOOST_AUTO_TEST_CASE(pool_spend_guard)
     // and nothing else; an LP input is rejected (op 5 is not in the fLpShare set).
     {
         CCoinsView base; CCoinsViewCache cache(&base);
-        Coin escrowNote(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, 0);
+        Coin escrowNote(CTxOut(POOL_DUST_VALUE, PoolEscrowScript(7)), 100, false, false, false, uint256());
         escrowNote.SetNote(7, 100000);
         escrowNote.SetPoolEscrow(7);
         cache.AddCoin(COutPoint(uint256S("0xe0"), 0), std::move(escrowNote), false);
-        Coin escrowBtx(CTxOut(100000, PoolEscrowScript(7)), 100, false, false, false, 0);
+        Coin escrowBtx(CTxOut(100000, PoolEscrowScript(7)), 100, false, false, false, uint256());
         escrowBtx.SetPoolEscrow(7);
         cache.AddCoin(COutPoint(uint256S("0xe1"), 0), std::move(escrowBtx), false);
-        Coin feeCoin(CTxOut(20000, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+        Coin feeCoin(CTxOut(20000, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
         cache.AddCoin(COutPoint(uint256S("0xac"), 0), std::move(feeCoin), false);
 
         PoolRetire ret;
@@ -1296,7 +1296,7 @@ BOOST_AUTO_TEST_CASE(pool_spend_guard)
         BOOST_CHECK_EQUAL(PoolInputsReject(mtx, cache), "OK");
 
         // Add an LP coin as an extra input: the fLpShare guard rejects it.
-        Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, 0);
+        Coin lp(CTxOut(POOL_DUST_VALUE, PoolScriptForPubKey(traderPub)), 100, false, false, false, uint256());
         lp.SetLpShare(7, 500);
         cache.AddCoin(COutPoint(uint256S("0xaa"), 0), std::move(lp), false);
         CMutableTransaction badLp = mtx;

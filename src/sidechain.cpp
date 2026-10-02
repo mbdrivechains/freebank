@@ -460,6 +460,22 @@ bool TxHasUnpayableWithdrawal(const CTransaction& tx, std::string& strReason)
     return false;
 }
 
+void GetTxWithdrawalIDs(const CTransaction& tx, std::vector<uint256>& vID)
+{
+    vID.clear();
+    for (const CTxOut& txout : tx.vout) {
+        std::vector<unsigned char> vch;
+        if (!txout.scriptPubKey.IsSidechainObj(vch))
+            continue;
+        std::unique_ptr<SidechainObj> obj(ParseSidechainObj(vch));
+        if (!obj || obj->sidechainop != DB_SIDECHAIN_WITHDRAWAL_OP)
+            continue;
+        const SidechainWithdrawal* withdrawal = dynamic_cast<const SidechainWithdrawal*>(obj.get());
+        if (withdrawal)
+            vID.push_back(withdrawal->GetID());
+    }
+}
+
 bool ClaimWithdrawalBurn(const SidechainWithdrawal& withdrawal,
                          const std::vector<CTxOut>& vout,
                          std::set<size_t>& setClaimed)

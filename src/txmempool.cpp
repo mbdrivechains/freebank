@@ -450,6 +450,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
     if (it->IsWithdrawalRefund()) {
         setWithdrawalRefund.erase(it->GetWITHDRAWALID());
     }
+    setAssetTx.erase(hash);
 
     totalTxSize -= it->GetTxSize();
     cachedInnerUsage -= it->DynamicMemoryUsage();
@@ -609,6 +610,7 @@ void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigne
 
 void CTxMemPool::_clear()
 {
+    setAssetTx.clear();
     mapLinks.clear();
     mapTx.clear();
     mapNextTx.clear();
@@ -632,11 +634,8 @@ static void CheckInputsAndUpdateCoins(const CTransaction& tx, CCoinsViewCache& m
     CAmount txfee = 0;
     bool fCheckResult = tx.IsCoinBase() || Consensus::CheckTxInputs(tx, state, mempoolDuplicate, spendheight, txfee);
     assert(fCheckResult);
-    CAmount amountAssetIn = CAmount(0);
-    int nControlN = -1;
-    uint32_t nAssetID = 0;
     CTxUndo undo;
-    UpdateCoins(tx, mempoolDuplicate, undo, 1000000, amountAssetIn, nControlN, nAssetID);
+    UpdateCoins(tx, mempoolDuplicate, undo, 1000000);
 }
 
 void CTxMemPool::check(const CCoinsViewCache *pcoins) const
@@ -918,9 +917,11 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
     CTransactionRef ptx = mempool.get(outpoint.hash);
     if (ptx) {
         if (outpoint.n < ptx->vout.size()) {
-            // TODO setting fBitAsset info false / 0 here. It doesn't seem like any
-            // callers will require that info.
-            coin = Coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false, false, false, 0);
+            // No asset colour here, by design (v0.2.18, layer-B review B5): a
+            // tx may not spend an output of an unconfirmed asset tx (mempool
+            // acceptance refuses it, "asset-unconfirmed-parent"), so no caller
+            // of this view ever needs an unconfirmed coin's colour.
+            coin = Coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false, false, false, uint256());
 
             // Bill title / escrow outputs MUST stay tagged even while
             // unconfirmed: the escrow script is spendable by anyone at the

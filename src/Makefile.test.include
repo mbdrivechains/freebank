@@ -49,6 +49,7 @@ BITCOIN_TESTS =\
   test/a5_strictsig_tests.cpp \
   test/addrman_tests.cpp \
   test/amount_tests.cpp \
+  test/asset_tests.cpp \
   test/allocator_tests.cpp \
   test/base32_tests.cpp \
   test/base58_tests.cpp \
@@ -77,6 +78,7 @@ BITCOIN_TESTS =\
   test/crypto_tests.cpp \
   test/cuckoocache_tests.cpp \
   test/DoS_tests.cpp \
+  test/p2p_dos_fixes_tests.cpp \
   test/getarg_tests.cpp \
   test/hash_tests.cpp \
   test/key_tests.cpp \
