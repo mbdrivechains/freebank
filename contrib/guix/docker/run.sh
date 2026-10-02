@@ -20,5 +20,6 @@ exec docker run --rm --init --privileged \
     -v "$TOP:$TOP" -v "$GITDIR:$GITDIR" -w "$TOP" \
     -e HOSTS="${HOSTS:-x86_64-linux-gnu}" -e JOBS="${JOBS:-2}" ${FORCE_VERSION:+-e FORCE_VERSION="$FORCE_VERSION"} \
     ${GUIX_URL:+-e GUIX_URL="$GUIX_URL"} ${SUBSTITUTE_URLS:+-e SUBSTITUTE_URLS="$SUBSTITUTE_URLS"} ${V:+-e V=1} \
+    ${ADDITIONAL_GUIX_COMMON_FLAGS:+-e ADDITIONAL_GUIX_COMMON_FLAGS="$ADDITIONAL_GUIX_COMMON_FLAGS"} \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     freebank-guix "$@"
