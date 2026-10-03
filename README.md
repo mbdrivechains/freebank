@@ -394,7 +394,8 @@ Two things worth knowing before you start:
 ## Verify your download
 
 To review the source of a release and confirm the Linux binary was built from it, see
-[VERIFY.md](VERIFY.md). The quick checks:
+[VERIFY.md](VERIFY.md). How releases are made: [doc/RELEASE_POLICY.md](doc/RELEASE_POLICY.md). Who produces blocks and
+what they include: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md). The quick checks:
 
 Each release lists its files' SHA-256 hashes in `SHA256SUMS`, signed with the FreeBank release key
 (`SHA256SUMS.sig`). The key's public half is below and is also published as a signing key on the
