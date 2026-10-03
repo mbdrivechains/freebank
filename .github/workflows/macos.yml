@@ -7,12 +7,13 @@ on:
 jobs:
   build:
     # One job per Mac CPU: a separate tarball for each, not a universal binary, because BitWindow
-    # picks its download by CPU name. macos-15-intel is GitHub's Intel image.
+    # picks its download by CPU name. macos-15-intel is GitHub's Intel image. macos-14 is retired on 2026-11-02
+    # (brownouts from 10-05), so Apple Silicon builds on macos-15 too: both tarballs need macOS 15 or later.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
             dbbuild: arm-apple-darwin
           - runner: macos-15-intel
