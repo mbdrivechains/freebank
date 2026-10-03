@@ -8,14 +8,16 @@ reserves, and *bills of exchange* backed by an escrow bond — in the lineage of
 free banking (1716–1845), cryptographically translated. It runs as a CUSF/BIP 300–301
 sidechain alongside the drivechain enforcer.
 
-> Be your own bank. Make your own credit.
-
 This is an exploration. It may or may not work out — but it illustrates just another
 possibility that drivechains open up: not only new execution environments or scaling, but
 new *monetary* arrangements settling against Bitcoin.
 
-FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT). It is **experimental,
-pre-audit software** — run it on regtest/testnet/signet with test coins only.
+FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
+
+> **Notice.** FreeBank is software. It is experimental and has not been audited; real money
+> can be lost. Houses are run by independent operators, not by the FreeBank developers, and
+> each operator is responsible for any licence its jurisdiction requires. FreeBank is not
+> offered where using it would be unlawful.
 
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
@@ -42,7 +44,7 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
   M-of-N partner governance; lifecycle register → top-up / admit / exit → wind-down →
   reclaim, with time-locked exit tails and a one-governance-op-per-house-per-block rule.
   RPCs: `registerhouse`, `listhouses`, `attesthouse`, and friends.
-- **Credit notes** (the money): per-house redeemable credit claims. Issuance is
+- **Credit notes**: per-house redeemable credit claims. Issuance is
   **reserve-gated at mint** — a mint must prove live reserves against the cap; notes
   transfer person-to-person; the issuing house redeems at par from reserves.
 - **Bearer redemption** (the holder's teeth): a note holder places a formal *demand* for
@@ -70,7 +72,7 @@ pre-audit software** — run it on regtest/testnet/signet with test coins only.
   noteholders claim pro-rata from the locked escrow pot, then a whole-house residual
   settlement.
 - **The option clause**, translated from the Scottish record: a stressed house may suspend
-  redemption, paying 10% a year on demanded notes until it pays, with its till locked into the
+  redemption, paying interest at the protocol rate on demanded notes until it pays, with its till locked into the
   claim pot. From v0.2.18 a suspension has no end date: it ends when the house reopens (an
   attestation back above its floor) or when its silence makes it insolvent. Holders' demands
   queue and the house may pay them alone. A consensus redemption spread (*brassage*) adds
@@ -108,7 +110,7 @@ v0.2.18 brings ECX credit with no closure date, and assets:
   must upgrade and restart once with `-reindex`** (the coin database now carries each coin's asset).
   The eCash beta chain is kept. A v0.2.17 node stops following the chain at the first asset
   transaction or the first use of the new suspension rules.
-  - A suspended house pays 10% a year on demanded notes, with no end date. A holder's demand is
+  - A suspended house pays interest at the protocol rate (`defer_interest_bps`) on demanded notes, with no end date. A holder's demand is
     pre-authorised by default, so the house can pay it alone (`dischargedemands`); `redeemnote`
     works for demanded notes while the house is suspended; `upgradedemand` turns a plain demand
     into a pre-authorised one. `renewdeferral` is retired.

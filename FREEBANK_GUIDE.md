@@ -60,7 +60,7 @@ the notes are redeemed.
 Bitcoin solved self-custody of base money. FreeBank is an attempt at the other half —
 self-provision of credit — using the mechanism of Scottish free banking (1716–1845, see
 section 6), translated into consensus rules so that reserves are **proven on-chain instead
-of trusted**. Tagline: *be your own bank, make your own credit.*
+of trusted**.
 
 Mechanically, FreeBank is a BIP 300/301 drivechain (a C++ fork of the MIT-licensed
 BitAssets sidechain chassis, itself Bitcoin Core lineage). It has **no coin of its own,
