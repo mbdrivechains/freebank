@@ -307,6 +307,19 @@ bool fHavePruned = false;
 bool fPruneMode = false;
 bool fIsBareMultisigStd = DEFAULT_PERMIT_BAREMULTISIG;
 bool fRequireStandard = true;
+
+unsigned int GetSpentLegacySigOps(const CTransaction& tx, const CCoinsViewCache& view)
+{
+    unsigned int n = 0;
+    for (const CTxIn& in : tx.vin) {
+        const CScript& spk = view.AccessCoin(in.prevout).out.scriptPubKey;
+        n += in.scriptSig.GetSigOpCount(true);
+        n += spk.GetSigOpCount(true);
+        if (spk.IsPayToScriptHash())
+            n += spk.GetSigOpCount(in.scriptSig);   // the redeem script's, counted accurately
+    }
+    return n;
+}
 bool fCheckBlockIndex = false;
 bool fCheckpointsEnabled = DEFAULT_CHECKPOINTS_ENABLED;
 size_t nCoinCacheUsage = 5000 * 300;
@@ -392,6 +405,12 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                          CHouse& houseOut);
+
+static bool CheckHouseMemberOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                                      const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                                      const std::function<bool(uint32_t, const uint160&, CHouseMember&)>& fnGetMember,
+                                      const std::function<uint32_t(uint32_t)>& fnGetCount,
+                                      HouseMemberEffects& effOut);
 
 bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHeight, uint64_t nNoteUnitsIn,
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
@@ -786,7 +805,7 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
 {
     nA = 0;
     nB = 0;
-    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
             mtx.vchHousePayload.size() >= 4) {
         memcpy(&nA, mtx.vchHousePayload.data(), 4);
         return nA != 0;
@@ -1030,6 +1049,13 @@ static void EvictStaleHouseNoteOps()
                 if (!CheckBillOperation(mtx, stateStale, nNextHeight, mi->GetFee(), fnGetBill,
                         fnHaveBillHash, fnGetHouse, fnGetProofCoin, fnGetBlockHash,
                         billResult, houseResult, fHouseChanged))
+                    fStale = true;
+            } else if (fHouseTx && IsHouseMemberOp(mtx.nHouseOp)) {
+                // v0.2.19: a member op's priors are against the confirmed records, which the block just changed
+                auto fnGetMember = [](uint32_t nID, const uint160& key, CHouseMember& rec) { return phousetree->GetHouseMember(nID, key, rec); };
+                auto fnGetCount = [](uint32_t nID) { return phousetree->GetHouseMemberCount(nID); };
+                HouseMemberEffects eff;
+                if (!CheckHouseMemberOperation(mtx, stateStale, nNextHeight, fnGetHouse, fnGetMember, fnGetCount, eff))
                     fStale = true;
             } else if (fHouseTx) {
                 CHouse houseResult;
@@ -1546,6 +1572,31 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return state.DoS(0, false, REJECT_NONSTANDARD, "asset-unconfirmed-parent", false,
                                  "spends an output of an unconfirmed asset transaction; wait for it to confirm");
         }
+        // v0.2.19 (C6 demand-tag-zero-pool-brick): no spending a note output
+        // of an UNCONFIRMED fresh DEMAND, or a receipt of an unconfirmed term-
+        // deposit ORIGINATE. Their tags carry the height of the block that
+        // confirms them (the demand stamp, the receipt's origination), which
+        // the mempool view cannot know: it sees 0, ConnectBlock sees the real
+        // height, so a spend accepted here could fail in every template. They
+        // are spendable one confirmation later. (Their plain change is not
+        // affected.)
+        for (const CTxIn& txin : tx.vin) {
+            CTransactionRef parent = pool.get(txin.prevout.hash);
+            if (!parent)
+                continue;
+            bool fStamped = false;
+            if (parent->nVersion == TRANSACTION_NOTE_VERSION && parent->nNoteOp == NOTE_OP_DEMAND) {
+                NoteDemand d;
+                fStamped = DecodeNotePayload(parent->vchNotePayload, d) && d.nPriorDemandHeight == 0 &&
+                           txin.prevout.n < d.vUnits.size();
+            } else if (parent->nVersion == TRANSACTION_DEPOSIT_VERSION && parent->nDepositOp == DEPOSIT_OP_ORIGINATE) {
+                DepositOriginate o;
+                fStamped = DecodeDepositPayload(parent->vchDepositPayload, o) && txin.prevout.n < o.vPrincipal.size();
+            }
+            if (fStamped)
+                return state.DoS(0, false, REJECT_NONSTANDARD, "unconfirmed-stamp-parent", false,
+                                 "spends a note of an unconfirmed demand or a receipt of an unconfirmed deposit; wait for it to confirm");
+        }
         // This tx moves an asset if it is a genesis or spends a coloured coin.
         // Its inputs are confirmed coins or outputs of plain pooled txs (the
         // rule above), so the view's colours are exact.
@@ -1727,12 +1778,38 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
         }
 
+        // v0.2.19 member-list ops: contextual check against the confirmed records, and their own slot - one
+        // pooled member op per house (consensus: one per house per block, which keeps the priors exact). They never
+        // conflict with house, note or deposit ops (spec 4.4: a member op must not keep a holder's exit out).
+        if (tx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseMemberOp(tx.nHouseOp)) {
+            auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
+            auto fnGetMember = [](uint32_t nID, const uint160& key, CHouseMember& rec) { return phousetree->GetHouseMember(nID, key, rec); };
+            auto fnGetCount = [](uint32_t nID) { return phousetree->GetHouseMemberCount(nID); };
+            HouseMemberEffects eff;
+            if (!CheckHouseMemberOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetMember, fnGetCount, eff))
+                return error("%s: CheckHouseMemberOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+            uint32_t nHouseIDNewLE = 0;
+            memcpy(&nHouseIDNewLE, tx.vchHousePayload.data(), 4);   // shape: the payload decoded, so >= 4 bytes
+            // -memberopguard=0 (regtest only) lets a second one in, so a gate can show the block rule refuse it
+            const bool fGuard = gArgs.GetBoolArg("-memberopguard", true);
+            for (CTxMemPool::txiter mi = pool.mapTx.begin(); fGuard && mi != pool.mapTx.end(); mi++) {
+                const CTransaction& mtx = mi->GetTx();
+                uint32_t nTheirs = 0;
+                if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseMemberOp(mtx.nHouseOp) &&
+                        mtx.vchHousePayload.size() >= 4) {
+                    memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
+                    if (nTheirs == nHouseIDNewLE)
+                        return state.DoS(0, false, REJECT_DUPLICATE, "house-member-op-in-mempool");
+                }
+            }
+        }
+
         // Contextual house checks. Consensus allows ONE house op per house per
         // block (deterministic undo), and house ops other than RECLAIM spend no
         // house-tagged coins, so two ops for the same house could otherwise sit
         // in the mempool together and invalidate our own BMM template. Reject
         // at admission if the mempool already carries an op for this house.
-        if (tx.nVersion == TRANSACTION_HOUSE_VERSION) {
+        else if (tx.nVersion == TRANSACTION_HOUSE_VERSION) {
             auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
             auto fnHaveHouseHash = [](const uint256& hash) { return phousetree->HaveHouseHash(hash); };
             auto fnHaveClassID = [](const std::string& strClassID) { return phousetree->HaveClassID(strClassID); };
@@ -1763,12 +1840,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // incoming tx is ALSO a REGISTER (classID / houseID collision);
             // otherwise compare the leading 4-byte dense nHouseID directly. This
             // keeps the common (non-register) case decode-free.
-            const bool fIncomingRegister = (tx.nHouseOp == HOUSE_OP_REGISTER);
+            const bool fIncomingRegister = IsHouseRegisterOp(tx.nHouseOp);
             const uint256 hashNew = fIncomingRegister ? houseResult.houseID : uint256();
             std::string strClassNew;
             if (fIncomingRegister) {
                 HouseRegister reg;
-                if (DecodeHousePayload(tx.vchHousePayload, reg))
+                uint8_t nFlags = 0;
+                if (DecodeHouseRegisterAny(tx, reg, nFlags))
                     strClassNew = reg.strClassID;
             }
             uint32_t nHouseIDNewLE = 0;
@@ -1778,11 +1856,14 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                 const CTransaction& mtx = mi->GetTx();
                 if (mtx.nVersion == TRANSACTION_HOUSE_VERSION) {
-                    const bool fTheirsRegister = (mtx.nHouseOp == HOUSE_OP_REGISTER);
-                    if (fIncomingRegister && fTheirsRegister) {
+                    const bool fTheirsRegister = IsHouseRegisterOp(mtx.nHouseOp);
+                    if (IsHouseMemberOp(mtx.nHouseOp)) {
+                        // a pooled member op takes no house slot (spec 4.4)
+                    } else if (fIncomingRegister && fTheirsRegister) {
                         HouseRegister mreg;
-                        if (DecodeHousePayload(mtx.vchHousePayload, mreg)) {
-                            if (HouseIDFromDeclaration(mreg) == hashNew || mreg.strClassID == strClassNew)
+                        uint8_t nMFlags = 0;
+                        if (DecodeHouseRegisterAny(mtx, mreg, nMFlags)) {
+                            if (HouseIDFromDeclaration(mreg, nMFlags) == hashNew || mreg.strClassID == strClassNew)
                                 return state.DoS(0, false, REJECT_DUPLICATE, "house-op-in-mempool");
                         }
                     } else if (!fIncomingRegister && !fTheirsRegister) {
@@ -1903,7 +1984,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                             return state.DoS(0, false, REJECT_DUPLICATE, "note-op-in-mempool");
                     }
                     // A governance op for the same house?
-                    else if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+                    else if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
                             mtx.vchHousePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
@@ -1942,7 +2023,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 memcpy(&nHouseDemanded, tx.vchNotePayload.data(), 4); // nHouseID leads every note payload
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                     const CTransaction& mtx = mi->GetTx();
-                    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+                    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
                             mtx.vchHousePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
@@ -1984,7 +2065,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
-                    } else if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+                    } else if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
                             mtx.vchHousePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -2026,7 +2107,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         return state.DoS(0, false, REJECT_DUPLICATE, "pool-op-in-mempool");
                 }
                 else if (tx.nPoolOp == POOL_OP_CREATE &&
-                        mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+                        mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
                         mtx.vchHousePayload.size() >= 4) {
                     uint32_t nTheirs = 0;
                     memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
@@ -2043,7 +2124,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 else if (tx.nPoolOp == POOL_OP_RETIRE) {
                     uint32_t nTheirs = 0;
                     bool fTheirsHouseChanging = false;
-                    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp != HOUSE_OP_REGISTER &&
+                    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
                             mtx.vchHousePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -2345,6 +2426,20 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST)
             return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-too-many-sigops", false,
                 strprintf("%d", nSigOpsCost));
+
+        // v0.2.19 (CVE-2025-46598): bounds on the legacy-sighash work one
+        // unconfirmed transaction can cost us, whatever its version. Upstream
+        // relies on standardness, which this chain leaves off (FreeBank's
+        // operations use their own versions and scripts). Legacy sighash
+        // re-serialises the transaction for every signature check, so the cost
+        // is sigops x size: at most MAX_TX_LEGACY_SIGOPS signature operations in
+        // the scripts it runs (Core 30's policy) and MAX_STANDARD_TX_WEIGHT.
+        if (GetTransactionWeight(tx) > MAX_STANDARD_TX_WEIGHT)
+            return state.DoS(0, false, REJECT_NONSTANDARD, "tx-size");
+        const unsigned int nLegacySigOps = GetSpentLegacySigOps(tx, view);
+        if (nLegacySigOps > MAX_TX_LEGACY_SIGOPS)
+            return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-nonstandard-too-many-sigops", false,
+                strprintf("%u legacy sigops", nLegacySigOps));
 
         CAmount mempoolRejectFee = pool.GetMinFee(gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000).GetFee(nSize);
         if (!bypass_limits && mempoolRejectFee > 0 && nModifiedFees < mempoolRejectFee) {
@@ -2959,6 +3054,147 @@ static bool VerifyHouseApprovers(const CHouse& house, const std::vector<uint32_t
                                  const uint256& sighash, uint32_t nRequired,
                                  CValidationState& state, const char* reject);
 
+/** v0.2.19 members-only houses: is keyid an active member of house nHouseID at nHeight? Reads only the CONFIRMED
+ * member records, so the answer for a height does not depend on the order of transactions within a block (spec 5):
+ * a record staged by a member op at height c only takes effect from c + 1 anyway. */
+static bool IsActiveHouseMember(uint32_t nHouseID, const uint160& keyid, int nHeight)
+{
+    CHouseMember rec;
+    return phousetree && phousetree->GetHouseMember(nHouseID, keyid, rec) && rec.IsActiveAt((uint32_t)nHeight);
+}
+
+/** v0.2.19 (spec 4.0): ISSUE = MINT, DISCOUNT, ORIGINATE; PASS_ON = TRANSFER, deposit TRANSFER, a plain DEMAND's
+ * re-issue. They differ only for a redeem-only house. */
+enum class MembersOnlyMove { ISSUE, PASS_ON };
+
+/** v0.2.19 members-only houses, "the one rule" (spec 4.1). Every output tx tags as a note or a term-deposit receipt
+ * of house must pay a P2PKH to a keyid the house allows at nHeight:
+ *  - an active member, or one of the house's own keys (implicit members, spec 4.2), or
+ *  - the spender's own key, the one pinned to the spent coins (exception 1; pvchSpender is null for ISSUE ops).
+ * A redeem-only house allows only the spender's own key and its own keys when notes are passed on, so members can
+ * split coins and hand them back but never pay each other.
+ * One pass over the outputs through the shared taggers (ApplyNoteCoinTags, ApplyBillCoinTags, the deposit receipt
+ * layout), so any op that creates such outputs is covered by calling this. Pre-auth DEMAND and PROTEST re-issue into
+ * custody pinned to the holder (exception 2) and do not call it; REDEEM, CLAIM and settle only burn. */
+static bool CheckMembersOnlyOutputs(const CTransaction& tx, CValidationState& state, int nHeight, const CHouse& house,
+                                    MembersOnlyMove move, const std::vector<unsigned char>* pvchSpender)
+{
+    if (!house.IsMembersOnly())
+        return true;
+    const std::vector<uint160> vOwn = HouseOwnKeyIDs(house);
+    const bool fSpender = pvchSpender != nullptr;
+    const uint160 keySpender = fSpender ? uint160(CPubKey(*pvchSpender).GetID()) : uint160();
+    const bool fPassOnRedeemOnly = house.IsRedeemOnly() && move == MembersOnlyMove::PASS_ON;
+
+    size_t nReceipts = 0;
+    if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION) {
+        if (tx.nDepositOp == DEPOSIT_OP_ORIGINATE) {
+            DepositOriginate o;
+            if (DecodeDepositPayload(tx.vchDepositPayload, o) && o.nHouseID == house.nHouseID)
+                nReceipts = o.vPrincipal.size();
+        } else if (tx.nDepositOp == DEPOSIT_OP_TRANSFER) {
+            DepositTransfer x;
+            if (DecodeDepositPayload(tx.vchDepositPayload, x) && x.nHouseID == house.nHouseID)
+                nReceipts = 1;
+        }
+    }
+
+    // Only the payload's tagged range can hold this house's notes (mempool review M1: the taggers decode the
+    // payload per output, so scanning every output of a large tx was unbounded work before any signature check).
+    size_t nScan = 0;
+    if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
+        NoteMint m; NoteTransfer x; NoteDemand d; NoteProtest pr;
+        if (tx.nNoteOp == NOTE_OP_MINT && DecodeNotePayload(tx.vchNotePayload, m)) nScan = m.vUnits.size();
+        else if (tx.nNoteOp == NOTE_OP_TRANSFER && DecodeNotePayload(tx.vchNotePayload, x)) nScan = x.vUnits.size();
+        else if (tx.nNoteOp == NOTE_OP_DEMAND && DecodeNotePayload(tx.vchNotePayload, d)) nScan = d.vUnits.size();
+        else if (tx.nNoteOp == NOTE_OP_PROTEST && DecodeNotePayload(tx.vchNotePayload, pr)) nScan = pr.vUnits.size();
+    } else if (tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp == BILL_OP_DISCOUNT) {
+        BillDiscount bd;
+        if (DecodeBillPayload(tx.vchBillPayload, bd)) nScan = 1 + (size_t)bd.nNoteOutputs;
+    }
+    nScan = std::min(std::max(nScan, nReceipts), tx.vout.size());
+
+    for (uint32_t n = 0; n < nScan; n++) {
+        Coin coin(tx.vout[n], nHeight, false, false, false, uint256());
+        ApplyNoteCoinTags(tx, n, coin, true /* fConnected */, (uint32_t)nHeight);
+        ApplyBillCoinTags(tx, n, coin);
+        const bool fTagged = (coin.fNote && coin.nHouseID == house.nHouseID) || n < nReceipts;
+        if (!fTagged)
+            continue;
+        // Exactly P2PKH (review F4: P2PK also yields a key id)
+        CTxDestination dest;
+        const CKeyID* pKey = ExtractDestination(tx.vout[n].scriptPubKey, dest) ? boost::get<CKeyID>(&dest) : nullptr;
+        if (!pKey || tx.vout[n].scriptPubKey != GetScriptForDestination(*pKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-members-only-script");
+        const uint160 key = *pKey;
+        bool fAllowed = (fSpender && key == keySpender) || std::find(vOwn.begin(), vOwn.end(), key) != vOwn.end();
+        if (!fAllowed && !fPassOnRedeemOnly)
+            fAllowed = IsActiveHouseMember(house.nHouseID, key, nHeight);
+        // DoS 10, not 100 (review F6): membership changes with height (an add counts from the next block, a
+        // removal after its delay), so an honest peer can relay a payment that crossed a boundary
+        if (!fAllowed)
+            return state.DoS(10, false, REJECT_INVALID, fPassOnRedeemOnly ? "bad-house-redeem-only" : "bad-house-not-member");
+    }
+    return true;
+}
+
+/** v0.2.19 member-list ops (spec 4.4): MEMBER_ADD, MEMBER_REMOVE, MEMBER_PURGE of a members-only house, approved by
+ * its M-of-N over the inputs (no replay). Every prior and the count prior must equal the CONFIRMED records: the
+ * callers' fnGetHouse / fnGetMember / fnGetCount read the DB only, never this block's staged changes, so the op's
+ * validity does not depend on its place in the block (one member op per house per block keeps the priors exact).
+ * effOut gets the records and count this op writes. */
+static bool CheckHouseMemberOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                                      const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                                      const std::function<bool(uint32_t, const uint160&, CHouseMember&)>& fnGetMember,
+                                      const std::function<uint32_t(uint32_t)>& fnGetCount,
+                                      HouseMemberEffects& effOut)
+{
+    HouseMemberOp op;
+    if (!IsHouseMemberOp(tx.nHouseOp) || !DecodeHousePayload(tx.vchHousePayload, op))
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-member-payload");
+    CHouse house;
+    if (!fnGetHouse(op.nHouseID, house))
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
+    if (!house.IsMembersOnly())
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-member-open-house");
+    // Stale-state refusals (count, priors, record state) score 10, not 100 (mempool review L3): an honest peer can
+    // relay a correctly signed op that a block has just made stale. The cheap count read goes before the signatures.
+    if (op.nPrevCount != fnGetCount(op.nHouseID))
+        return state.DoS(10, false, REJECT_INVALID, "bad-house-member-prior-count");
+    const uint256 sighash = HouseMemberSigHash(house.houseID, tx.nHouseOp, op, NoteHashPrevouts(tx));
+    if (!VerifyHouseApprovers(house, op.vApproverIndex, op.vApproverSig, sighash, house.nThresholdM, state,
+                              "bad-house-member-approver"))
+        return false;
+
+    const std::vector<uint160> vOwn = HouseOwnKeyIDs(house);
+    const uint32_t nH = (uint32_t)nHeight;
+    uint32_t nCount = op.nPrevCount;
+    effOut = HouseMemberEffects();
+    for (size_t i = 0; i < op.vKeyID.size(); i++) {
+        const uint160& key = op.vKeyID[i];
+        HouseMemberPrior cur;
+        cur.fPresent = fnGetMember(op.nHouseID, key, cur.rec) ? 1 : 0;
+        if (!(cur == op.vPrior[i]))
+            return state.DoS(10, false, REJECT_INVALID, "bad-house-member-prior");
+        // The house's own keys are members already (implicit, never stored)
+        if (tx.nHouseOp == HOUSE_OP_MEMBER_ADD && std::find(vOwn.begin(), vOwn.end(), key) != vOwn.end())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-member-own-key");
+        HouseMemberPrior next;
+        std::string strReject;
+        if (!HouseMemberNext(tx.nHouseOp, cur, nH, next, strReject))
+            return state.DoS(10, false, REJECT_INVALID, strReject);
+        if (tx.nHouseOp == HOUSE_OP_MEMBER_ADD && !cur.fPresent)
+            nCount++;
+        else if (tx.nHouseOp == HOUSE_OP_MEMBER_PURGE)
+            nCount--;
+        effOut.mapRecord[std::make_pair(op.nHouseID, key)] = next;
+    }
+    if (nCount > MAX_HOUSE_MEMBERS)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-member-cap");
+    effOut.mapCount[op.nHouseID] = nCount;
+    return true;
+}
+
 /** Every payload ECDSA site is strict (A5, SECURITY_GATE_SIGNOFF_A5.md):
  * canonical encoding AND a valid signature, so no confirmed op ever has a
  * second valid encoding. B1's ops 5-8 were born this way; the A5 swap routed
@@ -3188,6 +3424,9 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // book or its issue while holders are queueing (CM-3 rung 1).
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-house-status");
+        // v0.2.19 members-only: the seller is paid in the house's new notes, so the seller must be a member
+        if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
+            return false;
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
                 (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-attest-stale");
@@ -3551,12 +3790,17 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                          CHouse& houseOut)
 {
-    if (tx.nHouseOp == HOUSE_OP_REGISTER) {
+    // v0.2.19: member-list ops change no house record; their callers route them to CheckHouseMemberOperation
+    if (IsHouseMemberOp(tx.nHouseOp))
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-member-op-route");
+
+    if (IsHouseRegisterOp(tx.nHouseOp)) {
         HouseRegister reg;
-        if (!DecodeHousePayload(tx.vchHousePayload, reg))
+        uint8_t nFlags = 0;
+        if (!DecodeHouseRegisterAny(tx, reg, nFlags))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-register-payload");
 
-        const uint256 houseID = HouseIDFromDeclaration(reg);
+        const uint256 houseID = HouseIDFromDeclaration(reg, nFlags);
         if (fnHaveHouseHash(houseID))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-duplicate");
         if (fnHaveClassID(reg.strClassID))
@@ -3566,7 +3810,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // that partner's own pledge (index + amount). These N ECDSA verifies
         // run here - contextually, AFTER Consensus::CheckTxInputs - so orphan
         // v12 spam cannot force free signature work (Bills DoS pricing).
-        const uint256 declDigest = HouseDeclarationDigest(reg);
+        const uint256 declDigest = HouseDeclarationDigest(reg, nFlags);
         for (size_t i = 0; i < reg.vPartnerPubKey.size(); i++) {
             const uint256 sighash = HouseRegisterSigHash(declDigest, i, reg.vPledgeAmount[i]);
             if (!CPubKey(reg.vPartnerPubKey[i]).VerifyStrict(sighash, reg.vPartnerSig[i]))
@@ -3580,6 +3824,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         houseOut.strClassID = reg.strClassID;
         houseOut.nDenomMgGold = reg.nDenomMgGold;
         houseOut.vchRedemptionDestPK = reg.vchRedemptionDestPK;
+        houseOut.nFlags = nFlags;   // v0.2.19: immutable from here (spec 4.0)
         houseOut.status = HOUSE_STATUS_OPEN;
         houseOut.nRegisteredHeight = nHeight;
         // Attestation clock starts at registration: the house has one full
@@ -4276,6 +4521,9 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // than stored - cannot issue; only redemption and recovery capital.
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-house-not-open");
+        // v0.2.19 members-only: new notes go to members (spec 4.1)
+        if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
+            return false;
 
         // CAPITAL cap (CM-2): N + total + D <= lambda * E, with lambda =
         // HOUSE_LAMBDA_X10/10 and E = active escrow (sats). D = outstanding term
@@ -4362,6 +4610,13 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!CPubKey(xfer.vchSenderPubKey).VerifyStrict(
                 NoteTransferSigHash(xfer.nHouseID, xfer.vUnits, hashOutputs), xfer.vchSenderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-transfer-sig");
+        // v0.2.19 members-only: notes pass on only to members, or back to the sender's own key (spec 4.1). The house
+        // must be known (fail closed, review F3; notes of a house that does not exist cannot exist).
+        CHouse house;
+        if (!fnGetHouse(xfer.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::PASS_ON, &xfer.vchSenderPubKey))
+            return false;
         return true; // no house-state change
     }
 
@@ -4644,6 +4899,11 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-house-closed");
             }
         }
+        // v0.2.19 members-only: a PLAIN demand re-issues to any P2PKH the holder names (shape only), so it is held to
+        // the rule (spec 4.1, the review's blocker). Pre-auth demands re-issue into custody pinned to the holder.
+        if (dem.fPreAuth == NOTE_DEMAND_MODE_PLAIN &&
+                !CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::PASS_ON, &dem.vchHolderPubKey))
+            return false;
 
         // The holder authorizes the exact re-issue (units + outputs).
         if (!CPubKey(dem.vchHolderPubKey).VerifyStrict(
@@ -4899,6 +5159,9 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // house cannot take on new term liabilities (it is already in trouble).
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-originate-house-not-open");
+        // v0.2.19 members-only: receipts go to members (spec 4.1)
+        if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
+            return false;
 
         // Per-receipt maturity: strictly in the future (a term is > 0 blocks) and
         // within the bound. Accumulate the 128-bit weighted maturity in one pass.
@@ -4980,6 +5243,13 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
                     x.nOriginationHeight, hashOutputs),
                 x.vchSenderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-transfer-sig");
+        // v0.2.19 members-only: a receipt passes on only to a member, or back to the sender's own key (spec 4.1). Fail
+        // closed on an unknown house (review F3).
+        CHouse house;
+        if (!fnGetHouse(x.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-unknown-house");
+        if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::PASS_ON, &x.vchSenderPubKey))
+            return false;
         return true; // whole-receipt reassignment - no house-state change
     }
 
@@ -5188,6 +5458,10 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         CHouse house;
         if (!fnGetHouse(create.nPoolID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-unknown-house");
+        // v0.2.19 (spec 4.3): no pool for a members-only or redeem-only house at launch. Every later pool op needs
+        // the pool, so this closes every pool and LP-share route.
+        if (house.IsMembersOnly())
+            return state.DoS(100, false, REJECT_INVALID, "bad-pool-members-only-house");
         // The house charters its own venue - only while effectively Open
         // (operator decision 1). Every LATER pool op is status-UNGATED.
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
@@ -6288,7 +6562,48 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         // Undo HouseDB updates. One house op per house per block (consensus)
         // keeps every inverse deterministic from the payload + current state.
         if (fHouseUndo && tx.nVersion == TRANSACTION_HOUSE_VERSION) {
-            if (tx.nHouseOp == HOUSE_OP_REGISTER) {
+            if (IsHouseMemberOp(tx.nHouseOp)) {
+                // v0.2.19: every record and the count back to the op's priors. Restore-to-value, so a repeated
+                // disconnect is harmless; one member op per house per block means no sibling touched them.
+                HouseMemberOp op;
+                if (!DecodeHousePayload(tx.vchHousePayload, op)) {
+                    error("DisconnectBlock(): Failed to decode a house member op!");
+                    return DISCONNECT_FAILED;
+                }
+                // Each record and the count must be what this op wrote or already its prior (a repeated undo), else
+                // the DB is not in the state this block left it in: fail closed (state review, finding 5)
+                uint32_t nCountAfter = op.nPrevCount;
+                for (size_t k = 0; k < op.vKeyID.size() && k < op.vPrior.size(); k++) {
+                    HouseMemberPrior cur, expect;
+                    cur.fPresent = phousetree->GetHouseMember(op.nHouseID, op.vKeyID[k], cur.rec) ? 1 : 0;
+                    std::string strReject;
+                    if (!HouseMemberNext(tx.nHouseOp, op.vPrior[k], (uint32_t)pindex->nHeight, expect, strReject) ||
+                            !(cur == expect || cur == op.vPrior[k])) {
+                        error("DisconnectBlock(): House member record undo mismatch!");
+                        return DISCONNECT_FAILED;
+                    }
+                    if (tx.nHouseOp == HOUSE_OP_MEMBER_ADD && !op.vPrior[k].fPresent)
+                        nCountAfter++;
+                    else if (tx.nHouseOp == HOUSE_OP_MEMBER_PURGE)
+                        nCountAfter--;
+                }
+                const uint32_t nCountNow = phousetree->GetHouseMemberCount(op.nHouseID);
+                if (nCountNow != nCountAfter && nCountNow != op.nPrevCount) {
+                    error("DisconnectBlock(): House member count undo mismatch!");
+                    return DISCONNECT_FAILED;
+                }
+                for (size_t k = 0; k < op.vKeyID.size() && k < op.vPrior.size(); k++) {
+                    if (!phousetree->WriteHouseMember(op.nHouseID, op.vKeyID[k], op.vPrior[k])) {
+                        error("DisconnectBlock(): Failed to undo a house member record!");
+                        return DISCONNECT_FAILED;
+                    }
+                }
+                if (!phousetree->WriteHouseMemberCount(op.nHouseID, op.nPrevCount)) {
+                    error("DisconnectBlock(): Failed to undo a house member count!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (IsHouseRegisterOp(tx.nHouseOp)) {
                 uint32_t nIDLast = 0;
                 phousetree->GetLastHouseID(nIDLast);
 
@@ -7525,6 +7840,18 @@ static L1Answer CheckDepositWithL1(const SidechainDeposit& d, CAmount amountPrev
     for (const L1DepositEvent& ev : events.vDeposit) {
         if (ev.outpoint != outpoint)
             continue;
+        // v0.2.19 (7a): the address the eCash transaction itself carries, read
+        // as the enforcer reads it. The enforcer's word alone let a wrong or
+        // hostile enforcer redirect a deposit on the node that trusted it. In
+        // the enforcer's (BIP300) layout only, as on every public network: the
+        // BitcoinX layout of regtest's default has no enforcer behind it.
+        if (UseCUSFBundleFormat()) {
+            std::string strTxAddress;
+            if (!GetDepositAddressFromL1Tx(d.dtx, d.nBurnIndex, strTxAddress) || strTxAddress != d.strDest) {
+                strWhy = "its address is not the one its eCash transaction carries";
+                return L1Answer::NO;
+            }
+        }
         if (std::string(ev.vchAddress.begin(), ev.vchAddress.end()) != d.strDest) {
             strWhy = "its address is not the one the depositor wrote";
             return L1Answer::NO;
@@ -7732,6 +8059,13 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
 
     CBlockUndo blockundo;
 
+    // v0.2.19 (7b, CVE-2024-52911): txdata is declared before control so it
+    // outlives it. Locals are destroyed in reverse order, and control's
+    // destructor waits for the script-check threads, which read txdata: on an
+    // early return they could read it after it was freed.
+    std::vector<PrecomputedTransactionData> txdata;
+    txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
+
     CCheckQueueControl<CScriptCheck> control(fScriptChecks && nScriptCheckThreads ? &scriptcheckqueue : nullptr);
 
     std::vector<int> prevheights;
@@ -7739,8 +8073,6 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
-    std::vector<PrecomputedTransactionData> txdata;
-    txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
     CAmount nDepositPayout = 0;
     // v0.2.17 A3: coinbase outputs already claimed as a deposit or refund
     // payout. vout[0] is the block maker's own and never counts as one. Before,
@@ -7758,6 +8090,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     std::map<uint32_t, CBill> mapBillUpdate;    // pre-existing bills mutated in this block
     uint32_t nBillIDNext = 0;                   // lazily seeded from BillDB
     std::vector<CHouse> vHouseNew;              // houses registered in this block
+    HouseMemberEffects memberEffects;           // v0.2.19: member records this block writes (one op per house)
+    std::set<uint32_t> setMemberOpHouse;
     std::map<uint32_t, CHouse> mapHouseUpdate;  // pre-existing houses mutated in this block
     uint32_t nHouseIDNext = 0;                  // lazily seeded from HouseDB
     std::map<uint32_t, CPool> mapPoolUpdate;    // pools created or mutated in this block
@@ -8370,10 +8704,11 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         if (fHouseDBReplay && tx.nVersion == TRANSACTION_HOUSE_VERSION) {
             // Crash replay: effects already in HouseDB - recover the dense id
             // for coin tagging only (RollforwardBlock pattern)
-            if (tx.nHouseOp == HOUSE_OP_REGISTER) {
+            if (IsHouseRegisterOp(tx.nHouseOp)) {
                 HouseRegister reg;
-                if (DecodeHousePayload(tx.vchHousePayload, reg))
-                    phousetree->GetHouseIDByHash(HouseIDFromDeclaration(reg), nNewHouseID);
+                uint8_t nFlags = 0;
+                if (DecodeHouseRegisterAny(tx, reg, nFlags))
+                    phousetree->GetHouseIDByHash(HouseIDFromDeclaration(reg, nFlags), nNewHouseID);
             } else if (tx.nHouseOp == HOUSE_OP_TOPUP) {
                 HouseTopup topup;
                 if (DecodeHousePayload(tx.vchHousePayload, topup))
@@ -8455,42 +8790,63 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 return true;
             };
 
-            CHouse houseResult;
-            if (!CheckHouseOperation(tx, state, pindex->nHeight, fnGetHouse, fnHaveHouseHash, fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult))
-                return error("ConnectBlock(): CheckHouseOperation on %s failed with %s",
-                    tx.GetHash().ToString(), FormatStateMessage(state));
-
-            if (tx.nHouseOp == HOUSE_OP_REGISTER) {
-                if (nHouseIDNext == 0) {
-                    uint32_t nIDLast = 0;
-                    phousetree->GetLastHouseID(nIDLast);
-                    nHouseIDNext = nIDLast + 1;
+            if (IsHouseMemberOp(tx.nHouseOp)) {
+                // v0.2.19 member-list op: checked against the CONFIRMED house and member records only (spec 5), so
+                // its place in the block does not matter; one per house per block keeps its priors exact. Its
+                // records are written with the block's house effects.
+                auto fnGetHouseDB = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
+                auto fnGetMember = [](uint32_t nID, const uint160& key, CHouseMember& rec) { return phousetree->GetHouseMember(nID, key, rec); };
+                auto fnGetCount = [](uint32_t nID) { return phousetree->GetHouseMemberCount(nID); };
+                HouseMemberEffects eff;
+                if (!CheckHouseMemberOperation(tx, state, pindex->nHeight, fnGetHouseDB, fnGetMember, fnGetCount, eff))
+                    return error("ConnectBlock(): CheckHouseMemberOperation on %s failed with %s",
+                        tx.GetHash().ToString(), FormatStateMessage(state));
+                for (const auto& kv : eff.mapCount) {
+                    if (!setMemberOpHouse.insert(kv.first).second)
+                        return state.DoS(100, error("ConnectBlock(): second member op in block for house %u", kv.first),
+                            REJECT_INVALID, "bad-house-member-multiple-ops");
+                    memberEffects.mapCount[kv.first] = kv.second;
                 }
-                houseResult.nHouseID = nHouseIDNext++;
-                vHouseNew.push_back(houseResult);
-                nNewHouseID = houseResult.nHouseID;
+                for (const auto& kv : eff.mapRecord)
+                    memberEffects.mapRecord[kv.first] = kv.second;
             } else {
-                // One op per house per block: a second mutation of a house
-                // already staged (registered or updated this block) is invalid
-                for (const CHouse& h : vHouseNew) {
-                    if (h.nHouseID == houseResult.nHouseID)
+                CHouse houseResult;
+                if (!CheckHouseOperation(tx, state, pindex->nHeight, fnGetHouse, fnHaveHouseHash, fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult))
+                    return error("ConnectBlock(): CheckHouseOperation on %s failed with %s",
+                        tx.GetHash().ToString(), FormatStateMessage(state));
+
+                if (IsHouseRegisterOp(tx.nHouseOp)) {
+                    if (nHouseIDNext == 0) {
+                        uint32_t nIDLast = 0;
+                        phousetree->GetLastHouseID(nIDLast);
+                        nHouseIDNext = nIDLast + 1;
+                    }
+                    houseResult.nHouseID = nHouseIDNext++;
+                    vHouseNew.push_back(houseResult);
+                    nNewHouseID = houseResult.nHouseID;
+                } else {
+                    // One op per house per block: a second mutation of a house
+                    // already staged (registered or updated this block) is invalid
+                    for (const CHouse& h : vHouseNew) {
+                        if (h.nHouseID == houseResult.nHouseID)
+                            return state.DoS(100, error("ConnectBlock(): second house op in block for house %u",
+                                houseResult.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
+                    }
+                    if (mapHouseUpdate.count(houseResult.nHouseID))
                         return state.DoS(100, error("ConnectBlock(): second house op in block for house %u",
                             houseResult.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
-                }
-                if (mapHouseUpdate.count(houseResult.nHouseID))
-                    return state.DoS(100, error("ConnectBlock(): second house op in block for house %u",
-                        houseResult.nHouseID), REJECT_INVALID, "bad-house-multiple-ops");
-                mapHouseUpdate[houseResult.nHouseID] = houseResult;
+                    mapHouseUpdate[houseResult.nHouseID] = houseResult;
 
-                // TOPUP / ADMIT / DEFER create a new escrow output that AddCoins
-                // must tag - propagate the dense id (RollforwardBlock does the
-                // same). Without this the escrow enters chainstate UNTAGGED
-                // (anyone-can-spend + a connect-vs-replay consensus split).
-                // DEFER's output is the locked till (3.5 D11); it is escrow
-                // custody exactly like a pledge.
-                if (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT ||
-                        tx.nHouseOp == HOUSE_OP_DEFER)
-                    nNewHouseID = houseResult.nHouseID;
+                    // TOPUP / ADMIT / DEFER create a new escrow output that AddCoins
+                    // must tag - propagate the dense id (RollforwardBlock does the
+                    // same). Without this the escrow enters chainstate UNTAGGED
+                    // (anyone-can-spend + a connect-vs-replay consensus split).
+                    // DEFER's output is the locked till (3.5 D11); it is escrow
+                    // custody exactly like a pledge.
+                    if (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT ||
+                            tx.nHouseOp == HOUSE_OP_DEFER)
+                        nNewHouseID = houseResult.nHouseID;
+                }
             }
         }
 
@@ -9343,7 +9699,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
         if (!phousetree->WriteBlockEffects(vHouseWrite, vHouseNew.size() ? &nLastHouseID : nullptr, pindex->GetBlockHash(),
                 fOracleFixWrite ? &oracleFixNew : nullptr, false,
                 vOracleSubWrite.empty() ? nullptr : &vOracleSubWrite, nullptr,
-                vOracleSubNew.size() ? &nLastOracleSubID : nullptr))
+                vOracleSubNew.size() ? &nLastOracleSubID : nullptr,
+                memberEffects.empty() ? nullptr : &memberEffects))
             return state.Error("Failed to write house index!");
     }
 
@@ -10421,6 +10778,39 @@ static bool SidechainDBHasBlock(const CBlockIndex* pindex)
     return it->second->nHeight >= pindex->nHeight && it->second->GetAncestor(pindex->nHeight) == pindex;
 }
 
+/** v0.2.19 (7c, consensus): a block's time is the header time of the L1 block
+ *  that carries its bid. The bid commits only h* (the merkle root) and the
+ *  coinbase commits the parent, the version and the bundle, so nothing bound
+ *  nTime: a copy of a block with another time was a second valid block on the
+ *  same bid. Both producers already set this time (SidechainClient::RefreshBMM,
+ *  the BMM submit RPC), and the original BitAssets fetched it in its BMM check
+ *  and dropped it. Runs on every check, after the bid itself is known: the
+ *  verified-BMM cache is kept on disk, so a hash cached before this rule
+ *  must not skip it. The time is cached by L1 hash, so this asks the L1 once
+ *  per L1 block. */
+static bool CheckBlockBMMTime(const CBlockHeader& block, CValidationState& state, bool fImport)
+{
+    uint32_t nTimeMain = 0;
+    if (!bmmCache.GetMainBlockTime(block.hashMainchainBlock, nTimeMain)) {
+        L1Answer answer = GetL1Oracle().BmmBlockTime(block.hashMainchainBlock, block.hashMerkleRoot, nTimeMain);
+        for (int nTry = 0; fImport && answer == L1Answer::UNKNOWN && nTry < 60 && !ShutdownRequested(); nTry++) {
+            MilliSleep(5000);
+            answer = GetL1Oracle().BmmBlockTime(block.hashMainchainBlock, block.hashMerkleRoot, nTimeMain);
+        }
+        if (answer != L1Answer::YES) {
+            g_nLastBmmUnknown = GetTime();
+            return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet the time of block %s",
+                                         block.hashMainchainBlock.ToString()));
+        }
+        bmmCache.CacheMainBlockTime(block.hashMainchainBlock, nTimeMain);
+    }
+    if (block.nTime != nTimeMain)
+        return state.DoS(10, false, REJECT_INVALID, "bad-bmm-time", false,
+                         strprintf("block time %u is not the time %u of its L1 block %s", block.nTime, nTimeMain,
+                                   block.hashMainchainBlock.ToString()));
+    return true;
+}
+
 bool CheckBlockBMM(const CBlock& block, CValidationState& state)
 {
     // v0.2.17 C1: three answers. Does E carry the bid (asked of the enforcer)?
@@ -10444,7 +10834,9 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state)
                          strprintf("L1 block %s is not on the L1's main chain", hashMain.ToString()));
 
     if (!bmmCache.HaveVerifiedBMM(block.GetHash())) {
-        L1Answer answer = GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
+        // v0.2.19: a pair already confirmed (another copy of this header) costs no L1 call
+        L1Answer answer = bmmCache.HaveBmmPair(hashMain, block.hashMerkleRoot) ? L1Answer::YES
+                                                                                : GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
         for (int nTry = 0; fImport && answer == L1Answer::UNKNOWN && nTry < 60 && !ShutdownRequested(); nTry++) {
             MilliSleep(5000);
             answer = GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
@@ -10457,6 +10849,7 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state)
             return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet whether block %s carries this block's BMM bid",
                                          hashMain.ToString()));
         }
+        bmmCache.CacheBmmPair(hashMain, block.hashMerkleRoot);
     }
     const uint256 hashMainPrev = bmmCache.GetMainPrevBlockHash(hashMain);
     if (!bmmCache.HaveMainBlock(hashMain) || hashMainPrev.IsNull()) {
@@ -10464,6 +10857,8 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state)
         return state.Error(strprintf("bmm-unknown: L1 block %s is not in our list of L1 main-chain blocks (yet)",
                                      hashMain.ToString()));
     }
+    if (!CheckBlockBMMTime(block, state, fImport))
+        return false;
     bmmCache.CacheVerifiedBMM(block.GetHash());
 
     // Check required PrevBlockCommit
@@ -10499,7 +10894,7 @@ bool IsWitnessEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& pa
 
 // Compute at which vout of the block's coinbase transaction the witness
 // commitment occurs, or -1 if not found.
-static int GetWitnessCommitmentIndex(const CBlock& block)
+int GetWitnessCommitmentIndex(const CBlock& block)
 {
     int commitpos = -1;
     if (!block.vtx.empty()) {
@@ -10750,6 +11145,11 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationSta
     const int nHeight = pindexPrev->nHeight + 1;
     const Consensus::Params& consensusParams = params.GetConsensus();
 
+    // v0.2.19 (genesis M1): a dormant chain has no block after genesis
+    if (consensusParams.fChainDormant)
+        return state.DoS(0, false, REJECT_INVALID, "chain-dormant", false,
+                         "this network is dormant: no block after genesis is valid until a release switches it on");
+
     // Check against checkpoints
     if (fCheckpointsEnabled) {
         // Don't accept any forks from the main chain prior to last checkpoint.
@@ -10893,12 +11293,6 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
 
     bool fGenesis = (hash == Params().GetConsensus().hashGenesisBlock);
 
-    // Check for mainchain connection
-    if (!fGenesis && !CheckMainchainConnection()) {
-        DisableNetworkForMainchain("Failed to connect to mainchain when checking block header!");
-        return false;
-    }
-
     // Check for duplicate
     BlockMap::iterator miSelf = mapBlockIndex.find(hash);
     CBlockIndex *pindex = nullptr;
@@ -10923,6 +11317,14 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
         if (pindexPrev->nStatus & BLOCK_FAILED_MASK)
             return state.DoS(100, error("%s: prev block invalid", __func__), REJECT_INVALID, "bad-prevblk");
 
+        // v0.2.19 (genesis M1): a dormant chain has no block after genesis.
+        // Refused here, before any L1 call; ContextualCheckBlockHeader holds
+        // the rule for every other path. No score: a peer on a switched-on
+        // release is ahead of us, not hostile.
+        if (chainparams.GetConsensus().fChainDormant)
+            return state.DoS(0, false, REJECT_INVALID, "chain-dormant", false,
+                             "this network is dormant: no block after genesis is valid until a release switches it on");
+
         // v0.2.18 L1-order rule, header half (ContextualCheckBlock has the
         // rest): a header anchored in its parent's own L1 block is invalid -
         // decided with no L1 call, so a fake chain re-using one (E, h*) pair
@@ -10945,7 +11347,27 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
         // L1 call. A "can't tell" is state.Error: the header is not accepted,
         // the peer not penalised.
         if (!bmmCache.HaveVerifiedBMM(hash)) {
-            const L1Answer answer = GetL1Oracle().BmmCommitment(block.hashMainchainBlock, block.hashMerkleRoot);
+            // v0.2.19 (C6 header-bmm-rpc-under-cs-main): answered from our own
+            // list of L1 main-chain blocks first (refreshed at the start of each
+            // headers message, ProcessNewBlockHeaders). A header anchored outside
+            // it costs no L1 call: "can't tell" without asking, without a score,
+            // and without relaxing the unconnecting-headers rule for every peer
+            // (g_nLastBmmUnknown). The block itself needs the anchor in that list
+            // anyway (ContextualCheckBlock). Before, each such header cost two L1
+            // calls under cs_main, and so did every known header (the mainchain
+            // check ran before the duplicate check).
+            if (!bmmCache.HaveMainBlock(block.hashMainchainBlock))
+                return state.Error(strprintf("bmm-unknown: L1 block %s is not in our list of L1 main-chain blocks (yet)",
+                                             block.hashMainchainBlock.ToString()));
+            // v0.2.19: a pair already confirmed (another copy of this header, a
+            // different parent) costs no L1 call, not even the connection check
+            const bool fPairKnown = bmmCache.HaveBmmPair(block.hashMainchainBlock, block.hashMerkleRoot);
+            if (!fPairKnown && !CheckMainchainConnection()) {
+                DisableNetworkForMainchain("Failed to connect to mainchain when checking block header!");
+                return false;
+            }
+            const L1Answer answer = fPairKnown ? L1Answer::YES
+                                  : GetL1Oracle().BmmCommitment(block.hashMainchainBlock, block.hashMerkleRoot);
             if (answer == L1Answer::NO)
                 return state.DoS(1, false, REJECT_INVALID, "bad-bmm", false, "Invalid BMM in block header!");
             if (answer != L1Answer::YES) {
@@ -10953,8 +11375,13 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
                 return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet whether block %s carries the BMM bid of header %s",
                                              block.hashMainchainBlock.ToString(), hash.ToString()));
             }
-            bmmCache.CacheVerifiedBMM(hash);
+            bmmCache.CacheBmmPair(block.hashMainchainBlock, block.hashMerkleRoot);
         }
+        // v0.2.19 (7c): outside the cache check above, which is kept on disk;
+        // a header is cached as verified only once its time is right too
+        if (!CheckBlockBMMTime(block, state, false))
+            return false;
+        bmmCache.CacheVerifiedBMM(hash);
         if (!ContextualCheckBlockHeader(block, state, chainparams, pindexPrev, GetAdjustedTime()))
             return error("%s: Consensus::ContextualCheckBlockHeader: %s, %s", __func__, hash.ToString(), FormatStateMessage(state));
 
@@ -10987,15 +11414,29 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
 // Exposed wrapper for AcceptBlockHeader
 bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidationState& state, const CChainParams& chainparams, const CBlockIndex** ppindex, CBlockHeader *first_invalid)
 {
-    bool fReorg = false;
-    std::vector<uint256> vOrphan;
-    if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
-        LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
-        DisableNetworkForMainchain("Failed to update the mainchain block cache when processing headers (mainchain unreachable)");
-        return false;
+    // v0.2.19: no refresh of our L1 list when every header is anchored in an
+    // L1 block already on it, with a bid pair the L1 already confirmed (copies
+    // of known headers, which 7c leaves only the parent to vary): nothing in
+    // them needs a newer list, and each refresh is an L1 call.
+    bool fNeedRefresh = false;
+    for (const CBlockHeader& header : headers) {
+        if (!bmmCache.HaveMainBlock(header.hashMainchainBlock) ||
+                !bmmCache.HaveBmmPair(header.hashMainchainBlock, header.hashMerkleRoot)) {
+            fNeedRefresh = true;
+            break;
+        }
     }
-    if (fReorg)
-        HandleMainchainReorg(vOrphan);
+    if (fNeedRefresh) {
+        bool fReorg = false;
+        std::vector<uint256> vOrphan;
+        if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
+            LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
+            DisableNetworkForMainchain("Failed to update the mainchain block cache when processing headers (mainchain unreachable)");
+            return false;
+        }
+        if (fReorg)
+            HandleMainchainReorg(vOrphan);
+    }
 
     if (first_invalid != nullptr) first_invalid->SetNull();
     {
@@ -11750,10 +12191,11 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
         // hash; TOPUP / ADMIT carry it in the payload. RECLAIM only spends.
         uint32_t nHouseID = 0;
         if (tx->nVersion == TRANSACTION_HOUSE_VERSION) {
-            if (tx->nHouseOp == HOUSE_OP_REGISTER) {
+            if (IsHouseRegisterOp(tx->nHouseOp)) {
                 HouseRegister reg;
-                if (DecodeHousePayload(tx->vchHousePayload, reg))
-                    phousetree->GetHouseIDByHash(HouseIDFromDeclaration(reg), nHouseID);
+                uint8_t nFlags = 0;
+                if (DecodeHouseRegisterAny(*tx, reg, nFlags))
+                    phousetree->GetHouseIDByHash(HouseIDFromDeclaration(reg, nFlags), nHouseID);
             } else if (tx->nHouseOp == HOUSE_OP_TOPUP) {
                 HouseTopup topup;
                 if (DecodeHousePayload(tx->vchHousePayload, topup))
@@ -11963,6 +12405,10 @@ void UnloadBlockIndex()
     chainActive.SetTip(nullptr);
     pindexBestInvalid = nullptr;
     pindexBestHeader = nullptr;
+    // v0.2.19: the fork-warning pointers point into the index freed below; left
+    // set, the next CheckForkWarningConditions read freed memory (unit fixtures).
+    pindexBestForkTip = nullptr;
+    pindexBestForkBase = nullptr;
     mempool.clear();
     mapBlocksUnlinked.clear();
     vinfoBlockFile.clear();

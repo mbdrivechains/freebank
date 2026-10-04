@@ -458,6 +458,12 @@ public:
      *  carries no bid or another one); UNKNOWN (not processed yet, or no
      *  answer). */
     virtual L1Answer BmmCommitment(const uint256& hashMainBlock, const uint256& hashBMM) = 0;
+
+    /** v0.2.19 (7c): the header time of L1 block hashMainBlock, which carries
+     *  the bid hashBMM. Asked as both producers ask it (L1Client::VerifyBMM:
+     *  SidechainClient::RefreshBMM and the BMM submit RPC copy this time into
+     *  the block). YES with nTime; UNKNOWN when the L1 cannot answer. */
+    virtual L1Answer BmmBlockTime(const uint256& hashMainBlock, const uint256& hashBMM, uint32_t& nTime) = 0;
 };
 
 /** v0.2.17 B3 + D1, decisions 2026-09-29: a bundle's outcome on the L1 from
@@ -487,6 +493,15 @@ L1Answer ClassifyPegEventsError(const std::string& strError);
 
 /** The injected test oracle if one is set, else the transport-backed one. */
 L1Oracle& GetL1Oracle();
+
+/** v0.2.19 (C6 a7-pin-fails-open-and-is-boot-only): while the enforcer is not
+ *  verified (unreachable at startup and not yet checked, or disagreeing with
+ *  the pinned REST node at a runtime re-check), the transport-backed oracle
+ *  answers UNKNOWN to every question: no block is accepted and no peg event
+ *  counted on the word of an enforcer that may index another L1. init.cpp sets
+ *  it (MaybeVerifyEnforcer); the injected test oracle ignores it. */
+void SetL1AnswersHeld(bool fHeld);
+bool L1AnswersHeld();
 
 /** Unit tests only: answer every L1Oracle question from pOracle (nullptr
  *  restores the transport-backed oracle). Never called outside src/test. */

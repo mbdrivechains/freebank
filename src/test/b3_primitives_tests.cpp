@@ -245,8 +245,8 @@ BOOST_AUTO_TEST_CASE(chouse_v9_reads_v8_and_rewrites_byte_identical)
     BOOST_REQUIRE(!v8.empty());
     BOOST_REQUIRE_EQUAL(v8[0], (unsigned char)HOUSE_SER_VERSION);   // version leads
     v8[0] = 8;
-    BOOST_REQUIRE(v8.size() >= 12);
-    v8.resize(v8.size() - 12);           // drop the three trailing uint32s
+    BOOST_REQUIRE(v8.size() >= 13);
+    v8.resize(v8.size() - 13);           // drop the v10 flags byte and the three v9 uint32s
     CHouse fromV8;
     BOOST_REQUIRE(Deser(v8, fromV8));
     BOOST_CHECK_EQUAL(fromV8.nProtestOpen, 0u);

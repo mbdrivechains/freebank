@@ -754,12 +754,25 @@ int EnforcerL1Client::RunGrpcurl(const std::string& strService, const std::strin
         return -1;
     }
 
+    // v0.2.19 (C6 l1-client-unbounded): the reply is capped like the Connect
+    // transport's (64 MiB); grpcurl's -max-time bounds the time.
+    static const size_t MAX_GRPCURL_REPLY = 64 * 1024 * 1024;
     char buffer[4096];
     size_t nRead;
-    while ((nRead = fread(buffer, 1, sizeof(buffer), pipe)) > 0)
+    bool fTooBig = false;
+    while ((nRead = fread(buffer, 1, sizeof(buffer), pipe)) > 0) {
+        if (strOutput.size() + nRead > MAX_GRPCURL_REPLY) {
+            fTooBig = true;
+            continue;   // drain, so grpcurl is not killed by SIGPIPE mid-write
+        }
         strOutput.append(buffer, nRead);
+    }
 
     int status = pclose(pipe);
+    if (fTooBig) {
+        LogPrintf("ERROR Enforcer client: grpcurl reply to %s over %u MiB; ignored\n", strMethod, (unsigned)(MAX_GRPCURL_REPLY >> 20));
+        return -1;
+    }
     if (status == -1 || !WIFEXITED(status))
         return -1;
 
@@ -1636,7 +1649,7 @@ bool EnforcerL1Client::VerifyBMM(const uint256& hashMainBlock, const uint256& ha
 
     // The sidechain block header copies the mainchain block time
     std::vector<L1BlockHeader> vHeader;
-    if (!GetHeaderInfos(hashMainBlock, 0, vHeader) || vHeader.empty())
+    if (!GetHeaderInfos(hashMainBlock, 0, vHeader) || vHeader.empty() || vHeader.front().hashBlock != hashMainBlock)
         return false;
 
     nTime = vHeader.front().nTime;
@@ -2269,15 +2282,21 @@ L1Client& GetL1Client()
 namespace {
 /** The production oracle: asks the selected transport (the JSON-RPC mainchain
  *  cannot answer the range question: UNKNOWN). */
+std::atomic<bool> g_fL1AnswersHeld{false};
+
 class TransportL1Oracle : public L1Oracle
 {
 public:
     L1Answer EventsInWindow(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events) override
     {
+        if (g_fL1AnswersHeld)
+            return L1Answer::UNKNOWN;
         return GetL1Client().GetPegEvents(hashStart, hashEnd, events);
     }
     L1Answer BmmCommitment(const uint256& hashMainBlock, const uint256& hashBMM) override
     {
+        if (g_fL1AnswersHeld)
+            return L1Answer::UNKNOWN;
         uint256 hashCommitment;
         switch (GetL1Client().ReadBmmCommitment(hashMainBlock, hashCommitment)) {
         case L1Client::Commitment::COMMITTED: return hashCommitment == hashBMM ? L1Answer::YES : L1Answer::NO;
@@ -2290,6 +2309,14 @@ public:
         uint32_t nTime = 0;
         return GetL1Client().VerifyBMM(hashMainBlock, hashBMM, txid, nTime) ? L1Answer::YES : L1Answer::UNKNOWN;
     }
+    L1Answer BmmBlockTime(const uint256& hashMainBlock, const uint256& hashBMM, uint32_t& nTime) override
+    {
+        nTime = 0;
+        if (g_fL1AnswersHeld)
+            return L1Answer::UNKNOWN;
+        uint256 txid;
+        return GetL1Client().VerifyBMM(hashMainBlock, hashBMM, txid, nTime) && nTime != 0 ? L1Answer::YES : L1Answer::UNKNOWN;
+    }
 };
 
 std::atomic<L1Oracle*> g_pL1OracleForTest{nullptr};
@@ -2300,6 +2327,18 @@ L1Oracle& GetL1Oracle()
     static TransportL1Oracle oracleTransport;
     L1Oracle* pOracle = g_pL1OracleForTest.load();
     return pOracle ? *pOracle : oracleTransport;
+}
+
+void SetL1AnswersHeld(bool fHeld)
+{
+    if (g_fL1AnswersHeld.exchange(fHeld) != fHeld)
+        LogPrintf("mainchain enforcer answers %s\n", fHeld ? "HELD: the enforcer is not verified (BMM and peg checks answer \"can't tell\")"
+                                                            : "released: the enforcer is verified");
+}
+
+bool L1AnswersHeld()
+{
+    return g_fL1AnswersHeld;
 }
 
 void SetL1OracleForTest(L1Oracle* pOracle)

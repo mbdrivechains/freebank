@@ -15,10 +15,13 @@
 #include <consensus/tx_verify.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
+#include <deposit.h>
 #include <hash.h>
+#include <house.h>
 #include <l1client.h>
 #include <validation.h>
 #include <net.h>
+#include <note.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <policy/withdrawalbundle.h>
@@ -126,6 +129,84 @@ void BlockAssembler::resetBlock()
     nFees = 0;
 }
 
+// The first transaction of a failed template that the block cannot hold (v0.2.19): the shortest prefix of the
+// block's transactions that fails TestBlockValidity ends with it. The template adds packages ancestors first, so
+// every prefix is a valid order. Each prefix keeps the refund requests and their in-block ancestors (the coinbase pays
+// their refunds) and gets a coinbase that claims exactly its fees, with the witness commitment made again. nullptr if
+// the block fails with only those kept transactions, so the fault is not one mempool transaction.
+static CTransactionRef FindFirstInvalidTx(const CBlock& block, const std::vector<CAmount>& vTxFees, CBlockIndex* pindexPrev,
+                                          bool fCheckBMM, bool fReorg, const CChainParams& chainparams, CValidationState& stateOut)
+{
+    const size_t n = block.vtx.size() - 1;
+    if (n == 0 || vTxFees.size() != block.vtx.size())
+        return nullptr;
+
+    std::vector<bool> vKeep(n + 1, false);
+    std::map<uint256, size_t> mapPos;
+    for (size_t i = 1; i <= n; i++) {
+        mapPos[block.vtx[i]->GetHash()] = i;
+        for (const CTxOut& o : block.vtx[i]->vout) {
+            uint256 id;
+            std::vector<unsigned char> vchSig;
+            if (o.scriptPubKey.IsWithdrawalRefundRequest(id, vchSig)) {
+                vKeep[i] = true;
+                break;
+            }
+        }
+    }
+    for (size_t i = n; i >= 1; i--) {   // parents come first, so one backward pass marks every ancestor
+        if (!vKeep[i]) continue;
+        for (const CTxIn& in : block.vtx[i]->vin) {
+            auto it = mapPos.find(in.prevout.hash);
+            if (it != mapPos.end()) vKeep[it->second] = true;
+        }
+    }
+
+    CMutableTransaction cb(*block.vtx[0]);
+    const int nCommitPos = GetWitnessCommitmentIndex(block);
+    if (nCommitPos != -1)
+        cb.vout.erase(cb.vout.begin() + nCommitPos);
+    CAmount nTxFees = 0;
+    for (size_t i = 1; i <= n; i++) nTxFees += vTxFees[i];
+    const CAmount nOtherFees = cb.vout[0].nValue - nTxFees;   // deposit fees: not from block transactions
+
+    auto fails = [&](size_t k, CValidationState& state) {
+        CBlock b = block;
+        b.fChecked = false;
+        b.vtx.resize(1);
+        CAmount nFees = nOtherFees;
+        for (size_t i = 1; i <= n; i++) {
+            if (i <= k || vKeep[i]) {
+                b.vtx.push_back(block.vtx[i]);
+                nFees += vTxFees[i];
+            }
+        }
+        CMutableTransaction c(cb);
+        c.vout[0].nValue = nFees;
+        b.vtx[0] = MakeTransactionRef(std::move(c));
+        GenerateCoinbaseCommitment(b, pindexPrev, chainparams.GetConsensus());
+        return !TestBlockValidity(state, chainparams, b, pindexPrev, false, fCheckBMM, fReorg);
+    };
+
+    CValidationState state0;
+    if (fails(0, state0))
+        return nullptr;
+    size_t lo = 0, hi = n;   // prefix lo passes, prefix hi fails (the whole template)
+    while (hi - lo > 1) {
+        const size_t mid = lo + (hi - lo) / 2;
+        CValidationState state;
+        if (fails(mid, state)) {
+            hi = mid;
+            stateOut = state;
+        } else {
+            lo = mid;
+        }
+    }
+    if (hi == n)
+        fails(n, stateOut);
+    return block.vtx[hi];
+}
+
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, bool fMineWitnessTx, bool fCheckBMM, const uint256& hashPrevBlock, CAmount* nFeesOut, const uint256& hashMainTip)
 {
     // TODO
@@ -139,6 +220,43 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         return nullptr;
     }
 
+    // v0.2.19 (C6 demand-tag-zero-pool-brick): a pooled transaction the block
+    // cannot hold no longer stops block production. Before, the failed template
+    // threw on every attempt until the transaction left the mempool (up to 14
+    // days). Now the transaction at fault is found, dropped from the mempool with
+    // its descendants, and the template is built again; after
+    // MAX_TEMPLATE_EVICTIONS drops, this block is built from no mempool
+    // transactions, and the next template carries on dropping.
+    LOCK2(cs_main, mempool.cs);
+    for (int nTry = 0; ; nTry++) {
+        const bool fNoMempoolTxs = nTry >= MAX_TEMPLATE_EVICTIONS;
+        bool fInvalid = false;
+        CValidationState state;
+        std::unique_ptr<CBlockTemplate> t = CreateNewBlockOnce(scriptPubKeyIn, hashPrevBlock, nFeesOut, hashMainTip,
+                                                               fCheckBMM, fNoMempoolTxs, fInvalid, state);
+        if (!fInvalid)
+            return t;
+        if (fNoMempoolTxs)
+            throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, FormatStateMessage(state)));
+
+        CBlockIndex* pindexPrev = hashPrevBlock.IsNull() ? chainActive.Tip() : mapBlockIndex[hashPrevBlock];
+        CValidationState stateTx;
+        CTransactionRef ptxBad = FindFirstInvalidTx(t->block, t->vTxFees, pindexPrev, fCheckBMM, !hashPrevBlock.IsNull(),
+                                                    chainparams, stateTx);
+        if (!ptxBad) {
+            LogPrintf("%s: template failed (%s) and no single mempool transaction is at fault; building this block from no mempool transactions\n",
+                      __func__, FormatStateMessage(state));
+            nTry = MAX_TEMPLATE_EVICTIONS - 1;
+            continue;
+        }
+        LogPrintf("%s: template failed: dropping tx %s (%s) and its descendants from the mempool\n", __func__,
+                  ptxBad->GetHash().ToString(), FormatStateMessage(stateTx));
+        mempool.removeRecursive(*ptxBad, MemPoolRemovalReason::UNKNOWN);
+    }
+}
+
+std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript& scriptPubKeyIn, const uint256& hashPrevBlock, CAmount* nFeesOut, const uint256& hashMainTip, bool fCheckBMM, bool fNoMempoolTxs, bool& fInvalid, CValidationState& state)
+{
     int64_t nTimeStart = GetTimeMicros();
 
     resetBlock();
@@ -205,7 +323,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     int nPackagesSelected = 0;
     int nDescendantsUpdated = 0;
     std::vector<CTxMemPool::txiter> vRefund;
-    addPackageTxs(nPackagesSelected, nDescendantsUpdated, vRefund, !fCreatedWithdrawalBundle /* fIncludeRefunds */);
+    if (!fNoMempoolTxs) {
+        addClockTxs(nPackagesSelected);
+        addPackageTxs(nPackagesSelected, nDescendantsUpdated, vRefund, !fCreatedWithdrawalBundle /* fIncludeRefunds */);
+    }
 
     int64_t nTime1 = GetTimeMicros();
 
@@ -542,10 +663,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
 
     // We have to skip BMM checks when first creating a block as we haven't
     // received BMM proof from the mainchain yet.
-    CValidationState state;
     if (!TestBlockValidity(state, chainparams, *pblock, pindexPrev, false,
                 fCheckBMM, hashPrevBlock.IsNull() ? false : true)) {
-        throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, FormatStateMessage(state)));
+        fInvalid = true;
+        return std::move(pblocktemplate);
     }
     int64_t nTime2 = GetTimeMicros();
 
@@ -704,6 +825,74 @@ void BlockAssembler::SortForBlock(const CTxMemPool::setEntries& package, CTxMemP
     sortedEntries.clear();
     sortedEntries.insert(sortedEntries.begin(), package.begin(), package.end());
     std::sort(sortedEntries.begin(), sortedEntries.end(), CompareTxIterByAncestorCount());
+}
+
+bool IsClockTx(const CTransaction& tx)
+{
+    if (tx.nVersion == TRANSACTION_NOTE_VERSION)
+        return tx.nNoteOp == NOTE_OP_REDEEM || tx.nNoteOp == NOTE_OP_DEMAND ||
+               tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_CLAIM;
+    if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION)
+        return tx.nDepositOp == DEPOSIT_OP_WITHDRAW || tx.nDepositOp == DEPOSIT_OP_CLAIM;
+    if (tx.nVersion == TRANSACTION_HOUSE_VERSION)
+        return tx.nHouseOp == HOUSE_OP_ATTEST;
+    return false;
+}
+
+void BlockAssembler::addClockTxs(int &nPackagesSelected)
+{
+    // Oldest first, so a long-waiting demand goes in before a newer one.
+    std::vector<CTxMemPool::txiter> vClock;
+    for (CTxMemPool::txiter it = mempool.mapTx.begin(); it != mempool.mapTx.end(); ++it) {
+        if (IsClockTx(it->GetTx()))
+            vClock.push_back(it);
+    }
+    if (vClock.empty())
+        return;
+    std::sort(vClock.begin(), vClock.end(), [](CTxMemPool::txiter a, CTxMemPool::txiter b) {
+        if (a->GetTime() != b->GetTime()) return a->GetTime() < b->GetTime();
+        return a->GetTx().GetHash() < b->GetTx().GetHash();
+    });
+
+    // Half the block at most: the fee-rate pass keeps room for everything else.
+    const uint64_t nClockMaxWeight = nBlockWeight + (nBlockMaxWeight - nBlockWeight) / 2;
+    uint64_t nNoLimit = std::numeric_limits<uint64_t>::max();
+    std::string dummy;
+    for (CTxMemPool::txiter iter : vClock) {
+        if (inBlock.count(iter))
+            continue;
+        CTxMemPool::setEntries package;
+        mempool.CalculateMemPoolAncestors(*iter, package, nNoLimit, nNoLimit, nNoLimit, nNoLimit, dummy, false);
+        onlyUnconfirmed(package);
+        package.insert(iter);
+
+        // A refund is only ever added after the fee-rate pass has checked it on its
+        // own (v0.2.17), so a package that carries one waits for that pass.
+        uint64_t nSize = 0;
+        int64_t nSigOps = 0;
+        CAmount nPackageFees = 0;
+        bool fRefund = false;
+        for (CTxMemPool::txiter it : package) {
+            nSize += it->GetTxSize();
+            nSigOps += it->GetSigOpCost();
+            nPackageFees += it->GetModifiedFee();
+            fRefund |= it->IsWithdrawalRefund();
+        }
+        if (fRefund)
+            continue;
+        if (nPackageFees < blockMinFeeRate.GetFee(nSize))
+            continue;
+        if (nBlockWeight + WITNESS_SCALE_FACTOR * nSize >= nClockMaxWeight || !TestPackage(nSize, nSigOps))
+            continue;
+        if (!TestPackageTransactions(package))
+            continue;
+
+        std::vector<CTxMemPool::txiter> sortedEntries;
+        SortForBlock(package, iter, sortedEntries);
+        for (CTxMemPool::txiter it : sortedEntries)
+            AddToBlock(it);
+        ++nPackagesSelected;
+    }
 }
 
 // This transaction selection algorithm orders the mempool based
@@ -993,14 +1182,15 @@ bool BlockAssembler::GenerateBMMBlock(CBlock& block, std::string& strError, CAmo
     // been passed in
     std::unique_ptr<CBlockTemplate> pblocktemplate;
     if (scriptPubKey.empty()) {
-        if (vpwallets.empty()) {
+        const std::vector<CWalletRef> wallets = GetWallets();
+        if (wallets.empty()) {
             strError = "No wallet active!\n";
             return false;
         }
 
         // Create script
         std::shared_ptr<CReserveScript> coinbaseScript;
-        vpwallets[0]->GetScriptForMining(coinbaseScript);
+        wallets[0]->GetScriptForMining(coinbaseScript);
 
         if (!coinbaseScript || coinbaseScript->reserveScript.empty()) {
             strError = "Failed to get script for mining!\n";

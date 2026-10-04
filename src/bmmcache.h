@@ -58,6 +58,17 @@ public:
     // Cache that we verified BMM for this sidechain block
     void CacheVerifiedBMM(const uint256& hashBlock);
 
+    // v0.2.19 (7c): the header time of an L1 block, by hash (it never changes
+    // for a hash). Memory only; cleared when it reaches MAX_MAIN_BLOCK_TIMES.
+    bool GetMainBlockTime(const uint256& hashMainBlock, uint32_t& nTime) const;
+    void CacheMainBlockTime(const uint256& hashMainBlock, uint32_t nTime);
+
+    // v0.2.19: (L1 block, h*) pairs the L1 confirmed carry the bid. A fact
+    // about the L1 block's contents, so copies of a header (same pair, another
+    // parent) cost no L1 call. Memory only; cleared at MAX_MAIN_BLOCK_TIMES.
+    bool HaveBmmPair(const uint256& hashMainBlock, const uint256& hashBMM) const;
+    void CacheBmmPair(const uint256& hashMainBlock, const uint256& hashBMM);
+
     // Check if we already verified deposit
     bool HaveVerifiedDeposit(const uint256& txid) const;
 
@@ -138,6 +149,10 @@ private:
 
     // Cache of deposit txid which we have already verified with the mainchain
     std::set<uint256 /* txid */> setDepositVerified;
+
+    // v0.2.19 (7c): L1 block header times (guarded by csVerified)
+    std::map<uint256 /* hashMainchainBlock */, uint32_t> mapMainBlockTime;
+    std::set<std::pair<uint256, uint256>> setBmmPair; // (hashMainchainBlock, h*), guarded by csVerified
 
     // WithdrawalBundle(s) that we have already broadcasted to the mainchain.
     std::set<uint256> setWithdrawalBundleBroadcasted;

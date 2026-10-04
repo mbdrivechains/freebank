@@ -90,7 +90,7 @@ UniValue validateaddress(const JSONRPCRequest& request)
     {
 
 #ifdef ENABLE_WALLET
-        if (!::vpwallets.empty() && IsDeprecatedRPCEnabled("validateaddress")) {
+        if (HasWallets() && IsDeprecatedRPCEnabled("validateaddress")) {
             ret.pushKVs(getaddressinfo(request));
         }
 #endif
@@ -572,6 +572,14 @@ static void BMMRequireEnforcer(const std::string& strMethod)
                            "(the legacy transport writes h* in the other byte order)");
 }
 
+// v0.2.19 (genesis M1): a dormant network has no blocks to produce
+static void BMMRefuseWhileDormant(const std::string& strMethod)
+{
+    if (Params().GetConsensus().fChainDormant)
+        throw JSONRPCError(RPC_MISC_ERROR, strMethod + ": this network is dormant: no FreeBank block is valid "
+                           "until a release switches it on");
+}
+
 static void BMMRefuseDuringImport(const std::string& strMethod)
 {
     if (fImporting || fReindex)
@@ -782,11 +790,12 @@ UniValue get_block_template(const JSONRPCRequest& request)
         );
 
     const std::string strMethod = "get_block_template";
+    BMMRefuseWhileDormant(strMethod);
     BMMRequireEnforcer(strMethod);
     BMMRpcLock lock(strMethod, 5);
     BMMRefuseDuringImport(strMethod);
 
-    if (vpwallets.empty())
+    if (!HasWallets())
         throw JSONRPCError(RPC_WALLET_NOT_FOUND, "No wallet: the block's coinbase pays this node's wallet");
 
     // v0.2.17: never a template while this node is behind (a Mac sync got one
@@ -969,6 +978,7 @@ UniValue connect_block(const JSONRPCRequest& request)
     const uint256 hashMain = ParseHashV(request.params[1], "main_block_hash");
     const uint256 hashCritical = block.hashMerkleRoot;
 
+    BMMRefuseWhileDormant(strMethod);
     BMMRequireEnforcer(strMethod);
     BMMRpcLock lock(strMethod, 30);
 
@@ -1219,6 +1229,7 @@ UniValue refreshbmm(const JSONRPCRequest& request)
     // chain yet, so a block built or connected now would build on the wrong
     // one, and mainchain reorgs are held until the import is done.
     // v0.2.16: one mutex for all four BMM RPCs (mapBMMBlocks has no lock)
+    BMMRefuseWhileDormant("refreshbmm");
     BMMRpcLock lock("refreshbmm", 30);
 
     if (fImporting || fReindex)
@@ -1873,6 +1884,11 @@ static UniValue HouseToJSON(const CHouse& house)
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("id", (uint64_t)house.nHouseID);
     obj.pushKV("househash", house.houseID.ToString());
+    // v0.2.19 members-only houses: "open", "members" (notes only between members) or "redeem" (notes only between
+    // the house and the holder), fixed at registration; and the member record count
+    obj.pushKV("type", house.IsRedeemOnly() ? "redeem" : house.IsMembersOnly() ? "members" : "open");
+    if (house.IsMembersOnly())
+        obj.pushKV("member_records", (uint64_t)phousetree->GetHouseMemberCount(house.nHouseID));
     obj.pushKV("tier", house.nTier);
     obj.pushKV("threshold", (uint64_t)house.nThresholdM);
     obj.pushKV("classid", house.strClassID);
@@ -2054,6 +2070,57 @@ UniValue gethouse(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_MISC_ERROR, "Unknown house!");
 
     return HouseToJSON(house);
+}
+
+UniValue listhousemembers(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
+        throw std::runtime_error(
+            "listhousemembers id ( \"start\" count )\n"
+            "\nThe member list of a members-only house (public on-chain, spec 4.4), in key order.\n"
+            "The house's own keys (partners, redemption destination) are members too and are not listed.\n"
+            "\nArguments:\n"
+            "1. id        (numeric, required) the house ID number\n"
+            "2. \"start\"   (string, optional) list from this member address on (inclusive)\n"
+            "3. count     (numeric, optional, default 1000, at most 10000) at most this many\n"
+            "\nResult:\n"
+            "[ { \"address\": \"...\", \"added_height\": n, \"removal_height\": n (0 = none), \"active\": true|false }, ... ]\n"
+            "\"active\" is as of the next block.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listhousemembers", "5")
+            + HelpExampleRpc("listhousemembers", "5")
+        );
+
+    const uint32_t nHouseID = request.params[0].get_int();
+    uint160 start;
+    if (request.params.size() >= 2 && !request.params[1].isNull() && !request.params[1].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[1].get_str());
+        const CKeyID* pKey = boost::get<CKeyID>(&dest);
+        if (!pKey)
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "start must be a FreeBank P2PKH address");
+        start = *pKey;
+    }
+    size_t nCount = 1000;
+    if (request.params.size() >= 3)
+        nCount = std::max(1, std::min(10000, request.params[2].get_int()));   // read under cs_main: page with "start"
+
+    LOCK(cs_main);
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house))
+        throw JSONRPCError(RPC_MISC_ERROR, "Unknown house!");
+    if (!house.IsMembersOnly())
+        throw JSONRPCError(RPC_MISC_ERROR, "This house is open: it has no member list");
+    const uint32_t nNext = (uint32_t)chainActive.Height() + 1;
+    UniValue ret(UniValue::VARR);
+    for (const auto& kv : phousetree->ListHouseMembers(nHouseID, start, nCount)) {
+        UniValue m(UniValue::VOBJ);
+        m.pushKV("address", EncodeDestination(CKeyID(kv.first)));
+        m.pushKV("added_height", (uint64_t)kv.second.nAddHeight);
+        m.pushKV("removal_height", (uint64_t)kv.second.nRemoveHeight);
+        m.pushKV("active", kv.second.IsActiveAt(nNext));
+        ret.push_back(m);
+    }
+    return ret;
 }
 
 static UniValue PoolToJSON(const CPool& pool)
@@ -2257,6 +2324,7 @@ static const CRPCCommand commands[] =
 
     { "houses",             "listhouses",                   &listhouses,                    {}},
     { "houses",             "gethouse",                     &gethouse,                      {"id"}},
+    { "houses",             "listhousemembers",             &listhousemembers,              {"id", "start", "count"}},
 
     { "pools",              "listpools",                    &listpools,                     {}},
     { "pools",              "getpool",                      &getpool,                       {"id"}},

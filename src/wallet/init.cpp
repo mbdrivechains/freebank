@@ -289,33 +289,37 @@ bool OpenWallets()
         if (!strEncWarning.empty()) {
             InitWarning(strprintf("Wallet %s: %s", walletFile, strEncWarning));
         }
-        vpwallets.push_back(pwallet);
+        AddWallet(pwallet);
     }
 
     return true;
 }
 
 void StartWallets(CScheduler& scheduler) {
-    for (CWalletRef pwallet : vpwallets) {
+    for (CWalletRef pwallet : GetWallets()) {
         pwallet->postInitProcess(scheduler);
     }
 }
 
 void FlushWallets() {
-    for (CWalletRef pwallet : vpwallets) {
+    for (CWalletRef pwallet : GetWallets()) {
         pwallet->Flush(false);
     }
 }
 
 void StopWallets() {
-    for (CWalletRef pwallet : vpwallets) {
+    for (CWalletRef pwallet : GetWallets()) {
         pwallet->Flush(true);
     }
 }
 
 void CloseWallets() {
-    for (CWalletRef pwallet : vpwallets) {
+    std::vector<CWalletRef> wallets;
+    {
+        LOCK(cs_wallets);
+        wallets.swap(vpwallets);
+    }
+    for (CWalletRef pwallet : wallets) {
         delete pwallet;
     }
-    vpwallets.clear();
 }

@@ -143,6 +143,43 @@ bool BMMCache::HaveVerifiedBMM(const uint256& hashBlock) const
     return (setBMMVerified.count(hashBlock));
 }
 
+static const size_t MAX_MAIN_BLOCK_TIMES = 100000;
+
+bool BMMCache::GetMainBlockTime(const uint256& hashMainBlock, uint32_t& nTime) const
+{
+    std::lock_guard<std::mutex> lock(csVerified);
+    const auto it = mapMainBlockTime.find(hashMainBlock);
+    if (it == mapMainBlockTime.end())
+        return false;
+    nTime = it->second;
+    return true;
+}
+
+void BMMCache::CacheMainBlockTime(const uint256& hashMainBlock, uint32_t nTime)
+{
+    if (hashMainBlock.IsNull())
+        return;
+
+    std::lock_guard<std::mutex> lock(csVerified);
+    if (mapMainBlockTime.size() >= MAX_MAIN_BLOCK_TIMES)
+        mapMainBlockTime.clear();
+    mapMainBlockTime[hashMainBlock] = nTime;
+}
+
+bool BMMCache::HaveBmmPair(const uint256& hashMainBlock, const uint256& hashBMM) const
+{
+    std::lock_guard<std::mutex> lock(csVerified);
+    return setBmmPair.count(std::make_pair(hashMainBlock, hashBMM)) > 0;
+}
+
+void BMMCache::CacheBmmPair(const uint256& hashMainBlock, const uint256& hashBMM)
+{
+    std::lock_guard<std::mutex> lock(csVerified);
+    if (setBmmPair.size() >= MAX_MAIN_BLOCK_TIMES)
+        setBmmPair.clear();
+    setBmmPair.insert(std::make_pair(hashMainBlock, hashBMM));
+}
+
 void BMMCache::CacheVerifiedBMM(const uint256& hashBlock)
 {
     if (hashBlock.IsNull())

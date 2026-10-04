@@ -61,6 +61,9 @@ static const char DB_HOUSE = 'D';
 static const char DB_HOUSE_HASH = 'E';
 static const char DB_HOUSE_CLASS = 'G';
 static const char DB_HOUSE_LAST_ID = 'K';
+// v0.2.19 members-only houses (HouseDB): (house id, keyid) -> CHouseMember, and house id -> record count
+static const char DB_HOUSE_MEMBER = 'Y';
+static const char DB_HOUSE_MEMBER_COUNT = 'U';
 // Best-block marker for the side DBs (HouseDB + BillDB are separate LevelDB
 // instances, so one char serves both): the last block whose effects are in
 // the DB, written ATOMICALLY with those effects (Phase 3.4 review - ties the
@@ -830,7 +833,8 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
                                 const CGoldFix* pFix, bool fEraseFix,
                                 const std::vector<COracleSubmitter>* pvSubmitter,
                                 const std::vector<uint32_t>* pvSubmitterRemove,
-                                const uint32_t* pnLastSubmitterID)
+                                const uint32_t* pnLastSubmitterID,
+                                const HouseMemberEffects* pMembers)
 {
     CDBBatch batch(*this);
     for (const CHouse& house : vHouse) {
@@ -862,8 +866,64 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
     }
     if (pnLastSubmitterID)
         batch.Write(DB_ORACLE_SUB_LAST_ID, *pnLastSubmitterID);
+    if (pMembers) {
+        for (const auto& kv : pMembers->mapRecord) {
+            const auto key = std::make_pair(DB_HOUSE_MEMBER, kv.first);
+            if (kv.second.fPresent)
+                batch.Write(key, kv.second.rec);
+            else
+                batch.Erase(key);
+        }
+        for (const auto& kv : pMembers->mapCount) {
+            if (kv.second)
+                batch.Write(std::make_pair(DB_HOUSE_MEMBER_COUNT, kv.first), kv.second);
+            else
+                batch.Erase(std::make_pair(DB_HOUSE_MEMBER_COUNT, kv.first));
+        }
+    }
     batch.Write(DB_SIDE_BEST_BLOCK, hashBestBlock);
     return WriteBatch(batch, true);
+}
+
+bool HouseDB::GetHouseMember(uint32_t nHouseID, const uint160& keyid, CHouseMember& rec)
+{
+    return Read(std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, keyid)), rec);
+}
+
+uint32_t HouseDB::GetHouseMemberCount(uint32_t nHouseID)
+{
+    uint32_t n = 0;
+    Read(std::make_pair(DB_HOUSE_MEMBER_COUNT, nHouseID), n);
+    return n;
+}
+
+bool HouseDB::WriteHouseMember(uint32_t nHouseID, const uint160& keyid, const HouseMemberPrior& prior)
+{
+    const auto key = std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, keyid));
+    return prior.fPresent ? Write(key, prior.rec) : Erase(key);
+}
+
+bool HouseDB::WriteHouseMemberCount(uint32_t nHouseID, uint32_t nCount)
+{
+    const auto key = std::make_pair(DB_HOUSE_MEMBER_COUNT, nHouseID);
+    return nCount ? Write(key, nCount) : Erase(key);
+}
+
+std::vector<std::pair<uint160, CHouseMember>> HouseDB::ListHouseMembers(uint32_t nHouseID, const uint160& start, size_t nMax)
+{
+    std::vector<std::pair<uint160, CHouseMember>> v;
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, start)));
+    while (pcursor->Valid() && v.size() < nMax) {
+        std::pair<char, std::pair<uint32_t, uint160>> key;
+        if (!pcursor->GetKey(key) || key.first != DB_HOUSE_MEMBER || key.second.first != nHouseID)
+            break;
+        CHouseMember rec;
+        if (pcursor->GetValue(rec))
+            v.emplace_back(key.second.second, rec);
+        pcursor->Next();
+    }
+    return v;
 }
 
 bool HouseDB::WriteGoldFix(const CGoldFix& fix)
@@ -958,10 +1018,12 @@ std::vector<CHouse> HouseDB::GetHouses()
 
         std::pair<char, uint32_t> key;
         CHouse house;
-        if (pcursor->GetKey(key) && key.first == DB_HOUSE) {
-            if (pcursor->GetValue(house))
-                vHouse.push_back(house);
-        }
+        // The house records are contiguous: stop at the first other key (v0.2.19: member records would otherwise
+        // be walked too, up to MAX_HOUSE_MEMBERS per house)
+        if (!pcursor->GetKey(key) || key.first != DB_HOUSE)
+            break;
+        if (pcursor->GetValue(house))
+            vHouse.push_back(house);
 
         pcursor->Next();
     }

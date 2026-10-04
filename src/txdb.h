@@ -242,6 +242,7 @@ public:
 
 /** Access to the house database (blocks/Houses/) */
 #include <oracle.h>
+#include <house.h>   // v0.2.19: CHouseMember, HouseMemberPrior, HouseMemberEffects
 
 class HouseDB : public CDBWrapper
 {
@@ -259,7 +260,17 @@ public:
                            const CGoldFix* pFix = nullptr, bool fEraseFix = false,
                            const std::vector<COracleSubmitter>* pvSubmitter = nullptr,
                            const std::vector<uint32_t>* pvSubmitterRemove = nullptr,
-                           const uint32_t* pnLastSubmitterID = nullptr);
+                           const uint32_t* pnLastSubmitterID = nullptr,
+                           const HouseMemberEffects* pMembers = nullptr);
+
+    /** v0.2.19 members-only houses: one record per (house, keyid), and the house's record count. */
+    bool GetHouseMember(uint32_t nHouseID, const uint160& keyid, CHouseMember& rec);
+    uint32_t GetHouseMemberCount(uint32_t nHouseID);
+    /** Undo: put a record back to its prior state (fPresent 0 erases it). */
+    bool WriteHouseMember(uint32_t nHouseID, const uint160& keyid, const HouseMemberPrior& prior);
+    bool WriteHouseMemberCount(uint32_t nHouseID, uint32_t nCount);
+    /** Up to nMax records of one house from keyid start (inclusive), in key order. */
+    std::vector<std::pair<uint160, CHouseMember>> ListHouseMembers(uint32_t nHouseID, const uint160& start, size_t nMax);
 
     /** Gold oracle (Phase G-1, consensus-INERT). Readers: oracle module +
      * RPC only - consult the inertness tripwire in oracle.h before adding a

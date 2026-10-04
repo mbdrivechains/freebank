@@ -1360,6 +1360,7 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
 
     bool received_new_header = false;
     const CBlockIndex *pindexLast = nullptr;
+    uint256 hashLastBlock;
     {
         LOCK(cs_main);
         CNodeState *nodestate = State(pfrom->GetId());
@@ -1396,7 +1397,6 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
             return true;
         }
 
-        uint256 hashLastBlock;
         for (const CBlockHeader& header : headers) {
             if (!hashLastBlock.IsNull() && header.hashPrevBlock != hashLastBlock) {
                 Misbehaving(pfrom->GetId(), 20, "non-continuous headers sequence");
@@ -1412,9 +1412,32 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
         }
     }
 
+    // v0.2.19 (C6 headers replay amplification): every header here is known
+    // already (the last one is, so its ancestors are). Nothing to validate, so
+    // no L1 refresh and no L1 call: a peer replaying our own headers back costs
+    // us a hash per header. A known-invalid one is treated as before (the
+    // "duplicate" answer AcceptBlockHeader would give).
+    bool fAllKnown = false;
+    if (!received_new_header) {
+        LOCK(cs_main);
+        for (const CBlockHeader& header : headers) {
+            BlockMap::const_iterator mi = mapBlockIndex.find(header.GetHash());
+            if (mi == mapBlockIndex.end())
+                break;   // can't happen (see above); take the full path
+            if (mi->second->nStatus & BLOCK_FAILED_MASK) {
+                LogPrint(BCLog::NET, "peer=%d: invalid header received (known invalid)\n", pfrom->GetId());
+                if (punish_duplicate_invalid)
+                    pfrom->fDisconnect = true;
+                return false;
+            }
+            pindexLast = mi->second;
+        }
+        fAllKnown = pindexLast != nullptr && pindexLast->GetBlockHash() == hashLastBlock;
+    }
+
     CValidationState state;
     CBlockHeader first_invalid_header;
-    if (!ProcessNewBlockHeaders(headers, state, chainparams, &pindexLast, &first_invalid_header)) {
+    if (!fAllKnown && !ProcessNewBlockHeaders(headers, state, chainparams, &pindexLast, &first_invalid_header)) {
         int nDoS;
         if (state.IsInvalid(nDoS)) {
             LOCK(cs_main);
@@ -1559,6 +1582,78 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
 
     return true;
 }
+
+// Queue the orphans that spend outputs of txid, to be re-tried by ProcessOrphanTx.
+void static AddChildrenToWorkSet(const uint256& txid, unsigned int nOutputs, std::set<uint256>& orphan_work_set) EXCLUSIVE_LOCKS_REQUIRED(g_cs_orphans)
+{
+    for (unsigned int i = 0; i < nOutputs; i++) {
+        auto it_by_prev = mapOrphanTransactionsByPrev.find(COutPoint(txid, i));
+        if (it_by_prev == mapOrphanTransactionsByPrev.end()) continue;
+        for (const auto& elem : it_by_prev->second) {
+            orphan_work_set.insert(elem->first);
+        }
+    }
+}
+
+// Re-try queued orphans until one is accepted or rejected, then return, so one message can't hold cs_main for the
+// whole orphan pool (Core #15644, CVE-2024-52914). The rest wait for later passes of ProcessMessages.
+void static ProcessOrphanTx(CConnman* connman, std::set<uint256>& orphan_work_set, std::list<CTransactionRef>& removed_txn) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_cs_orphans)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(g_cs_orphans);
+    std::set<NodeId> setMisbehaving;
+    bool done = false;
+    while (!done && !orphan_work_set.empty()) {
+        const uint256 orphanHash = *orphan_work_set.begin();
+        orphan_work_set.erase(orphan_work_set.begin());
+
+        auto orphan_it = mapOrphanTransactions.find(orphanHash);
+        if (orphan_it == mapOrphanTransactions.end()) continue;
+
+        const CTransactionRef porphanTx = orphan_it->second.tx;
+        const CTransaction& orphanTx = *porphanTx;
+        NodeId fromPeer = orphan_it->second.fromPeer;
+        bool fMissingInputs2 = false;
+        // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
+        // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
+        // anyone relaying LegitTxX banned)
+        CValidationState stateDummy;
+
+        if (setMisbehaving.count(fromPeer)) continue;
+        if (AcceptToMemoryPool(mempool, stateDummy, porphanTx, &fMissingInputs2, &removed_txn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {
+            LogPrint(BCLog::MEMPOOL, "   accepted orphan tx %s\n", orphanHash.ToString());
+            RelayTransaction(orphanTx, connman);
+            AddChildrenToWorkSet(orphanHash, orphanTx.vout.size(), orphan_work_set);
+            EraseOrphanTx(orphanHash);
+            done = true;
+        } else if (!fMissingInputs2) {
+            int nDos = 0;
+            if (stateDummy.IsInvalid(nDos) && nDos > 0) {
+                // Punish peer that gave us an invalid orphan tx
+                Misbehaving(fromPeer, nDos);
+                setMisbehaving.insert(fromPeer);
+                LogPrint(BCLog::MEMPOOL, "   invalid orphan tx %s\n", orphanHash.ToString());
+            }
+            // Has inputs but not accepted to mempool
+            // Probably non-standard or insufficient fee
+            LogPrint(BCLog::MEMPOOL, "   removed orphan tx %s\n", orphanHash.ToString());
+            if (!orphanTx.HasWitness() && !stateDummy.CorruptionPossible()) {
+                // Do not use rejection cache for witness transactions or
+                // witness-stripped transactions, as they can have been malleated.
+                // See https://github.com/bitcoin/bitcoin/issues/8279 for details.
+                assert(recentRejects);
+                recentRejects->insert(orphanHash);
+            }
+            EraseOrphanTx(orphanHash);
+            done = true;
+        }
+        mempool.check(pcoinsTip.get());
+    }
+}
+
+/** v0.2.19 (Core #13907): the most block hashes a getheaders / getblocks
+ *  locator may carry. Our own locators are ~10 + log2(height) long. */
+static const unsigned int MAX_LOCATOR_SZ = 101;
 
 bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStream& vRecv, int64_t nTimeReceived, const CChainParams& chainparams, CConnman* connman, const std::atomic<bool>& interruptMsgProc)
 {
@@ -1940,6 +2035,10 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         LOCK(cs_main);
 
         uint32_t nFetchFlags = GetFetchFlags(pfrom);
+        // v0.2.19 (CVE-2024-52915, Core #18962): one getheaders per inv message,
+        // for its last unknown block, not one per block: an inv of 50,000 unknown
+        // block hashes queued ~50 MB of getheaders.
+        const uint256* best_block{nullptr};
 
         for (CInv &inv : vInv)
         {
@@ -1956,13 +2055,12 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             if (inv.type == MSG_BLOCK) {
                 UpdateBlockAvailability(pfrom->GetId(), inv.hash);
                 if (!fAlreadyHave && !fImporting && !fReindex && !mapBlocksInFlight.count(inv.hash)) {
-                    // We used to request the full block here, but since headers-announcements are now the
-                    // primary method of announcement on the network, and since, in the case that a node
-                    // fell back to inv we probably have a reorg which we should get the headers for first,
-                    // we now only provide a getheaders response here. When we receive the headers, we will
-                    // then ask for the blocks we need.
-                    connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::GETHEADERS, chainActive.GetLocator(pindexBestHeader), inv.hash));
-                    LogPrint(BCLog::NET, "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->GetId());
+                    // Headers-first is the primary method of announcement on
+                    // the network. If a node fell back to sending blocks by inv,
+                    // it's probably for a re-org. The final block hash
+                    // provided should be the highest, so send a getheaders and
+                    // then fetch the blocks we need to catch up.
+                    best_block = &inv.hash;
                 }
             }
             else
@@ -1974,6 +2072,11 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                     pfrom->AskFor(inv);
                 }
             }
+        }
+
+        if (best_block != nullptr) {
+            connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::GETHEADERS, chainActive.GetLocator(pindexBestHeader), *best_block));
+            LogPrint(BCLog::NET, "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, best_block->ToString(), pfrom->GetId());
         }
     }
 
@@ -2005,6 +2108,12 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         CBlockLocator locator;
         uint256 hashStop;
         vRecv >> locator >> hashStop;
+
+        if (locator.vHave.size() > MAX_LOCATOR_SZ) {
+            LogPrint(BCLog::NET, "getblocks locator size %lld > %d, disconnect peer=%d\n", locator.vHave.size(), MAX_LOCATOR_SZ, pfrom->GetId());
+            pfrom->fDisconnect = true;
+            return true;
+        }
 
         // We might have announced the currently-being-connected tip using a
         // compact block, which resulted in the peer sending a getblocks
@@ -2117,6 +2226,12 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         uint256 hashStop;
         vRecv >> locator >> hashStop;
 
+        if (locator.vHave.size() > MAX_LOCATOR_SZ) {
+            LogPrint(BCLog::NET, "getheaders locator size %lld > %d, disconnect peer=%d\n", locator.vHave.size(), MAX_LOCATOR_SZ, pfrom->GetId());
+            pfrom->fDisconnect = true;
+            return true;
+        }
+
         LOCK(cs_main);
         // v0.2.17: with the 2 h -maxtipage a node restarted during a long stall is in
         // initial block download at the network's tip. It still answers getheaders
@@ -2186,8 +2301,6 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             return true;
         }
 
-        std::deque<COutPoint> vWorkQueue;
-        std::vector<uint256> vEraseQueue;
         CTransactionRef ptx;
         vRecv >> ptx;
         const CTransaction& tx = *ptx;
@@ -2209,9 +2322,7 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             AcceptToMemoryPool(mempool, state, ptx, &fMissingInputs, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {
             mempool.check(pcoinsTip.get());
             RelayTransaction(tx, connman);
-            for (unsigned int i = 0; i < tx.vout.size(); i++) {
-                vWorkQueue.emplace_back(inv.hash, i);
-            }
+            AddChildrenToWorkSet(inv.hash, tx.vout.size(), pfrom->orphan_work_set);
 
             pfrom->nLastTXTime = GetTime();
 
@@ -2220,66 +2331,8 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                 tx.GetHash().ToString(),
                 mempool.size(), mempool.DynamicMemoryUsage() / 1000);
 
-            // Recursively process any orphan transactions that depended on this one
-            std::set<NodeId> setMisbehaving;
-            while (!vWorkQueue.empty()) {
-                auto itByPrev = mapOrphanTransactionsByPrev.find(vWorkQueue.front());
-                vWorkQueue.pop_front();
-                if (itByPrev == mapOrphanTransactionsByPrev.end())
-                    continue;
-                for (auto mi = itByPrev->second.begin();
-                     mi != itByPrev->second.end();
-                     ++mi)
-                {
-                    const CTransactionRef& porphanTx = (*mi)->second.tx;
-                    const CTransaction& orphanTx = *porphanTx;
-                    const uint256& orphanHash = orphanTx.GetHash();
-                    NodeId fromPeer = (*mi)->second.fromPeer;
-                    bool fMissingInputs2 = false;
-                    // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
-                    // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
-                    // anyone relaying LegitTxX banned)
-                    CValidationState stateDummy;
-
-
-                    if (setMisbehaving.count(fromPeer))
-                        continue;
-                    if (AcceptToMemoryPool(mempool, stateDummy, porphanTx, &fMissingInputs2, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {
-                        LogPrint(BCLog::MEMPOOL, "   accepted orphan tx %s\n", orphanHash.ToString());
-                        RelayTransaction(orphanTx, connman);
-                        for (unsigned int i = 0; i < orphanTx.vout.size(); i++) {
-                            vWorkQueue.emplace_back(orphanHash, i);
-                        }
-                        vEraseQueue.push_back(orphanHash);
-                    }
-                    else if (!fMissingInputs2)
-                    {
-                        int nDos = 0;
-                        if (stateDummy.IsInvalid(nDos) && nDos > 0)
-                        {
-                            // Punish peer that gave us an invalid orphan tx
-                            Misbehaving(fromPeer, nDos);
-                            setMisbehaving.insert(fromPeer);
-                            LogPrint(BCLog::MEMPOOL, "   invalid orphan tx %s\n", orphanHash.ToString());
-                        }
-                        // Has inputs but not accepted to mempool
-                        // Probably non-standard or insufficient fee
-                        LogPrint(BCLog::MEMPOOL, "   removed orphan tx %s\n", orphanHash.ToString());
-                        vEraseQueue.push_back(orphanHash);
-                        if (!orphanTx.HasWitness() && !stateDummy.CorruptionPossible()) {
-                            // Do not use rejection cache for witness transactions or
-                            // witness-stripped transactions, as they can have been malleated.
-                            // See https://github.com/bitcoin/bitcoin/issues/8279 for details.
-                            assert(recentRejects);
-                            recentRejects->insert(orphanHash);
-                        }
-                    }
-                    mempool.check(pcoinsTip.get());
-                }
-            }
-
-            for (uint256 hash : vEraseQueue)
-                EraseOrphanTx(hash);
+            // Process the orphans that depended on this one: one now, the rest on later passes of ProcessMessages
+            ProcessOrphanTx(connman, pfrom->orphan_work_set, lRemovedTxn);
         }
         else if (fMissingInputs)
         {
@@ -2977,11 +3030,22 @@ bool PeerLogicValidation::ProcessMessages(CNode* pfrom, std::atomic<bool>& inter
     if (!pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom, chainparams.GetConsensus(), connman, interruptMsgProc);
 
+    if (!pfrom->orphan_work_set.empty()) {
+        std::list<CTransactionRef> removed_txn;
+        LOCK2(cs_main, g_cs_orphans);
+        ProcessOrphanTx(connman, pfrom->orphan_work_set, removed_txn);
+        for (const CTransactionRef& removedTx : removed_txn) {
+            AddToCompactExtraTransactions(removedTx);
+        }
+    }
+
     if (pfrom->fDisconnect)
         return false;
 
     // this maintains the order of responses
     if (!pfrom->vRecvGetData.empty()) return true;
+    // finish this peer's orphans before reading its next message
+    if (!pfrom->orphan_work_set.empty()) return true;
 
     // Don't bother if send buffer is too full to respond anyway
     if (pfrom->fPauseSend)

@@ -103,9 +103,17 @@ v0.2.13 repairs the withdrawal path for life on a shared eCash slot and opens th
 v0.2.14 lets block producers name their blocks and tightens the mempool to what honest wallets send,
 v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block,
 v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe,
-v0.2.17 checks every peg step against eCash itself, and
-v0.2.18 brings ECX credit with no closure date, and assets:
+v0.2.17 checks every peg step against eCash itself,
+v0.2.18 brings ECX credit with no closure date, and assets, and
+v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant:
 
+- **Members-only houses** (v0.2.19). **A consensus change on the beta: every node must upgrade**
+  (no `-reindex`, no new flag: a node runs the beta as before). A house can be registered as
+  members-only (notes and term deposits go only to its members' keys) or redeem-only (for co-ops
+  that lend to members but don't issue money that circulates). Also: the deposit address is read
+  from the eCash transaction itself, each block's time is bound to its eCash block, and a security
+  batch. FreeBank mainnet (its own network and genesis block) is in the code, dormant and not
+  selectable; a separate mainnet release runs it. Details in the release notes.
 - **Suspension instead of closure, and assets** (v0.2.18). **This is a consensus change: every node
   must upgrade and restart once with `-reindex`** (the coin database now carries each coin's asset).
   The eCash beta chain is kept. A v0.2.17 node stops following the chain at the first asset

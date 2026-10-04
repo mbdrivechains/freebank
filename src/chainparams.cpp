@@ -49,6 +49,11 @@ static CBlock CreateGenesisBlock(uint32_t nTime, int32_t nVersion, const CAmount
     return CreateGenesisBlock(pszTimestamp, genesisOutputScript, nTime, nVersion, genesisReward);
 }
 
+void CChainParams::UpdateChainDormant(bool fDormant)
+{
+    consensus.fChainDormant = fDormant;
+}
+
 void CChainParams::UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime, int64_t nTimeout)
 {
     consensus.vDeployments[d].nStartTime = nStartTime;
@@ -79,10 +84,16 @@ static bool DeferScheduleIsValid(const std::vector<Consensus::DeferInterestStep>
     return true;
 }
 
-class CMainParams : public CChainParams {
+/**
+ * FreeBank beta: the eCash betanet era (slot 130 since 2026-09). Until v0.2.19
+ * this was the "main" network; its identity is unchanged (magic, genesis,
+ * ports, the root data directory), and it is still what a node runs with no
+ * flag, so a beta node upgrades with nothing to change.
+ */
+class CBetaParams : public CChainParams {
 public:
-    CMainParams() {
-        strNetworkID = "main";
+    CBetaParams() {
+        strNetworkID = "beta";
         consensus.nSubsidyHalvingInterval = 210000;
         consensus.BIP16Height = 0;
         consensus.BIP34Height = 1;
@@ -113,7 +124,8 @@ public:
                                                   // row-1 hourly cadence promise can never enter a
                                                   // fix; 6 << the 144 brake cap; 2.1% of G3's ~2d
         // Withdrawal poison-row guard from genesis (operator sign-off 2026-09-24, H = 0).
-        // CMainParams serves BOTH the eCash beta and eCash mainnet, so one H covers both.
+        // Until v0.2.19 these params served BOTH the eCash beta and eCash mainnet, so one H
+        // covered both; mainnet (CMainParams below) inherits it.
         // 0 is safe on beta only while no block of its FreeBank chain holds a withdrawal
         // object: only such a block can break the rule. Check that directly at the swap,
         // with v0.2.12 stopped so it cannot connect a block in between: no output in blocks
@@ -216,6 +228,45 @@ public:
                //   (the tx=... number in the SetBestChain debug.log lines)
             0  // * estimated number of transactions per second after that timestamp
         };
+    }
+};
+
+/**
+ * FreeBank mainnet, on eCash mainnet (opens 2026-10-31). Beta's rules from
+ * block 0, its own identity: magic, genesis and data directory ("mainnet"),
+ * the same ports and seed name (beta stops when mainnet starts, so the two
+ * never need to run side by side). Ships DORMANT (genesis M1, option A).
+ * No flag selects it in a beta build: the mainnet release runs it as its one
+ * public network.
+ */
+class CMainParams : public CBetaParams {
+public:
+    CMainParams() {
+        strNetworkID = "main";
+
+        // v0.2.19: dormant until a later release switches it on
+        consensus.fChainDormant = true;
+
+        // Its own network: a mainnet node never talks to a beta node
+        pchMessageStart[0] = 0xfb;
+        pchMessageStart[1] = 0x4b;
+        pchMessageStart[2] = 0xec;
+        pchMessageStart[3] = 0x58;
+
+        genesis = CreateGenesisBlock("FreeBank mainnet genesis: eCash slot 130, 2026-10-04",
+                                     CScript() << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f") << OP_CHECKSIG,
+                                     1791072000, 1, 0);
+        consensus.hashGenesisBlock = genesis.GetHash();
+        // LOCKED (v0.2.19, the release the mainnet M1 names)
+        assert(consensus.hashGenesisBlock == uint256S("0x6e5a41bcc2793325e79d952de3766989f70181294e32f19b10d4968b74d919fc"));
+        assert(genesis.hashMerkleRoot == uint256S("0xd0a6ddf613dfbf632067bed8386ee4f2afbb0d142a32ad413b283b53f5e3011e"));
+        consensus.defaultAssumeValid = consensus.hashGenesisBlock;
+        checkpointData = {
+            {
+                { 0, consensus.hashGenesisBlock },
+            }
+        };
+        chainTxData = ChainTxData{0, 0, 0};
     }
 };
 
@@ -325,6 +376,8 @@ std::unique_ptr<CChainParams> CreateChainParams(const std::string& chain)
 {
     if (chain == CBaseChainParams::MAIN)
         return std::unique_ptr<CChainParams>(new CMainParams());
+    else if (chain == CBaseChainParams::BETA)
+        return std::unique_ptr<CChainParams>(new CBetaParams());
     else if (chain == CBaseChainParams::REGTEST)
         return std::unique_ptr<CChainParams>(new CRegTestParams());
     throw std::runtime_error(strprintf("%s: Unknown chain %s.", __func__, chain));
@@ -339,4 +392,9 @@ void SelectParams(const std::string& network)
 void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime, int64_t nTimeout)
 {
     globalChainParams->UpdateVersionBitsParameters(d, nStartTime, nTimeout);
+}
+
+void UpdateChainDormantForTest(bool fDormant)
+{
+    globalChainParams->UpdateChainDormant(fDormant);
 }

@@ -356,6 +356,15 @@ bool GetDepositPayoutOutput(const SidechainDeposit& deposit, CTxOut& out);
 bool ParseFullDepositAddress(const std::string& strDest, std::string& strAddressOut);
 
 /**
+ * v0.2.19 (7a, consensus): the address a BIP300 deposit transaction carries,
+ * read exactly as the enforcer reads it (try_parse_op_return_address): output
+ * nBurnIndex + 1 must be OP_RETURN followed by one data push (any push opcode,
+ * an empty push included) and nothing else; the pushed bytes are the address.
+ * False when there is no such output.
+ */
+bool GetDepositAddressFromL1Tx(const CMutableTransaction& tx, uint32_t nBurnIndex, std::string& strAddressOut);
+
+/**
  * Claim a coinbase output satisfying `required`, marking it consumed.
  *
  * D-1: the old check scanned the coinbase for a matching (value, scriptPubKey)

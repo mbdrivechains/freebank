@@ -106,78 +106,16 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
         // (bad-house-colored-input), so they always take this branch.
         bool fHouseTx = tx.nVersion == TRANSACTION_HOUSE_VERSION && nHouseID != 0;
         size_t nHousePledges = 0;
-        if (fHouseTx && tx.nHouseOp == HOUSE_OP_REGISTER) {
+        if (fHouseTx && IsHouseRegisterOp(tx.nHouseOp)) {
             HouseRegister reg;
-            if (DecodeHousePayload(tx.vchHousePayload, reg))
+            uint8_t nFlags = 0;
+            if (DecodeHouseRegisterAny(tx, reg, nFlags))
                 nHousePledges = reg.vPartnerPubKey.size();
         }
 
-        // Note transactions tag their new note outputs (fNote + nHouseID +
-        // per-output nNoteUnits). Unlike houses, a note carries its house and
-        // unit split in the PAYLOAD, so AddCoins is self-contained and tags
-        // identically on ConnectBlock and RollforwardBlock with no threaded id
-        // (sidestepping the positional-arg / stale-id regression class). MINT
-        // and TRANSFER create note outputs at vout[0..vUnits-1]; REDEEM does not.
-        bool fNoteTx = tx.nVersion == TRANSACTION_NOTE_VERSION;
-        uint32_t nNoteHouse = 0;
-        std::vector<uint64_t> vNoteUnits;
-        // Demand height carried onto the new note outputs (3.5). DEMAND stamps
-        // THIS block's height; TRANSFER carries the payload's value forward
-        // (tx_verify has already forced it to equal the spent notes' height),
-        // so a demanded note keeps its interest clock when it changes hands.
-        uint32_t nNoteDemandHeight = 0;
-        bool fClaimEscrowChange = false;
-        uint32_t nClaimHouse = 0;
-        if (fNoteTx) {
-            if (tx.nNoteOp == NOTE_OP_MINT) {
-                NoteMint m;
-                if (DecodeNotePayload(tx.vchNotePayload, m)) { nNoteHouse = m.nHouseID; vNoteUnits = m.vUnits; }
-            } else if (tx.nNoteOp == NOTE_OP_TRANSFER) {
-                NoteTransfer x;
-                if (DecodeNotePayload(tx.vchNotePayload, x)) { nNoteHouse = x.nHouseID; vNoteUnits = x.vUnits; nNoteDemandHeight = x.nDemandHeight; }
-            } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
-                NoteDemand d;
-                if (DecodeNotePayload(tx.vchNotePayload, d)) {
-                    nNoteHouse = d.nHouseID; vNoteUnits = d.vUnits;
-                    // B3: a fresh demand stamps THIS height; the delta-1b
-                    // upgrade re-stamps the PRIOR height (tx_verify has forced
-                    // it to equal the spent coins'), so the clock is preserved
-                    // rather than reset. The pre-auth bit rides in the same
-                    // field - see NOTE_DEMAND_PREAUTH_BIT (D-i: no Coin format
-                    // change, so no fleet -reindex).
-                    const uint32_t nBase = d.nPriorDemandHeight != 0
-                                         ? d.nPriorDemandHeight : (uint32_t)nHeight;
-                    nNoteDemandHeight = NoteDemandTag(nBase, d.fPreAuth);
-                }
-            } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
-                // Re-issued UNCHANGED: same units, same tag. A protest asserts
-                // a claim; it must not alter it.
-                NoteProtest pro;
-                if (DecodeNotePayload(tx.vchNotePayload, pro)) {
-                    nNoteHouse = pro.nHouseID; vNoteUnits = pro.vUnits;
-                    nNoteDemandHeight = pro.nDemandTag;
-                }
-            } else if (tx.nNoteOp == NOTE_OP_REDEEM) {
-                // The dynamic-brassage spread (3.5) is an escrow output at
-                // vout[1] - payload-driven like every other note tag, so
-                // connect == rollforward.
-                NoteRedeem r;
-                if (DecodeNotePayload(tx.vchNotePayload, r) && r.fBrassage) {
-                    fClaimEscrowChange = true;
-                    nClaimHouse = r.nHouseID;
-                }
-            } else if (tx.nNoteOp == NOTE_OP_CLAIM) {
-                // An insolvency claim may return escrow change at vout[1]; the
-                // payload is self-contained (connect == rollforward), and the
-                // contextual check pinned vout[1]'s script to the canonical
-                // escrow script before this coin can exist.
-                NoteClaim c;
-                if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange) {
-                    fClaimEscrowChange = true;
-                    nClaimHouse = c.nHouseID;
-                }
-            }
-        }
+        // Note transactions tag their outputs via the shared payload-pure
+        // tagger (ApplyNoteCoinTags, below): no threaded id, so connect ==
+        // rollforward == the mempool view.
 
         // Term-deposit receipts (Phase 3.8) self-tag from the payload, exactly
         // like notes - no threaded dense id, so connect == rollforward. ORIGINATE
@@ -240,7 +178,7 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
             }
 
             if (fHouseTx) {
-                if (tx.nHouseOp == HOUSE_OP_REGISTER && i < nHousePledges)
+                if (IsHouseRegisterOp(tx.nHouseOp) && i < nHousePledges)
                     coin.SetHouseEscrow(nHouseID);
                 else if ((tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT) && i == 0)
                     coin.SetHouseEscrow(nHouseID);
@@ -249,11 +187,7 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
                     coin.SetHouseEscrow(nHouseID);
             }
 
-            if (fNoteTx && nNoteHouse != 0 && i < vNoteUnits.size())
-                coin.SetNote(nNoteHouse, vNoteUnits[i], nNoteDemandHeight);
-
-            if (fNoteTx && fClaimEscrowChange && i == 1)
-                coin.SetHouseEscrow(nClaimHouse);
+            ApplyNoteCoinTags(tx, i, coin, true /* fConnected */, (uint32_t)nHeight);
 
             if (fDepositTx && nDepHouse != 0 && i < vDepPrincipal.size())
                 coin.SetDeposit(nDepHouse, vDepPrincipal[i], vDepRate[i], vDepMaturity[i], nDepOrigination);

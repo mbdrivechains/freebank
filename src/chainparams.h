@@ -80,6 +80,7 @@ public:
     const CCheckpointData& Checkpoints() const { return checkpointData; }
     const ChainTxData& TxData() const { return chainTxData; }
     void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime, int64_t nTimeout);
+    void UpdateChainDormant(bool fDormant);
 protected:
     CChainParams() {}
 
@@ -126,5 +127,8 @@ void SelectParams(const std::string& chain);
  * Allows modifying the Version Bits regtest parameters.
  */
 void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime, int64_t nTimeout);
+
+/** v0.2.19: regtest only (-dormant), so gates can show a dormant chain and its switch-on. */
+void UpdateChainDormantForTest(bool fDormant);
 
 #endif // BITCOIN_CHAINPARAMS_H

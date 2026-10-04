@@ -121,3 +121,8 @@ contrib/devtools/split-debug.sh
 # Guix build outputs (contrib/guix); the patches it needs are tracked despite *.patch above
 guix-build-*/
 !contrib/guix/patches/*.patch
+
+# test byproducts (unit wallet_tests write these into the working dir)
+wallet_test.dat
+src/wallet_test.dat
+build.err

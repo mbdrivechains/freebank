@@ -71,6 +71,9 @@ BITCOIN_TESTS =\
   test/bswap_tests.cpp \
   test/checkqueue_tests.cpp \
   test/coinbasetag_tests.cpp \
+  test/template_evict_tests.cpp \
+  test/legacy_sigops_tests.cpp \
+  test/members_tests.cpp \
   test/coins_tests.cpp \
   test/enforcerconnect_tests.cpp \
   test/l1client_tests.cpp \

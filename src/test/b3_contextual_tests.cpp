@@ -1118,4 +1118,57 @@ BOOST_AUTO_TEST_CASE(protest_queue_demand_window_starts_at_reopen)
                                 house, fnNoCoin), "");
 }
 
+// v0.2.19 members-only houses: a PLAIN demand re-issues notes to a P2PKH the holder names (shape only), so it is held
+// to the members-only rule (spec 4.1; the draft-1 review blocker). The wallet always re-issues to the holder's own key,
+// so only a hand-built demand reaches the refusal. No member records exist here (no HouseDB in this suite): only the
+// holder's own key and the house's redemption key are allowed.
+static CMutableTransaction MakePlainDemandTo(uint32_t nHouseID, uint64_t nUnits, const CKey& keyHolder, const CScript& scriptTo)
+{
+    const CPubKey pub = keyHolder.GetPubKey();
+    NoteDemand d;
+    d.nHouseID = nHouseID;
+    d.vUnits.push_back(nUnits);
+    d.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+    d.fPreAuth = NOTE_DEMAND_MODE_PLAIN;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_DEMAND;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("de3a"), 0)));
+    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, scriptTo));
+    keyHolder.Sign(NoteDemandSigHash(nHouseID, d.vUnits, BillHashOutputs(mtx)), d.vchHolderSig);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << d;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+
+BOOST_AUTO_TEST_CASE(demand_plain_members_only_rule)
+{
+    const int H = 5000;
+    const uint64_t U = 1000000;
+    CKey key; key.MakeNewKey(true);
+    CKey other; other.MakeNewKey(true);
+    const CScript scriptOwn = GetScriptForDestination(key.GetPubKey().GetID());
+    const CScript scriptOther = GetScriptForDestination(other.GetPubKey().GetID());
+
+    CHouse house = MakeOpenHouse(1, H, 2 * U);
+    house.nDeferInvokedHeight = (uint32_t)H - 10;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
+    const CScript scriptHouse = GetScriptForDestination(CPubKey(house.vchRedemptionDestPK).GetID());
+
+    // An open house: any P2PKH, as before
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainDemandTo(1, U, key, scriptOther), H, U, house, fnNoCoin), "");
+    // Members-only: the holder's own key and the house's key, not another key
+    house.nFlags = HOUSE_FLAG_MEMBERS_ONLY;
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainDemandTo(1, U, key, scriptOwn), H, U, house, fnNoCoin), "");
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainDemandTo(1, U, key, scriptHouse), H, U, house, fnNoCoin), "");
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainDemandTo(1, U, key, scriptOther), H, U, house, fnNoCoin), "bad-house-not-member");
+    // Redeem-only: the same, refused as passing on between holders
+    house.nFlags = HOUSE_FLAG_MEMBERS_ONLY | HOUSE_FLAG_REDEEM_ONLY;
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainDemandTo(1, U, key, scriptOwn), H, U, house, fnNoCoin), "");
+    BOOST_CHECK_EQUAL(CtxReject(MakePlainDemandTo(1, U, key, scriptOther), H, U, house, fnNoCoin), "bad-house-redeem-only");
+    // The pre-auth modes re-issue into custody pinned to the holder: not this rule's business
+    BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, std::vector<unsigned char>(scriptOther.begin(), scriptOther.end()),
+                                             true, true, true), H, U, house, fnNoCoin), "");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

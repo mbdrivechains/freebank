@@ -133,6 +133,11 @@ struct Params {
      *  never-a-CLI-knob rule as nSettleCadence; unit tests move it through a
      *  const_cast on Params().GetConsensus(). */
     int nWithdrawalGuardHeight;
+    /** v0.2.19 (genesis M1, Michael 2026-10-04, option A): while set, no block
+     *  after genesis is valid and none is produced. Mainnet ships dormant so its
+     *  M1 can name a real release; a later release clears it ("switches it on"),
+     *  and its first blocks credit every deposit made in the meantime, in order. */
+    bool fChainDormant = false;
     BIP9Deployment vDeployments[MAX_VERSION_BITS_DEPLOYMENTS];
     /** Proof of work parameters */
     uint256 powLimit;

@@ -76,10 +76,13 @@ bool fMainchainIdentityMismatch = false;
 /** v0.2.17 D5: the enforcer was not verified at startup (unreachable or still
  *  syncing). MaybeVerifyEnforcer checks it on first contact. */
 static std::atomic<bool> g_fEnforcerUnverified{false};
+/** v0.2.19: the enforcer's identity is pinned (enforcer transport, checked at
+ *  startup), so MaybeVerifyEnforcer re-checks it while running. */
+static std::atomic<bool> g_fEnforcerPinned{false};
 
 static void RefuseEnforcer(const std::string& strWhy)
 {
-    const std::string strMessage = strprintf(_("mainchain ENFORCER checked on first contact: %s. Shutting down: "
+    const std::string strMessage = strprintf(_("mainchain ENFORCER check failed: %s. Shutting down: "
                                                "a wrong enforcer makes this node split off."), strWhy);
     LogPrintf("ERROR: %s\n", strMessage);
     uiInterface.ThreadSafeMessageBox(strMessage, "", CClientUIInterface::MSG_ERROR);
@@ -93,8 +96,35 @@ static void RefuseEnforcer(const std::string& strWhy)
 static void MaybeVerifyEnforcer()
 {
     static int nMismatch = 0;
-    if (!g_fEnforcerUnverified)
+    static int nTick = 0;
+    if (!g_fEnforcerUnverified) {
+        if (!g_fEnforcerPinned)
+            return;
+        // v0.2.19 (C6 a7-pin-fails-open-and-is-boot-only): a verified enforcer
+        // is checked again every 10 minutes (20 ticks), so a later swap to an
+        // enforcer on another L1 is caught. While it disagrees: every tick, its
+        // answers held (SetL1AnswersHeld), and 12 in a row (6 min) shut the node
+        // down, as startup would refuse it. "Not ready" breaks a run.
+        // Regtest only: -enforcerrecheckticks=<n> (gate enforcer_recheck).
+        static const int nEvery = Params().NetworkIDString() == CBaseChainParams::REGTEST
+                                ? std::max<int64_t>(1, gArgs.GetArg("-enforcerrecheckticks", 20)) : 20;
+        if (nMismatch == 0 && ++nTick % nEvery != 0)
+            return;
+        std::string strDetail;
+        const EnforcerIdentity r = ProbeEnforcerIdentity(strDetail);
+        if (r == ENFORCER_IDENTITY_MISMATCH) {
+            SetL1AnswersHeld(true);
+            LogPrintf("mainchain enforcer re-check: it indexes a different L1 than the pinned REST node (%d in a row): %s\n",
+                      nMismatch + 1, strDetail);
+            if (++nMismatch >= 12)
+                RefuseEnforcer(strprintf("it indexes a different L1 than the pinned REST node (%s)", strDetail));
+            return;
+        }
+        nMismatch = 0;
+        SetL1AnswersHeld(false);
         return;
+    }
+    SetL1AnswersHeld(true);
     std::string strDetail;
     const EnforcerIdentity r = ProbeEnforcerIdentity(strDetail);
     if (r == ENFORCER_IDENTITY_NOTREADY) {
@@ -115,6 +145,7 @@ static void MaybeVerifyEnforcer()
         RefuseEnforcer(strDetail);
         return;
     }
+    SetL1AnswersHeld(false);
     LogPrintf("mainchain enforcer verified on first contact (identity and settings)\n");
 }
 static const bool DEFAULT_PROXYRANDOMIZE = true;
@@ -383,8 +414,8 @@ void OnRPCStopped()
 
 std::string HelpMessage(HelpMessageMode mode)
 {
-    const auto defaultBaseParams = CreateBaseChainParams(CBaseChainParams::MAIN);
-    const auto defaultChainParams = CreateChainParams(CBaseChainParams::MAIN);
+    const auto defaultBaseParams = CreateBaseChainParams(CBaseChainParams::BETA);
+    const auto defaultChainParams = CreateChainParams(CBaseChainParams::BETA);
     const bool showDebug = gArgs.GetBoolArg("-help-debug", false);
 
     // When adding new options to the categories, please keep and ensure alphabetical ordering.
@@ -506,6 +537,8 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-limitdescendantcount=<n>", strprintf("Do not accept transactions if any ancestor would have <n> or more in-mempool descendants (default: %u)", DEFAULT_DESCENDANT_LIMIT));
         strUsage += HelpMessageOpt("-limitdescendantsize=<n>", strprintf("Do not accept transactions if any ancestor would have more than <n> kilobytes of in-mempool descendants (default: %u).", DEFAULT_DESCENDANT_SIZE_LIMIT));
         strUsage += HelpMessageOpt("-vbparams=deployment:start:end", "Use given start/end times for specified version bits deployment (regtest-only)");
+        strUsage += HelpMessageOpt("-dormant=<0|1>", "Run the chain dormant (no block after genesis), as FreeBank mainnet ships (regtest-only)");
+        strUsage += HelpMessageOpt("-memberopguard=0", "Let a second member op for a house into the mempool, to test the block rule (regtest-only)");
     }
     strUsage += HelpMessageOpt("-debug=<category>", strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
         _("If <category> is not supplied or if <category> = 1, output all debugging information.") + " " + _("<category> can be:") + " " + ListLogCategories() + ".");
@@ -1100,6 +1133,7 @@ bool AppInitParameterInteraction()
         // a chain reset) self-heals to a pass. Never bricks on an UNREACHABLE
         // enforcer - that failure is loud at runtime (BMM simply cannot proceed).
         {
+            g_fEnforcerPinned = true;
             bool fVerified = false, fRefuse = false;
             std::string strIdErr;
             int nNotReady = 0, nMismatch = 0;
@@ -1151,8 +1185,10 @@ bool AppInitParameterInteraction()
                                              "enforcer with this network's --network-preset. Refusing to start."),
                                            strSettings));
             }
-            // v0.2.17 D5: not checked now, checked on first contact
+            // v0.2.17 D5: not checked now, checked on first contact; v0.2.19:
+            // its BMM and peg answers held until then
             g_fEnforcerUnverified = settings != EnforcerSettingsCheck::OK;
+            SetL1AnswersHeld(g_fEnforcerUnverified);
         }
     }
     LogPrintf("Using mainchain transport: %s\n", strMainchainTransport);
@@ -1408,6 +1444,24 @@ bool AppInitParameterInteraction()
         boost::split(vstrReplacementModes, strReplacementModeList, boost::is_any_of(","));
         fEnableReplacement = (std::find(vstrReplacementModes.begin(), vstrReplacementModes.end(), "fee") != vstrReplacementModes.end());
     }
+
+    // v0.2.19: -memberopguard=0 lets a second member op for a house into the
+    // mempool, so a gate can show the block rule (one per house per block)
+    // refuse it. Regtest only.
+    if (gArgs.IsArgSet("-memberopguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-memberopguard is a regtest-only test override."));
+
+    // v0.2.19 (genesis M1): -dormant=0|1 is a regtest-only gate knob. On
+    // mainnet the dormancy is consensus, cleared only by a later release.
+    if (gArgs.IsArgSet("-dormant")) {
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+            return InitError(_("-dormant is a regtest-only test override; on other networks it is fixed by network consensus."));
+        UpdateChainDormantForTest(gArgs.GetBoolArg("-dormant", false));
+        LogPrintf("REGTEST override: chain dormant = %d\n", Params().GetConsensus().fChainDormant);
+    }
+    if (Params().GetConsensus().fChainDormant)
+        LogPrintf("This network is DORMANT: no block after genesis is valid and none is produced until a release "
+                  "switches it on. Deposits to slot %u made meanwhile are credited, in order, once it is.\n", THIS_SIDECHAIN);
 
     if (gArgs.IsArgSet("-vbparams")) {
         // Allow overriding version bits parameters for testing

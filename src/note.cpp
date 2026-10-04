@@ -6,6 +6,7 @@
 
 #include <house.h>   // BLOCKS_PER_YEAR (deferral interest)
 
+#include <coins.h>   // Coin, for the shared payload-pure output tagger
 #include <consensus/validation.h>
 #include <algorithm>
 #include <hash.h>
@@ -290,6 +291,62 @@ template bool DecodeNotePayload<NoteRedeem>(const std::vector<unsigned char>&, N
 template bool DecodeNotePayload<NoteClaim>(const std::vector<unsigned char>&, NoteClaim&);
 template bool DecodeNotePayload<NoteDemand>(const std::vector<unsigned char>&, NoteDemand&);
 template bool DecodeNotePayload<NoteProtest>(const std::vector<unsigned char>&, NoteProtest&);
+
+void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight)
+{
+    if (tx.nVersion != TRANSACTION_NOTE_VERSION)
+        return;
+
+    // A note carries its house and unit split in the PAYLOAD, so the tag needs
+    // no threaded id and connect == rollforward == mempool. MINT, TRANSFER,
+    // DEMAND and PROTEST create note outputs at vout[0..vUnits-1].
+    if (tx.nNoteOp == NOTE_OP_MINT) {
+        NoteMint m;
+        if (DecodeNotePayload(tx.vchNotePayload, m) && m.nHouseID != 0 && n < m.vUnits.size())
+            coin.SetNote(m.nHouseID, m.vUnits[n], 0);
+    } else if (tx.nNoteOp == NOTE_OP_TRANSFER) {
+        // Carries the payload's demand height forward (tx_verify has forced it
+        // to equal the spent notes'), so a demanded note keeps its interest
+        // clock when it changes hands.
+        NoteTransfer x;
+        if (DecodeNotePayload(tx.vchNotePayload, x) && x.nHouseID != 0 && n < x.vUnits.size())
+            coin.SetNote(x.nHouseID, x.vUnits[n], x.nDemandHeight);
+    } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
+        // B3: a fresh demand stamps the height it confirms at; the delta-1b
+        // upgrade re-stamps the PRIOR height (tx_verify has forced it to equal
+        // the spent coins'), so the clock is preserved rather than reset. The
+        // pre-auth bit rides in the same field - see NOTE_DEMAND_PREAUTH_BIT
+        // (D-i: no Coin format change, so no fleet -reindex). Unconfirmed, a
+        // fresh demand's stamp is unknown: tag 0, and spending it is refused.
+        NoteDemand d;
+        if (DecodeNotePayload(tx.vchNotePayload, d) && d.nHouseID != 0 && n < d.vUnits.size()) {
+            uint32_t nTag = 0;
+            if (d.nPriorDemandHeight != 0)
+                nTag = NoteDemandTag(d.nPriorDemandHeight, d.fPreAuth);
+            else if (fConnected)
+                nTag = NoteDemandTag(nHeight, d.fPreAuth);
+            coin.SetNote(d.nHouseID, d.vUnits[n], nTag);
+        }
+    } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
+        // Re-issued UNCHANGED: same units, same tag. A protest asserts a claim;
+        // it must not alter it.
+        NoteProtest pro;
+        if (DecodeNotePayload(tx.vchNotePayload, pro) && pro.nHouseID != 0 && n < pro.vUnits.size())
+            coin.SetNote(pro.nHouseID, pro.vUnits[n], pro.nDemandTag);
+    } else if (tx.nNoteOp == NOTE_OP_REDEEM && n == 1) {
+        // The dynamic-brassage spread (3.5) is an escrow output at vout[1].
+        NoteRedeem r;
+        if (DecodeNotePayload(tx.vchNotePayload, r) && r.fBrassage)
+            coin.SetHouseEscrow(fConnected ? r.nHouseID : 0);
+    } else if (tx.nNoteOp == NOTE_OP_CLAIM && n == 1) {
+        // An insolvency claim may return escrow change at vout[1]; the
+        // contextual check pinned its script to the canonical escrow script
+        // before this coin can exist.
+        NoteClaim c;
+        if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange)
+            coin.SetHouseEscrow(fConnected ? c.nHouseID : 0);
+    }
+}
 
 static bool IsValidNotePubKey(const std::vector<unsigned char>& vch)
 {

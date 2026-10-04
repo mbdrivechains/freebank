@@ -25,13 +25,23 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <sync.h>
+
 #include <stdint.h>
 #include <string>
 #include <utility>
 #include <vector>
 
 typedef CWallet* CWalletRef;
+/** The loaded wallets. v0.2.19: loadwallet / createwallet add to it while RPC
+ *  threads read it, so it is guarded by cs_wallets: read it through GetWallets()
+ *  (a copy) or HasWallets(), add through AddWallet(). Wallets are never removed
+ *  while the node runs (no unloadwallet), so a CWalletRef stays valid. */
+extern CCriticalSection cs_wallets;
 extern std::vector<CWalletRef> vpwallets;
+std::vector<CWalletRef> GetWallets();
+bool HasWallets();
+void AddWallet(CWalletRef pwallet);
 
 /**
  * Settings
@@ -1077,7 +1087,7 @@ public:
     // Notes (Phase 3.2). Single-wallet v1: this wallet plays the house
     // (partner keys) and the holders. MINT to a fresh holder key; TRANSFER /
     // REDEEM spend a single holder's note coins.
-    bool MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    bool MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
     /** Transfer nUnits of a house's notes. scriptRecipient empty => self
      * (fresh own key, the v1 default); otherwise pay the note to the supplied
      * P2PKH script (a note is a plain P2PKH coin, so any standard address
@@ -1131,9 +1141,9 @@ public:
     /** House issues one term-deposit receipt: nPrincipal locked at nRateBps/yr
      * until nMaturityHeight, to a fresh holder key. Cap N + D + principal <=
      * lambda*E (capital only - deposits are outside rho). */
-    bool OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight, const CAmount& nFee);
+    bool OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight, const CAmount& nFee, const CScript& scriptRecipient = CScript());
     /** Reassign a whole receipt (house, nPrincipal) to a fresh holder key. */
-    bool TransferDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
+    bool TransferDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee, const CScript& scriptRecipient = CScript());
     /** At/after maturity and while the house is Open, burn a matured receipt
      * (house, nPrincipal) for principal + accrued interest (consensus floor). */
     bool WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
@@ -1180,7 +1190,10 @@ public:
      * effective-Insolvent, else charter M-of-N. */
     bool RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolID, const CAmount& nFee);
 
-    bool RegisterHouse(std::string& strFail, uint256& txidOut, uint8_t nTier, uint32_t nThresholdM, const std::string& strClassID, uint64_t nDenomMgGold, const std::vector<CAmount>& vPledge, const CAmount& nFee);
+    bool RegisterHouse(std::string& strFail, uint256& txidOut, uint8_t nTier, uint32_t nThresholdM, const std::string& strClassID, uint64_t nDenomMgGold, const std::vector<CAmount>& vPledge, const CAmount& nFee, uint8_t nFlags = 0);
+    /** v0.2.19: MEMBER_ADD / MEMBER_REMOVE / MEMBER_PURGE (nHouseOp) of a members-only house, approved with this
+     *  wallet's partner keys; priors read from the confirmed records and checked here first. */
+    bool HouseMembersOp(std::string& strFail, uint256& txidOut, uint8_t nHouseOp, uint32_t nHouseID, const std::vector<uint160>& vKeyID, const CAmount& nFee);
     bool TopupHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nAmount, const CAmount& nFee);
     bool AdmitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nPledge, const CAmount& nFee);
     bool ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);

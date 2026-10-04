@@ -328,6 +328,26 @@ bool ParseDepositAddress(const std::string& strAddressIn, std::string& strAddres
     return true;
 }
 
+bool GetDepositAddressFromL1Tx(const CMutableTransaction& tx, uint32_t nBurnIndex, std::string& strAddressOut)
+{
+    if ((uint64_t)nBurnIndex + 1 >= tx.vout.size())
+        return false;
+    const CScript& script = tx.vout[nBurnIndex + 1].scriptPubKey;
+    CScript::const_iterator pc = script.begin();
+    opcodetype opcode;
+    std::vector<unsigned char> vch;
+    if (!script.GetOp(pc, opcode) || opcode != OP_RETURN)
+        return false;
+    // A data push: OP_0 (empty), OP_PUSHBYTES_1..75 or OP_PUSHDATA1/2/4. GetOp
+    // fails on a push that runs past the end, as the enforcer's parser does.
+    if (!script.GetOp(pc, opcode, vch) || opcode > OP_PUSHDATA4)
+        return false;
+    if (pc != script.end())
+        return false;
+    strAddressOut.assign(vch.begin(), vch.end());
+    return true;
+}
+
 bool ParseFullDepositAddress(const std::string& strDest, std::string& strAddressOut)
 {
     // Consensus code (GetDepositPayoutOutput), so one exact grammar and nothing

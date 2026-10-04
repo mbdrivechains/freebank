@@ -13,15 +13,18 @@
 #include <version.h>
 
 #include <limits>
+#include <set>
 
 // Consensus defaults; regtest-only init.cpp overrides (integration gates).
 uint32_t HOUSE_ATTEST_CADENCE = 144;
 uint32_t HOUSE_STRESSED_WINDOW = 1008;
 
-uint256 HouseDeclarationDigest(const HouseRegister& reg)
+uint256 HouseDeclarationDigest(const HouseRegister& reg, uint8_t nFlags)
 {
     CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/declaration");
+    // v0.2.19: a REGISTER_MO declaration has its own tag and ends with its flags; an open house's digest (and so
+    // its id) is exactly as before.
+    ss << std::string(nFlags ? "FreeBankHouse/declaration-mo" : "FreeBankHouse/declaration");
     ss << reg.nTier;
     ss << reg.nThresholdM;
     ss << reg.strClassID;
@@ -29,15 +32,91 @@ uint256 HouseDeclarationDigest(const HouseRegister& reg)
     ss << reg.vchRedemptionDestPK;
     ss << reg.vPartnerPubKey;
     ss << reg.vPledgeAmount;
+    if (nFlags)
+        ss << nFlags;
     return ss.GetHash();
 }
 
-uint256 HouseIDFromDeclaration(const HouseRegister& reg)
+bool DecodeHouseRegisterAny(const CTransaction& tx, HouseRegister& reg, uint8_t& nFlags)
+{
+    nFlags = 0;
+    if (tx.nHouseOp == HOUSE_OP_REGISTER)
+        return DecodeHousePayload(tx.vchHousePayload, reg);
+    if (tx.nHouseOp == HOUSE_OP_REGISTER_MO) {
+        HouseRegisterMO mo;
+        if (!DecodeHousePayload(tx.vchHousePayload, mo))
+            return false;
+        reg = mo.reg;
+        nFlags = mo.nFlags;
+        return true;
+    }
+    return false;
+}
+
+uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const HouseMemberOp& op, const uint256& hashPrevouts)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankHouse/member");
+    ss << houseID;
+    ss << nHouseOp;
+    ss << op.nHouseID;
+    ss << op.vKeyID;
+    ss << op.vPrior;
+    ss << op.nPrevCount;
+    ss << hashPrevouts;
+    return ss.GetHash();
+}
+
+bool HouseMemberNext(uint8_t nHouseOp, const HouseMemberPrior& cur, uint32_t nH, HouseMemberPrior& next, std::string& strReject)
+{
+    next = HouseMemberPrior();
+    next.fPresent = 1;
+    if (nHouseOp == HOUSE_OP_MEMBER_ADD) {
+        if (!cur.fPresent)
+            next.rec = CHouseMember(nH, 0);
+        else if (cur.rec.nRemoveHeight == 0) {
+            strReject = "bad-house-member-already";
+            return false;
+        } else if (cur.rec.nRemoveHeight > nH)
+            next.rec = CHouseMember(cur.rec.nAddHeight, 0);   // a re-add cancels a pending removal
+        else
+            next.rec = CHouseMember(nH, 0);                   // the removal is final: a fresh add
+        return true;
+    }
+    if (nHouseOp == HOUSE_OP_MEMBER_REMOVE) {
+        if (!cur.fPresent || cur.rec.nRemoveHeight != 0) {
+            strReject = "bad-house-member-not-active";
+            return false;
+        }
+        next.rec = CHouseMember(cur.rec.nAddHeight, nH + MEMBER_REMOVE_DELAY);
+        return true;
+    }
+    if (nHouseOp == HOUSE_OP_MEMBER_PURGE) {
+        if (!cur.fPresent || cur.rec.nRemoveHeight == 0 || cur.rec.nRemoveHeight > nH) {
+            strReject = "bad-house-member-not-final";
+            return false;
+        }
+        next = HouseMemberPrior();   // erased
+        return true;
+    }
+    strReject = "bad-house-member-op";
+    return false;
+}
+
+std::vector<uint160> HouseOwnKeyIDs(const CHouse& house)
+{
+    // Only the redemption destination: it is fixed at registration, so the answer cannot change inside a block or
+    // keep an exited partner's key a member forever (review F1/F5). A partner who should hold notes is added with
+    // MEMBER_ADD, and can be removed.
+    return std::vector<uint160>(1, uint160(CPubKey(house.vchRedemptionDestPK).GetID()));
+}
+
+uint256 HouseIDFromDeclaration(const HouseRegister& reg, uint8_t nFlags)
 {
     // Content-derived identity (the register txid cannot appear inside its own
     // outputs). Two registrations with identical declarations collide, but the
     // class-id uniqueness index rejects the second one anyway.
-    return HouseDeclarationDigest(reg);
+    return HouseDeclarationDigest(reg, nFlags);
 }
 
 uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, const CAmount& amountPledge)
@@ -485,6 +564,8 @@ template bool DecodeHousePayload<HouseAttest>(const std::vector<unsigned char>&,
 template bool DecodeHousePayload<HouseDefer>(const std::vector<unsigned char>&, HouseDefer&);
 template bool DecodeHousePayload<HouseRenew>(const std::vector<unsigned char>&, HouseRenew&);
 template bool DecodeHousePayload<HouseRelease>(const std::vector<unsigned char>&, HouseRelease&);
+template bool DecodeHousePayload<HouseRegisterMO>(const std::vector<unsigned char>&, HouseRegisterMO&);
+template bool DecodeHousePayload<HouseMemberOp>(const std::vector<unsigned char>&, HouseMemberOp&);
 
 static bool IsValidHousePubKey(const std::vector<unsigned char>& vch)
 {
@@ -515,71 +596,84 @@ static bool CheckApproverShape(const std::vector<uint32_t>& vIndex,
     return true;
 }
 
+/** The REGISTER declaration rules, for both register ops (v0.2.19). The escrow script binds the house id, which for
+ * a REGISTER_MO house covers its flags. */
+static bool CheckHouseRegisterShape(const CTransaction& tx, const HouseRegister& reg, uint8_t nFlags, CValidationState& state)
+{
+    if (reg.nTier > MAX_HOUSE_TIER)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-tier");
+    if (!IsValidHouseClassID(reg.strClassID))
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-classid");
+    if (reg.nDenomMgGold == 0)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-denom");
+    if (!IsValidHousePubKey(reg.vchRedemptionDestPK))
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-redemptionpk");
+
+    const size_t nPartners = reg.vPartnerPubKey.size();
+    if (nPartners == 0 || nPartners > MAX_HOUSE_PARTNERS)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-partner-count");
+    if (reg.vPledgeAmount.size() != nPartners || reg.vPartnerSig.size() != nPartners)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-parallel-arrays");
+
+    // Tier / set-size / threshold coherence
+    const bool fSolo = (reg.nTier == HOUSE_TIER_BONDED_SOLO || reg.nTier == HOUSE_TIER_ENCUMBERED_SOLO);
+    if (fSolo && (nPartners != 1 || reg.nThresholdM != 1))
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-solo-shape");
+    if (!fSolo && nPartners < 2)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-multi-size");
+    if (reg.nThresholdM < 1 || reg.nThresholdM > nPartners)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-threshold");
+    // Multi-partner tiers need a real quorum: M==1 is single-point control
+    // (one partner could unilaterally admit/expel/wind down), which defeats
+    // the co-liability the tier exists for.
+    if (!fSolo && reg.nThresholdM < 2)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-multi-threshold");
+
+    // Per-partner: valid distinct keys, pledge floor, pledge output at vout[i]
+    if (tx.vout.size() < nPartners)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-vout-size");
+
+    const uint256 houseID = HouseIDFromDeclaration(reg, nFlags);
+    const CScript escrowScript = HouseEscrowScript(houseID);
+    for (size_t i = 0; i < nPartners; i++) {
+        if (!IsValidHousePubKey(reg.vPartnerPubKey[i]))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-pubkey");
+        for (size_t j = 0; j < i; j++) {
+            if (reg.vPartnerPubKey[j] == reg.vPartnerPubKey[i])
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-register-dup-key");
+        }
+        if (reg.vPledgeAmount[i] < HOUSE_MIN_PLEDGE || reg.vPledgeAmount[i] > MAX_MONEY)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-pledge");
+        if (tx.vout[i].nValue != reg.vPledgeAmount[i] ||
+                tx.vout[i].scriptPubKey != escrowScript)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-escrow");
+    }
+    return true;
+}
+
 bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
 {
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-house-coinbase");
 
-    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_RELEASE)
+    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_MEMBER_PURGE)
         return state.DoS(100, false, REJECT_INVALID, "bad-house-op");
 
     // Register: 64 partners x (33B key + 72B sig + amount) + declaration
     if (tx.vchHousePayload.size() > 16384)
         return state.DoS(100, false, REJECT_INVALID, "bad-house-payload-oversize");
 
-    if (tx.nHouseOp == HOUSE_OP_REGISTER) {
+    if (IsHouseRegisterOp(tx.nHouseOp)) {
         HouseRegister reg;
-        if (!DecodeHousePayload(tx.vchHousePayload, reg))
+        uint8_t nFlags = 0;
+        if (!DecodeHouseRegisterAny(tx, reg, nFlags))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-register-payload");
-
-        if (reg.nTier > MAX_HOUSE_TIER)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-tier");
-        if (!IsValidHouseClassID(reg.strClassID))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-classid");
-        if (reg.nDenomMgGold == 0)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-denom");
-        if (!IsValidHousePubKey(reg.vchRedemptionDestPK))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-redemptionpk");
-
-        const size_t nPartners = reg.vPartnerPubKey.size();
-        if (nPartners == 0 || nPartners > MAX_HOUSE_PARTNERS)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-partner-count");
-        if (reg.vPledgeAmount.size() != nPartners || reg.vPartnerSig.size() != nPartners)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-parallel-arrays");
-
-        // Tier / set-size / threshold coherence
-        const bool fSolo = (reg.nTier == HOUSE_TIER_BONDED_SOLO || reg.nTier == HOUSE_TIER_ENCUMBERED_SOLO);
-        if (fSolo && (nPartners != 1 || reg.nThresholdM != 1))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-solo-shape");
-        if (!fSolo && nPartners < 2)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-multi-size");
-        if (reg.nThresholdM < 1 || reg.nThresholdM > nPartners)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-threshold");
-        // Multi-partner tiers need a real quorum: M==1 is single-point control
-        // (one partner could unilaterally admit/expel/wind down), which defeats
-        // the co-liability the tier exists for.
-        if (!fSolo && reg.nThresholdM < 2)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-multi-threshold");
-
-        // Per-partner: valid distinct keys, pledge floor, pledge output at vout[i]
-        if (tx.vout.size() < nPartners)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-vout-size");
-
-        const uint256 houseID = HouseIDFromDeclaration(reg);
-        const CScript escrowScript = HouseEscrowScript(houseID);
-        for (size_t i = 0; i < nPartners; i++) {
-            if (!IsValidHousePubKey(reg.vPartnerPubKey[i]))
-                return state.DoS(100, false, REJECT_INVALID, "bad-house-register-pubkey");
-            for (size_t j = 0; j < i; j++) {
-                if (reg.vPartnerPubKey[j] == reg.vPartnerPubKey[i])
-                    return state.DoS(100, false, REJECT_INVALID, "bad-house-register-dup-key");
-            }
-            if (reg.vPledgeAmount[i] < HOUSE_MIN_PLEDGE || reg.vPledgeAmount[i] > MAX_MONEY)
-                return state.DoS(100, false, REJECT_INVALID, "bad-house-register-pledge");
-            if (tx.vout[i].nValue != reg.vPledgeAmount[i] ||
-                    tx.vout[i].scriptPubKey != escrowScript)
-                return state.DoS(100, false, REJECT_INVALID, "bad-house-register-escrow");
-        }
+        // v0.2.19: a REGISTER_MO house is members-only, optionally redeem-only; no other bits
+        if (tx.nHouseOp == HOUSE_OP_REGISTER_MO &&
+                (!(nFlags & HOUSE_FLAG_MEMBERS_ONLY) || (nFlags & ~HOUSE_FLAGS_KNOWN)))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-register-flags");
+        if (!CheckHouseRegisterShape(tx, reg, nFlags, state))
+            return false;
         // Partner ECDSA verifies run contextually (CheckHouseOperation, after
         // CheckTxInputs) - same DoS pricing rationale as Bills ISSUE.
     }
@@ -705,6 +799,29 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
 
         if (!CheckApproverShape(rel.vApproverIndex, rel.vApproverSig) || rel.vApproverIndex.empty())
             return state.DoS(100, false, REJECT_INVALID, "bad-house-release-approvers");
+    }
+    else
+    if (IsHouseMemberOp(tx.nHouseOp)) {
+        // v0.2.19 member-list ops (spec 4.4): 1..256 distinct keyids, one prior each, an approver set. The house's
+        // flags, the priors and the approvals are contextual.
+        HouseMemberOp op;
+        if (!DecodeHousePayload(tx.vchHousePayload, op))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-member-payload");
+        if (op.nHouseID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-member-house");
+        if (op.vKeyID.empty() || op.vKeyID.size() > MAX_HOUSE_MEMBER_BATCH || op.vPrior.size() != op.vKeyID.size())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-member-count");
+        std::set<uint160> setKey;
+        for (const uint160& k : op.vKeyID) {
+            if (k.IsNull() || !setKey.insert(k).second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-member-dup-key");
+        }
+        for (const HouseMemberPrior& prior : op.vPrior) {
+            if (prior.fPresent > 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-member-prior");
+        }
+        if (!CheckApproverShape(op.vApproverIndex, op.vApproverSig) || op.vApproverIndex.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-member-approvers");
     }
 
     return true;

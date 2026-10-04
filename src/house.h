@@ -12,6 +12,7 @@
 #include <serialize.h>
 #include <uint256.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,22 @@ static const uint8_t HOUSE_OP_ATTEST   = 7;  // Phase 3.4 reserve attestation
 static const uint8_t HOUSE_OP_DEFER    = 8;  // Phase 3.5 option clause: invoke
 static const uint8_t HOUSE_OP_RENEW    = 9;  // Phase 3.5 option clause: one renewal
 static const uint8_t HOUSE_OP_RELEASE  = 10; // Phase 3.5: release the locked till after recovery
+// v0.2.19 members-only houses (spec gateway docs/design/members/MEMBERS_ONLY_HOUSES.md, D-2026-10-03-5)
+static const uint8_t HOUSE_OP_REGISTER_MO   = 11; // REGISTER + house-type flags (a new op: old REGISTERs still decode)
+static const uint8_t HOUSE_OP_MEMBER_ADD    = 12; // add member keyids (M-of-N)
+static const uint8_t HOUSE_OP_MEMBER_REMOVE = 13; // schedule removals, MEMBER_REMOVE_DELAY blocks out (M-of-N)
+static const uint8_t HOUSE_OP_MEMBER_PURGE  = 14; // delete records whose removal is final (M-of-N)
+
+// House-type flags, fixed at registration (spec 4.0). REDEEM_ONLY only together with MEMBERS_ONLY.
+static const uint8_t HOUSE_FLAG_MEMBERS_ONLY = 1;
+static const uint8_t HOUSE_FLAG_REDEEM_ONLY  = 2;
+static const uint8_t HOUSE_FLAGS_KNOWN       = HOUSE_FLAG_MEMBERS_ONLY | HOUSE_FLAG_REDEEM_ONLY;
+/** Member records per house, removed-but-unpurged included (spec 4.4, PROVISIONAL). */
+static const uint32_t MAX_HOUSE_MEMBERS = 100000;
+/** Keyids per member op (spec 4.4; a 256-key batch with priors fits the 16,384-byte payload cap). */
+static const size_t MAX_HOUSE_MEMBER_BATCH = 256;
+/** Blocks from a removal's confirmation to its effect (spec 5: wallet comfort, not safety). */
+static const uint32_t MEMBER_REMOVE_DELAY = 3;
 
 // On-chain house status. Open / WoundDown are STORED; Stressed, Deferred and
 // (until a waterfall op materializes it) Insolvent are DERIVED from stored
@@ -199,7 +216,9 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // v8 (Phase 3.9 / B1): the loan book - nLoanBookFace plus the 128-bit
 // maturity-weight accumulator. A v7 record defaults to an empty book, which is
 // exactly what every pre-B1 house has (no discount op existed).
-static const uint8_t HOUSE_SER_VERSION = 9;
+// v10 (members-only houses, v0.2.19): the house-type flags. A v9 record reads as 0 = open, which every pre-v0.2.19
+// house is (REGISTER_MO did not exist).
+static const uint8_t HOUSE_SER_VERSION = 10;
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -364,6 +383,8 @@ struct CHouse {
     uint32_t nProtestOpen;
     uint32_t nProtestHeight;
     uint32_t nProtestDemandHeight;
+    // v10: HOUSE_FLAG_* from HOUSE_OP_REGISTER_MO, immutable (spec 4.0). 0 = an open house.
+    uint8_t nFlags;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -374,7 +395,10 @@ struct CHouse {
                nDepositUnits(0), nDepositWtMatHi(0), nDepositWtMatLo(0),
                nInsolventDepositPrincipal(0), nLastSettleHeight(0),
                nLoanBookFace(0), nLoanWtMatHi(0), nLoanWtMatLo(0),
-               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0) {}
+               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0) {}
+
+    bool IsMembersOnly() const { return (nFlags & HOUSE_FLAG_MEMBERS_ONLY) != 0; }
+    bool IsRedeemOnly() const { return (nFlags & HOUSE_FLAG_REDEEM_ONLY) != 0; }
 
     /** The 128-bit weighted-maturity accumulator Sigma(principal_i * maturity_i). */
     unsigned __int128 DepositWtMaturity() const
@@ -493,6 +517,10 @@ struct CHouse {
             READWRITE(nProtestOpen);
             READWRITE(nProtestHeight);
             READWRITE(nProtestDemandHeight);
+        }
+        // v10: house-type flags. A v9 record is an open house (see HOUSE_SER_VERSION).
+        if (nSerVersion >= 10) {
+            READWRITE(nFlags);
         }
     }
 
@@ -810,6 +838,101 @@ struct HouseReclaim {
     }
 };
 
+/** v0.2.19 REGISTER_MO: a REGISTER plus the house-type flags (spec 4.2). A separate op, not a new field on
+ * HouseRegister: DecodeHousePayload rejects any payload that does not decode exactly, so a field added there would
+ * make every past REGISTER fail on reindex. */
+struct HouseRegisterMO {
+    HouseRegister reg;
+    uint8_t nFlags;
+
+    HouseRegisterMO() : nFlags(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(reg);
+        READWRITE(nFlags);
+    }
+};
+
+/** One member record of a members-only house (HouseDB, spec 4.4), keyed (house, keyid). Active at height h iff
+ * nAddHeight < h and (nRemoveHeight == 0 or h < nRemoveHeight). */
+struct CHouseMember {
+    uint32_t nAddHeight;
+    uint32_t nRemoveHeight;   // 0 = no removal scheduled
+
+    CHouseMember() : nAddHeight(0), nRemoveHeight(0) {}
+    CHouseMember(uint32_t nAdd, uint32_t nRemove) : nAddHeight(nAdd), nRemoveHeight(nRemove) {}
+
+    bool IsActiveAt(uint32_t nHeight) const
+    {
+        return nAddHeight < nHeight && (nRemoveHeight == 0 || nHeight < nRemoveHeight);
+    }
+    bool operator==(const CHouseMember& o) const { return nAddHeight == o.nAddHeight && nRemoveHeight == o.nRemoveHeight; }
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nAddHeight);
+        READWRITE(nRemoveHeight);
+    }
+};
+
+/** A member record's state before an op: the undo prior (must equal the DB at connect). */
+struct HouseMemberPrior {
+    uint8_t fPresent;
+    CHouseMember rec;
+
+    HouseMemberPrior() : fPresent(0) {}
+
+    bool operator==(const HouseMemberPrior& o) const { return fPresent == o.fPresent && (!fPresent || rec == o.rec); }
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(fPresent);
+        READWRITE(rec);
+    }
+};
+
+/** MEMBER_ADD / MEMBER_REMOVE / MEMBER_PURGE (the op code says which). Up to MAX_HOUSE_MEMBER_BATCH distinct keyids
+ * with one prior each, and the house's member count before the op (records, removed-but-unpurged included). The
+ * priors make the op exact to undo and impossible to replay; the M-of-N approvals also bind the inputs. */
+struct HouseMemberOp {
+    uint32_t nHouseID;                     // leading - mempool-guard convention
+    std::vector<uint160> vKeyID;
+    std::vector<HouseMemberPrior> vPrior;  // parallel to vKeyID
+    uint32_t nPrevCount;
+    std::vector<uint32_t> vApproverIndex;  // strictly ascending, M-of-N
+    std::vector<std::vector<unsigned char>> vApproverSig;
+
+    HouseMemberOp() : nHouseID(0), nPrevCount(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(vKeyID);
+        READWRITE(vPrior);
+        READWRITE(nPrevCount);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
+    }
+};
+
+/** v0.2.19: one block's member-record effects, written in the house batch (HouseDB::WriteBlockEffects). The final
+ * state per (house, keyid): fPresent 0 erases the record. A count of 0 erases the count. */
+struct HouseMemberEffects {
+    std::map<std::pair<uint32_t, uint160>, HouseMemberPrior> mapRecord;
+    std::map<uint32_t, uint32_t> mapCount;
+
+    bool empty() const { return mapRecord.empty() && mapCount.empty(); }
+};
+
 //
 // Pure helpers (house.cpp)
 //
@@ -817,10 +940,33 @@ struct HouseReclaim {
 /** Canonical house identity: sha256 over the founding declaration (content-
  * derived like bill_id - the registration txid cannot appear in its own
  * outputs' escrow script). Uniqueness rides on strClassID uniqueness. */
-uint256 HouseIDFromDeclaration(const HouseRegister& reg);
+uint256 HouseIDFromDeclaration(const HouseRegister& reg, uint8_t nFlags = 0);
 
-/** Digest of the declaration fields every founding signature commits to. */
-uint256 HouseDeclarationDigest(const HouseRegister& reg);
+/** Digest of the declaration fields every founding signature commits to. v0.2.19: a REGISTER_MO house (nFlags != 0)
+ * hashes its flags too, under its own tag, so an open house's id is unchanged and no relay can flip a flag. */
+uint256 HouseDeclarationDigest(const HouseRegister& reg, uint8_t nFlags = 0);
+
+/** v0.2.19: REGISTER or REGISTER_MO. Every site that treats a registration specially asks this. */
+inline bool IsHouseRegisterOp(uint8_t nHouseOp) { return nHouseOp == HOUSE_OP_REGISTER || nHouseOp == HOUSE_OP_REGISTER_MO; }
+/** v0.2.19: a member-list op (MEMBER_ADD / REMOVE / PURGE). They take the member slot, not the house slot. */
+inline bool IsHouseMemberOp(uint8_t nHouseOp) { return nHouseOp >= HOUSE_OP_MEMBER_ADD && nHouseOp <= HOUSE_OP_MEMBER_PURGE; }
+/** v0.2.19: a member record after one member op (nHouseOp) at height nH, from its state before (cur). False, with the
+ * reject reason, if the op cannot apply to that record. Shared by the contextual check and the undo's own check. The
+ * house's own keys and the count are the caller's. */
+bool HouseMemberNext(uint8_t nHouseOp, const HouseMemberPrior& cur, uint32_t nH, HouseMemberPrior& next, std::string& strReject);
+
+/** v0.2.19: the declaration of either register op, with its flags (0 for a plain REGISTER). False if tx is not a
+ * register op or its payload does not decode. */
+bool DecodeHouseRegisterAny(const CTransaction& tx, HouseRegister& reg, uint8_t& nFlags);
+
+/** What a member op's M-of-N approvers sign: the house, the op, its keyids and priors and count, and the tx's inputs
+ * (spec 4.4: no replay). */
+uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const HouseMemberOp& op, const uint256& hashPrevouts);
+
+/** The house's own keys, implicit members of a members-only house (spec 4.2): its redemption destination, the key it
+ * mints to and presents notes from. Fixed at registration; never stored, so never removable. Partners' personal keys
+ * are not implicit members (an exited partner's would stay one forever, review F1/F2): add them with MEMBER_ADD. */
+std::vector<uint160> HouseOwnKeyIDs(const CHouse& house);
 
 uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, const CAmount& amountPledge);
 uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs);

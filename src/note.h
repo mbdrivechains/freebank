@@ -18,6 +18,7 @@
 #include <vector>
 
 class CValidationState;
+class Coin;
 
 //
 // Notes (Phase 3.2) - the per-house named credit asset.
@@ -493,5 +494,18 @@ bool DecodeNotePayload(const std::vector<unsigned char>& vch, T& payload);
 /** Context-free shape rules for v13 note txs (no DB, no ECDSA - signatures and
  * the cap/status checks run contextually in CheckNoteOperation, DoS pricing). */
 bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state);
+
+/** PAYLOAD-PURE tagger for a v13 output (v0.2.19): sets the note / escrow tag of
+ * vout[n] and nothing else. ONE decision point for AddCoins (fConnected, at
+ * nHeight) and the mempool view (!fConnected): before it the mempool view kept
+ * its own copy of the list, PROTEST was added to AddCoins only, and a plain
+ * spend of an unconfirmed protest's notes passed mempool acceptance and failed
+ * ConnectBlock (C6 protest-mempool-tag-gap).
+ * Unconfirmed, two things are not knowable and fail closed instead:
+ *  - a fresh DEMAND's stamp is the height it confirms at: its notes get tag 0,
+ *    and mempool acceptance refuses to spend them (unconfirmed-stamp-parent);
+ *  - escrow outputs (REDEEM brassage, CLAIM change) get house id 0, so nothing
+ *    can chain off them. */
+void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight);
 
 #endif // BITCOIN_NOTE_H

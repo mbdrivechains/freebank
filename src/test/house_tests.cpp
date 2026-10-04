@@ -869,9 +869,9 @@ BOOST_AUTO_TEST_CASE(house_suspended_silence_clock)
     CheckSilenceClock(4032);                  // main: ~4 weeks (operator Q5)
     SelectParams(CBaseChainParams::REGTEST);
     CheckSilenceClock(40);                    // regtest: gate-testable
-    SelectParams(CBaseChainParams::MAIN);     // restore the fixture's network
-    // The schedule is the same on both networks: 10%/yr from block 0.
-    for (const std::string& net : {CBaseChainParams::MAIN, CBaseChainParams::REGTEST}) {
+    SelectParams(CBaseChainParams::BETA);     // restore the fixture's network
+    // The schedule is the same on every network: 10%/yr from block 0.
+    for (const std::string& net : {CBaseChainParams::MAIN, CBaseChainParams::BETA, CBaseChainParams::REGTEST}) {
         const std::unique_ptr<const CChainParams> params = CreateChainParams(net);
         const std::vector<Consensus::DeferInterestStep>& v = params->GetConsensus().vDeferInterestSchedule;
         BOOST_REQUIRE_EQUAL(v.size(), 1u);
@@ -1539,7 +1539,7 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
     // BOTH this pin and the addendum arithmetic together, or the synthesis
     // silently builds a malformed record and the migration it claims to prove
     // proves nothing.
-    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 9);
+    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 10);   // fired again at v9 -> v10 (members-only flags, 1 byte)
 
     CHouse back;
     CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
@@ -1570,9 +1570,11 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
         // Strip EVERY post-v7 addendum, newest first:
         //   v8 loan book   = 3 x uint64 = 24 bytes
         //   v9 protest     = 3 x uint32 = 12 bytes
+        //   v10 flags      = 1 x uint8  =  1 byte
         static const size_t V8_ADDENDUM = 3 * sizeof(uint64_t);
         static const size_t V9_ADDENDUM = 3 * sizeof(uint32_t);
-        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM));
+        static const size_t V10_ADDENDUM = sizeof(uint8_t);
+        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM));
         CDataStream ssV7(b, SER_NETWORK, PROTOCOL_VERSION);
         CHouse h7;
         ssV7 >> h7;                                   // must not throw

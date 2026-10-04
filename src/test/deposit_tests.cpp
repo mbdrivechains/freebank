@@ -424,6 +424,8 @@ BOOST_AUTO_TEST_CASE(deposit_transfer_gate)
         if (o == COutPoint(uint256S("de"), 0)) { c = receipt; return true; } return false;
     };
     auto fnNoHouse = [](uint32_t, CHouse&) { return false; };
+    // v0.2.19: a TRANSFER needs its (open) house, for the members-only rule; it fails closed without one
+    auto fnOpenHouse = [&](uint32_t id, CHouse& h) { if (id != H) return false; h = CHouse(); h.nHouseID = H; return true; };
 
     // hashOutputs is over vout only (stable across payload/sig), so sign once.
     CMutableTransaction tmp = build(P, M, std::vector<unsigned char>(70, 0x30));
@@ -434,8 +436,12 @@ BOOST_AUTO_TEST_CASE(deposit_transfer_gate)
     {
         CMutableTransaction mtx = build(P, M, sig);
         CValidationState state; CHouse houseOut; bool fChanged = true;
-        BOOST_CHECK(CheckDepositOperation(CTransaction(mtx), state, 1000, fnNoHouse, fnGetCoin, houseOut, fChanged));
+        BOOST_CHECK(CheckDepositOperation(CTransaction(mtx), state, 1000, fnOpenHouse, fnGetCoin, houseOut, fChanged));
         BOOST_CHECK(!fChanged);   // TRANSFER changes no house state
+        // ...and without its house it fails closed (review F3)
+        CValidationState state2;
+        BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state2, 1000, fnNoHouse, fnGetCoin, houseOut, fChanged));
+        BOOST_CHECK_EQUAL(state2.GetRejectReason(), "bad-deposit-unknown-house");
     }
     // Terms mismatch (payload principal != the receipt's) -> rejected before sig.
     {

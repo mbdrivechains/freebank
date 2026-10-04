@@ -17,6 +17,7 @@
 class CBlockIndex;
 class CChainParams;
 class CScript;
+class CValidationState;
 
 namespace Consensus { struct Params; };
 
@@ -123,6 +124,8 @@ struct update_for_parent_inclusion
 //! -bmmblockmaxweight default (v0.2.16): the weight cap for get_block_template's
 //! mempool transactions. The BMM engine stores every template in its bid records.
 static const unsigned int DEFAULT_BMM_BLOCK_MAX_WEIGHT = 300000;
+/** Pooled transactions a template drops before it builds the block from no mempool transactions (v0.2.19) */
+static const int MAX_TEMPLATE_EVICTIONS = 10;
 
 class BlockAssembler
 {
@@ -175,6 +178,11 @@ private:
     // Note: Moved to private, should always use GenerateBMMBlock().
     /** Construct a new block template with coinbase to scriptPubKeyIn */
     std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn, bool fMineWitnessTx=true, bool fCheckBMM = true, const uint256& hashPrevBlock = uint256(), CAmount* nFeesOut = nullptr, const uint256& hashMainTip = uint256());
+    /** One attempt (v0.2.19): fNoMempoolTxs builds the block from no mempool
+      * transactions. A template that fails TestBlockValidity comes back with
+      * fInvalid set and the failure in state, for CreateNewBlock to find and
+      * drop the transaction at fault. Caller holds cs_main and mempool.cs. */
+    std::unique_ptr<CBlockTemplate> CreateNewBlockOnce(const CScript& scriptPubKeyIn, const uint256& hashPrevBlock, CAmount* nFeesOut, const uint256& hashMainTip, bool fCheckBMM, bool fNoMempoolTxs, bool& fInvalid, CValidationState& state);
 
     // utility functions
     /** Clear the block's state and prepare for assembling a new block */
@@ -192,6 +200,11 @@ private:
       * Increments nPackagesSelected / nDescendantsUpdated with corresponding
       * statistics from the package selection (for logging statistics). */
     void addPackageTxs(int &nPackagesSelected, int &nDescendantsUpdated, std::vector<CTxMemPool::txiter>& vRefundTx, bool fIncludeRefunds);
+    /** v0.2.19: before the fee-rate pass, add the pooled transactions that run a
+      * house's solvency clock (IsClockTx) with their ancestors, oldest first, in at
+      * most half the block. A demand, protest or redemption must not wait behind
+      * cheaper traffic: the sole producer's no-censorship rule (D-2026-10-03-2). */
+    void addClockTxs(int &nPackagesSelected);
 
     // helper functions for addPackageTxs()
     /** Remove confirmed (inBlock) entries from given set */
@@ -219,6 +232,12 @@ private:
  *  after the transactions and are still bounded by MAX_BLOCK_WEIGHT only,
  *  so the cap never truncates them. */
 BlockAssembler::Options BMMTemplateAssemblerOptions();
+
+/** v0.2.19 policy: a transaction that runs a house's solvency clock or a holder's
+ *  exit from it. Notes: REDEEM (a holder's redemption or the house's discharge of
+ *  queued demands), DEMAND, PROTEST, CLAIM. Term deposits: WITHDRAW, CLAIM. Houses:
+ *  ATTEST (a missed cadence makes a house Stressed). */
+bool IsClockTx(const CTransaction& tx);
 
 /** Modify the extranonce in a block. The coinbase scriptSig becomes
  *  <height> <extranonce> + COINBASE_FLAGS (the -coinbasetag push, or nothing). */

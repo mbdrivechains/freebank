@@ -83,14 +83,28 @@ struct TestL1Oracle : public L1Oracle {
     L1PegEvents eventsAnyWindow;
     int nWindowCalls = 0;
     std::map<std::pair<uint256, uint256>, L1Answer> mapBmm;
+    // v0.2.19 (7c): L1 block header times; a block not in it: UNKNOWN
+    std::map<uint256, uint32_t> mapTime;
+    int nTimeCalls = 0;
 
     TestL1Oracle() { SetL1OracleForTest(this); }
     ~TestL1Oracle() { SetL1OracleForTest(nullptr); }
 
+    int nBmmCalls = 0;
     L1Answer BmmCommitment(const uint256& hashMainBlock, const uint256& hashBMM) override
     {
+        nBmmCalls++;
         const auto it = mapBmm.find(std::make_pair(hashMainBlock, hashBMM));
         return it == mapBmm.end() ? L1Answer::UNKNOWN : it->second;
+    }
+    L1Answer BmmBlockTime(const uint256& hashMainBlock, const uint256& hashBMM, uint32_t& nTime) override
+    {
+        nTimeCalls++;
+        const auto it = mapTime.find(hashMainBlock);
+        if (it == mapTime.end())
+            return L1Answer::UNKNOWN;
+        nTime = it->second;
+        return L1Answer::YES;
     }
     L1Answer EventsInWindow(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events) override
     {
@@ -1263,12 +1277,15 @@ BOOST_AUTO_TEST_CASE(c1_bmm_three_answers)
     const uint256 hashG = ArithToUint256(arith_uint256(0xa0)), hashP = ArithToUint256(arith_uint256(0xa1)),
                   hashE = ArithToUint256(arith_uint256(0xa2)), hashE2 = ArithToUint256(arith_uint256(0xa3));
     MainCacheScope cache({hashG, hashP, hashE});
+    oracle.mapTime[hashE] = 1790000000;
+    oracle.mapTime[hashE2] = 1790000600;
 
     int nBlock = 0;
     auto Block = [&](const uint256& hashMain, const uint256& hashPrevMain) {
         CBlock block;
         block.hashPrevBlock = ArithToUint256(arith_uint256(0x5c));
         block.hashMainchainBlock = hashMain;
+        block.nTime = oracle.mapTime.count(hashMain) ? oracle.mapTime[hashMain] : 0; // v0.2.19 (7c)
         block.hashMerkleRoot = ArithToUint256(arith_uint256(0xb000 + ++nBlock)); // h*, and a fresh block hash
         CMutableTransaction cb;
         cb.vin.resize(1);
@@ -1324,6 +1341,79 @@ BOOST_AUTO_TEST_CASE(c1_bmm_three_answers)
     fReindex = true;
     BOOST_CHECK_EQUAL(BmmVerdict(block), "no:bad-mc-prev:0");
     fReindex = fReindexSaved;
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.19 (7c, consensus): a block's time is the header time of the L1 block
+// that carries its bid. The bid commits only the merkle root and the coinbase
+// commits the parent, version and bundle, so nothing bound nTime: a copy of a
+// block with another time was a second valid block on the same bid. Both
+// producers already copy the L1 block's time. The check runs even for a hash
+// on the verified-BMM list (kept on disk, so filled by older versions too),
+// and asks the L1 once per L1 block.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(c7c_block_time_is_its_l1_blocks)
+{
+    TestL1Oracle oracle;
+    const uint256 hashG = ArithToUint256(arith_uint256(0xc0)), hashP = ArithToUint256(arith_uint256(0xc1)),
+                  hashE = ArithToUint256(arith_uint256(0xc2)), hashE2 = ArithToUint256(arith_uint256(0xc3));
+    MainCacheScope cache({hashG, hashP, hashE, hashE2});
+    const uint32_t nTimeE = 1790001000, nTimeE2 = 1790001600;
+    oracle.mapTime[hashE] = nTimeE;
+
+    int nBlock = 0;
+    auto Block = [&](const uint256& hashMain, const uint256& hashPrevMain, uint32_t nTime) {
+        CBlock block;
+        block.hashPrevBlock = ArithToUint256(arith_uint256(0x7c));
+        block.hashMainchainBlock = hashMain;
+        block.hashMerkleRoot = ArithToUint256(arith_uint256(0xc000 + ++nBlock));
+        block.nTime = nTime;
+        CMutableTransaction cb;
+        cb.vin.resize(1);
+        cb.vin[0].prevout.SetNull();
+        cb.vout.push_back(CTxOut(0, GeneratePrevBlockCommit(hashPrevMain, block.hashPrevBlock)));
+        block.vtx.push_back(MakeTransactionRef(std::move(cb)));
+        oracle.mapBmm[std::make_pair(hashMain, block.hashMerkleRoot)] = L1Answer::YES;
+        return block;
+    };
+
+    // Yes: the block's time is E's
+    const CBlock block = Block(hashE, hashP, nTimeE);
+    BOOST_CHECK_EQUAL(BmmVerdict(block), "yes");
+
+    // No: a copy of it with another time, on the same bid in the same E
+    CBlock copy = block;
+    copy.nTime = nTimeE + 1;
+    BOOST_CHECK(copy.GetHash() != block.GetHash());
+    BOOST_CHECK_EQUAL(BmmVerdict(copy), "no:bad-bmm-time:10");
+    copy.nTime = nTimeE - 1;
+    BOOST_CHECK_EQUAL(BmmVerdict(copy), "no:bad-bmm-time:10");
+
+    // No, even with its hash on the verified-BMM list (a v0.2.18 node put it there)
+    copy.nTime = nTimeE + 2;
+    bmmCache.CacheVerifiedBMM(copy.GetHash());
+    BOOST_CHECK_EQUAL(BmmVerdict(copy), "no:bad-bmm-time:10");
+
+    // Can't tell: the L1 cannot give E2's time yet; then it can
+    const CBlock block2 = Block(hashE2, hashE, nTimeE2);
+    BOOST_CHECK_EQUAL(BmmVerdict(block2), "cant-tell");
+    oracle.mapTime[hashE2] = nTimeE2;
+    BOOST_CHECK_EQUAL(BmmVerdict(block2), "yes");
+
+    // E's time is asked once: further checks on E come from the cache
+    const int nCalls = oracle.nTimeCalls;
+    BOOST_CHECK_EQUAL(BmmVerdict(Block(hashE, hashP, nTimeE)), "yes");
+    BOOST_CHECK_EQUAL(BmmVerdict(Block(hashE, hashP, nTimeE + 5)), "no:bad-bmm-time:10");
+    BOOST_CHECK_EQUAL(oracle.nTimeCalls, nCalls);
+
+    // A copy with another parent (the one header field 7c leaves free) asks the
+    // L1 nothing - its (E, h*) pair is known - and the coinbase still refuses it
+    CBlock copyPrev = block;
+    copyPrev.hashPrevBlock = ArithToUint256(arith_uint256(0x7d));
+    const int nBmm = oracle.nBmmCalls, nTime = oracle.nTimeCalls;
+    BOOST_CHECK_EQUAL(BmmVerdict(copyPrev), "no:bad-sc-prev:25");
+    BOOST_CHECK_EQUAL(oracle.nBmmCalls, nBmm);
+    BOOST_CHECK_EQUAL(oracle.nTimeCalls, nTime);
 }
 
 
@@ -1687,6 +1777,15 @@ PEGBIND_BOTH_LAYOUTS(a1_deposit_must_be_on_the_l1_list)
     L1ListsDeposit(chain.oracle, dFake, 5 * COIN, 0, alice.strAddress);
     const SidechainDeposit dRedirect = MakeDepositRecord(dtx, nBurn, mallory.strAddress, 5 * COIN, hashL1a);
     chain.Reject(Try(dRedirect, true), "bad-deposit-l1", "a deposit redirected");
+
+    // v0.2.19 (7a): a wrong or hostile enforcer lists it for mallory, as the
+    // record says, but the eCash transaction carries alice: refused, the
+    // address is read from the transaction (the enforcer's layout only)
+    if (layout == Layout::CUSF) {
+        chain.oracle.mapWindowEvents.clear();
+        L1ListsDeposit(chain.oracle, dFake, 5 * COIN, 0, mallory.strAddress);
+        chain.Reject(Try(dRedirect, true), "bad-deposit-l1", "an enforcer redirects a deposit");
+    }
 
     // The L1 recorded 4 COIN deposited, the record's treasury output adds 5
     chain.oracle.mapWindowEvents.clear();

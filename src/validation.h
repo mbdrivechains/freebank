@@ -478,6 +478,14 @@ void UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPr
 
 /** Produce the necessary coinbase commitment for a block (modifies the hash, don't call for mined blocks). */
 std::vector<unsigned char> GenerateCoinbaseCommitment(CBlock& block, const CBlockIndex* pindexPrev, const Consensus::Params& consensusParams);
+/** v0.2.19 (CVE-2025-46598): the most legacy signature operations an unconfirmed
+ *  transaction may run (in its scriptSigs, the scripts it spends and their P2SH
+ *  redeem scripts), as Core 30's policy. */
+static const unsigned int MAX_TX_LEGACY_SIGOPS = 2500;
+/** The legacy signature operations tx runs, counted accurately (inputs in view). */
+unsigned int GetSpentLegacySigOps(const CTransaction& tx, const CCoinsViewCache& view);
+/** The coinbase output index of the witness commitment, or -1 if there is none. */
+int GetWitnessCommitmentIndex(const CBlock& block);
 
 /** Produce withdrawal bundle status commitment for a block */
 CScript GenerateWithdrawalBundleFailCommit(const uint256& hashWithdrawalBundle);

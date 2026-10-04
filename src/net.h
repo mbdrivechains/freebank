@@ -618,6 +618,9 @@ public:
     CCriticalSection cs_sendProcessing;
 
     std::deque<CInv> vRecvGetData;
+    // Orphans whose parents arrived from this peer, still to be re-tried: one per message-handler pass
+    // (Core #15644, CVE-2024-52914). Message-handler thread only.
+    std::set<uint256> orphan_work_set;
     uint64_t nRecvBytes;
     std::atomic<int> nRecvVersion;
 

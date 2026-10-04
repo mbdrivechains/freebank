@@ -134,7 +134,7 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
         // one per partner at vout[0..N-1]; TOPUP / ADMIT post one at vout[0]
         if (tx.nVersion == TRANSACTION_HOUSE_VERSION &&
                 IsHouseEscrowScript(txout.scriptPubKey) &&
-                (tx.nHouseOp == HOUSE_OP_REGISTER ||
+                (IsHouseRegisterOp(tx.nHouseOp) ||
                  (o == 0 && (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT))))
             continue;
 

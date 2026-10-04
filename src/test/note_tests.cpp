@@ -14,6 +14,7 @@
 #include <script/standard.h>
 #include <streams.h>
 #include <test/test_bitcoin.h>
+#include <txmempool.h>
 #include <utilstrencodings.h>
 #include <version.h>
 
@@ -867,4 +868,118 @@ BOOST_AUTO_TEST_CASE(note_redeem_demanded_note_pays_brassage)
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-note-redeem-brassage-missing");
 }
 
+// v0.2.19: the shared payload-pure note tagger (ApplyNoteCoinTags). One tx per
+// op that tags outputs, with a payload but no signatures (tagging reads only the
+// payload).
+template <typename T>
+static CMutableTransaction MakeNoteOpTx(uint8_t nOp, const T& payload, size_t nOuts)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = nOp;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << payload;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("02"), nOp)));
+    for (size_t i = 0; i < nOuts; i++)
+        mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE + i, CScript() << OP_TRUE));
+    return mtx;
+}
+
+static std::vector<CMutableTransaction> TaggerVectors()
+{
+    std::vector<CMutableTransaction> v;
+    NoteMint m; m.nHouseID = 7; m.vUnits = {100, 200};
+    v.push_back(MakeNoteOpTx(NOTE_OP_MINT, m, 3));                  // vout[2] = change
+    NoteTransfer x; x.nHouseID = 7; x.vUnits = {300}; x.nDemandHeight = 77;
+    v.push_back(MakeNoteOpTx(NOTE_OP_TRANSFER, x, 2));
+    NoteDemand d; d.nHouseID = 7; d.vUnits = {400, 500}; d.fPreAuth = NOTE_DEMAND_MODE_PREAUTH;
+    v.push_back(MakeNoteOpTx(NOTE_OP_DEMAND, d, 3));                // fresh: stamp = connect height
+    NoteDemand u; u.nHouseID = 7; u.vUnits = {600}; u.fPreAuth = NOTE_DEMAND_MODE_PREAUTH_QUEUE; u.nPriorDemandHeight = 60;
+    v.push_back(MakeNoteOpTx(NOTE_OP_DEMAND, u, 2));                // upgrade: stamp = prior height
+    NoteProtest pro; pro.nHouseID = 7; pro.vUnits = {700}; pro.nDemandTag = 77 | NOTE_DEMAND_PROTESTED_BIT;
+    v.push_back(MakeNoteOpTx(NOTE_OP_PROTEST, pro, 2));
+    NoteRedeem r; r.nHouseID = 7; r.fBrassage = 1;
+    v.push_back(MakeNoteOpTx(NOTE_OP_REDEEM, r, 3));                // vout[1] = brassage escrow
+    NoteClaim c; c.nHouseID = 7; c.fEscrowChange = 1;
+    v.push_back(MakeNoteOpTx(NOTE_OP_CLAIM, c, 3));                 // vout[1] = escrow change
+    return v;
+}
+
+static void CheckSameTag(const Coin& a, const Coin& b)
+{
+    BOOST_CHECK_EQUAL(a.fNote, b.fNote);
+    BOOST_CHECK_EQUAL(a.fHouseEscrow, b.fHouseEscrow);
+    BOOST_CHECK_EQUAL(a.nHouseID, b.nHouseID);
+    BOOST_CHECK_EQUAL(a.nNoteUnits, b.nNoteUnits);
+    BOOST_CHECK_EQUAL(a.nDemandHeight, b.nDemandHeight);
+}
+
+BOOST_AUTO_TEST_CASE(note_coin_tagger_matches_addcoins)
+{
+    const int H = 500;
+    for (const CMutableTransaction& mtx : TaggerVectors()) {
+        const CTransaction tx(mtx);
+        CCoinsView dummy;
+        CCoinsViewCache cache(&dummy);
+        AddCoins(cache, tx, H);
+        for (uint32_t n = 0; n < tx.vout.size(); n++) {
+            Coin want(tx.vout[n], H, false, false, false, uint256());
+            ApplyNoteCoinTags(tx, n, want, true, H);
+            CheckSameTag(cache.AccessCoin(COutPoint(tx.GetHash(), n)), want);
+        }
+    }
+    // The values themselves, connected at H.
+    const std::vector<CMutableTransaction> v = TaggerVectors();
+    auto tag = [&](size_t i, uint32_t n) {
+        Coin coin(v[i].vout[n], H, false, false, false, uint256());
+        ApplyNoteCoinTags(CTransaction(v[i]), n, coin, true, H);
+        return coin;
+    };
+    BOOST_CHECK(tag(0, 1).fNote && tag(0, 1).nNoteUnits == 200 && tag(0, 1).nDemandHeight == 0);
+    BOOST_CHECK(!tag(0, 2).fNote);
+    BOOST_CHECK_EQUAL(tag(1, 0).nDemandHeight, 77U);
+    BOOST_CHECK_EQUAL(tag(2, 1).nDemandHeight, NoteDemandTag(H, NOTE_DEMAND_MODE_PREAUTH));
+    BOOST_CHECK(!tag(2, 2).fNote);
+    BOOST_CHECK_EQUAL(tag(3, 0).nDemandHeight, NoteDemandTag(60, NOTE_DEMAND_MODE_PREAUTH_QUEUE));
+    BOOST_CHECK_EQUAL(tag(4, 0).nDemandHeight, 77U | NOTE_DEMAND_PROTESTED_BIT);
+    BOOST_CHECK(!tag(5, 0).fNote && !tag(5, 0).fHouseEscrow);
+    BOOST_CHECK(tag(5, 1).fHouseEscrow && tag(5, 1).nHouseID == 7);
+    BOOST_CHECK(tag(6, 1).fHouseEscrow && tag(6, 1).nHouseID == 7);
+}
+
+BOOST_AUTO_TEST_CASE(note_mempool_view_tags)
+{
+    // C6 protest-mempool-tag-gap: an unconfirmed PROTEST's notes were untagged in
+    // the mempool view, so a plain spend passed mempool acceptance and failed
+    // ConnectBlock. The view now tags exactly as the shared tagger does unconfirmed.
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+    const std::vector<CMutableTransaction> v = TaggerVectors();
+    for (const CMutableTransaction& mtx : v)
+        pool.addUnchecked(mtx.GetHash(), entry.FromTx(mtx));
+    CCoinsView dummy;
+    CCoinsViewCache cache(&dummy);
+    CCoinsViewMemPool view(&cache, pool);
+    for (const CMutableTransaction& mtx : v) {
+        const CTransaction tx(mtx);
+        for (uint32_t n = 0; n < tx.vout.size(); n++) {
+            Coin got, want(tx.vout[n], MEMPOOL_HEIGHT, false, false, false, uint256());
+            BOOST_CHECK(view.GetCoin(COutPoint(tx.GetHash(), n), got));
+            ApplyNoteCoinTags(tx, n, want, false, 0);
+            CheckSameTag(got, want);
+        }
+    }
+    Coin coin;
+    BOOST_CHECK(view.GetCoin(COutPoint(v[4].GetHash(), 0), coin));       // PROTEST: tagged, real tag
+    BOOST_CHECK(coin.fNote && coin.nHouseID == 7 && coin.nDemandHeight == (77U | NOTE_DEMAND_PROTESTED_BIT));
+    BOOST_CHECK(view.GetCoin(COutPoint(v[2].GetHash(), 0), coin));       // fresh DEMAND: stamp unknown, 0
+    BOOST_CHECK(coin.fNote && coin.nDemandHeight == 0);
+    BOOST_CHECK(view.GetCoin(COutPoint(v[3].GetHash(), 0), coin));       // upgrade: prior height is in the payload
+    BOOST_CHECK_EQUAL(coin.nDemandHeight, NoteDemandTag(60, NOTE_DEMAND_MODE_PREAUTH_QUEUE));
+    BOOST_CHECK(view.GetCoin(COutPoint(v[5].GetHash(), 1), coin));       // escrow: house id 0, nothing chains
+    BOOST_CHECK(coin.fHouseEscrow && coin.nHouseID == 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
+

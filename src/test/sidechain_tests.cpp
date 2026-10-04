@@ -6,6 +6,7 @@
 #include "bmmcache.h"
 #include "base58.h"
 #include "chainparams.h"
+#include "chainparamsbase.h"
 #include "consensus/merkle.h"
 #include "consensus/validation.h"
 #include "crypto/sha256.h"
@@ -1580,6 +1581,112 @@ BOOST_AUTO_TEST_CASE(default_max_tip_age)
     BOOST_CHECK_EQUAL(GetDefaultMaxTipAge(CBaseChainParams::REGTEST), 24 * 60 * 60);
     BOOST_CHECK_EQUAL(DEFAULT_MAX_TIP_AGE_FREEBANK, 2 * 60 * 60);
     BOOST_CHECK(DEFAULT_MAX_TIP_AGE_FREEBANK < MAX_FEE_ESTIMATION_TIP_AGE);
+}
+
+// v0.2.19 (7a, consensus): the address a deposit transaction carries, read as
+// the enforcer reads it (try_parse_op_return_address): the output after the
+// treasury is exactly OP_RETURN and one data push, nothing else.
+BOOST_AUTO_TEST_CASE(deposit_address_from_l1_tx)
+{
+    const std::string strAddr = "s130_1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2_abcdef";
+    const std::vector<unsigned char> vchAddr(strAddr.begin(), strAddr.end());
+    CMutableTransaction tx;
+    tx.vout.resize(3);
+    tx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    tx.vout[1].scriptPubKey = CScript() << OP_RETURN << vchAddr;
+    tx.vout[2].scriptPubKey = CScript() << OP_TRUE;
+    std::string strOut;
+
+    BOOST_CHECK(GetDepositAddressFromL1Tx(tx, 0, strOut));
+    BOOST_CHECK_EQUAL(strOut, strAddr);
+    // The address must be the output right after the treasury
+    BOOST_CHECK(!GetDepositAddressFromL1Tx(tx, 1, strOut));
+    BOOST_CHECK(!GetDepositAddressFromL1Tx(tx, 2, strOut)); // no output after it
+    BOOST_CHECK(!GetDepositAddressFromL1Tx(tx, 0xffffffff, strOut));
+
+    auto Read = [&](const CScript& script, std::string& str) {
+        tx.vout[1].scriptPubKey = script;
+        return GetDepositAddressFromL1Tx(tx, 0, str);
+    };
+    // An empty push is an (empty) address, as for the enforcer
+    BOOST_CHECK(Read(CScript() << OP_RETURN << OP_0, strOut));
+    BOOST_CHECK_EQUAL(strOut, "");
+    // Any push opcode: a non-minimal PUSHDATA1, and PUSHDATA2 for a long one
+    CScript scriptPushData1;
+    scriptPushData1.push_back(OP_RETURN);
+    scriptPushData1.push_back(OP_PUSHDATA1);
+    scriptPushData1.push_back(3);
+    const std::vector<unsigned char> vchAbc{'a', 'b', 'c'};
+    scriptPushData1.insert(scriptPushData1.end(), vchAbc.begin(), vchAbc.end());
+    BOOST_CHECK(Read(scriptPushData1, strOut));
+    BOOST_CHECK_EQUAL(strOut, "abc");
+    const std::string strLong(300, 'x');
+    BOOST_CHECK(Read(CScript() << OP_RETURN << std::vector<unsigned char>(strLong.begin(), strLong.end()), strOut));
+    BOOST_CHECK_EQUAL(strOut, strLong);
+    // Not an address
+    BOOST_CHECK(!Read(CScript() << OP_RETURN, strOut));                       // no push
+    BOOST_CHECK(!Read(CScript() << OP_RETURN << vchAddr << vchAddr, strOut)); // two pushes
+    BOOST_CHECK(!Read(CScript() << OP_RETURN << vchAddr << OP_TRUE, strOut)); // something after it
+    BOOST_CHECK(!Read(CScript() << OP_RETURN << OP_1, strOut));               // OP_1 is not a data push
+    BOOST_CHECK(!Read(CScript() << vchAddr, strOut));                         // no OP_RETURN
+    BOOST_CHECK(!Read(CScript() << OP_NOP << OP_RETURN << vchAddr, strOut));  // OP_RETURN not first
+    CScript scriptShort;                                                      // a push past the end
+    scriptShort.push_back(OP_RETURN);
+    scriptShort.push_back(5);
+    scriptShort.insert(scriptShort.end(), vchAbc.begin(), vchAbc.begin() + 2);
+    BOOST_CHECK(!Read(scriptShort, strOut));
+}
+
+// v0.2.19: beta keeps its identity (the network a node runs with no flag, in
+// the data directory itself); mainnet has its own magic and genesis, beta's
+// rules, its own data directory, the same ports, and ships dormant (genesis M1,
+// option A), selected by no flag in this build.
+BOOST_AUTO_TEST_CASE(networks_beta_and_dormant_mainnet)
+{
+    const auto beta = CreateChainParams(CBaseChainParams::BETA);
+    const auto main = CreateChainParams(CBaseChainParams::MAIN);
+    const auto regtest = CreateChainParams(CBaseChainParams::REGTEST);
+
+    BOOST_CHECK_EQUAL(beta->NetworkIDString(), "beta");
+    BOOST_CHECK_EQUAL(beta->GenesisBlock().GetHash().GetHex(), "359d17fc7cc60653fb72bbec271efab88af16ba9f15a55b060fe632c7de5e978");
+    BOOST_CHECK_EQUAL(HexStr(beta->MessageStart(), beta->MessageStart() + 4), "fb4b1845");
+    BOOST_CHECK_EQUAL(beta->GetDefaultPort(), 8455);
+    BOOST_CHECK(!beta->GetConsensus().fChainDormant);
+
+    BOOST_CHECK_EQUAL(main->NetworkIDString(), "main");
+    BOOST_CHECK(main->GenesisBlock().GetHash() != beta->GenesisBlock().GetHash());
+    BOOST_CHECK_EQUAL(main->GetConsensus().hashGenesisBlock.GetHex(), main->GenesisBlock().GetHash().GetHex());
+    BOOST_CHECK_EQUAL(HexStr(main->MessageStart(), main->MessageStart() + 4), "fb4bec58");
+    BOOST_CHECK_EQUAL(main->GetDefaultPort(), 8455);
+    BOOST_CHECK(main->GetConsensus().fChainDormant);
+    // Beta's rules from block 0
+    BOOST_CHECK_EQUAL(main->GetConsensus().nWithdrawalGuardHeight, beta->GetConsensus().nWithdrawalGuardHeight);
+    BOOST_CHECK_EQUAL(main->GetConsensus().nDemandWindow, beta->GetConsensus().nDemandWindow);
+    BOOST_CHECK(main->CUSFBundleFormat() && beta->CUSFBundleFormat());
+    BOOST_CHECK_EQUAL(main->Bech32HRP(), beta->Bech32HRP());
+
+    BOOST_CHECK(!regtest->GetConsensus().fChainDormant);
+    BOOST_CHECK_EQUAL(main->GenesisBlock().GetHash().GetHex(), "6e5a41bcc2793325e79d952de3766989f70181294e32f19b10d4968b74d919fc");
+
+    const auto baseMain = CreateBaseChainParams(CBaseChainParams::MAIN);
+    const auto baseBeta = CreateBaseChainParams(CBaseChainParams::BETA);
+    BOOST_CHECK_EQUAL(baseMain->DataDir(), "mainnet");
+    BOOST_CHECK_EQUAL(baseBeta->DataDir(), "");
+    BOOST_CHECK_EQUAL(baseMain->RPCPort(), 8454);
+    BOOST_CHECK_EQUAL(baseBeta->RPCPort(), 8454);
+
+    // One public network per build: no flag runs beta; -beta and -mainnet are
+    // not network flags (an unknown argument changes nothing); -regtest is.
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::BETA);
+    gArgs.ForceSetArg("-mainnet", "1");
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::BETA);
+    gArgs.ForceSetArg("-beta", "1");
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::BETA);
+    gArgs.ForceSetArg("-regtest", "1");
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::REGTEST);
+    gArgs.ForceSetArg("-regtest", "0");
+    gArgs.ForceSetArg("-beta", "0");
+    gArgs.ForceSetArg("-mainnet", "0");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

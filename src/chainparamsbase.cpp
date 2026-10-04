@@ -11,6 +11,7 @@
 #include <assert.h>
 
 const std::string CBaseChainParams::MAIN = "main";
+const std::string CBaseChainParams::BETA = "beta";
 const std::string CBaseChainParams::REGTEST = "regtest";
 
 void AppendParamsHelpMessages(std::string& strUsage, bool debugHelp)
@@ -32,8 +33,13 @@ const CBaseChainParams& BaseParams()
 
 std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain)
 {
-    // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
+    // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11): RPC 8454 for the FreeBank
+    // network. v0.2.19: mainnet and beta share it (they never run side by side)
+    // but not the data directory: beta keeps the directory itself, as before;
+    // mainnet lives in "mainnet".
     if (chain == CBaseChainParams::MAIN)
+        return MakeUnique<CBaseChainParams>("mainnet", 8454);
+    else if (chain == CBaseChainParams::BETA)
         return MakeUnique<CBaseChainParams>("", 8454);
     else if (chain == CBaseChainParams::REGTEST)
         return MakeUnique<CBaseChainParams>("regtest", 18457);
@@ -48,10 +54,13 @@ void SelectBaseParams(const std::string& chain)
 
 std::string ChainNameFromCommandLine()
 {
+    // One public network per build (Michael, 2026-10-04): this build runs beta,
+    // with no flag, as every release before it. FreeBank mainnet is in the code
+    // (dormant) but no flag selects it: the mainnet release runs it the same way.
     bool fRegTest = gArgs.GetBoolArg("-regtest", false);
 
     if (fRegTest)
         return CBaseChainParams::REGTEST;
 
-    return CBaseChainParams::MAIN;
+    return CBaseChainParams::BETA;
 }

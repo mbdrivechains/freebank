@@ -33,6 +33,7 @@
 #include <txdb.h>
 #include <util.h>
 #include <utilmoneystr.h>
+#include <utilstrencodings.h>
 #include <wallet/coincontrol.h>
 #include <wallet/feebumper.h>
 #include <wallet/rpcwallet.h>
@@ -53,14 +54,15 @@ CWallet *GetWalletForJSONRPCRequest(const JSONRPCRequest& request)
     if (request.URI.substr(0, WALLET_ENDPOINT_BASE.size()) == WALLET_ENDPOINT_BASE) {
         // wallet endpoint was used
         std::string requestedWallet = urlDecode(request.URI.substr(WALLET_ENDPOINT_BASE.size()));
-        for (CWalletRef pwallet : ::vpwallets) {
+        for (CWalletRef pwallet : GetWallets()) {
             if (pwallet->GetName() == requestedWallet) {
                 return pwallet;
             }
         }
         throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Requested wallet does not exist or is not loaded");
     }
-    return ::vpwallets.size() == 1 || (request.fHelp && ::vpwallets.size() > 0) ? ::vpwallets[0] : nullptr;
+    const std::vector<CWalletRef> wallets = GetWallets();
+    return wallets.size() == 1 || (request.fHelp && wallets.size() > 0) ? wallets[0] : nullptr;
 }
 
 std::string HelpRequiringPassphrase(CWallet * const pwallet)
@@ -74,7 +76,7 @@ bool EnsureWalletIsAvailable(CWallet * const pwallet, bool avoidException)
 {
     if (pwallet) return true;
     if (avoidException) return false;
-    if (::vpwallets.empty()) {
+    if (!HasWallets()) {
         // Note: It isn't currently possible to trigger this error because
         // wallet RPC methods aren't registered unless a wallet is loaded. But
         // this error is being kept as a precaution, because it's possible in
@@ -2993,7 +2995,7 @@ UniValue listwallets(const JSONRPCRequest& request)
 
     UniValue obj(UniValue::VARR);
 
-    for (CWalletRef pwallet : vpwallets) {
+    for (CWalletRef pwallet : GetWallets()) {
 
         if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
             return NullUniValue;
@@ -3005,6 +3007,106 @@ UniValue listwallets(const JSONRPCRequest& request)
     }
 
     return obj;
+}
+
+// v0.2.19 (Core 0.17 #10740 / #13058): load and create wallets while the node
+// runs. A wallet name is a file name in the wallet directory, checked as a
+// -wallet name is at startup (VerifyWallets). One load at a time, so two calls
+// for one name cannot open its database twice. Loaded wallets are not added to
+// the config: name them with -wallet= to load them at startup.
+static CCriticalSection cs_walletload;
+
+static void CheckWalletName(const std::string& strName)
+{
+    if (strName.empty() || fs::path(strName).filename() != strName)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "A wallet name is a file name in the wallet directory, not a path");
+    if (SanitizeString(strName, SAFE_CHARS_FILENAME) != strName)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid characters in the wallet name");
+    for (CWalletRef pwallet : GetWallets()) {
+        if (pwallet->GetName() == strName)
+            throw JSONRPCError(RPC_WALLET_ALREADY_LOADED, strprintf("Wallet %s is already loaded", strName));
+    }
+}
+
+static UniValue OpenWalletAtRuntime(const std::string& strName)
+{
+    std::string strError, strWarning;
+    if (!CWalletDB::VerifyEnvironment(strName, GetWalletDir(), strError))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet environment check failed: " + strError);
+    if (!CWalletDB::VerifyDatabaseFile(strName, GetWalletDir(), strWarning, strError))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet file verification failed: " + strError);
+
+    CWallet * const pwallet = CWallet::CreateWalletFromFile(strName);
+    if (!pwallet)
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet loading failed (see the log)");
+    AddWallet(pwallet);
+    // As StartWallets does at startup (the periodic flush is already scheduled)
+    pwallet->ReacceptWalletTransactions();
+
+    const std::string strEnc = pwallet->GetEncryptionWarning();
+    if (!strEnc.empty())
+        strWarning += (strWarning.empty() ? "" : " ") + strEnc;
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("name", pwallet->GetName());
+    obj.pushKV("warning", strWarning);
+    return obj;
+}
+
+UniValue loadwallet(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "loadwallet \"filename\"\n"
+            "\nLoads a wallet from a wallet file in the wallet directory while the node runs.\n"
+            "Wallets named with -wallet= are loaded at startup; this one is not added to them.\n"
+            "\nArguments:\n"
+            "1. \"filename\"    (string, required) The wallet file name in the wallet directory\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"name\" :    <wallet_name>,        (string) The wallet name, for -rpcwallet= or /wallet/<name>\n"
+            "  \"warning\" : <warning>,            (string) Warning message, if any\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("loadwallet", "\"savings\"")
+            + HelpExampleRpc("loadwallet", "\"savings\"")
+        );
+
+    const std::string strName = request.params[0].get_str();
+    LOCK(cs_walletload);
+    CheckWalletName(strName);
+    const fs::path path = fs::absolute(strName, GetWalletDir());
+    if (!fs::exists(path))
+        throw JSONRPCError(RPC_WALLET_NOT_FOUND, strprintf("Wallet %s not found", strName));
+    if (!fs::is_regular_file(path) || fs::is_symlink(path))
+        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Wallet %s is not a regular file", strName));
+    return OpenWalletAtRuntime(strName);
+}
+
+UniValue createwallet(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "createwallet \"wallet_name\"\n"
+            "\nCreates and loads a new wallet (a new HD seed) while the node runs.\n"
+            "Name it with -wallet= to load it at startup.\n"
+            "\nArguments:\n"
+            "1. \"wallet_name\"    (string, required) The new wallet's file name in the wallet directory\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"name\" :    <wallet_name>,        (string) The wallet name, for -rpcwallet= or /wallet/<name>\n"
+            "  \"warning\" : <warning>,            (string) Warning message, if any\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("createwallet", "\"savings\"")
+            + HelpExampleRpc("createwallet", "\"savings\"")
+        );
+
+    const std::string strName = request.params[0].get_str();
+    LOCK(cs_walletload);
+    CheckWalletName(strName);
+    if (fs::symlink_status(fs::absolute(strName, GetWalletDir())).type() != fs::file_not_found)
+        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Wallet %s already exists", strName));
+    return OpenWalletAtRuntime(strName);
 }
 
 UniValue resendwallettransactions(const JSONRPCRequest& request)
@@ -4041,13 +4143,15 @@ UniValue mintnote(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "mintnote\n"
             "\nArguments:\n"
             "1. \"id\"     (numeric, required) the house ID number\n"
             "2. \"units\"  (numeric, required) note units to mint (base-native, 1 unit redeems 1 sat)\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "4. \"address\" (string, optional) the holder's FreeBank P2PKH address (a member, for a members-only\n"
+            "               house); default a fresh key of this wallet, or a members-only house's own redemption key\n"
             "\nMint house notes to a fresh holder key. House M-of-N authorized;\n"
             "capped by the escrow (N + minted <= lambda * active escrow).\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -4060,7 +4164,14 @@ UniValue mintnote(const JSONRPCRequest& request)
     const uint32_t nHouseID = request.params[0].get_int();
     const uint64_t nUnits = request.params[1].get_int64();
     CAmount nFee = 100000;
-    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+    if (request.params.size() >= 3 && !request.params[2].isNull()) nFee = AmountFromValue(request.params[2]);
+    CScript scriptRecipient;
+    if (request.params.size() >= 4 && !request.params[3].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[3].get_str());
+        if (!boost::get<CKeyID>(&dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "The holder must be a FreeBank P2PKH address");
+        scriptRecipient = GetScriptForDestination(dest);
+    }
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -4068,7 +4179,7 @@ UniValue mintnote(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->MintNote(strFail, txid, nHouseID, nUnits, nFee)) {
+    if (!pwallet->MintNote(strFail, txid, nHouseID, nUnits, nFee, scriptRecipient)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -4460,14 +4571,14 @@ UniValue listmynotes(const JSONRPCRequest& request)
             "    \"demandable\": true|false   (bool) a demand can be lodged now (house suspended)\n"
             "  }, ...\n"
             "]\n"
-            + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("listmynotes", "")
             + HelpExampleRpc("listmynotes", "")
         );
 
     ObserveSafeMode();
-    EnsureWalletIsUnlocked(pwallet);
+    // v0.2.19 (Michael 2026-10-04, app request): read-only, answered on a locked
+    // wallet. It reads public keys and IsMine only, which need no passphrase.
     pwallet->BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, pwallet->cs_wallet);
 
@@ -4543,14 +4654,14 @@ UniValue listmylp(const JSONRPCRequest& request)
             "    \"fee_bps\": n              (numeric) pool swap fee in basis points\n"
             "  }, ...\n"
             "]\n"
-            + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("listmylp", "")
             + HelpExampleRpc("listmylp", "")
         );
 
     ObserveSafeMode();
-    EnsureWalletIsUnlocked(pwallet);
+    // v0.2.19 (Michael 2026-10-04, app request): read-only, answered on a locked
+    // wallet. It reads public keys and IsMine only, which need no passphrase.
     pwallet->BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, pwallet->cs_wallet);
 
@@ -4600,7 +4711,7 @@ UniValue originatedeposit(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 4 || request.params.size() > 5)
+    if (request.fHelp || request.params.size() < 4 || request.params.size() > 6)
         throw std::runtime_error(
             "originatedeposit\n"
             "\nArguments:\n"
@@ -4609,6 +4720,8 @@ UniValue originatedeposit(const JSONRPCRequest& request)
             "3. \"ratebps\"   (numeric, required) annual rate in basis points (house-set)\n"
             "4. \"maturity\"  (numeric, required) absolute sidechain height the term ends at\n"
             "5. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "6. \"address\"   (string, optional) the saver's FreeBank P2PKH address (a member, for a members-only\n"
+            "                 house; required there); default a fresh key of this wallet\n"
             "\nHouse issues a term-deposit receipt to a fresh holder key. House M-of-N\n"
             "authorized; capped by capital (N + D + principal <= lambda * active escrow).\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -4623,7 +4736,14 @@ UniValue originatedeposit(const JSONRPCRequest& request)
     const uint32_t nRateBps = request.params[2].get_int();
     const uint32_t nMaturityHeight = request.params[3].get_int();
     CAmount nFee = 100000;
-    if (request.params.size() >= 5) nFee = AmountFromValue(request.params[4]);
+    if (request.params.size() >= 5 && !request.params[4].isNull()) nFee = AmountFromValue(request.params[4]);
+    CScript scriptRecipient;
+    if (request.params.size() >= 6 && !request.params[5].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[5].get_str());
+        if (!boost::get<CKeyID>(&dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "The saver must be a FreeBank P2PKH address");
+        scriptRecipient = GetScriptForDestination(dest);
+    }
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -4631,7 +4751,7 @@ UniValue originatedeposit(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->OriginateDeposit(strFail, txid, nHouseID, nPrincipal, nRateBps, nMaturityHeight, nFee)) {
+    if (!pwallet->OriginateDeposit(strFail, txid, nHouseID, nPrincipal, nRateBps, nMaturityHeight, nFee, scriptRecipient)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -4646,13 +4766,16 @@ UniValue transferdeposit(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "transferdeposit\n"
             "\nArguments:\n"
             "1. \"id\"        (numeric, required) the house ID number\n"
             "2. \"principal\" (numeric, required) principal of the whole receipt to reassign\n"
             "3. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "4. \"address\"   (string, optional) the recipient's FreeBank P2PKH address (a member, for a\n"
+            "                 members-only house); default a fresh key of this wallet, or for a members-only\n"
+            "                 house the receipt's own key (a fresh key would not be a member)\n"
             "\nReassign a whole term-deposit receipt (house, principal) held by this\n"
             "wallet to a fresh recipient key. Immutable terms carry over exactly.\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -4665,7 +4788,14 @@ UniValue transferdeposit(const JSONRPCRequest& request)
     const uint32_t nHouseID = request.params[0].get_int();
     const uint64_t nPrincipal = request.params[1].get_int64();
     CAmount nFee = 100000;
-    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+    if (request.params.size() >= 3 && !request.params[2].isNull()) nFee = AmountFromValue(request.params[2]);
+    CScript scriptRecipient;
+    if (request.params.size() >= 4 && !request.params[3].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[3].get_str());
+        if (!boost::get<CKeyID>(&dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "The recipient must be a FreeBank P2PKH address");
+        scriptRecipient = GetScriptForDestination(dest);
+    }
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -4673,7 +4803,7 @@ UniValue transferdeposit(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->TransferDeposit(strFail, txid, nHouseID, nPrincipal, nFee)) {
+    if (!pwallet->TransferDeposit(strFail, txid, nHouseID, nPrincipal, nFee, scriptRecipient)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -5210,7 +5340,7 @@ UniValue registerhouse(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 5 || request.params.size() > 6)
+    if (request.fHelp || request.params.size() < 5 || request.params.size() > 7)
         throw std::runtime_error(
             "registerhouse\n"
             "\nArguments:\n"
@@ -5220,6 +5350,9 @@ UniValue registerhouse(const JSONRPCRequest& request)
             "4. \"denommg\"   (numeric, required) note denomination unit in mg of gold\n"
             "5. \"pledges\"   (array, required) pledge amount per partner (1 entry = solo)\n"
             "6. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "7. \"type\"      (string, optional) \"open\" (default), \"members\" (its notes and deposit receipts\n"
+            "                 go only to its members) or \"redeem\" (members-only, and notes pass only between\n"
+            "                 the house and the holder). Fixed for the life of the house.\n"
             "\nRegister a discount house. This wallet holds every partner key\n"
             "(single-wallet handshake, v1).\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -5241,8 +5374,19 @@ UniValue registerhouse(const JSONRPCRequest& request)
         vPledge.push_back(AmountFromValue(arr[i]));
 
     CAmount nFee = 100000;
-    if (request.params.size() >= 6)
+    if (request.params.size() >= 6 && !request.params[5].isNull())
         nFee = AmountFromValue(request.params[5]);
+
+    uint8_t nFlags = 0;
+    if (request.params.size() >= 7) {
+        const std::string strType = request.params[6].get_str();
+        if (strType == "members")
+            nFlags = HOUSE_FLAG_MEMBERS_ONLY;
+        else if (strType == "redeem")
+            nFlags = HOUSE_FLAG_MEMBERS_ONLY | HOUSE_FLAG_REDEEM_ONLY;
+        else if (strType != "open")
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "type must be \"open\", \"members\" or \"redeem\"");
+    }
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -5251,7 +5395,7 @@ UniValue registerhouse(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->RegisterHouse(strFail, txid, nTier, nThresholdM, strClassID, nDenomMgGold, vPledge, nFee)) {
+    if (!pwallet->RegisterHouse(strFail, txid, nTier, nThresholdM, strClassID, nDenomMgGold, vPledge, nFee, nFlags)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -5259,6 +5403,77 @@ UniValue registerhouse(const JSONRPCRequest& request)
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
     return response;
+}
+
+// v0.2.19 members-only houses: addhousemembers / removehousemembers / purgehousemembers
+static UniValue HouseMembersRPC(const JSONRPCRequest& request, uint8_t nHouseOp, const char* strName, const char* strWhat)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            std::string(strName) + " id [\"address\",...] ( fee )\n"
+            "\n" + strWhat + "\n"
+            "Approved with this wallet's partner keys (M-of-N). One member op per house per block.\n"
+            "\nArguments:\n"
+            "1. id          (numeric, required) the members-only house ID number\n"
+            "2. members     (array, required) 1 to 256 FreeBank P2PKH addresses (keys dedicated to this house)\n"
+            "3. fee         (numeric or string, optional) default 0.001\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli(strName, "5 \"[\\\"Xaddress...\\\"]\"")
+            + HelpExampleRpc(strName, "5, [\"Xaddress...\"]")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<uint160> vKeyID;
+    const UniValue arr = request.params[1].get_array();
+    for (size_t i = 0; i < arr.size(); i++) {
+        CTxDestination dest = DecodeDestination(arr[i].get_str());
+        const CKeyID* pKey = boost::get<CKeyID>(&dest);
+        if (!pKey)
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Members are FreeBank P2PKH addresses: " + arr[i].get_str());
+        vKeyID.push_back(*pKey);
+    }
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3)
+        nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->HouseMembersOp(strFail, txid, nHouseOp, nHouseID, vKeyID, nFee)) {
+        LogPrintf("%s: %s\n", strName, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue addhousemembers(const JSONRPCRequest& request)
+{
+    return HouseMembersRPC(request, HOUSE_OP_MEMBER_ADD, "addhousemembers",
+        "Add members to a members-only house. They count from the next block.");
+}
+
+UniValue removehousemembers(const JSONRPCRequest& request)
+{
+    return HouseMembersRPC(request, HOUSE_OP_MEMBER_REMOVE, "removehousemembers",
+        "Remove members from a members-only house, 3 blocks after this confirms. A removed member keeps their notes and\n"
+        "can still redeem, demand, protest, claim, and pass notes back to their own key or to a member.");
+}
+
+UniValue purgehousemembers(const JSONRPCRequest& request)
+{
+    return HouseMembersRPC(request, HOUSE_OP_MEMBER_PURGE, "purgehousemembers",
+        "Delete the records of removed members whose removal is final (they count toward the 100,000 cap until then).");
 }
 
 UniValue topuphouse(const JSONRPCRequest& request)
@@ -6110,7 +6325,6 @@ UniValue listmybills(const JSONRPCRequest& request)
         throw std::runtime_error(
             "listmybills\n"
             "\nList bills this wallet participates in, with our role(s)\n"
-            + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("listmybills", "")
             + HelpExampleRpc("listmybills", "")
@@ -6118,7 +6332,8 @@ UniValue listmybills(const JSONRPCRequest& request)
 
     ObserveSafeMode();
 
-    EnsureWalletIsUnlocked(pwallet);
+    // v0.2.19 (Michael 2026-10-04, app request): read-only, answered on a locked
+    // wallet. It asks HaveKey only, which needs no passphrase.
     pwallet->BlockUntilSyncedToCurrentChain();
 
     LOCK2(cs_main, pwallet->cs_wallet);
@@ -6744,6 +6959,8 @@ static const CRPCCommand commands[] =
     { "wallet",             "listtransactions",                 &listtransactions,              {"account","count","skip","include_watchonly"} },
     { "wallet",             "listunspent",                      &listunspent,                   {"minconf","maxconf","addresses","include_unsafe","query_options"} },
     { "wallet",             "listwallets",                      &listwallets,                   {} },
+    { "wallet",             "loadwallet",                       &loadwallet,                    {"filename"} },
+    { "wallet",             "createwallet",                     &createwallet,                  {"wallet_name"} },
     { "wallet",             "lockunspent",                      &lockunspent,                   {"unlock","transactions"} },
     { "wallet",             "move",                             &movecmd,                       {"fromaccount","toaccount","amount","minconf","comment"} },
     { "wallet",             "sendfrom",                         &sendfrom,                      {"fromaccount","toaddress","amount","minconf","comment","comment_to"} },
@@ -6779,7 +6996,7 @@ static const CRPCCommand commands[] =
     { "bills",              "recoursebill",                     &recoursebill,                  {"id", "fee"} },
     { "bills",              "listmybills",                      &listmybills,                   {} },
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
-    { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee"} },
+    { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee", "address"} },
     { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress"} },
     { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
     { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
@@ -6788,8 +7005,8 @@ static const CRPCCommand commands[] =
     { "notes",              "protestnote",                      &protestnote,                   {"id", "fee"} },
     { "notes",              "dischargedemands",                 &dischargedemands,              {"id", "fee"} },
     { "notes",              "listmynotes",                      &listmynotes,                   {} },
-    { "deposits",           "originatedeposit",                 &originatedeposit,              {"id", "principal", "ratebps", "maturity", "fee"} },
-    { "deposits",           "transferdeposit",                  &transferdeposit,               {"id", "principal", "fee"} },
+    { "deposits",           "originatedeposit",                 &originatedeposit,              {"id", "principal", "ratebps", "maturity", "fee", "address"} },
+    { "deposits",           "transferdeposit",                  &transferdeposit,               {"id", "principal", "fee", "address"} },
     { "deposits",           "withdrawdeposit",                  &withdrawdeposit,               {"id", "principal", "fee"} },
     { "deposits",           "claimdeposit",                     &claimdeposit,                  {"id", "principal", "fee"} },
 
@@ -6804,7 +7021,10 @@ static const CRPCCommand commands[] =
     { "settle",             "completesettle",                   &completesettle,                {"hex"} },
     { "settle",             "listpresentable",                  &listpresentable,               {"id"} },
     { "settle",             "listsettlements",                  &listsettlements,               {} },
-    { "houses",             "registerhouse",                    &registerhouse,                 {"tier", "threshold", "classid", "denommg", "pledges", "fee"} },
+    { "houses",             "registerhouse",                    &registerhouse,                 {"tier", "threshold", "classid", "denommg", "pledges", "fee", "type"} },
+    { "houses",             "addhousemembers",                  &addhousemembers,               {"id", "members", "fee"} },
+    { "houses",             "removehousemembers",               &removehousemembers,            {"id", "members", "fee"} },
+    { "houses",             "purgehousemembers",                &purgehousemembers,             {"id", "members", "fee"} },
     { "houses",             "topuphouse",                       &topuphouse,                    {"id", "partner", "amount", "fee"} },
     { "houses",             "admitpartner",                     &admitpartner,                  {"id", "pledge", "fee"} },
     { "houses",             "exitpartner",                      &exitpartner,                   {"id", "partner", "fee"} },
