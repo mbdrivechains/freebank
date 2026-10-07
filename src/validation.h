@@ -344,6 +344,12 @@ void PruneBlockFilesManual(int nManualPruneHeight);
 
 /** (try to) add transaction to memory pool
  * plTxnReplaced will be appended to with all transactions replaced from mempool **/
+/** v0.2.21: run a token claim op's shape and contextual checks against the tip, as the mempool would (the wallet
+ *  asks before committing: this Core's CommitTransaction keeps a tx the mempool refused). Needs cs_main. */
+bool CheckTokenOperationAtTip(const CTransaction& tx, CValidationState& state);
+/** v0.2.21: does a token CLAIM share a token (Y) with a pooled claim of the same house? (The mempool refuses it.) */
+bool TokenClaimConflictsMempool(const CTransaction& tx);
+
 bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransactionRef &tx,
                         bool* pfMissingInputs, std::list<CTransactionRef>* plTxnReplaced,
                         bool bypass_limits, const CAmount nAbsurdFee);

@@ -243,6 +243,7 @@ public:
 /** Access to the house database (blocks/Houses/) */
 #include <oracle.h>
 #include <house.h>   // v0.2.19: CHouseMember, HouseMemberPrior, HouseMemberEffects
+#include <token.h>   // v0.2.21: the token claim records
 
 class HouseDB : public CDBWrapper
 {
@@ -261,7 +262,22 @@ public:
                            const std::vector<COracleSubmitter>* pvSubmitter = nullptr,
                            const std::vector<uint32_t>* pvSubmitterRemove = nullptr,
                            const uint32_t* pnLastSubmitterID = nullptr,
-                           const HouseMemberEffects* pMembers = nullptr);
+                           const HouseMemberEffects* pMembers = nullptr,
+                           const TokenEffects* pTokens = nullptr);
+
+    /** v0.2.21 token claim records (token.h). Undo erases what the disconnected block wrote, or resets a collect. */
+    bool GetTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID, CTokenKeyset& rec);
+    bool GetTokenIssued(uint32_t nHouseID, const std::vector<unsigned char>& vchB, CTokenMark& rec);
+    bool GetTokenSpent(uint32_t nHouseID, const uint256& y, CTokenMark& rec);
+    bool GetTokenClaim(uint32_t nHouseID, const uint256& y, CTokenClaim& rec);
+    bool EraseTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID);
+    /** A POST's undo in one batch: the issue and spend records it wrote. */
+    bool EraseTokenMarks(uint32_t nHouseID, const std::vector<std::vector<unsigned char>>& vB, const std::vector<uint256>& vY);
+    bool WriteTokenClaim(uint32_t nHouseID, const uint256& y, const CTokenClaim& rec);
+    bool EraseTokenClaim(uint32_t nHouseID, const uint256& y);
+    /** For the RPC: a house's keysets, and up to nMax claims from y start (inclusive), in key order. */
+    std::vector<std::pair<uint64_t, CTokenKeyset>> ListTokenKeysets(uint32_t nHouseID);
+    std::vector<std::pair<uint256, CTokenClaim>> ListTokenClaims(uint32_t nHouseID, const uint256& start, size_t nMax);
 
     /** v0.2.19 members-only houses: one record per (house, keyid), and the house's record count. */
     bool GetHouseMember(uint32_t nHouseID, const uint160& keyid, CHouseMember& rec);

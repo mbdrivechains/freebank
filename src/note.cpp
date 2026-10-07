@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <note.h>
+#include <token.h>
 
 #include <house.h>   // BLOCKS_PER_YEAR (deferral interest)
 
@@ -318,6 +319,10 @@ template bool DecodeNotePayload<NoteDemand>(const std::vector<unsigned char>&, N
 template bool DecodeNotePayload<NoteProtest>(const std::vector<unsigned char>&, NoteProtest&);
 template bool DecodeNotePayload<NoteLock>(const std::vector<unsigned char>&, NoteLock&);
 template bool DecodeNotePayload<NoteUnlock>(const std::vector<unsigned char>&, NoteUnlock&);
+template bool DecodeNotePayload<NoteTokenKeyset>(const std::vector<unsigned char>&, NoteTokenKeyset&);
+template bool DecodeNotePayload<NoteTokenPost>(const std::vector<unsigned char>&, NoteTokenPost&);
+template bool DecodeNotePayload<NoteTokenClaim>(const std::vector<unsigned char>&, NoteTokenClaim&);
+template bool DecodeNotePayload<NoteTokenCollect>(const std::vector<unsigned char>&, NoteTokenCollect&);
 
 void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight)
 {
@@ -383,6 +388,11 @@ void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fCon
         NoteClaim c;
         if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange)
             coin.SetHouseEscrow(fConnected ? c.nHouseID : 0);
+    } else if (tx.nNoteOp == NOTE_OP_TOKEN_COLLECT && n == 0) {
+        // v0.2.21: a token collect may return escrow change at vout[0]; the contextual check pinned its script.
+        NoteTokenCollect c;
+        if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange)
+            coin.SetHouseEscrow(fConnected ? c.nHouseID : 0);
     }
 }
 
@@ -438,12 +448,15 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
 
     // v0.2.20: LOCK (4) and UNLOCK (5), reserved inert since v1, are live (the
     // token mint and burn record, D-2026-10-08-1).
-    if (tx.nNoteOp < NOTE_OP_MINT || tx.nNoteOp > NOTE_OP_PROTEST)
+    // v0.2.21: 9-12 are the token holders' claim at a failed house (token.h).
+    if (tx.nNoteOp < NOTE_OP_MINT || (tx.nNoteOp > NOTE_OP_PROTEST && !IsTokenClaimOp(tx.nNoteOp)))
         return state.DoS(100, false, REJECT_INVALID, "bad-note-op");
 
     // 100 outputs x u64 + M approver sigs + (MINT, R-i7) up to 64 reserve proofs
     // (~145 B each); bounded well above the worst case.
-    if (tx.vchNotePayload.size() > 32768)
+    // A token POST (2,000 entries of up to 42 bytes) and CLAIM (64 tokens) are larger by design.
+    const size_t nMaxPayload = (tx.nNoteOp == NOTE_OP_TOKEN_POST || tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) ? 100000 : 32768;
+    if (tx.vchNotePayload.size() > nMaxPayload)
         return state.DoS(100, false, REJECT_INVALID, "bad-note-payload-oversize");
 
     if (tx.nNoteOp == NOTE_OP_MINT) {
@@ -642,6 +655,74 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
             return false;
         if (!CheckNoteApproverShape(unlock.vApproverIndex, unlock.vApproverSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-approvers");
+    }
+    else if (tx.nNoteOp == NOTE_OP_TOKEN_KEYSET) {
+        NoteTokenKeyset ks;
+        if (!DecodeNotePayload(tx.vchNotePayload, ks))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-payload");
+        if (!IsValidNotePubKey(ks.vchPostingPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-posting-key");
+        if (ks.vKey.empty() || ks.vKey.size() > (size_t)MAX_TOKEN_AMOUNT_EXP + 1)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-size");
+        std::set<std::vector<unsigned char>> setKey;
+        for (size_t i = 0; i < ks.vKey.size(); i++) {
+            const TokenKey& k = ks.vKey[i];
+            if (k.nExp > MAX_TOKEN_AMOUNT_EXP || (i > 0 && k.nExp <= ks.vKey[i - 1].nExp))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-amounts");
+            // One key per amount: a key listed twice would let a small token claim as a large one.
+            if (!IsValidNotePubKey(k.vchPubKey) || !setKey.insert(k.vchPubKey).second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-key");
+        }
+        if (!CheckNoteApproverShape(ks.vApproverIndex, ks.vApproverSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-approvers");
+    }
+    else if (tx.nNoteOp == NOTE_OP_TOKEN_POST) {
+        NoteTokenPost post;
+        if (!DecodeNotePayload(tx.vchNotePayload, post))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-post-payload");
+        const size_t n = post.vIssued.size() + post.vSpent.size();
+        if (n == 0 || n > MAX_TOKEN_POST_ENTRIES)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-post-size");
+        std::set<std::vector<unsigned char>> setB;
+        for (const TokenIssued& iss : post.vIssued) {
+            if (!IsValidNotePubKey(iss.vchB) || iss.nAmount == 0 || !setB.insert(iss.vchB).second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-post-issued");
+        }
+        std::set<uint256> setY;
+        for (const uint256& y : post.vSpent) {
+            if (!setY.insert(y).second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-post-spent");
+        }
+        if (post.vchSig.empty() || post.vchSig.size() > 80)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-post-sig");
+    }
+    else if (tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+        NoteTokenClaim claim;
+        if (!DecodeNotePayload(tx.vchNotePayload, claim))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payload");
+        if (claim.vEntry.empty() || claim.vEntry.size() > MAX_TOKEN_CLAIM_ENTRIES)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-size");
+        for (const TokenClaimEntry& e : claim.vEntry) {
+            if (e.vchSecret.empty() || e.vchSecret.size() > MAX_TOKEN_SECRET_SIZE)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-secret");
+            if (!IsValidNotePubKey(e.vchB) || !IsValidNotePubKey(e.vchC) ||
+                    e.vchE.size() != 32 || e.vchS.size() != 32)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-proof");
+            if (e.vchPayoutScript.empty() || e.vchPayoutScript.size() > MAX_TOKEN_PAYOUT_SCRIPT)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payout");
+            if (e.nFeeBps > TOKEN_FEE_BPS_MAX || (e.nFeeBps == 0) != e.vchRelayerScript.empty() ||
+                    e.vchRelayerScript.size() > MAX_TOKEN_RELAYER_SCRIPT)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-fee");
+            if (e.vchSig.empty() || e.vchSig.size() > 80)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-sig");
+        }
+    }
+    else if (tx.nNoteOp == NOTE_OP_TOKEN_COLLECT) {
+        NoteTokenCollect col;
+        if (!DecodeNotePayload(tx.vchNotePayload, col))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-payload");
+        if (col.vY.size() > MAX_TOKEN_COLLECT_ENTRIES || col.fEscrowChange > 1)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-shape");
     }
 
     return true;

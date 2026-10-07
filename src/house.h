@@ -220,7 +220,9 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // house is (REGISTER_MO did not exist).
 // v11 (Chaumian token record, v0.2.20): nTokenUnits. A v10 record reads as 0, which every pre-v0.2.20 house holds
 // (NOTE_OP_LOCK was reserved inert).
-static const uint8_t HOUSE_SER_VERSION = 11;
+// v12 (token holders' claim at a failed house, gateway docs/freebank/TOKEN_CLAIM_DESIGN.md draft 3): the claim
+// totals. A v11 record reads as 0: no claim op existed.
+static const uint8_t HOUSE_SER_VERSION = 12;
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -393,6 +395,18 @@ struct CHouse {
     // Part of nMintedUnits, never in addition to it: the locked notes are still the house's liability, so every cap,
     // the health report, wind-down and the failure payout count tokens as notes.
     uint64_t nTokenUnits;
+    // v12: the token holders' claim at a failed house (NOTE_OP_TOKEN_CLAIM / NOTE_OP_TOKEN_COLLECT). T and the claim
+    // count grow during the window; collects (after it) pay each claim amount x min(1, B / T) from the escrow, where B
+    // is nTokenBase: nTokenUnits as the first collect found it (nothing else moves nTokenUnits once insolvent).
+    // Stamped heights make each first-time effect exact to undo.
+    uint64_t nTokenClaimed;        // T: the sum of claimed token amounts
+    uint32_t nTokenClaims;         // claims recorded
+    uint32_t nTokenCollected;      // claims collected
+    uint64_t nTokenBase;           // B, set by the first collect
+    uint32_t nTokenBaseHeight;     // the first collect's height (0 = none yet)
+    uint64_t nTokenPaid;           // units paid out by collects
+    uint64_t nTokenWriteOff;       // units written off when the last claim was collected (or none was made)
+    uint32_t nTokenWriteOffHeight; // 0 = not written off
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -403,7 +417,9 @@ struct CHouse {
                nDepositUnits(0), nDepositWtMatHi(0), nDepositWtMatLo(0),
                nInsolventDepositPrincipal(0), nLastSettleHeight(0),
                nLoanBookFace(0), nLoanWtMatHi(0), nLoanWtMatLo(0),
-               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0), nTokenUnits(0) {}
+               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0), nTokenUnits(0),
+               nTokenClaimed(0), nTokenClaims(0), nTokenCollected(0), nTokenBase(0), nTokenBaseHeight(0),
+               nTokenPaid(0), nTokenWriteOff(0), nTokenWriteOffHeight(0) {}
 
     bool IsMembersOnly() const { return (nFlags & HOUSE_FLAG_MEMBERS_ONLY) != 0; }
     bool IsRedeemOnly() const { return (nFlags & HOUSE_FLAG_REDEEM_ONLY) != 0; }
@@ -533,6 +549,17 @@ struct CHouse {
         // v11: the token backing. A v10 record has none (LOCK was inert): 0.
         if (nSerVersion >= 11) {
             READWRITE(nTokenUnits);
+        }
+        // v12: the claim totals. A v11 record has none (no claim op existed): 0.
+        if (nSerVersion >= 12) {
+            READWRITE(nTokenClaimed);
+            READWRITE(nTokenClaims);
+            READWRITE(nTokenCollected);
+            READWRITE(nTokenBase);
+            READWRITE(nTokenBaseHeight);
+            READWRITE(nTokenPaid);
+            READWRITE(nTokenWriteOff);
+            READWRITE(nTokenWriteOffHeight);
         }
     }
 
@@ -1052,6 +1079,12 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight);
  * (the silence clock starts the block after the missed-cadence deadline, the
  * same origin an open house's stress clock uses). 0 if not suspended. */
 uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house);
+
+/** E for the token holders' claim (v0.2.21): the height from which the chain counts the house insolvent, or 0 if it is
+ * not insolvent at nHeight. Insolvency is absorbing - once insolvent, every op that could move these inputs (ATTEST,
+ * TOPUP, REDEEM, DEFER) is refused - so E never moves. A materialized house (status stored INSOLVENT) is derived from
+ * the same fields: materializing changes none of them. A house wound down is never insolvent. */
+uint32_t HouseInsolventSince(const CHouse& house, int nHeight);
 
 /** The nStressSinceHeight value an accepted attestation of amountReserves at
  * nHeight leaves behind (T2 below-floor / T4 recovery-with-hysteresis /

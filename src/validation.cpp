@@ -37,6 +37,8 @@
 #include <bill.h>
 #include <house.h>
 #include <note.h>
+#include <token.h>
+#include <cashu.h>
 #include <deposit.h>
 #include <pool.h>
 #include <oracle.h>
@@ -418,6 +420,11 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                         CHouse& houseOut, bool& fHouseChanged);
+bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                         const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
+                         const TokenView& view, TokenEffects& eff,
+                         CHouse& houseOut, bool& fHouseChanged);
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                            const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                            const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
@@ -801,6 +808,112 @@ static bool IsCurrentForFeeEstimation()
  * Status-dependent but state-NEUTRAL ops (pool CREATE, note DEMAND) take no
  * slot and cannot interact with a settle either way: a settle changes no
  * status and they change no house record. */
+/** The escrow change list before an escrow-spending op (note CLAIM, deposit CLAIM, token COLLECT), from the list after
+ * it and the op's spent inputs: drop the change coin it created (vout[nChangeVout]) and put back the change coins it
+ * consumed. Every escrow coin sits in exactly one list - a pledge, the change list, or the DEFER till (vOutReserveLock)
+ * - so a consumed change coin is a spent escrow input in neither of the other two. (v0.2.21 review H1: the till was
+ * put back as change too, so after a reorg it was listed twice and the pot counted it twice.) */
+std::vector<COutPoint> EscrowChangeBeforeOp(const CHouse& house, const CTransaction& tx, const CTxUndo* pundo,
+                                                   uint32_t nChangeVout)
+{
+    const COutPoint outChange(tx.GetHash(), nChangeVout);
+    std::vector<COutPoint> vRestore;
+    for (const COutPoint& out : house.vOutEscrowChange) {
+        if (!(out == outChange))
+            vRestore.push_back(out);
+    }
+    std::set<COutPoint> setOther(house.vOutReserveLock.begin(), house.vOutReserveLock.end());
+    for (const HousePartner& p : house.vPartner)
+        setOther.insert(p.vOutPledge.begin(), p.vOutPledge.end());
+    if (pundo) {
+        for (size_t j = 0; j < tx.vin.size() && j < pundo->vprevout.size(); j++) {
+            if (pundo->vprevout[j].fHouseEscrow && !setOther.count(tx.vin[j].prevout))
+                vRestore.push_back(tx.vin[j].prevout);
+        }
+    }
+    std::sort(vRestore.begin(), vRestore.end());
+    return vRestore;
+}
+
+/** v0.2.21: the house and the token Ys a CLAIM names (hash_to_curve of each secret). False if it does not decode. */
+/** The house id a note payload leads with (every note payload's leading field), without decoding it. */
+static bool NotePayloadHouse(const CTransaction& tx, uint32_t& nHouseID)
+{
+    if (tx.vchNotePayload.size() < 4)
+        return false;
+    memcpy(&nHouseID, tx.vchNotePayload.data(), 4);
+    return true;
+}
+
+static bool TokenClaimYs(const CTransaction& tx, uint32_t& nHouseID, std::set<uint256>& setY)
+{
+    NoteTokenClaim claim;
+    if (!DecodeNotePayload(tx.vchNotePayload, claim))
+        return false;
+    nHouseID = claim.nHouseID;
+    for (const TokenClaimEntry& e : claim.vEntry) {
+        CPubKey Y;
+        if (!CashuHashToCurve(e.vchSecret, Y))
+            return false;
+        setY.insert(TokenYID(Y));
+    }
+    return true;
+}
+
+/** v0.2.21: is a pooled CLAIM still inside its window with every token still unclaimed? (The sweep's re-check.) */
+static bool TokenClaimStillValid(const CTransaction& tx, int nHeight)
+{
+    std::set<uint256> setY;
+    uint32_t nHouseID = 0;
+    CHouse house;
+    if (!TokenClaimYs(tx, nHouseID, setY) || !phousetree->GetHouse(nHouseID, house))
+        return false;
+    const uint32_t nE = HouseInsolventSince(house, nHeight);
+    if (nE == 0 || (uint64_t)nHeight >= (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
+        return false;
+    for (const uint256& y : setY) {
+        CTokenClaim c;
+        if (phousetree->GetTokenClaim(nHouseID, y, c))
+            return false;
+    }
+    return true;
+}
+
+bool TokenClaimConflictsMempool(const CTransaction& tx)
+{
+    std::set<uint256> setMine;
+    uint32_t nMineHouse = 0;
+    if (!TokenClaimYs(tx, nMineHouse, setMine))
+        return true;
+    LOCK(mempool.cs);
+    for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
+        const CTransaction& mtx = mi->GetTx();
+        uint32_t nTheirHouse = 0;
+        if (mtx.nVersion != TRANSACTION_NOTE_VERSION || mtx.nNoteOp != NOTE_OP_TOKEN_CLAIM ||
+                !NotePayloadHouse(mtx, nTheirHouse) || nTheirHouse != nMineHouse)
+            continue;
+        std::set<uint256> setTheirs;
+        if (!TokenClaimYs(mtx, nTheirHouse, setTheirs))
+            continue;
+        for (const uint256& y : setMine)
+            if (setTheirs.count(y))
+                return true;
+    }
+    return false;
+}
+
+/** v0.2.21: the token claim records as confirmed (HouseDB). The mempool reads this; ConnectBlock stages the block's
+ * POST and CLAIM records in front of it. */
+static TokenView ConfirmedTokenView()
+{
+    TokenView v;
+    v.fnGetKeyset = [](uint32_t h, uint64_t id, CTokenKeyset& r) { return phousetree->GetTokenKeyset(h, id, r); };
+    v.fnGetIssued = [](uint32_t h, const std::vector<unsigned char>& b, CTokenMark& r) { return phousetree->GetTokenIssued(h, b, r); };
+    v.fnGetSpent = [](uint32_t h, const uint256& y, CTokenMark& r) { return phousetree->GetTokenSpent(h, y, r); };
+    v.fnGetClaim = [](uint32_t h, const uint256& y, CTokenClaim& r) { return phousetree->GetTokenClaim(h, y, r); };
+    return v;
+}
+
 static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
 {
     nA = 0;
@@ -827,11 +940,13 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     // PROTEST (B3 T-b3) writes the CHouse protest fields, so it takes the
     // slot. DEMAND still does not - in either mode it re-issues coins and
     // writes nothing onto the house record. LOCK / UNLOCK (v0.2.20) write
-    // nTokenUnits, so they take it.
+    // nTokenUnits, so they take it. The token COLLECT (v0.2.21) writes the house: so does it. A token CLAIM does not
+    // (its totals are added at the block's end, so any number of holders can claim in one block).
     if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
              mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
-             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
+             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
             mtx.vchNotePayload.size() >= 4) {
         memcpy(&nA, mtx.vchNotePayload.data(), 4);
         return nA != 0;
@@ -1073,7 +1188,17 @@ static void EvictStaleHouseNoteOps()
                 }
                 CHouse houseResult;
                 bool fHouseChanged = false;
-                if (!CheckNoteOperation(mtx, stateStale, nNextHeight, nNoteUnitsIn, fnGetHouse,
+                if (mtx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+                    // Only the window and the claimed marks can change with the chain (signatures, DLEQ, issue and
+                    // spend records can't once the house is insolvent): re-check just those (review M-b).
+                    if (!TokenClaimStillValid(mtx, nNextHeight))
+                        fStale = true;
+                } else if (IsTokenClaimOp(mtx.nNoteOp)) {
+                    TokenEffects eff;
+                    if (!CheckTokenOperation(mtx, stateStale, nNextHeight, fnGetHouse, fnGetCoin, ConfirmedTokenView(),
+                            eff, houseResult, fHouseChanged))
+                        fStale = true;
+                } else if (!CheckNoteOperation(mtx, stateStale, nNextHeight, nNoteUnitsIn, fnGetHouse,
                         fnGetCoin, fnGetProofCoin, fnGetBlockHash, houseResult, fHouseChanged))
                     fStale = true;
             } else if (fDepositTx) {
@@ -1891,7 +2016,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 // permanent-brick class; the guard is the only cure.
                 else if (!fIncomingRegister && mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                         (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
-                         mtx.nNoteOp == NOTE_OP_DEMAND || mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
+                         mtx.nNoteOp == NOTE_OP_DEMAND || mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
                         mtx.vchNotePayload.size() >= 4) {
                     uint32_t nTheirs = 0;
                     memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID leads every note payload
@@ -1968,7 +2094,33 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // which is exactly the parent-state the reserve proof needs, so it doubles
             // as fnGetProofCoin here (a mempool spend of a reserve coin does not evict
             // the mint - it can still ride the next block).
-            if (!CheckNoteOperation(tx, state, GetSpendHeight(view), nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin, fnGetBlockHash, houseResult, fHouseChanged))
+            if (IsTokenClaimOp(tx.nNoteOp)) {
+                // v0.2.21: a token CLAIM takes no house slot, so two pooled claims must not share a token (Y): the
+                // second would make a block that holds both invalid. Checked before any curve work (review L2).
+                if (tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+                    std::set<uint256> setMine;
+                    uint32_t nMineHouse = 0;
+                    if (!TokenClaimYs(tx, nMineHouse, setMine))
+                        return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payload");
+                    for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                        const CTransaction& mtx = mi->GetTx();
+                        uint32_t nTheirHouse = 0;
+                        if (mtx.nVersion != TRANSACTION_NOTE_VERSION || mtx.nNoteOp != NOTE_OP_TOKEN_CLAIM ||
+                                !NotePayloadHouse(mtx, nTheirHouse) || nTheirHouse != nMineHouse)
+                            continue;   // the house first: no hashing for another house's claims (review M-b)
+                        std::set<uint256> setTheirs;
+                        if (!TokenClaimYs(mtx, nTheirHouse, setTheirs))
+                            continue;
+                        for (const uint256& y : setMine)
+                            if (setTheirs.count(y))
+                                return state.DoS(0, false, REJECT_DUPLICATE, "token-claim-pending");
+                    }
+                }
+                TokenEffects eff;   // the mempool records nothing
+                if (!CheckTokenOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, ConfirmedTokenView(),
+                        eff, houseResult, fHouseChanged))
+                    return error("%s: CheckTokenOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+            } else if (!CheckNoteOperation(tx, state, GetSpendHeight(view), nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin, fnGetBlockHash, houseResult, fHouseChanged))
                 return error("%s: CheckNoteOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             if (fHouseChanged) {
@@ -1979,7 +2131,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
                              mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
-                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
+                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
                             mtx.vchNotePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID is the leading field
@@ -2065,7 +2218,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         fTheirsHouseChanging = true;
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
-                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
+                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -2134,7 +2288,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         fTheirsHouseChanging = true;
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
-                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
+                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -5170,7 +5325,10 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
     }
 
     if (tx.nNoteOp == NOTE_OP_UNLOCK) {
-        // v0.2.20 token BURN RECORD. Allowed in every status (Q3): token holders can always get their notes back.
+        // v0.2.20 token BURN RECORD. v0.2.21 (token claim design draft 3, Michael 2026-10-08: "no burns in
+        // suspension"): refused once the house is suspended or insolvent, so partners can't burn the token backing
+        // into their own notes in the weeks before a failure; from then on it leaves only through token claims.
+        // While merely Stressed, burns stay allowed so holders can still redeem at par.
         NoteUnlock unlock;
         if (!DecodeNotePayload(tx.vchNotePayload, unlock))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-payload");
@@ -5180,6 +5338,9 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         CHouse house;
         if (!fnGetHouse(unlock.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        const char statusUnlock = HouseEffectiveStatus(house, nHeight);
+        if (statusUnlock == HOUSE_STATUS_DEFERRED || statusUnlock == HOUSE_STATUS_INSOLVENT)
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-unlock-house-status");   // state-dependent
         // The rule the record exists for: a burn can never exceed what was minted.
         if (total > house.nTokenUnits)
             return state.DoS(10, false, REJECT_INVALID, "bad-note-unlock-over-locked");   // state-dependent
@@ -5197,6 +5358,316 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
     }
 
     return state.DoS(100, false, REJECT_INVALID, "bad-note-op");
+}
+
+/** The escrow change list after an op that spends escrow inputs and may return change at vout[nChange] (shared by the
+ * note claim's rule, 3.4 review): drop change coins the tx consumed, add its own, keep it sorted. */
+static void TrackEscrowChange(CHouse& house, const CTransaction& tx, bool fChange, uint32_t nChange)
+{
+    std::set<COutPoint> setSpentIn;
+    for (const CTxIn& in : tx.vin)
+        setSpentIn.insert(in.prevout);
+    std::vector<COutPoint> vKeep;
+    for (const COutPoint& out : house.vOutEscrowChange) {
+        if (!setSpentIn.count(out))
+            vKeep.push_back(out);
+    }
+    if (fChange)
+        vKeep.push_back(COutPoint(tx.GetHash(), nChange));
+    std::sort(vKeep.begin(), vKeep.end());
+    house.vOutEscrowChange = vKeep;
+}
+
+bool CheckTokenOperationAtTip(const CTransaction& tx, CValidationState& state)
+{
+    AssertLockHeld(cs_main);
+    if (!CheckNoteTransactionShape(tx, state))
+        return false;
+    auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
+    auto fnGetCoin = [](const COutPoint& out, Coin& coin) { return pcoinsTip->GetCoin(out, coin) && !coin.IsSpent(); };
+    TokenEffects eff;
+    CHouse houseOut;
+    bool fChanged = false;
+    return CheckTokenOperation(tx, state, chainActive.Height() + 1, fnGetHouse, fnGetCoin, ConfirmedTokenView(), eff,
+                               houseOut, fChanged);
+}
+
+/** v0.2.21: the token holders' claim at a failed house (token.h; gateway docs/freebank/TOKEN_CLAIM_DESIGN.md draft 3,
+ * signed off 2026-10-08; overriding rule "keep noteholders whole"). The confirmed token records come from view (in
+ * ConnectBlock with the block's earlier POST and CLAIM records staged in); what the op writes goes to eff. KEYSET,
+ * POST and CLAIM take no house slot (a CLAIM's totals are staged in eff and added at the block's end); COLLECT takes
+ * the house slot. */
+bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                         const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
+                         const TokenView& view, TokenEffects& eff,
+                         CHouse& houseOut, bool& fHouseChanged)
+{
+    fHouseChanged = false;
+    const uint256 hashPrevouts = NoteHashPrevouts(tx);
+
+    if (tx.nNoteOp == NOTE_OP_TOKEN_KEYSET) {
+        NoteTokenKeyset ks;
+        if (!DecodeNotePayload(tx.vchNotePayload, ks))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-payload");
+        CHouse house;
+        if (!fnGetHouse(ks.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        if (house.IsMembersOnly())
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-members-only");   // tokens are bearer
+        const char status = HouseEffectiveStatus(house, nHeight);
+        if (status == HOUSE_STATUS_INSOLVENT || status == HOUSE_STATUS_WOUNDDOWN)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-keyset-house-status");
+        const uint64_t nKeysetID = TokenKeysetID(ks.vKey);
+        CTokenKeyset existing;
+        if (view.fnGetKeyset(ks.nHouseID, nKeysetID, existing))
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-keyset-exists");
+        // Keys are unique within a keyset (the shape check), not across houses (Michael 2026-10-08, review M1): mint
+        // keys are public, so a chain-wide rule would let another house squat a mint's keys. A house that copies
+        // another's keys only pays its own backing out to the other's token holders.
+        if (!VerifyHouseApprovers(house, ks.vApproverIndex, ks.vApproverSig, TokenKeysetSigHash(ks, hashPrevouts),
+                house.nThresholdM, state, "bad-token-keyset-approver"))
+            return false;
+        CTokenKeyset rec;
+        rec.nHeight = (uint32_t)nHeight;
+        rec.txid = tx.GetHash();
+        rec.vchPostingPubKey = ks.vchPostingPubKey;
+        rec.vKey = ks.vKey;
+        // The same keyset twice in one block: the first record stands (undo erases only its own), as for a POST.
+        eff.mapKeyset.insert(std::make_pair(std::make_pair(ks.nHouseID, nKeysetID), rec));
+        return true;
+    }
+
+    if (tx.nNoteOp == NOTE_OP_TOKEN_POST) {
+        NoteTokenPost post;
+        if (!DecodeNotePayload(tx.vchNotePayload, post))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-post-payload");
+        CHouse house;
+        if (!fnGetHouse(post.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        // Refused once insolvent (no grace): a failed mint can't mark unspent tokens spent, nor add issues.
+        const char status = HouseEffectiveStatus(house, nHeight);
+        if (status == HOUSE_STATUS_INSOLVENT || status == HOUSE_STATUS_WOUNDDOWN)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-post-house-status");
+        CTokenKeyset ks;
+        if (!view.fnGetKeyset(post.nHouseID, post.nKeysetID, ks))
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-post-keyset");
+        if (!CPubKey(ks.vchPostingPubKey).VerifyStrict(TokenPostSigHash(post, hashPrevouts), post.vchSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-post-sig");
+        CTokenMark mark;
+        mark.nHeight = (uint32_t)nHeight;
+        mark.txid = tx.GetHash();
+        for (const TokenIssued& iss : post.vIssued) {
+            CPubKey key;
+            if (!ks.KeyFor(iss.nAmount, key))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-post-amount");
+            CTokenMark cur;
+            if (view.fnGetIssued(post.nHouseID, iss.vchB, cur))
+                continue;   // already posted: ignored (undo erases only its own records)
+            CTokenMark m = mark;
+            m.nKeysetID = post.nKeysetID;
+            m.nAmount = iss.nAmount;
+            eff.mapIssued[std::make_pair(post.nHouseID, iss.vchB)] = m;
+        }
+        for (const uint256& y : post.vSpent) {
+            CTokenMark cur;
+            if (view.fnGetSpent(post.nHouseID, y, cur))
+                continue;
+            eff.mapSpent[std::make_pair(post.nHouseID, y)] = mark;
+        }
+        return true;
+    }
+
+    if (tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+        NoteTokenClaim claim;
+        if (!DecodeNotePayload(tx.vchNotePayload, claim))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payload");
+        CHouse house;
+        if (!fnGetHouse(claim.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        const uint32_t nE = HouseInsolventSince(house, nHeight);
+        if (nE == 0)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-not-insolvent");
+        if ((uint64_t)nHeight >= (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-window-closed");
+
+        // Record checks first, the elliptic-curve work last (a bad claim costs little).
+        struct Checked { uint256 y; CPubKey Y; CPubKey A; };
+        std::vector<Checked> vChecked;
+        std::set<uint256> setY;
+        uint64_t nSum = 0;
+        for (const TokenClaimEntry& e : claim.vEntry) {
+            CTokenKeyset ks;
+            if (!view.fnGetKeyset(claim.nHouseID, e.nKeysetID, ks) || ks.nHeight >= nE)
+                return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-keyset");
+            Checked c;
+            if (!ks.KeyFor(e.nAmount, c.A))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-amount");
+            if (IsTokenConditionSecret(e.vchSecret))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-condition");
+            if (!CashuHashToCurve(e.vchSecret, c.Y))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-secret");
+            c.y = TokenYID(c.Y);
+            if (!setY.insert(c.y).second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-duplicate");
+            CTokenMark issued;
+            if (!view.fnGetIssued(claim.nHouseID, e.vchB, issued) || issued.nHeight >= nE ||
+                    issued.nKeysetID != e.nKeysetID || issued.nAmount != e.nAmount)
+                return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-not-issued");
+            CTokenMark spent;
+            if (view.fnGetSpent(claim.nHouseID, c.y, spent))
+                return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-spent");
+            CTokenClaim prior;
+            if (view.fnGetClaim(claim.nHouseID, c.y, prior))
+                return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-claimed");
+            nSum += e.nAmount;   // <= 64 x 2^50: no overflow
+            vChecked.push_back(c);
+        }
+        // A bound on T against the CONFIRMED total only (the same verdict in the mempool and in any block order;
+        // review M-a). nSum <= 64 x 2^50; a block's staged claims are bounded by its weight, far below the headroom.
+        if (house.nTokenClaimed > std::numeric_limits<uint64_t>::max() / 4 - nSum)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-total");
+        for (size_t i = 0; i < claim.vEntry.size(); i++) {
+            const TokenClaimEntry& e = claim.vEntry[i];
+            const Checked& c = vChecked[i];
+            const CPubKey B(e.vchB.begin(), e.vchB.end()), C(e.vchC.begin(), e.vchC.end());
+            // The holder's signature under P = B_ - Y (private key r): a copier learns the secret, not r.
+            CPubKey P;
+            if (!CashuPointSub(B, c.Y, P) ||
+                    !P.VerifyStrict(TokenClaimSigHash(claim.nHouseID, c.y, e.vchPayoutScript, e.nFeeBps, e.vchRelayerScript), e.vchSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-sig");
+            // The mint signed B_ with the keyset's key for this amount (NUT-12 DLEQ).
+            CashuScalar es, ss;
+            memcpy(es.data(), e.vchE.data(), 32);
+            memcpy(ss.data(), e.vchS.data(), 32);
+            if (!CashuVerifyDLEQ(c.A, B, C, es, ss))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-dleq");
+            CTokenClaim rec;
+            rec.nAmount = e.nAmount;
+            rec.vchPayoutScript = e.vchPayoutScript;
+            rec.nFeeBps = e.nFeeBps;
+            rec.vchRelayerScript = e.vchRelayerScript;
+            rec.nHeight = (uint32_t)nHeight;
+            eff.mapClaim[std::make_pair(claim.nHouseID, c.y)] = rec;
+        }
+        auto& totals = eff.mapClaimTotals[claim.nHouseID];
+        totals.first += nSum;
+        totals.second += (uint32_t)claim.vEntry.size();
+        return true;   // no house record written here (fHouseChanged stays false)
+    }
+
+    if (tx.nNoteOp == NOTE_OP_TOKEN_COLLECT) {
+        NoteTokenCollect col;
+        if (!DecodeNotePayload(tx.vchNotePayload, col))
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-payload");
+        CHouse house;
+        if (!fnGetHouse(col.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        const uint32_t nE = HouseInsolventSince(house, nHeight);
+        if (nE == 0)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-not-insolvent");
+        if ((uint64_t)nHeight < (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-window-open");
+        if (col.vY.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-empty");
+
+        // The payout is a waterfall op: the first one materializes the pro-rata snapshot (as a note claim does).
+        if (house.status != HOUSE_STATUS_INSOLVENT)
+            MaterializeInsolvency(house, nHeight, fnGetCoin);
+        if (house.nTokenBaseHeight == 0) {
+            house.nTokenBase = house.nTokenUnits;   // B: nothing moves nTokenUnits once insolvent but collects
+            house.nTokenBaseHeight = (uint32_t)nHeight;
+        }
+        const uint64_t nBase = house.nTokenBase, nClaimed = house.nTokenClaimed;
+
+        size_t o = col.fEscrowChange ? 1 : 0;
+        uint64_t nUnitsPaid = 0;
+        CAmount amountDue = 0;
+        std::set<uint256> setY;
+        for (const uint256& y : col.vY) {
+            if (!setY.insert(y).second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-duplicate");
+            CTokenClaim c;
+            if (!view.fnGetClaim(col.nHouseID, y, c))
+                return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-unknown");
+            if (c.nCollectHeight != 0)
+                return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-collected");
+            const uint64_t u = TokenClaimUnits(c.nAmount, nBase, nClaimed);
+            // The same share a note gets (keep note holders whole): the snapshot pot over the snapshot units.
+            const CAmount amountEnt = NoteClaimEntitlement(u, house.amountInsolventPot, house.nInsolventUnits);
+            const CAmount amountFee = TokenRelayerFee(amountEnt, c.nFeeBps);
+            const CAmount amountPay = amountEnt - amountFee;
+            if (amountPay > 0) {
+                const CScript scriptPay(c.vchPayoutScript.begin(), c.vchPayoutScript.end());
+                if (o >= tx.vout.size() || tx.vout[o].scriptPubKey != scriptPay || tx.vout[o].nValue != amountPay)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-payout");
+                o++;
+            }
+            if (amountFee > 0) {
+                const CScript scriptFee(c.vchRelayerScript.begin(), c.vchRelayerScript.end());
+                if (o >= tx.vout.size() || tx.vout[o].scriptPubKey != scriptFee || tx.vout[o].nValue != amountFee)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-fee");
+                o++;
+            }
+            nUnitsPaid += u;
+            amountDue += amountEnt;
+            c.nCollectHeight = (uint32_t)nHeight;
+            eff.mapClaim[std::make_pair(col.nHouseID, y)] = c;
+        }
+
+        // Escrow accounting, as the note claim's: only this house's escrow, change only at vout[0].
+        CAmount amountEscrowIn = 0;
+        for (const CTxIn& in : tx.vin) {
+            Coin coin;
+            if (fnGetCoin(in.prevout, coin) && !coin.IsSpent() && coin.fHouseEscrow) {
+                if (coin.nHouseID != col.nHouseID)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-other-escrow");
+                amountEscrowIn += coin.out.nValue;
+            }
+        }
+        const CScript scriptEscrow = HouseEscrowScript(house.houseID);
+        CAmount amountEscrowChange = 0;
+        if (col.fEscrowChange) {
+            if (tx.vout.empty() || tx.vout[0].scriptPubKey != scriptEscrow)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-escrow-script");
+            amountEscrowChange = tx.vout[0].nValue;
+        }
+        for (size_t n = 0; n < tx.vout.size(); n++) {
+            if ((n != 0 || !col.fEscrowChange) && tx.vout[n].scriptPubKey == scriptEscrow)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-stray-escrow");
+        }
+        if (amountEscrowChange > amountEscrowIn)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-escrow-inflation");
+        if (amountEscrowIn - amountEscrowChange > amountDue)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-over-entitlement");
+
+        if (house.nTokenUnits < nUnitsPaid || house.nMintedUnits < nUnitsPaid)
+            return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-underflow");
+        house.nTokenUnits -= nUnitsPaid;
+        house.nMintedUnits -= nUnitsPaid;
+        house.nTokenPaid += nUnitsPaid;
+        house.nTokenCollected += (uint32_t)col.vY.size();
+        // Rounding: when claims exceeded the backing (T > B) every unit of it was claimed, and the floors of the
+        // pro-rata cut leave a little; when the last claim is collected that dust is written off so the residual
+        // settle (nMintedUnits == 0) can run. Backing nobody claimed (T < B) is NOT written off (Michael 2026-10-08,
+        // review M2): it stays like an unclaimed note, so partners gain nothing by not posting what their mint issued.
+        if (house.nTokenCollected == house.nTokenClaims && house.nTokenWriteOffHeight == 0 &&
+                house.nTokenClaimed > house.nTokenBase) {
+            const uint64_t w = house.nTokenUnits;
+            if (house.nMintedUnits < w)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-underflow");
+            house.nMintedUnits -= w;
+            house.nTokenUnits = 0;
+            house.nTokenWriteOff = w;
+            house.nTokenWriteOffHeight = (uint32_t)nHeight;
+        }
+        TrackEscrowChange(house, tx, col.fEscrowChange, 0);
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    return state.DoS(100, false, REJECT_INVALID, "bad-token-op");
 }
 
 /** Contextual validation of a term-deposit operation (Phase 3.8). tx_verify has
@@ -7032,27 +7503,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nDepositUnits += p;
                 house.SetDepositWtMaturity(house.DepositWtMaturity() + (unsigned __int128)p * (unsigned __int128)m);
                 // Restore the escrow-change bookkeeping (identical to note CLAIM).
-                {
-                    const COutPoint outChange(hash, 1);
-                    std::vector<COutPoint> vRestore;
-                    for (const COutPoint& out : house.vOutEscrowChange) {
-                        if (!(out == outChange))
-                            vRestore.push_back(out);
-                    }
-                    std::set<COutPoint> setPledge;
-                    for (const HousePartner& pr : house.vPartner)
-                        setPledge.insert(pr.vOutPledge.begin(), pr.vOutPledge.end());
-                    if (i > 0) {
-                        const CTxUndo& txundoClaim = blockUndo.vtxundo[i - 1];
-                        for (size_t j2 = 0; j2 < tx.vin.size() && j2 < txundoClaim.vprevout.size(); j2++) {
-                            if (txundoClaim.vprevout[j2].fHouseEscrow &&
-                                    !setPledge.count(tx.vin[j2].prevout))
-                                vRestore.push_back(tx.vin[j2].prevout);
-                        }
-                    }
-                    std::sort(vRestore.begin(), vRestore.end());
-                    house.vOutEscrowChange = vRestore;
-                }
+                house.vOutEscrowChange = EscrowChangeBeforeOp(house, tx, i > 0 ? &blockUndo.vtxundo[i - 1] : nullptr, 1);
                 if (house.nInsolventHeight == (uint32_t)pindex->nHeight) {
                     house.status = HOUSE_STATUS_OPEN;
                     house.nInsolventHeight = 0;
@@ -7202,6 +7653,145 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     return DISCONNECT_FAILED;
                 }
             }
+            else if (tx.nNoteOp == NOTE_OP_TOKEN_KEYSET || tx.nNoteOp == NOTE_OP_TOKEN_POST) {
+                // v0.2.21: erase only the records this tx wrote (a record already present was ignored at connect, so
+                // its first poster's txid is on it). Restore-to-absent: a repeated undo is harmless.
+                if (tx.nNoteOp == NOTE_OP_TOKEN_KEYSET) {
+                    NoteTokenKeyset ks;
+                    if (!DecodeNotePayload(tx.vchNotePayload, ks)) {
+                        error("DisconnectBlock(): Failed to decode a token keyset!");
+                        return DISCONNECT_FAILED;
+                    }
+                    const uint64_t nKeysetID = TokenKeysetID(ks.vKey);
+                    CTokenKeyset rec;
+                    if (phousetree->GetTokenKeyset(ks.nHouseID, nKeysetID, rec) && rec.txid == hash &&
+                            !phousetree->EraseTokenKeyset(ks.nHouseID, nKeysetID)) {
+                        error("DisconnectBlock(): Failed to undo a token keyset!");
+                        return DISCONNECT_FAILED;
+                    }
+                } else {
+                    NoteTokenPost post;
+                    if (!DecodeNotePayload(tx.vchNotePayload, post)) {
+                        error("DisconnectBlock(): Failed to decode a token post!");
+                        return DISCONNECT_FAILED;
+                    }
+                    std::vector<std::vector<unsigned char>> vB;
+                    std::vector<uint256> vY;
+                    for (const TokenIssued& iss : post.vIssued) {
+                        CTokenMark m;
+                        if (phousetree->GetTokenIssued(post.nHouseID, iss.vchB, m) && m.txid == hash)
+                            vB.push_back(iss.vchB);
+                    }
+                    for (const uint256& y : post.vSpent) {
+                        CTokenMark m;
+                        if (phousetree->GetTokenSpent(post.nHouseID, y, m) && m.txid == hash)
+                            vY.push_back(y);
+                    }
+                    if ((!vB.empty() || !vY.empty()) && !phousetree->EraseTokenMarks(post.nHouseID, vB, vY)) {
+                        error("DisconnectBlock(): Failed to undo a token post!");
+                        return DISCONNECT_FAILED;
+                    }
+                }
+            }
+            else if (tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+                // v0.2.21: every token in it was unclaimed before (consensus), so erase each claim this tx wrote and
+                // take its amount back off the totals. A Y is claimed at most once per house per block, so each record
+                // belongs to exactly one tx; the subtraction is per tx and independent of order.
+                NoteTokenClaim claim;
+                CHouse house;
+                if (!DecodeNotePayload(tx.vchNotePayload, claim) || !phousetree->GetHouse(claim.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo a token claim!");
+                    return DISCONNECT_FAILED;
+                }
+                for (const TokenClaimEntry& e : claim.vEntry) {
+                    CPubKey Y;
+                    CTokenClaim rec;
+                    if (!CashuHashToCurve(e.vchSecret, Y)) {
+                        error("DisconnectBlock(): Token claim undo: secret does not hash!");
+                        return DISCONNECT_FAILED;
+                    }
+                    const uint256 y = TokenYID(Y);
+                    if (!phousetree->GetTokenClaim(claim.nHouseID, y, rec) || rec.nHeight != (uint32_t)pindex->nHeight) {
+                        error("DisconnectBlock(): Token claim undo mismatch!");
+                        return DISCONNECT_FAILED;
+                    }
+                    if (house.nTokenClaimed < rec.nAmount || house.nTokenClaims == 0) {
+                        error("DisconnectBlock(): Token claim undo total mismatch!");
+                        return DISCONNECT_FAILED;
+                    }
+                    house.nTokenClaimed -= rec.nAmount;
+                    house.nTokenClaims--;
+                    if (!phousetree->EraseTokenClaim(claim.nHouseID, y)) {
+                        error("DisconnectBlock(): Failed to undo a token claim record!");
+                        return DISCONNECT_FAILED;
+                    }
+                }
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write token claim undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nNoteOp == NOTE_OP_TOKEN_COLLECT) {
+                // v0.2.21: the exact inverse, from the payload, the claim records and the stamps on the house: the
+                // units paid (recomputed with the same B and T), the write-off and the first-collect base if this
+                // block set them, the escrow change list, and the insolvency snapshot if this collect materialized it.
+                NoteTokenCollect col;
+                CHouse house;
+                if (!DecodeNotePayload(tx.vchNotePayload, col) || !phousetree->GetHouse(col.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo a token collect!");
+                    return DISCONNECT_FAILED;
+                }
+                const uint32_t nH = (uint32_t)pindex->nHeight;
+                uint64_t nUnits = 0;
+                for (const uint256& y : col.vY) {
+                    CTokenClaim rec;
+                    if (!phousetree->GetTokenClaim(col.nHouseID, y, rec) || rec.nCollectHeight != nH) {
+                        error("DisconnectBlock(): Token collect undo mismatch!");
+                        return DISCONNECT_FAILED;
+                    }
+                    nUnits += TokenClaimUnits(rec.nAmount, house.nTokenBase, house.nTokenClaimed);
+                    rec.nCollectHeight = 0;
+                    if (!phousetree->WriteTokenClaim(col.nHouseID, y, rec)) {
+                        error("DisconnectBlock(): Failed to undo a token claim collect!");
+                        return DISCONNECT_FAILED;
+                    }
+                }
+                uint64_t nBack = nUnits;
+                if (house.nTokenWriteOffHeight == nH) {
+                    nBack += house.nTokenWriteOff;
+                    house.nTokenWriteOff = 0;
+                    house.nTokenWriteOffHeight = 0;
+                }
+                if (house.nTokenPaid < nUnits || house.nTokenCollected < col.vY.size() ||
+                        house.nMintedUnits > (uint64_t)MAX_MONEY - nBack) {
+                    error("DisconnectBlock(): Token collect undo total mismatch!");
+                    return DISCONNECT_FAILED;
+                }
+                house.nTokenPaid -= nUnits;
+                house.nTokenCollected -= (uint32_t)col.vY.size();
+                house.nTokenUnits += nBack;
+                house.nMintedUnits += nBack;
+                if (house.nTokenBaseHeight == nH) {
+                    house.nTokenBase = 0;
+                    house.nTokenBaseHeight = 0;
+                }
+                // Escrow change: drop the one this collect created (vout[0]), restore the change coins it consumed (a
+                // spent escrow input not in any pledge list), as the note claim's undo does.
+                house.vOutEscrowChange = EscrowChangeBeforeOp(house, tx, i > 0 ? &blockUndo.vtxundo[i - 1] : nullptr, 0);
+                if (house.nInsolventHeight == nH) {
+                    house.status = HOUSE_STATUS_OPEN;
+                    house.nInsolventHeight = 0;
+                    house.nInsolventUnits = 0;
+                    house.amountInsolventPot = 0;
+                    house.nInsolventDepositPrincipal = 0;
+                    for (HousePartner& p : house.vPartner)
+                        p.amountInsolventPledge = 0;
+                }
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write token collect undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
             else if (tx.nNoteOp == NOTE_OP_LOCK || tx.nNoteOp == NOTE_OP_UNLOCK) {
                 // v0.2.20 token records: the exact inverse of the connect delta, read from the self-contained payload
                 // (LOCK added nUnits to the backing, UNLOCK took sum(vUnits) out).
@@ -7323,27 +7913,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 // change coins it CONSUMED. A spent escrow input is a change
                 // coin exactly when it is not in any partner's pledge list
                 // (claims never prune those; only RECLAIM does).
-                {
-                    const COutPoint outChange(hash, 1);
-                    std::vector<COutPoint> vRestore;
-                    for (const COutPoint& out : house.vOutEscrowChange) {
-                        if (!(out == outChange))
-                            vRestore.push_back(out);
-                    }
-                    std::set<COutPoint> setPledge;
-                    for (const HousePartner& p : house.vPartner)
-                        setPledge.insert(p.vOutPledge.begin(), p.vOutPledge.end());
-                    if (i > 0) {
-                        const CTxUndo& txundoClaim = blockUndo.vtxundo[i - 1];
-                        for (size_t j2 = 0; j2 < tx.vin.size() && j2 < txundoClaim.vprevout.size(); j2++) {
-                            if (txundoClaim.vprevout[j2].fHouseEscrow &&
-                                    !setPledge.count(tx.vin[j2].prevout))
-                                vRestore.push_back(tx.vin[j2].prevout);
-                        }
-                    }
-                    std::sort(vRestore.begin(), vRestore.end());
-                    house.vOutEscrowChange = vRestore;
-                }
+                house.vOutEscrowChange = EscrowChangeBeforeOp(house, tx, i > 0 ? &blockUndo.vtxundo[i - 1] : nullptr, 1);
                 if (house.nInsolventHeight == (uint32_t)pindex->nHeight) {
                     house.status = HOUSE_STATUS_OPEN;
                     house.nInsolventHeight = 0;
@@ -8199,6 +8769,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     uint32_t nBillIDNext = 0;                   // lazily seeded from BillDB
     std::vector<CHouse> vHouseNew;              // houses registered in this block
     HouseMemberEffects memberEffects;           // v0.2.19: member records this block writes (one op per house)
+    TokenEffects tokenEffects;                  // v0.2.21: token claim records this block writes, and claim totals
     std::set<uint32_t> setMemberOpHouse;
     std::map<uint32_t, CHouse> mapHouseUpdate;  // pre-existing houses mutated in this block
     uint32_t nHouseIDNext = 0;                  // lazily seeded from HouseDB
@@ -9031,7 +9602,36 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             };
             CHouse houseResult;
             bool fHouseChanged = false;
-            if (!CheckNoteOperation(tx, state, pindex->nHeight, nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetProofCoin, fnGetBlockHash, houseResult, fHouseChanged))
+            if (IsTokenClaimOp(tx.nNoteOp)) {
+                // v0.2.21 token claim ops. KEYSET, POST and CLAIM take no house slot, so their place in the block
+                // must not matter: they read the CONFIRMED house (insolvency and E are pure functions of height; no op
+                // in a block moves them) and confirmed keysets; POSTs and CLAIMs also see this block's earlier records,
+                // so a record written twice keeps its first writer and a token claimed twice in one block is refused
+                // (the mempool never holds two claims of one token). COLLECT takes the slot and reads the block's house.
+                auto fnGetHouseConfirmed = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
+                TokenView tokenView = ConfirmedTokenView();
+                tokenView.fnGetClaim = [&](uint32_t h, const uint256& y, CTokenClaim& r) {
+                    auto it = tokenEffects.mapClaim.find(std::make_pair(h, y));
+                    if (it != tokenEffects.mapClaim.end()) { r = it->second; return true; }
+                    return phousetree->GetTokenClaim(h, y, r);
+                };
+                tokenView.fnGetIssued = [&](uint32_t h, const std::vector<unsigned char>& b, CTokenMark& r) {
+                    auto it = tokenEffects.mapIssued.find(std::make_pair(h, b));
+                    if (it != tokenEffects.mapIssued.end()) { r = it->second; return true; }
+                    return phousetree->GetTokenIssued(h, b, r);
+                };
+                tokenView.fnGetSpent = [&](uint32_t h, const uint256& y, CTokenMark& r) {
+                    auto it = tokenEffects.mapSpent.find(std::make_pair(h, y));
+                    if (it != tokenEffects.mapSpent.end()) { r = it->second; return true; }
+                    return phousetree->GetTokenSpent(h, y, r);
+                };
+                if (!CheckTokenOperation(tx, state, pindex->nHeight,
+                        tx.nNoteOp == NOTE_OP_TOKEN_COLLECT ? std::function<bool(uint32_t, CHouse&)>(fnGetHouse)
+                                                            : std::function<bool(uint32_t, CHouse&)>(fnGetHouseConfirmed),
+                        fnGetCoin, tokenView, tokenEffects, houseResult, fHouseChanged))
+                    return error("ConnectBlock(): CheckTokenOperation on %s failed with %s",
+                        tx.GetHash().ToString(), FormatStateMessage(state));
+            } else if (!CheckNoteOperation(tx, state, pindex->nHeight, nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetProofCoin, fnGetBlockHash, houseResult, fHouseChanged))
                 return error("ConnectBlock(): CheckNoteOperation on %s failed with %s",
                     tx.GetHash().ToString(), FormatStateMessage(state));
 
@@ -9777,6 +10377,20 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     }
 
     if (!fHouseDBReplay) {
+        // v0.2.21: the token claims' totals (claims take no house slot), added to the house as the block left it.
+        for (const auto& kv : tokenEffects.mapClaimTotals) {
+            CHouse h;
+            std::map<uint32_t, CHouse>::const_iterator it = mapHouseUpdate.find(kv.first);
+            if (it != mapHouseUpdate.end())
+                h = it->second;
+            else if (!phousetree->GetHouse(kv.first, h))
+                return state.Error("Token claim totals for an unknown house!");
+            if (h.nTokenClaimed > std::numeric_limits<uint64_t>::max() / 2 - kv.second.first)
+                return state.Error("Token claim totals overflow!");
+            h.nTokenClaimed += kv.second.first;
+            h.nTokenClaims += kv.second.second;
+            mapHouseUpdate[kv.first] = h;
+        }
         std::vector<CHouse> vHouseWrite = vHouseNew;
         for (const std::pair<const uint32_t, CHouse>& p : mapHouseUpdate)
             vHouseWrite.push_back(p.second);
@@ -9808,7 +10422,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 fOracleFixWrite ? &oracleFixNew : nullptr, false,
                 vOracleSubWrite.empty() ? nullptr : &vOracleSubWrite, nullptr,
                 vOracleSubNew.size() ? &nLastOracleSubID : nullptr,
-                memberEffects.empty() ? nullptr : &memberEffects))
+                memberEffects.empty() ? nullptr : &memberEffects,
+                tokenEffects.empty() ? nullptr : &tokenEffects))
             return state.Error("Failed to write house index!");
     }
 

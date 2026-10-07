@@ -95,6 +95,18 @@ class CBlockIndex;
 class CCoinControl;
 class COutput;
 struct CBill;
+struct NoteLock;
+#include <cashu.h>   // v0.2.21 token claim: CashuScalar
+#include <token.h>   // v0.2.21 token claim: TokenKey, TokenIssued
+
+/** v0.2.21: one token as a holder has it (a Cashu proof with its NUT-12 DLEQ, r included). */
+struct TokenProofIn {
+    uint64_t nKeysetID;
+    uint64_t nAmount;
+    std::vector<unsigned char> vchSecret;
+    CPubKey C;
+    CashuScalar e, s, r;
+};
 class CReserveKey;
 class CScript;
 class CScheduler;
@@ -1092,11 +1104,44 @@ public:
      * (fresh own key, the v1 default); otherwise pay the note to the supplied
      * P2PKH script (a note is a plain P2PKH coin, so any standard address
      * works as the payee — note-ness comes from the tx payload tagging). */
-    bool TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
+    /** pFrom (v0.2.21, the mint's ask): spend only that holder's notes (change back to it). */
+    bool TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript(),
+                      const CKeyID* pFrom = nullptr);
     /** v0.2.20 token MINT RECORD (NOTE_OP_LOCK): lock nUnits of this wallet's undemanded notes of the house as the
      *  backing of its Chaumian tokens; change returns to the same holder. The wallet must hold the notes' key AND
-     *  the house's approver keys (both sign). */
-    bool LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+     *  the house's approver keys (both sign).
+     *  v0.2.21 one-step lock, the customer's half: with pmtxUnsent set, the house's approvals are left out and nothing
+     *  is sent; the holder-signed lock is returned in *pmtxUnsent for the house to approve (ApproveNoteLock). */
+    bool LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee,
+                   CMutableTransaction* pmtxUnsent = nullptr, const CKeyID* pFrom = nullptr);
+    /** v0.2.21 (the mint's ask): this wallet's spendable note coins, one row each (nHouseID 0: every house). */
+    struct NoteCoinRow { uint32_t nHouseID; COutPoint outpoint; uint64_t units; CScript script; std::vector<unsigned char> vchHolderPubKey; uint32_t nDemandHeight; int nDepth; };
+    void ListNoteCoins(uint32_t nHouseID, std::vector<NoteCoinRow>& vOut);
+    /** v0.2.21 one-step lock, the house's half: check a customer's holder-signed lock of this house's notes and add
+     *  the partners' signatures from this wallet. Inputs' signatures don't cover the note payload, so the customer's
+     *  input signatures stay valid. Returns the lock's payload in lockOut; nothing is sent. */
+    bool ApproveNoteLock(std::string& strFail, CMutableTransaction& mtx, NoteLock& lockOut);
+    /** v0.2.21 token holders' claim at a failed house (token.h). Each funds its own fee from this wallet. */
+    bool RegisterTokenKeyset(std::string& strFail, uint256& txidOut, uint64_t& nKeysetIDOut, uint32_t nHouseID,
+                             const std::vector<TokenKey>& vKey, const CPubKey& pubPosting, const CAmount& nFee);
+    bool PostTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nKeysetID,
+                    const std::vector<TokenIssued>& vIssued, const std::vector<uint256>& vSpent, const CAmount& nFee);
+    bool ClaimTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
+                     const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer, const CAmount& nFee);
+    /** A holder's half (what a phone does itself): each proof signed with its r over the payout terms. No funds. */
+    bool SignTokenClaims(std::string& strFail, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
+                         const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer,
+                         std::vector<TokenClaimEntry>& vEntryOut);
+    /** A relayer's half: send signed entries (from any holders) as one claim, paying the fee. */
+    bool RelayTokenClaims(std::string& strFail, uint256& txidOut, uint32_t nHouseID,
+                          const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee);
+    bool CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, std::vector<uint256>& vY,
+                       const CAmount& nFee);
+    /** Fund and send a v13 note op whose outputs (and any extra inputs, unsigned: escrow) are already set: add this
+     *  wallet's coins for the outputs not covered and the fee, plain change last, then fnPayload fills the payload
+     *  (the inputs are fixed by then, so it can sign over them). */
+    bool SendFundedNoteOp(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx, const CAmount& amountExtraIn,
+                          const CAmount& nFee, const std::function<bool(CMutableTransaction&, std::string&)>& fnPayload);
     /** v0.2.20 token BURN RECORD (NOTE_OP_UNLOCK): release nUnits of the house's token backing as new notes to the
      *  recipient (a P2PKH; default a fresh key of this wallet). House M-of-N approved; nUnits <= the backing. */
     bool UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());

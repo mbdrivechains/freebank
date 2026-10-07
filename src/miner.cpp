@@ -5,6 +5,8 @@
 
 #include <miner.h>
 
+#include <token.h>
+
 #include <amount.h>
 #include <base58.h>
 #include <bmmcache.h>
@@ -831,7 +833,8 @@ bool IsClockTx(const CTransaction& tx)
 {
     if (tx.nVersion == TRANSACTION_NOTE_VERSION)
         return tx.nNoteOp == NOTE_OP_REDEEM || tx.nNoteOp == NOTE_OP_DEMAND ||
-               tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_CLAIM;
+               tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_CLAIM ||
+               tx.nNoteOp == NOTE_OP_TOKEN_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT;   // v0.2.21: token holders' turn
     if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION)
         return tx.nDepositOp == DEPOSIT_OP_WITHDRAW || tx.nDepositOp == DEPOSIT_OP_CLAIM;
     if (tx.nVersion == TRANSACTION_HOUSE_VERSION)

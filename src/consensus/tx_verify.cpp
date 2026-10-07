@@ -9,6 +9,7 @@
 #include <bill.h>
 #include <house.h>
 #include <note.h>
+#include <token.h>
 #include <deposit.h>
 #include <oracle.h>
 #include <pool.h>
@@ -504,7 +505,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         if (coin.fHouseEscrow) {
             const bool fReclaim = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RECLAIM;
             const bool fRelease = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RELEASE;
-            const bool fClaim = tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_CLAIM;
+            // v0.2.21: a token COLLECT pays token holders from the same pot.
+            const bool fClaim = tx.nVersion == TRANSACTION_NOTE_VERSION &&
+                    (tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT);
             // A deposit CLAIM (v14) pays the subordinated tranche FROM the escrow
             // pot too, so it may spend house escrow (like the note CLAIM).
             const bool fDepClaim = tx.nVersion == TRANSACTION_DEPOSIT_VERSION && tx.nDepositOp == DEPOSIT_OP_CLAIM;
@@ -674,7 +677,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         }
         else if (tx.nVersion == TRANSACTION_NOTE_VERSION &&
                 (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow ||
-                 (coin.fHouseEscrow && tx.nNoteOp != NOTE_OP_CLAIM))) {
+                 (coin.fHouseEscrow && tx.nNoteOp != NOTE_OP_CLAIM && tx.nNoteOp != NOTE_OP_TOKEN_COLLECT))) {
             return state.DoS(100, false, REJECT_INVALID, "bad-note-colored-input");
         }
 
@@ -1037,6 +1040,22 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // already rejects it - this names the reason, like MINT).
             if (nNoteIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-spends-note");
+        }
+        else if (IsTokenClaimOp(tx.nNoteOp)) {
+            // v0.2.21 token claim ops spend no notes (the coin-loop guard already refuses them); only a COLLECT
+            // spends escrow, and only its own house's.
+            if (nNoteIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-op-spends-note");
+            if (tx.nNoteOp != NOTE_OP_TOKEN_COLLECT) {
+                if (nHouseEscrowIn != 0)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-op-spends-escrow");
+            } else if (nHouseEscrowIn != 0) {
+                NoteTokenCollect c;
+                if (!DecodeNotePayload(tx.vchNotePayload, c))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-payload");
+                if (nHouseIDIn != c.nHouseID)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-escrow-mismatch");
+            }
         }
     }
 

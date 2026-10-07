@@ -14,6 +14,8 @@
 #include <settle.h>
 #include <house.h>
 #include <note.h>
+#include <token.h>
+#include <cashu.h>
 #include <txdb.h>
 
 #include <base58.h>
@@ -4098,7 +4100,8 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     return true;
 }
 
-bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient)
+bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient,
+                           const CKeyID* pFrom)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
@@ -4119,11 +4122,17 @@ bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHou
         // group so the wallet never builds the doomed tx.
         if (NoteDemandIsPreAuth(kv.first.second))
             continue;
+        if (pFrom && kv.first.first != *pFrom)
+            continue;   // v0.2.21: only the named holder
         uint64_t sum = 0;
         for (const WalletNoteCoin& nc : kv.second) sum += nc.units;
         if (sum >= nUnits) { chosen = kv.second; have = sum; break; }
     }
-    if (chosen.empty()) { strFail = "No single holder has enough transferable note units (pre-auth demanded coins cannot transfer)!"; return false; }
+    if (chosen.empty()) {
+        strFail = pFrom ? "That address does not hold enough transferable note units of this house!"
+                        : "No single holder has enough transferable note units (pre-auth demanded coins cannot transfer)!";
+        return false;
+    }
 
     CKey keySender;
     if (!GetKey(CPubKey(chosen[0].vchHolderPubKey).GetID(), keySender)) { strFail = "Sender key missing!"; return false; }
@@ -4240,12 +4249,14 @@ bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHou
     return true;
 }
 
-bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee)
+bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee,
+                        CMutableTransaction* pmtxUnsent, const CKeyID* pFrom)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
-    // A lock takes the house's one-per-block slot (it writes nTokenUnits): fail fast like MintNote.
-    if (HouseStateChangePending(nHouseID)) {
+    // A lock takes the house's one-per-block slot (it writes nTokenUnits): fail fast like MintNote. The customer's
+    // half of a one-step lock is not sent here; the house checks the slot when it approves.
+    if (!pmtxUnsent && HouseStateChangePending(nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -4271,6 +4282,8 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     for (const auto& kv : mapByHolder) {
         if (kv.first.second != 0)
             continue;
+        if (pFrom && kv.first.first != *pFrom)
+            continue;   // v0.2.21: only the named holder
         std::vector<WalletNoteCoin> vOK;
         uint64_t sum = 0;
         for (const WalletNoteCoin& nc : kv.second) {
@@ -4283,7 +4296,11 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
         }
         if (sum >= nUnits) { chosen = vOK; break; }
     }
-    if (chosen.empty()) { strFail = "No single holder in this wallet has enough confirmed, undemanded notes of this house!"; return false; }
+    if (chosen.empty()) {
+        strFail = pFrom ? "That address does not hold enough confirmed, undemanded notes of this house!"
+                        : "No single holder in this wallet has enough confirmed, undemanded notes of this house!";
+        return false;
+    }
     CKey keyHolder;
     if (!GetKey(CPubKey(chosen[0].vchHolderPubKey).GetID(), keyHolder)) { strFail = "Holder key missing!"; return false; }
 
@@ -4335,7 +4352,7 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     const uint256 sighash = NoteLockSigHash(nHouseID, lock.nUnits, lock.vChangeUnits,
                                             NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
     if (!keyHolder.Sign(sighash, lock.vchHolderSig)) { strFail = "Failed to sign the lock as holder!"; return false; }
-    if (!SignHouseApprovers(this, house, sighash, lock.vApproverIndex, lock.vApproverSig, strFail))
+    if (!pmtxUnsent && !SignHouseApprovers(this, house, sighash, lock.vApproverIndex, lock.vApproverSig, strFail))
         return false;
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
     ssPayload << lock;
@@ -4360,6 +4377,18 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
         nIn++;
     }
 
+    if (pmtxUnsent) {
+        // The customer's half: keep the change key out of the pool (the house sends this later) and hold the funding
+        // coins back from this wallet's other spends until a restart. The note coins need no hold: a later note op
+        // spending them makes the house's send fail, which is safe.
+        reserveKey.KeepKey();
+        for (const auto& coin : setCoins)
+            LockCoin(coin.outpoint);
+        *pmtxUnsent = mtx;
+        txidOut = mtx.GetHash();
+        return true;
+    }
+
     CWalletTx walletTx;
     walletTx.fTimeReceivedIsTxTime = true;
     walletTx.fFromMe = true;
@@ -4370,6 +4399,46 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
         strFail = "Failed to commit the lock! Reject reason: " + FormatStateMessage(state); return false;
     }
     txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+bool CWallet::ApproveNoteLock(std::string& strFail, CMutableTransaction& mtx, NoteLock& lockOut)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    if (mtx.nVersion != TRANSACTION_NOTE_VERSION || mtx.nNoteOp != NOTE_OP_LOCK) { strFail = "Not a note lock!"; return false; }
+    NoteLock lock;
+    if (!DecodeNotePayload(mtx.vchNotePayload, lock)) { strFail = "The lock's payload does not decode!"; return false; }
+    if (lock.nUnits == 0 || lock.nUnits > (uint64_t)MAX_MONEY) { strFail = "Invalid note units!"; return false; }
+    if (HouseStateChangePending(lock.nHouseID)) {
+        strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
+        return false;
+    }
+
+    LOCK2(cs_main, cs_wallet);
+
+    CHouse house;
+    if (!phousetree->GetHouse(lock.nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    if (house.IsMembersOnly()) { strFail = "A members-only house can't issue tokens (they are bearer)!"; return false; }
+    const char status = HouseEffectiveStatus(house, chainActive.Height() + 1);
+    if (status != HOUSE_STATUS_OPEN && status != HOUSE_STATUS_STRESSED) {
+        strFail = "The house is suspended, insolvent or wound down - no new tokens!"; return false;
+    }
+    // The customer's signature must already hold: the house approves exactly what the holder signed (units, change,
+    // inputs, outputs), and a lock the holder did not sign would only be refused when sent.
+    const CPubKey pubHolder(lock.vchHolderPubKey);
+    if (!pubHolder.IsFullyValid()) { strFail = "The lock's holder key is not valid!"; return false; }
+    const uint256 sighash = NoteLockSigHash(lock.nHouseID, lock.nUnits, lock.vChangeUnits,
+                                            NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    if (!pubHolder.Verify(sighash, lock.vchHolderSig)) {
+        strFail = "The holder's signature does not cover this lock (changed after signing?)!"; return false;
+    }
+    if (!SignHouseApprovers(this, house, sighash, lock.vApproverIndex, lock.vApproverSig, strFail))
+        return false;
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << lock;
+    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+    lockOut = lock;
     return true;
 }
 
@@ -4388,6 +4457,11 @@ bool CWallet::UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHous
 
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    // v0.2.21: no burns from suspension on (consensus refuses them; this Core's wallet would keep the refused tx).
+    const char statusUnlock = HouseEffectiveStatus(house, chainActive.Height() + 1);
+    if (statusUnlock == HOUSE_STATUS_DEFERRED || statusUnlock == HOUSE_STATUS_INSOLVENT) {
+        strFail = "The house is suspended or insolvent - no burns (bad-note-unlock-house-status)!"; return false;
+    }
     if (nUnits > house.nTokenUnits) {
         strFail = strprintf("Only %u units back this house's tokens - a burn can't exceed what was minted!", house.nTokenUnits);
         return false;
@@ -4457,6 +4531,33 @@ bool CWallet::UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHous
     return true;
 }
 
+void CWallet::ListNoteCoins(uint32_t nHouseID, std::vector<NoteCoinRow>& vOut)
+{
+    // Caller holds cs_main + cs_wallet and has synced. The same collector the note builders spend from.
+    vOut.clear();
+    if (!phousetree) return;
+    for (const CHouse& house : phousetree->GetHouses()) {
+        if (nHouseID != 0 && house.nHouseID != nHouseID)
+            continue;
+        std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
+        CollectWalletNoteCoins(this, house.nHouseID, mapByHolder);
+        for (const auto& kv : mapByHolder) {
+            for (const WalletNoteCoin& nc : kv.second) {
+                NoteCoinRow r;
+                r.nHouseID = house.nHouseID;
+                r.outpoint = nc.outpoint;
+                r.units = nc.units;
+                r.script = nc.script;
+                r.vchHolderPubKey = nc.vchHolderPubKey;
+                r.nDemandHeight = nc.nDemandHeight;
+                std::map<uint256, CWalletTx>::const_iterator it = mapWallet.find(nc.outpoint.hash);
+                r.nDepth = it == mapWallet.end() ? 0 : it->second.GetDepthInMainChain();
+                vOut.push_back(r);
+            }
+        }
+    }
+}
+
 void CWallet::CollectNoteHoldings(std::map<uint32_t, WalletNoteHolding>& out)
 {
     // Caller holds cs_main + cs_wallet and has synced (CollectWalletNoteCoins'
@@ -4485,6 +4586,298 @@ void CWallet::CollectNoteHoldings(std::map<uint32_t, WalletNoteHolding>& out)
         }
         if (h.units > 0) out[house.nHouseID] = h;
     }
+}
+
+bool CWallet::SendFundedNoteOp(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx, const CAmount& amountExtraIn,
+                               const CAmount& nFee, const std::function<bool(CMutableTransaction&, std::string&)>& fnPayload)
+{
+    CAmount amountOut = 0;
+    for (const CTxOut& out : mtx.vout)
+        amountOut += out.nValue;
+    CAmount nTarget = amountOut + nFee - amountExtraIn;
+    if (nTarget < nFee)
+        nTarget = nFee;   // the extra inputs only ever cover the outputs; the fee is this wallet's
+    // A plain change output always closes the tx (and is its only output when nothing else is paid).
+    const CAmount nMinPlain = 10 * NOTE_DUST_VALUE;
+    std::vector<COutput> vCoins;
+    AvailableCoins(vCoins, true);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vCoins, nTarget + nMinPlain, setCoins, nAmountRet)) { strFail = "Could not fund the fee!"; return false; }
+    CReserveKey reserveKey(this);
+    CPubKey vchPubKey;
+    if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
+    mtx.vout.push_back(CTxOut(nAmountRet - nTarget, GetScriptForDestination(vchPubKey.GetID())));
+    const size_t nExtra = mtx.vin.size();
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    if (!fnPayload(mtx, strFail))
+        return false;
+    // This Core's CommitTransaction keeps a tx the mempool refuses: check it as the mempool will, first.
+    {
+        CValidationState stateCheck;
+        if (IsTokenClaimOp(mtx.nNoteOp) && !CheckTokenOperationAtTip(CTransaction(mtx), stateCheck)) {
+            strFail = "Refused: " + FormatStateMessage(stateCheck); return false;
+        }
+        if (mtx.nNoteOp == NOTE_OP_TOKEN_CLAIM && TokenClaimConflictsMempool(CTransaction(mtx))) {
+            strFail = "Refused: a token in it is already in a pending claim (token-claim-pending)"; return false;
+        }
+    }
+    const CTransaction txToSign = mtx;
+    size_t nIn = nExtra;
+    for (const auto& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL), coin.txout.scriptPubKey, sigdata)) {
+            strFail = "Signing the fee inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+bool CWallet::RegisterTokenKeyset(std::string& strFail, uint256& txidOut, uint64_t& nKeysetIDOut, uint32_t nHouseID,
+                                  const std::vector<TokenKey>& vKey, const CPubKey& pubPosting, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    NoteTokenKeyset ks;
+    ks.nHouseID = nHouseID;
+    ks.vchPostingPubKey = std::vector<unsigned char>(pubPosting.begin(), pubPosting.end());
+    ks.vKey = vKey;
+    nKeysetIDOut = TokenKeysetID(vKey);
+    CTokenKeyset existing;
+    if (phousetree->GetTokenKeyset(nHouseID, nKeysetIDOut, existing)) { strFail = "This keyset is already recorded!"; return false; }
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_TOKEN_KEYSET;
+    return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string& strErr) {
+        if (!SignHouseApprovers(this, house, TokenKeysetSigHash(ks, NoteHashPrevouts(CTransaction(m))),
+                ks.vApproverIndex, ks.vApproverSig, strErr))
+            return false;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << ks;
+        m.vchNotePayload.assign(ss.begin(), ss.end());
+        return true;
+    });
+}
+
+bool CWallet::PostTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nKeysetID,
+                         const std::vector<TokenIssued>& vIssued, const std::vector<uint256>& vSpent, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    CTokenKeyset ks;
+    if (!phousetree->GetTokenKeyset(nHouseID, nKeysetID, ks)) { strFail = "Unknown keyset for this house!"; return false; }
+    CKey keyPosting;
+    if (!GetKey(CPubKey(ks.vchPostingPubKey).GetID(), keyPosting)) { strFail = "This wallet does not hold the keyset's posting key!"; return false; }
+    NoteTokenPost post;
+    post.nHouseID = nHouseID;
+    post.nKeysetID = nKeysetID;
+    post.vIssued = vIssued;
+    post.vSpent = vSpent;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_TOKEN_POST;
+    return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string& strErr) {
+        if (!keyPosting.Sign(TokenPostSigHash(post, NoteHashPrevouts(CTransaction(m))), post.vchSig)) {
+            strErr = "Failed to sign the post!"; return false;
+        }
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << post;
+        m.vchNotePayload.assign(ss.begin(), ss.end());
+        return true;
+    });
+}
+
+bool CWallet::SignTokenClaims(std::string& strFail, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
+                              const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer,
+                              std::vector<TokenClaimEntry>& vEntryOut)
+{
+    strFail = "Unknown error!";
+    if (vProof.empty() || vProof.size() > MAX_TOKEN_CLAIM_ENTRIES) { strFail = "Claim 1 to 64 tokens per transaction!"; return false; }
+    LOCK(cs_main);
+    vEntryOut.clear();
+    for (const TokenProofIn& p0 : vProof) {
+        TokenProofIn p = p0;
+        CTokenKeyset ks;
+        CPubKey A, Y, B, C;
+        if (!CashuHashToCurve(p.vchSecret, Y)) { strFail = "A token's secret does not hash to the curve!"; return false; }
+        // The chain names a keyset by its own id (the NUT-02 v1 formula over the recorded keys). A proof that names
+        // the mint's own id - a v2 id (CDK's default), or a v1 id over more keys than were recorded - is matched to
+        // the recorded keyset whose key for its amount makes its proof check out.
+        bool fFound = p.nKeysetID != 0 && phousetree->GetTokenKeyset(nHouseID, p.nKeysetID, ks) && ks.KeyFor(p.nAmount, A) &&
+                      CashuReblind(A, Y, p.C, p.r, B, C);
+        if (!fFound) {
+            for (const auto& kv : phousetree->ListTokenKeysets(nHouseID)) {
+                CPubKey A2, B2, C2;
+                if (kv.second.KeyFor(p.nAmount, A2) && CashuReblind(A2, Y, p.C, p.r, B2, C2) &&
+                        CashuVerifyDLEQ(A2, B2, C2, p.e, p.s)) {
+                    p.nKeysetID = kv.first;
+                    A = A2; B = B2; C = C2;
+                    fFound = true;
+                    break;
+                }
+            }
+        }
+        if (!fFound) { strFail = "No keyset recorded for this house signed a token (amount or keys)!"; return false; }
+        // The holder's key is r (P = B_ - Y): sign the payout terms with it.
+        CKey keyR;
+        keyR.Set(p.r.begin(), p.r.end(), true);
+        CPubKey P;
+        if (!keyR.IsValid() || !CashuPointSub(B, Y, P) || keyR.GetPubKey() != P) { strFail = "A token's blinding factor does not match!"; return false; }
+        TokenClaimEntry e;
+        e.nKeysetID = p.nKeysetID;
+        e.nAmount = p.nAmount;
+        e.vchSecret = p.vchSecret;
+        e.vchB = std::vector<unsigned char>(B.begin(), B.end());
+        e.vchC = std::vector<unsigned char>(C.begin(), C.end());
+        e.vchE.assign(p.e.begin(), p.e.end());
+        e.vchS.assign(p.s.begin(), p.s.end());
+        e.vchPayoutScript = std::vector<unsigned char>(scriptPayout.begin(), scriptPayout.end());
+        e.nFeeBps = nFeeBps;
+        e.vchRelayerScript = std::vector<unsigned char>(scriptRelayer.begin(), scriptRelayer.end());
+        if (!keyR.Sign(TokenClaimSigHash(nHouseID, TokenYID(Y), e.vchPayoutScript, e.nFeeBps, e.vchRelayerScript), e.vchSig)) {
+            strFail = "Failed to sign a token claim!"; return false;
+        }
+        vEntryOut.push_back(e);
+    }
+    return true;
+}
+
+bool CWallet::RelayTokenClaims(std::string& strFail, uint256& txidOut, uint32_t nHouseID,
+                               const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    if (vEntry.empty() || vEntry.size() > MAX_TOKEN_CLAIM_ENTRIES) { strFail = "Claim 1 to 64 tokens per transaction!"; return false; }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    NoteTokenClaim claim;
+    claim.nHouseID = nHouseID;
+    claim.vEntry = vEntry;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
+    return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string&) {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << claim;
+        m.vchNotePayload.assign(ss.begin(), ss.end());
+        return true;
+    });
+}
+
+bool CWallet::ClaimTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
+                          const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer, const CAmount& nFee)
+{
+    std::vector<TokenClaimEntry> vEntry;
+    if (!SignTokenClaims(strFail, nHouseID, vProof, scriptPayout, nFeeBps, scriptRelayer, vEntry))
+        return false;
+    return RelayTokenClaims(strFail, txidOut, nHouseID, vEntry, nFee);
+}
+
+bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, std::vector<uint256>& vY,
+                            const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    if (HouseStateChangePending(nHouseID)) {
+        strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
+    }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    if (vY.empty()) {
+        // Every uncollected claim, up to the per-tx limit.
+        for (const auto& kv : phousetree->ListTokenClaims(nHouseID, uint256(), 100000)) {
+            if (kv.second.nCollectHeight == 0)
+                vY.push_back(kv.first);
+            if (vY.size() >= MAX_TOKEN_COLLECT_ENTRIES)
+                break;
+        }
+    }
+    // The snapshot this collect pays from: the stored one, or exactly what it will materialize (consensus
+    // HouseEscrowOutpoints + HouseLiveEscrowPot).
+    LOCK(mempool.cs);
+    CCoinsViewMemPool viewMempool(pcoinsTip.get(), mempool);
+    std::vector<COutPoint> vEscrowOutpoints;
+    for (const HousePartner& p : house.vPartner)
+        vEscrowOutpoints.insert(vEscrowOutpoints.end(), p.vOutPledge.begin(), p.vOutPledge.end());
+    vEscrowOutpoints.insert(vEscrowOutpoints.end(), house.vOutEscrowChange.begin(), house.vOutEscrowChange.end());
+    vEscrowOutpoints.insert(vEscrowOutpoints.end(), house.vOutReserveLock.begin(), house.vOutReserveLock.end());
+    std::vector<std::pair<COutPoint, CAmount>> vEscrowAll;
+    CAmount amountLive = 0;
+    for (const COutPoint& out : vEscrowOutpoints) {
+        Coin coin;
+        if (viewMempool.GetCoin(out, coin) && !coin.IsSpent() && coin.fHouseEscrow && coin.nHouseID == nHouseID) {
+            vEscrowAll.push_back(std::make_pair(out, coin.out.nValue));
+            amountLive += coin.out.nValue;
+        }
+    }
+    const bool fMaterialized = house.status == HOUSE_STATUS_INSOLVENT;
+    const CAmount amountPot = fMaterialized ? house.amountInsolventPot : amountLive;
+    const uint64_t nSnapshotUnits = fMaterialized ? house.nInsolventUnits : house.nMintedUnits;
+    const uint64_t nBase = house.nTokenBaseHeight ? house.nTokenBase : house.nTokenUnits;
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_TOKEN_COLLECT;
+    std::vector<CTxOut> vPay;
+    CAmount amountDue = 0;
+    for (const uint256& y : vY) {
+        CTokenClaim c;
+        if (!phousetree->GetTokenClaim(nHouseID, y, c) || c.nCollectHeight != 0) { strFail = "A claim is unknown or already collected!"; return false; }
+        const uint64_t u = TokenClaimUnits(c.nAmount, nBase, house.nTokenClaimed);
+        const CAmount amountEnt = NoteClaimEntitlement(u, amountPot, nSnapshotUnits);
+        const CAmount amountFee = TokenRelayerFee(amountEnt, c.nFeeBps);
+        if (amountEnt - amountFee > 0)
+            vPay.push_back(CTxOut(amountEnt - amountFee, CScript(c.vchPayoutScript.begin(), c.vchPayoutScript.end())));
+        if (amountFee > 0)
+            vPay.push_back(CTxOut(amountFee, CScript(c.vchRelayerScript.begin(), c.vchRelayerScript.end())));
+        amountDue += amountEnt;
+    }
+    // Escrow coins, largest first, until the payouts are covered; change back to escrow at vout[0].
+    std::sort(vEscrowAll.begin(), vEscrowAll.end(),
+              [](const std::pair<COutPoint, CAmount>& a, const std::pair<COutPoint, CAmount>& b) { return a.second > b.second; });
+    CAmount amountEscrowIn = 0;
+    for (const auto& e : vEscrowAll) {
+        if (amountEscrowIn >= amountDue)
+            break;
+        mtx.vin.push_back(CTxIn(e.first.hash, e.first.n, CScript()));
+        amountEscrowIn += e.second;
+    }
+    if (amountEscrowIn < amountDue) { strFail = "The escrow pot no longer covers these claims!"; return false; }
+    NoteTokenCollect col;
+    col.nHouseID = nHouseID;
+    col.vY = vY;
+    col.fEscrowChange = amountEscrowIn > amountDue ? 1 : 0;
+    if (col.fEscrowChange)
+        mtx.vout.push_back(CTxOut(amountEscrowIn - amountDue, HouseEscrowScript(house.houseID)));
+    for (const CTxOut& out : vPay)
+        mtx.vout.push_back(out);
+    return SendFundedNoteOp(strFail, txidOut, mtx, amountEscrowIn, nFee, [&](CMutableTransaction& m, std::string&) {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << col;
+        m.vchNotePayload.assign(ss.begin(), ss.end());
+        return true;
+    });
 }
 
 bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptPayout, bool fPlain, bool fUpgrade)
@@ -6085,7 +6478,8 @@ static bool HouseStateChangePending(uint32_t nHouseID)
         } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                 (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
                  mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
-                 mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
+                 mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
+                 mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
                 mtx.vchNotePayload.size() >= 4) {
             // PROTEST (B3 T-b3) writes the house's protest fields = takes the
             // slot; mirrored in GetHouseSlotIDs and the ATMP scan - the

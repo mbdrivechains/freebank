@@ -1539,7 +1539,7 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
     // BOTH this pin and the addendum arithmetic together, or the synthesis
     // silently builds a malformed record and the migration it claims to prove
     // proves nothing.
-    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 11);   // fired again at v9 -> v10 (members-only flags, 1 byte)
+    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 12);   // fired again at v9 -> v10 (members-only flags, 1 byte)
                                                 // and at v10 -> v11 (token backing, 1 u64)
 
     CHouse back;
@@ -1577,7 +1577,8 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
         static const size_t V9_ADDENDUM = 3 * sizeof(uint32_t);
         static const size_t V10_ADDENDUM = sizeof(uint8_t);
         static const size_t V11_ADDENDUM = sizeof(uint64_t);
-        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM));
+        static const size_t V12_ADDENDUM = 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t);   // the token claim totals
+        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM + V12_ADDENDUM));
         CDataStream ssV7(b, SER_NETWORK, PROTOCOL_VERSION);
         CHouse h7;
         ssV7 >> h7;                                   // must not throw

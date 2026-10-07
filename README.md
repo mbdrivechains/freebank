@@ -56,13 +56,20 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
   if the house cannot recover it ripens into insolvency where the bearer claims the custody
   coin directly from reserves. A protest that rides through a lawful deferral re-arms at the
   recovery height rather than being cleared by it. RPCs: `mintnote`, `transfernote`,
-  `redeemnote`, `demandnote`, `protestnote`, `dischargedemands`, `listmynotes`.
+  `redeemnote`, `demandnote`, `protestnote`, `dischargedemands`, `listmynotes`, `listnotecoins`.
 - **Token records** (v0.2.20): a house may run a Chaumian mint (Cashu-style blind-signed bearer
   tokens, off-chain). The chain keeps the public record: each mint locks the same amount of the
   house's notes as backing (signed by the notes' holder and the house's partners), and each burn
   releases backing as notes to the redeemer, never more than was locked. Tokens stay the house's
   liability in every cap and in the payout if it fails. RPCs: `locknotes`, `unlocknotes`;
-  `gethouse` shows `tokenunits`. The mint and the token wallet are separate software.
+  `gethouse` shows `tokenunits`. A customer and the house can sign one lock from their own wallets
+  (`createnotelock`, `approvenotelock`). The mint and the token wallet are separate software.
+- **Token holders' claim at a failed house** (v0.2.21): the partners record the mint's keysets, the
+  mint posts what it issues and marks spent, and for four weeks after a house fails any holder can
+  claim with their tokens (checked against the mint's keys, signed with the token's own blinding
+  factor), with no partner signature. After the window claims are paid in ECX from the escrow, at a
+  note's share, never more than the token backing. RPCs: `registertokenkeyset`, `posttokens`,
+  `claimtokens`, `signtokenclaims`, `relaytokenclaims`, `collecttokens`, `gettokenclaims`.
 - **Discounting** (credit creation, the point of the whole thing): a house buys a bill of
   exchange from a holder, paying with its **own notes minted in the same operation** under
   the full reserve/leverage discipline, and books the bill as a loan asset — the Scottish
@@ -111,8 +118,16 @@ v0.2.15 keeps deposit crediting going when an unreadable eCash transaction share
 v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe,
 v0.2.17 checks every peg step against eCash itself,
 v0.2.18 brings ECX credit with no closure date, and assets,
-v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant, and
-v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned:
+v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant,
+v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned, and
+v0.2.21 lets token holders claim at a failed house without its partners:
+
+- **The token holders' claim** (v0.2.21). **A hard fork on the beta: every node must upgrade** (no
+  `-reindex`, no new flag). Four new operations (keysets, the mint's posts, claims, collects); a burn
+  is refused once a house is suspended or insolvent. A v0.2.20 node stops following the chain at the
+  first block that differs. Also a one-step lock from two wallets, and a fix to undoing a block that
+  paid a failed house's holders from its escrow. FreeBank mainnet will have these rules from its
+  first block. Details in the release notes.
 
 - **Token records** (v0.2.20). **A hard fork on the beta: every node must upgrade** (no `-reindex`, no
   new flag). Two operations reserved since the first release become valid: the mint record

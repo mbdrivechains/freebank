@@ -245,8 +245,9 @@ BOOST_AUTO_TEST_CASE(chouse_v9_reads_v8_and_rewrites_byte_identical)
     BOOST_REQUIRE(!v8.empty());
     BOOST_REQUIRE_EQUAL(v8[0], (unsigned char)HOUSE_SER_VERSION);   // version leads
     v8[0] = 8;
-    BOOST_REQUIRE(v8.size() >= 21);
-    v8.resize(v8.size() - 21);           // drop the v11 token u64, the v10 flags byte and the three v9 uint32s
+    BOOST_REQUIRE(v8.size() >= 69);
+    v8.resize(v8.size() - 69);           // drop the v12 claim totals (48 bytes), the v11 token u64, the v10 flags byte
+                                         // and the three v9 uint32s
     CHouse fromV8;
     BOOST_REQUIRE(Deser(v8, fromV8));
     BOOST_CHECK_EQUAL(fromV8.nProtestOpen, 0u);
@@ -397,10 +398,14 @@ BOOST_AUTO_TEST_CASE(shape_protest_is_in_range_and_reserved_ops_are_not)
         SetNotePayload(bad, p);
         BOOST_CHECK_EQUAL(ShapeReject(bad), op == NOTE_OP_LOCK ? "bad-note-lock-payload" : "bad-note-unlock-payload");
     }
-    // and 9 is still out of range - widening the ceiling must not widen it twice
+    // v0.2.21: 9-12 are the token claim ops (their own payload rejects); 13 is out of range - widening the ceiling
+    // must not widen it twice
     CMutableTransaction nine = NoteTx(9);
     SetNotePayload(nine, p);
-    BOOST_CHECK_EQUAL(ShapeReject(nine), "bad-note-op");
+    BOOST_CHECK_EQUAL(ShapeReject(nine), "bad-token-keyset-payload");
+    CMutableTransaction thirteen = NoteTx(13);
+    SetNotePayload(thirteen, p);
+    BOOST_CHECK_EQUAL(ShapeReject(thirteen), "bad-note-op");
 }
 
 BOOST_AUTO_TEST_CASE(shape_preauth_fields_are_all_or_nothing)

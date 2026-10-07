@@ -141,7 +141,7 @@ BOOST_AUTO_TEST_CASE(members_chouse_v10_and_v9)
     std::vector<unsigned char> v(ss.begin(), ss.end());
     BOOST_REQUIRE_EQUAL(v[0], HOUSE_SER_VERSION);
     v[0] = 9;
-    v.resize(v.size() - (1 + sizeof(uint64_t)));
+    v.resize(v.size() - (1 + sizeof(uint64_t) + 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t)));   // + the v12 claim totals
     CDataStream ss9(v, SER_DISK, CLIENT_VERSION);
     CHouse old;
     ss9 >> old;

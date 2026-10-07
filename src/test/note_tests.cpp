@@ -12,6 +12,7 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <key.h>
+#include <script/interpreter.h>
 #include <script/standard.h>
 #include <streams.h>
 #include <test/test_bitcoin.h>
@@ -1185,14 +1186,15 @@ BOOST_AUTO_TEST_CASE(token_lock_house_rules)
         t.house.nFlags = HOUSE_FLAG_MEMBERS_ONLY;
         BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-members-only");
     }
-    // No new tokens while suspended or failed; burns still allowed (Q3).
+    // No new tokens while suspended or failed (Q3). v0.2.21 (claim design draft 3, Michael 2026-10-08: "no burns in
+    // suspension"): no burns either, from suspension on; while merely Stressed, burns stay allowed.
     {
         TokenHouse t;
         t.house.nDeferInvokedHeight = 1590;
         t.house.nTokenUnits = 500;
         BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(t.house, 1600), HOUSE_STATUS_DEFERRED);
         BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-house-status");
-        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "OK");
+        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "bad-note-unlock-house-status");
     }
     {
         TokenHouse t;
@@ -1200,7 +1202,7 @@ BOOST_AUTO_TEST_CASE(token_lock_house_rules)
         t.house.nTokenUnits = 500;
         BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(t.house, 1600), HOUSE_STATUS_INSOLVENT);
         BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-house-status");
-        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "OK");
+        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "bad-note-unlock-house-status");
     }
     {
         TokenHouse t;
@@ -1211,8 +1213,11 @@ BOOST_AUTO_TEST_CASE(token_lock_house_rules)
     {
         TokenHouse t;
         t.house.nStressSinceHeight = 1595;
-        if (HouseEffectiveStatus(t.house, 1600) == HOUSE_STATUS_STRESSED)
+        t.house.nTokenUnits = 500;
+        if (HouseEffectiveStatus(t.house, 1600) == HOUSE_STATUS_STRESSED) {
             BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "OK");
+            BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "OK");   // and burns stay open while stressed
+        }
     }
     // Defence in depth: the backing never exceeds the outstanding notes.
     {
@@ -1267,6 +1272,50 @@ BOOST_AUTO_TEST_CASE(token_lock_inputs)
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("0a"), 0)));
         BOOST_CHECK_EQUAL(inputs(mtx, 0, t.pubHolder, 1000), "bad-txns-spend-note-coin");
     }
+}
+
+// v0.2.21 one-step lock: the customer signs its inputs before the house adds its partners' signatures to the payload.
+// That works only because an input's signature hash leaves out nNoteOp and the note payload (the payload carries its
+// own signatures over hashPrevouts + hashOutputs). Pin it: if the payload ever enters the input sighash, the
+// customer's input signatures break when the house approves, and this test says why.
+BOOST_AUTO_TEST_CASE(note_payload_outside_input_sighash)
+{
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript script = GetScriptForDestination(key.GetPubKey().GetID());
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_LOCK;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0a"), 0)));
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0b"), 1)));
+    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, script));
+    NoteLock lock;
+    lock.nHouseID = 1;
+    lock.nUnits = 1000;
+    lock.vchHolderPubKey = ToByteVector(key.GetPubKey());
+    lock.vchHolderSig = std::vector<unsigned char>(71, 0x30);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << lock;
+    mtx.vchNotePayload.assign(ss.begin(), ss.end());
+    const uint256 txidBefore = CTransaction(mtx).GetHash();
+    const uint256 h0 = SignatureHash(script, CTransaction(mtx), 0, SIGHASH_ALL, NOTE_DUST_VALUE, SIGVERSION_BASE);
+    const uint256 h1 = SignatureHash(script, CTransaction(mtx), 1, SIGHASH_ALL, 50000, SIGVERSION_BASE);
+
+    // The house adds its approvals: the payload grows, the inputs' signature hashes do not move.
+    lock.vApproverIndex = {0, 1};
+    lock.vApproverSig = {std::vector<unsigned char>(71, 0x31), std::vector<unsigned char>(71, 0x32)};
+    CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
+    ss2 << lock;
+    mtx.vchNotePayload.assign(ss2.begin(), ss2.end());
+    BOOST_CHECK(SignatureHash(script, CTransaction(mtx), 0, SIGHASH_ALL, NOTE_DUST_VALUE, SIGVERSION_BASE) == h0);
+    BOOST_CHECK(SignatureHash(script, CTransaction(mtx), 1, SIGHASH_ALL, 50000, SIGVERSION_BASE) == h1);
+    // ... while the txid does (the payload is part of the transaction).
+    BOOST_CHECK(CTransaction(mtx).GetHash() != txidBefore);
+
+    // The payload's own digest is what binds the lock: it changes with the outputs.
+    const uint256 d0 = NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    mtx.vout[0].nValue += 1;
+    BOOST_CHECK(NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)) != d0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

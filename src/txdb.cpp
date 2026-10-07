@@ -64,6 +64,12 @@ static const char DB_HOUSE_LAST_ID = 'K';
 // v0.2.19 members-only houses (HouseDB): (house id, keyid) -> CHouseMember, and house id -> record count
 static const char DB_HOUSE_MEMBER = 'Y';
 static const char DB_HOUSE_MEMBER_COUNT = 'U';
+// v0.2.21 token holders' claim (HouseDB, token.h): (house, keyset id) -> CTokenKeyset; (house, B_) -> CTokenMark
+// issued; (house, Y) -> CTokenMark spent; (house, Y) -> CTokenClaim
+static const char DB_TOKEN_KEYSET = 'T';
+static const char DB_TOKEN_ISSUED = 'I';
+static const char DB_TOKEN_SPENT = 'S';
+static const char DB_TOKEN_CLAIM = 'L';
 // Best-block marker for the side DBs (HouseDB + BillDB are separate LevelDB
 // instances, so one char serves both): the last block whose effects are in
 // the DB, written ATOMICALLY with those effects (Phase 3.4 review - ties the
@@ -834,7 +840,8 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
                                 const std::vector<COracleSubmitter>* pvSubmitter,
                                 const std::vector<uint32_t>* pvSubmitterRemove,
                                 const uint32_t* pnLastSubmitterID,
-                                const HouseMemberEffects* pMembers)
+                                const HouseMemberEffects* pMembers,
+                                const TokenEffects* pTokens)
 {
     CDBBatch batch(*this);
     for (const CHouse& house : vHouse) {
@@ -881,8 +888,97 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
                 batch.Erase(std::make_pair(DB_HOUSE_MEMBER_COUNT, kv.first));
         }
     }
+    if (pTokens) {
+        for (const auto& kv : pTokens->mapKeyset)
+            batch.Write(std::make_pair(DB_TOKEN_KEYSET, kv.first), kv.second);
+        for (const auto& kv : pTokens->mapIssued)
+            batch.Write(std::make_pair(DB_TOKEN_ISSUED, kv.first), kv.second);
+        for (const auto& kv : pTokens->mapSpent)
+            batch.Write(std::make_pair(DB_TOKEN_SPENT, kv.first), kv.second);
+        for (const auto& kv : pTokens->mapClaim)
+            batch.Write(std::make_pair(DB_TOKEN_CLAIM, kv.first), kv.second);
+    }
     batch.Write(DB_SIDE_BEST_BLOCK, hashBestBlock);
     return WriteBatch(batch, true);
+}
+
+bool HouseDB::GetTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID, CTokenKeyset& rec)
+{
+    return Read(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, nKeysetID)), rec);
+}
+
+bool HouseDB::GetTokenIssued(uint32_t nHouseID, const std::vector<unsigned char>& vchB, CTokenMark& rec)
+{
+    return Read(std::make_pair(DB_TOKEN_ISSUED, std::make_pair(nHouseID, vchB)), rec);
+}
+
+bool HouseDB::GetTokenSpent(uint32_t nHouseID, const uint256& y, CTokenMark& rec)
+{
+    return Read(std::make_pair(DB_TOKEN_SPENT, std::make_pair(nHouseID, y)), rec);
+}
+
+bool HouseDB::GetTokenClaim(uint32_t nHouseID, const uint256& y, CTokenClaim& rec)
+{
+    return Read(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), rec);
+}
+
+bool HouseDB::EraseTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID)
+{
+    return Erase(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, nKeysetID)), true);
+}
+
+bool HouseDB::EraseTokenMarks(uint32_t nHouseID, const std::vector<std::vector<unsigned char>>& vB, const std::vector<uint256>& vY)
+{
+    CDBBatch batch(*this);
+    for (const std::vector<unsigned char>& b : vB)
+        batch.Erase(std::make_pair(DB_TOKEN_ISSUED, std::make_pair(nHouseID, b)));
+    for (const uint256& y : vY)
+        batch.Erase(std::make_pair(DB_TOKEN_SPENT, std::make_pair(nHouseID, y)));
+    return WriteBatch(batch, true);
+}
+
+bool HouseDB::WriteTokenClaim(uint32_t nHouseID, const uint256& y, const CTokenClaim& rec)
+{
+    return Write(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), rec, true);
+}
+
+bool HouseDB::EraseTokenClaim(uint32_t nHouseID, const uint256& y)
+{
+    return Erase(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), true);
+}
+
+std::vector<std::pair<uint64_t, CTokenKeyset>> HouseDB::ListTokenKeysets(uint32_t nHouseID)
+{
+    std::vector<std::pair<uint64_t, CTokenKeyset>> v;
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, (uint64_t)0)));
+    while (pcursor->Valid()) {
+        std::pair<char, std::pair<uint32_t, uint64_t>> key;
+        if (!pcursor->GetKey(key) || key.first != DB_TOKEN_KEYSET || key.second.first != nHouseID)
+            break;
+        CTokenKeyset rec;
+        if (pcursor->GetValue(rec))
+            v.emplace_back(key.second.second, rec);
+        pcursor->Next();
+    }
+    return v;
+}
+
+std::vector<std::pair<uint256, CTokenClaim>> HouseDB::ListTokenClaims(uint32_t nHouseID, const uint256& start, size_t nMax)
+{
+    std::vector<std::pair<uint256, CTokenClaim>> v;
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, start)));
+    while (pcursor->Valid() && v.size() < nMax) {
+        std::pair<char, std::pair<uint32_t, uint256>> key;
+        if (!pcursor->GetKey(key) || key.first != DB_TOKEN_CLAIM || key.second.first != nHouseID)
+            break;
+        CTokenClaim rec;
+        if (pcursor->GetValue(rec))
+            v.emplace_back(key.second.second, rec);
+        pcursor->Next();
+    }
+    return v;
 }
 
 bool HouseDB::GetHouseMember(uint32_t nHouseID, const uint160& keyid, CHouseMember& rec)

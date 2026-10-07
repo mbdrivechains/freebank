@@ -103,6 +103,8 @@ struct Params {
      *  to attest again before it is (lazily) Insolvent. ~4 weeks on mainnet.
      *  Open/stressed houses keep HOUSE_STRESSED_WINDOW. Never a CLI knob. */
     uint32_t nDeferSilenceWindow;
+    /** v0.2.21: the token holders' claim window at a failed house, in blocks from E (TOKEN_CLAIM_DESIGN.md). */
+    uint32_t nTokenClaimWindow;
     /** Gold oracle (Phase G-1, consensus-inert). Same never-a-CLI-knob rule.
      *  Quorum = DISTINCT registered submitters required in one block for a
      *  new fix; brake = max fall of the braked view, ppm per elapsed block,

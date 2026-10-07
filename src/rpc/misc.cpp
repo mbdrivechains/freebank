@@ -9,6 +9,7 @@
 #include <oracle.h>
 #include <pool.h>
 #include <note.h>
+#include <token.h>
 #include <bmmcache.h>
 #include <chain.h>
 #include <clientversion.h>
@@ -1899,6 +1900,10 @@ static UniValue HouseToJSON(const CHouse& house)
     // v0.2.20: the part of mintedunits held as the backing of the house's Chaumian tokens (locked by the mint record,
     // released by the burn record). Tokens outstanding can't be redeemed against more than this.
     obj.pushKV("tokenunits", house.nTokenUnits);
+    // v0.2.21 token holders' claim (gettokenclaims has the detail)
+    obj.pushKV("tokenclaimed", house.nTokenClaimed);
+    obj.pushKV("tokenclaims", (int64_t)house.nTokenClaims);
+    obj.pushKV("tokencollected", (int64_t)house.nTokenCollected);
     // Term-deposit accounting (Phase 3.8): the D in the shared cap N + D <=
     // lambda*E, and the weighted-average REMAINING term (blocks) of the deposit
     // book - the market's view of the maturity profile (a full bucketed ladder
@@ -2073,6 +2078,80 @@ UniValue gethouse(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_MISC_ERROR, "Unknown house!");
 
     return HouseToJSON(house);
+}
+
+UniValue gettokenclaims(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
+        throw std::runtime_error(
+            "gettokenclaims \"id\" ( \"start\" count )\n"
+            "\nThe token holders' claim at a failed house (v0.2.21): the window, the totals, the house's mint keysets\n"
+            "and the claims, in key order from start (a Y, hex; default the first), at most count (default 100).\n"
+            "\nResult:\n"
+            "{ \"insolventsince\": n (E, 0 if not insolvent), \"windowend\": n, \"base\": n (B, set by the first\n"
+            "  collect), \"claimed\": n (T), \"claims\": n, \"collected\": n, \"paid\": n, \"writeoff\": n,\n"
+            "  \"keysets\": [ { \"id\", \"height\", \"postingpubkey\", \"keys\": [ { \"amount\", \"pubkey\" } ] } ],\n"
+            "  \"list\": [ { \"y\", \"amount\", \"payout\", \"feebps\", \"relayer\", \"height\", \"collectheight\" } ] }\n"
+            + HelpExampleCli("gettokenclaims", "1")
+        );
+    const uint32_t nHouseID = request.params[0].get_int();
+    uint256 start;
+    if (request.params.size() >= 2 && !request.params[1].get_str().empty()) {
+        const std::vector<unsigned char> v = ParseHex(request.params[1].get_str());
+        if (v.size() != 32)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "start must be a 32-byte Y (hex)");
+        memcpy(start.begin(), v.data(), 32);
+    }
+    size_t nMax = 100;
+    if (request.params.size() >= 3)
+        nMax = (size_t)std::max(1, std::min(1000, request.params[2].get_int()));
+
+    LOCK(cs_main);
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house))
+        throw JSONRPCError(RPC_MISC_ERROR, "Unknown house!");
+    const uint32_t nE = HouseInsolventSince(house, chainActive.Height() + 1);
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("insolventsince", (int64_t)nE);
+    obj.pushKV("windowend", nE ? (int64_t)nE + Params().GetConsensus().nTokenClaimWindow : 0);
+    obj.pushKV("tokenunits", house.nTokenUnits);
+    obj.pushKV("base", house.nTokenBase);
+    obj.pushKV("claimed", house.nTokenClaimed);
+    obj.pushKV("claims", (int64_t)house.nTokenClaims);
+    obj.pushKV("collected", (int64_t)house.nTokenCollected);
+    obj.pushKV("paid", house.nTokenPaid);
+    obj.pushKV("writeoff", house.nTokenWriteOff);
+    UniValue keysets(UniValue::VARR);
+    for (const auto& kv : phousetree->ListTokenKeysets(nHouseID)) {
+        UniValue k(UniValue::VOBJ);
+        k.pushKV("id", strprintf("%016x", kv.first));
+        k.pushKV("height", (int64_t)kv.second.nHeight);
+        k.pushKV("postingpubkey", HexStr(kv.second.vchPostingPubKey));
+        UniValue keys(UniValue::VARR);
+        for (const TokenKey& tk : kv.second.vKey) {
+            UniValue e(UniValue::VOBJ);
+            e.pushKV("amount", (uint64_t)1 << tk.nExp);
+            e.pushKV("pubkey", HexStr(tk.vchPubKey));
+            keys.push_back(e);
+        }
+        k.pushKV("keys", keys);
+        keysets.push_back(k);
+    }
+    obj.pushKV("keysets", keysets);
+    UniValue list(UniValue::VARR);
+    for (const auto& kv : phousetree->ListTokenClaims(nHouseID, start, nMax)) {
+        UniValue c(UniValue::VOBJ);
+        c.pushKV("y", HexStr(kv.first.begin(), kv.first.end()));   // the point's x, as posted (raw byte order)
+        c.pushKV("amount", kv.second.nAmount);
+        c.pushKV("payout", HexStr(kv.second.vchPayoutScript));
+        c.pushKV("feebps", (int64_t)kv.second.nFeeBps);
+        c.pushKV("relayer", HexStr(kv.second.vchRelayerScript));
+        c.pushKV("height", (int64_t)kv.second.nHeight);
+        c.pushKV("collectheight", (int64_t)kv.second.nCollectHeight);
+        list.push_back(c);
+    }
+    obj.pushKV("list", list);
+    return obj;
 }
 
 UniValue listhousemembers(const JSONRPCRequest& request)
@@ -2327,6 +2406,7 @@ static const CRPCCommand commands[] =
 
     { "houses",             "listhouses",                   &listhouses,                    {}},
     { "houses",             "gethouse",                     &gethouse,                      {"id"}},
+    { "houses",             "gettokenclaims",               &gettokenclaims,                {"id", "start", "count"}},
     { "houses",             "listhousemembers",             &listhousemembers,              {"id", "start", "count"}},
 
     { "pools",              "listpools",                    &listpools,                     {}},

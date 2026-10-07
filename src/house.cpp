@@ -373,6 +373,21 @@ uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house)
     return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
 }
 
+uint32_t HouseInsolventSince(const CHouse& house, int nHeight)
+{
+    if (house.status == HOUSE_STATUS_WOUNDDOWN || HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
+        return 0;
+    if (house.nDeferInvokedHeight != 0)
+        return HouseDeferSilenceInsolventHeight(house);
+    // The ordinary stress path: insolvent at the stress origin + the window (HouseEffectiveStatus). The origin is
+    // stable for heights past the attestation deadline, which an insolvent house is.
+    const uint32_t nStress = HouseStressOrigin(house, nHeight);
+    if (nStress == 0)
+        return 0;   // unreachable for an insolvent house
+    const uint64_t n = (uint64_t)nStress + HOUSE_STRESSED_WINDOW;
+    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+}
+
 uint64_t HouseCapitalCapUnits(const CHouse& house)
 {
     const uint32_t nTierIdx = house.nTier <= MAX_HOUSE_TIER ? house.nTier : 0;

@@ -11,6 +11,8 @@
 #include <pool.h>
 #include <settle.h>
 #include <note.h>
+#include <token.h>
+#include <cashu.h>
 #include <bmmcache.h>
 #include <chain.h>
 #include <consensus/validation.h>
@@ -4188,15 +4190,28 @@ UniValue mintnote(const JSONRPCRequest& request)
     return response;
 }
 
+/** v0.2.21 (the mint's ask): an optional "fromaddress" (a P2PKH holder of this wallet's notes) at params[n]. */
+static bool ParseFromAddress(const JSONRPCRequest& request, size_t n, CKeyID& keyFrom)
+{
+    if (request.params.size() <= n || request.params[n].isNull() || request.params[n].get_str().empty())
+        return false;
+    const CTxDestination dest = DecodeDestination(request.params[n].get_str());
+    const CKeyID* pKey = boost::get<CKeyID>(&dest);
+    if (!pKey)
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "fromaddress must be a legacy (P2PKH) address");
+    keyFrom = *pKey;
+    return true;
+}
+
 UniValue locknotes(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
-            "locknotes \"id\" units ( fee )\n"
+            "locknotes \"id\" units ( fee \"fromaddress\" )\n"
             "\nRecord a mint of the house's Chaumian tokens on-chain (v0.2.20, NOTE_OP_LOCK): lock this wallet's\n"
             "undemanded notes of the house as the tokens' backing. Change returns to the same holder. Needs the\n"
             "notes' key and the house's approver keys in this wallet (both sign). Refused for a members-only house\n"
@@ -4205,6 +4220,8 @@ UniValue locknotes(const JSONRPCRequest& request)
             "1. \"id\"     (numeric, required) the house ID number\n"
             "2. \"units\"  (numeric, required) note units to lock as token backing\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "4. \"fromaddress\" (string, optional) lock only this holder's notes (a P2PKH address of this wallet);\n"
+            "               change returns to it\n"
             "\nResult:\n"
             "{ \"txid\": \"hex\" }\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -4225,13 +4242,439 @@ UniValue locknotes(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->LockNotes(strFail, txid, nHouseID, nUnits, nFee)) {
+    CKeyID keyFrom;
+    const bool fFrom = ParseFromAddress(request, 3, keyFrom);
+    if (!pwallet->LockNotes(strFail, txid, nHouseID, nUnits, nFee, nullptr, fFrom ? &keyFrom : nullptr)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
     return response;
+}
+
+UniValue createnotelock(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+        throw std::runtime_error(
+            "createnotelock \"id\" units ( fee \"fromaddress\" )\n"
+            "\nOne-step lock, the customer's half (v0.2.21): build and sign a lock of this wallet's undemanded notes of\n"
+            "the house as backing for the house's tokens, without the house's approval, and send nothing. Give the\n"
+            "hex to the house: it checks it and adds its partners' signatures (approvenotelock), then sends it\n"
+            "(sendrawtransaction). This wallet pays the fee; change comes back to the same holder. The fee coins are\n"
+            "held back from this wallet's other spends until a restart. Refused for a members-only house and while\n"
+            "the house is suspended or insolvent.\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"units\"  (numeric, required) note units to lock as token backing\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "4. \"fromaddress\" (string, optional) lock only this holder's notes; change returns to it\n"
+            "\nResult:\n"
+            "{ \"hex\": \"hex\", \"house\": n, \"units\": n }\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("createnotelock", "1 50000")
+            + HelpExampleRpc("createnotelock", "1, 50000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3 && !request.params[2].isNull()) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    CMutableTransaction mtx;
+    std::string strFail = "";
+    CKeyID keyFrom;
+    const bool fFrom = ParseFromAddress(request, 3, keyFrom);
+    if (!pwallet->LockNotes(strFail, txid, nHouseID, nUnits, nFee, &mtx, fFrom ? &keyFrom : nullptr)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("hex", EncodeHexTx(mtx));
+    response.pushKV("house", (int64_t)nHouseID);
+    response.pushKV("units", (int64_t)nUnits);
+    return response;
+}
+
+UniValue approvenotelock(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "approvenotelock \"hex\"\n"
+            "\nOne-step lock, the house's half (v0.2.21): check a customer's lock (createnotelock) and add the house's\n"
+            "partners' signatures from this wallet's keys. The customer's signature must cover the lock as given.\n"
+            "Nothing is sent: send the returned hex with sendrawtransaction, and issue tokens for \"units\" once it\n"
+            "is accepted. Refused for a members-only house, while the house is suspended or insolvent, and while\n"
+            "another house-state op of the house is in the mempool.\n"
+            "\nArguments:\n"
+            "1. \"hex\"    (string, required) the customer's lock\n"
+            "\nResult:\n"
+            "{ \"hex\": \"hex\", \"txid\": \"hex\", \"house\": n, \"units\": n, \"holder\": \"address\" }\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("approvenotelock", "\"0d000000...\"")
+            + HelpExampleRpc("approvenotelock", "\"0d000000...\"")
+        );
+
+    ObserveSafeMode();
+    CMutableTransaction mtx;
+    if (!DecodeHexTx(mtx, request.params[0].get_str(), true))
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    NoteLock lock;
+    std::string strFail = "";
+    if (!pwallet->ApproveNoteLock(strFail, mtx, lock)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("hex", EncodeHexTx(mtx));
+    response.pushKV("txid", mtx.GetHash().GetHex());
+    response.pushKV("house", (int64_t)lock.nHouseID);
+    response.pushKV("units", (int64_t)lock.nUnits);
+    response.pushKV("holder", EncodeDestination(CPubKey(lock.vchHolderPubKey).GetID()));
+    return response;
+}
+
+// v0.2.21 token holders' claim at a failed house (token.h; gateway docs/freebank/TOKEN_CLAIM_DESIGN.md)
+
+static uint64_t ParseTokenKeysetID(const UniValue& v)
+{
+    const std::string str = v.get_str();
+    if (str.size() != 16 || !IsHex(str))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "A keyset id is 16 hex characters");
+    return std::stoull(str, nullptr, 16);
+}
+
+static uint8_t ParseTokenAmountExp(const UniValue& v)
+{
+    const int64_t n = v.get_int64();
+    if (n <= 0 || (n & (n - 1)) != 0 || n > ((int64_t)1 << MAX_TOKEN_AMOUNT_EXP))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "A token amount is a power of two, at most 2^50");
+    uint8_t e = 0;
+    while (((int64_t)1 << e) != n)
+        e++;
+    return e;
+}
+
+static std::vector<unsigned char> ParseTokenPoint(const UniValue& v, const char* name)
+{
+    const std::vector<unsigned char> b = ParseHex(v.get_str());
+    if (b.size() != CPubKey::COMPRESSED_PUBLIC_KEY_SIZE || !CPubKey(b).IsFullyValid())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, std::string(name) + " must be a compressed point (33 bytes, hex)");
+    return b;
+}
+
+/** A Y as a 33-byte 02-point or its 32-byte x (raw, as gettokenclaims lists it). */
+static uint256 ParseTokenY(const UniValue& v)
+{
+    const std::vector<unsigned char> b = ParseHex(v.get_str());
+    uint256 y;
+    if (b.size() == 33 && b[0] == 0x02)
+        memcpy(y.begin(), b.data() + 1, 32);
+    else if (b.size() == 32)
+        memcpy(y.begin(), b.data(), 32);
+    else
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "A Y is a 02-prefixed point (33 bytes) or its x (32 bytes), hex");
+    return y;
+}
+
+static CashuScalar ParseTokenScalar(const UniValue& v, const char* name)
+{
+    const std::vector<unsigned char> b = ParseHex(v.get_str());
+    if (b.size() != 32)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, std::string(name) + " must be 32 bytes, hex");
+    CashuScalar s;
+    memcpy(s.data(), b.data(), 32);
+    return s;
+}
+
+static CAmount ParseTokenFee(const JSONRPCRequest& request, size_t n)
+{
+    if (request.params.size() > n && !request.params[n].isNull())
+        return AmountFromValue(request.params[n]);
+    return 100000;
+}
+
+UniValue registertokenkeyset(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
+        throw std::runtime_error(
+            "registertokenkeyset \"id\" [{\"amount\":n,\"pubkey\":\"hex\"},...] \"postingpubkey\" ( fee )\n"
+            "\nRecord the house's mint keyset on chain (v0.2.21): one public key per amount (powers of two), and the\n"
+            "posting key that signs the mint's posts (posttokens). The house's partners sign: this wallet needs\n"
+            "enough of their keys. Keys are unique on the chain. Needed before the house fails, for its tokens to\n"
+            "be claimable.\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\", \"keysetid\": \"hex\" (Cashu NUT-02) }\n"
+            + HelpExampleCli("registertokenkeyset", "1 '[{\"amount\":1,\"pubkey\":\"02..\"}]' \"02..\"")
+        );
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<TokenKey> vKey;
+    for (const UniValue& k : request.params[1].get_array().getValues())
+        vKey.emplace_back(ParseTokenAmountExp(find_value(k, "amount")), ParseTokenPoint(find_value(k, "pubkey"), "pubkey"));
+    std::sort(vKey.begin(), vKey.end(), [](const TokenKey& a, const TokenKey& b) { return a.nExp < b.nExp; });
+    const std::vector<unsigned char> vchPosting = ParseTokenPoint(request.params[2], "postingpubkey");
+    const CAmount nFee = ParseTokenFee(request, 3);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    uint64_t nKeysetID = 0;
+    std::string strFail;
+    if (!pwallet->RegisterTokenKeyset(strFail, txid, nKeysetID, nHouseID, vKey, CPubKey(vchPosting), nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid", txid.ToString());
+    ret.pushKV("keysetid", strprintf("%016x", nKeysetID));
+    return ret;
+}
+
+UniValue posttokens(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 4 || request.params.size() > 5)
+        throw std::runtime_error(
+            "posttokens \"id\" \"keysetid\" [{\"B_\":\"hex\",\"amount\":n},...] [\"Y\",...] ( fee )\n"
+            "\nThe mint's post (v0.2.21): blinded messages this keyset signed (B_, amount) and token Ys the mint\n"
+            "marked spent. Signed with the keyset's posting key (in this wallet). A record already posted is\n"
+            "ignored. Refused once the house is insolvent. At most 2,000 entries.\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\" }\n"
+            + HelpExampleCli("posttokens", "1 \"00ab..\" '[{\"B_\":\"02..\",\"amount\":8}]' '[\"02..\"]'")
+        );
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nKeysetID = ParseTokenKeysetID(request.params[1]);
+    std::vector<TokenIssued> vIssued;
+    for (const UniValue& i : request.params[2].get_array().getValues()) {
+        const int64_t n = find_value(i, "amount").get_int64();
+        ParseTokenAmountExp(find_value(i, "amount"));
+        vIssued.emplace_back(ParseTokenPoint(find_value(i, "B_"), "B_"), (uint64_t)n);
+    }
+    std::vector<uint256> vSpent;
+    for (const UniValue& y : request.params[3].get_array().getValues())
+        vSpent.push_back(ParseTokenY(y));
+    const CAmount nFee = ParseTokenFee(request, 4);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->PostTokens(strFail, txid, nHouseID, nKeysetID, vIssued, vSpent, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid", txid.ToString());
+    return ret;
+}
+
+/** claimtokens / signtokenclaims: proofs, payout address, fee bps and relayer address from params [1..4]. */
+static void ParseTokenClaimTerms(const JSONRPCRequest& request, std::vector<TokenProofIn>& vProof, CScript& scriptPayout,
+                                 uint16_t& nFeeBps, CScript& scriptRelayer)
+{
+    for (const UniValue& p : request.params[1].get_array().getValues()) {
+        TokenProofIn in;
+        // The chain's keyset id (16 hex); any other id (a CDK v2 id, say) is matched to a recorded keyset by its keys.
+        const UniValue& vid = find_value(p, "id");
+        const std::string strId = vid.isStr() ? vid.get_str() : "";
+        in.nKeysetID = (strId.size() == 16 && IsHex(strId)) ? std::stoull(strId, nullptr, 16) : 0;
+        ParseTokenAmountExp(find_value(p, "amount"));
+        in.nAmount = (uint64_t)find_value(p, "amount").get_int64();
+        const std::string strSecret = find_value(p, "secret").get_str();
+        in.vchSecret.assign(strSecret.begin(), strSecret.end());
+        in.C = CPubKey(ParseTokenPoint(find_value(p, "C"), "C"));
+        const UniValue& dleq = find_value(p, "dleq");
+        if (!dleq.isObject())
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Each proof needs its dleq (e, s, r)");
+        in.e = ParseTokenScalar(find_value(dleq, "e"), "e");
+        in.s = ParseTokenScalar(find_value(dleq, "s"), "s");
+        in.r = ParseTokenScalar(find_value(dleq, "r"), "r");
+        vProof.push_back(in);
+    }
+    const CTxDestination destPayout = DecodeDestination(request.params[2].get_str());
+    if (!IsValidDestination(destPayout))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid payout address");
+    scriptPayout = GetScriptForDestination(destPayout);
+    nFeeBps = 0;
+    if (request.params.size() >= 4 && !request.params[3].isNull()) {
+        const int n = request.params[3].get_int();
+        if (n < 0 || n > TOKEN_FEE_BPS_MAX)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "feebps is 0 to 10000");
+        nFeeBps = (uint16_t)n;
+    }
+    if (nFeeBps > 0) {
+        if (request.params.size() < 5 || request.params[4].get_str().empty())
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "A relayer fee needs relayeraddress");
+        const CTxDestination destRelayer = DecodeDestination(request.params[4].get_str());
+        if (!IsValidDestination(destRelayer))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid relayer address");
+        scriptRelayer = GetScriptForDestination(destRelayer);
+    }
+}
+
+UniValue signtokenclaims(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 5)
+        throw std::runtime_error(
+            "signtokenclaims \"id\" [proofs] \"payoutaddress\" ( feebps \"relayeraddress\" )\n"
+            "\nA holder's half of a token claim (v0.2.21), as a phone does it: each Cashu proof signed with its blinding\n"
+            "factor r over the payout terms. Sends nothing and needs no funds: hand the entries to any node to relay\n"
+            "(relaytokenclaims). Whoever relays them can't change the payout. Proofs as in claimtokens.\n"
+            "\nResult:\n"
+            "{ \"entries\": [\"hex\",...] }\n"
+            + HelpExampleCli("signtokenclaims", "1 '[...]' \"Xpayout...\" 100 \"Xrelayer...\"")
+        );
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<TokenProofIn> vProof;
+    CScript scriptPayout, scriptRelayer;
+    uint16_t nFeeBps = 0;
+    ParseTokenClaimTerms(request, vProof, scriptPayout, nFeeBps, scriptRelayer);
+    std::vector<TokenClaimEntry> vEntry;
+    std::string strFail;
+    if (!pwallet->SignTokenClaims(strFail, nHouseID, vProof, scriptPayout, nFeeBps, scriptRelayer, vEntry))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue arr(UniValue::VARR);
+    for (const TokenClaimEntry& e : vEntry) {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << e;
+        arr.push_back(HexStr(ss.begin(), ss.end()));
+    }
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("entries", arr);
+    return ret;
+}
+
+UniValue relaytokenclaims(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "relaytokenclaims \"id\" [\"entry\",...] ( fee )\n"
+            "\nSend holders' signed token claim entries (signtokenclaims, or a phone wallet) as one claim (v0.2.21).\n"
+            "This wallet pays the fee; its share of each payout is what each holder signed. Up to 64 entries.\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\" }\n"
+            + HelpExampleCli("relaytokenclaims", "1 '[\"0100..\"]'")
+        );
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<TokenClaimEntry> vEntry;
+    for (const UniValue& h : request.params[1].get_array().getValues()) {
+        const std::vector<unsigned char> b = ParseHex(h.get_str());
+        CDataStream ss(b, SER_NETWORK, PROTOCOL_VERSION);
+        TokenClaimEntry e;
+        try {
+            ss >> e;
+        } catch (const std::exception&) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "An entry does not decode");
+        }
+        if (!ss.empty())
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "An entry has trailing bytes");
+        vEntry.push_back(e);
+    }
+    const CAmount nFee = ParseTokenFee(request, 2);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->RelayTokenClaims(strFail, txid, nHouseID, vEntry, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid", txid.ToString());
+    return ret;
+}
+
+UniValue claimtokens(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 6)
+        throw std::runtime_error(
+            "claimtokens \"id\" [proofs] \"payoutaddress\" ( feebps \"relayeraddress\" fee )\n"
+            "\nClaim a failed house's tokens (v0.2.21), during its claim window: each Cashu proof (with its NUT-12\n"
+            "dleq e, s and r) is signed with its blinding factor r, so nobody who sees the claim can redirect it.\n"
+            "This wallet relays it and pays the fee; it may take feebps (basis points) of the payout, paid to\n"
+            "relayeraddress at the collect. The payout (ECX from the escrow, after the window) goes to\n"
+            "payoutaddress. Up to 64 proofs.\n"
+            "\nArguments:\n"
+            "2. proofs  [{\"id\":\"keysetid\",\"amount\":n,\"secret\":\"str\",\"C\":\"hex\",\"dleq\":{\"e\":\"hex\",\"s\":\"hex\",\"r\":\"hex\"}},...]\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\" }\n"
+            + HelpExampleCli("claimtokens", "1 '[...]' \"Xpayout...\"")
+        );
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<TokenProofIn> vProof;
+    CScript scriptPayout, scriptRelayer;
+    uint16_t nFeeBps = 0;
+    ParseTokenClaimTerms(request, vProof, scriptPayout, nFeeBps, scriptRelayer);
+    const CAmount nFee = ParseTokenFee(request, 5);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->ClaimTokens(strFail, txid, nHouseID, vProof, scriptPayout, nFeeBps, scriptRelayer, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid", txid.ToString());
+    return ret;
+}
+
+UniValue collecttokens(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
+        throw std::runtime_error(
+            "collecttokens \"id\" ( [\"Y\",...] fee )\n"
+            "\nAfter a failed house's claim window (v0.2.21): pay claims from the escrow - each its amount x\n"
+            "min(1, backing / claimed) at a note's share of the pot, less its relayer fee. Anyone can send it; this\n"
+            "wallet pays the fee. Default: up to 100 uncollected claims. With no claims made, it writes the backing off.\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\", \"collected\": n }\n"
+            + HelpExampleCli("collecttokens", "1")
+        );
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    std::vector<uint256> vY;
+    if (request.params.size() >= 2 && !request.params[1].isNull())
+        for (const UniValue& y : request.params[1].get_array().getValues())
+            vY.push_back(ParseTokenY(y));
+    const CAmount nFee = ParseTokenFee(request, 2);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->CollectTokens(strFail, txid, nHouseID, vY, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid", txid.ToString());
+    ret.pushKV("collected", (int64_t)vY.size());
+    return ret;
 }
 
 UniValue unlocknotes(const JSONRPCRequest& request)
@@ -4294,7 +4737,7 @@ UniValue transfernote(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 5)
         throw std::runtime_error(
             "transfernote\n"
             "\nArguments:\n"
@@ -4303,6 +4746,8 @@ UniValue transfernote(const JSONRPCRequest& request)
             "3. \"fee\"       (numeric or string, optional) default 0.001\n"
             "4. \"toaddress\" (string, optional) a FreeBank P2PKH address to pay the notes to;\n"
             "               omit or pass \"\" to transfer to a fresh key in this wallet (self)\n"
+            "5. \"fromaddress\" (string, optional) spend only this holder's notes (a P2PKH address of this wallet);\n"
+            "               change returns to it\n"
             "\nTransfer notes of a house held by this wallet (single sender). A note is a\n"
             "plain P2PKH coin, so any standard address can receive it; the payee's wallet\n"
             "recognizes the incoming note automatically.\n"
@@ -4339,7 +4784,9 @@ UniValue transfernote(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->TransferNote(strFail, txid, nHouseID, nUnits, nFee, scriptRecipient)) {
+    CKeyID keyFrom;
+    const bool fFrom = ParseFromAddress(request, 4, keyFrom);
+    if (!pwallet->TransferNote(strFail, txid, nHouseID, nUnits, nFee, scriptRecipient, fFrom ? &keyFrom : nullptr)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -4643,6 +5090,43 @@ UniValue claimnote(const JSONRPCRequest& request)
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
     return response;
+}
+
+UniValue listnotecoins(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() > 1)
+        throw std::runtime_error(
+            "listnotecoins ( id )\n"
+            "\nThis wallet's spendable note coins, one row each (v0.2.21): of one house, or of every house. Read-only;\n"
+            "answered on a locked wallet.\n"
+            "\nResult:\n"
+            "[ { \"house_id\": n, \"txid\": \"hex\", \"vout\": n, \"units\": n, \"address\": \"x\" (the holder's P2PKH address),\n"
+            "    \"confirmations\": n, \"demand_height\": n (0 if none), \"preauth\": true|false }, ... ]\n"
+            + HelpExampleCli("listnotecoins", "1")
+        );
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params.size() >= 1 && !request.params[0].isNull() ? request.params[0].get_int() : 0;
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+    std::vector<CWallet::NoteCoinRow> vRow;
+    pwallet->ListNoteCoins(nHouseID, vRow);
+    UniValue ret(UniValue::VARR);
+    for (const CWallet::NoteCoinRow& r : vRow) {
+        UniValue o(UniValue::VOBJ);
+        o.pushKV("house_id", (int64_t)r.nHouseID);
+        o.pushKV("txid", r.outpoint.hash.GetHex());
+        o.pushKV("vout", (int64_t)r.outpoint.n);
+        o.pushKV("units", r.units);
+        o.pushKV("address", EncodeDestination(CPubKey(r.vchHolderPubKey).GetID()));
+        o.pushKV("confirmations", (int64_t)std::max(0, r.nDepth));
+        o.pushKV("demand_height", (int64_t)NoteDemandHeightOf(r.nDemandHeight));
+        o.pushKV("preauth", NoteDemandIsPreAuth(r.nDemandHeight));
+        ret.push_back(o);
+    }
+    return ret;
 }
 
 UniValue listmynotes(const JSONRPCRequest& request)
@@ -7097,9 +7581,18 @@ static const CRPCCommand commands[] =
     { "bills",              "listmybills",                      &listmybills,                   {} },
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
     { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee", "address"} },
-    { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress"} },
-    { "notes",              "locknotes",                        &locknotes,                     {"id", "units", "fee"} },
+    { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress", "fromaddress"} },
+    { "notes",              "locknotes",                        &locknotes,                     {"id", "units", "fee", "fromaddress"} },
     { "notes",              "unlocknotes",                      &unlocknotes,                   {"id", "units", "fee", "address"} },
+    { "notes",              "createnotelock",                   &createnotelock,                {"id", "units", "fee", "fromaddress"} },
+    { "notes",              "approvenotelock",                  &approvenotelock,               {"hex"} },
+    { "notes",              "registertokenkeyset",              &registertokenkeyset,           {"id", "keys", "postingpubkey", "fee"} },
+    { "notes",              "posttokens",                       &posttokens,                    {"id", "keysetid", "issued", "spent", "fee"} },
+    { "notes",              "claimtokens",                      &claimtokens,                   {"id", "proofs", "payoutaddress", "feebps", "relayeraddress", "fee"} },
+    { "notes",              "collecttokens",                    &collecttokens,                 {"id", "ys", "fee"} },
+    { "notes",              "signtokenclaims",                  &signtokenclaims,               {"id", "proofs", "payoutaddress", "feebps", "relayeraddress"} },
+    { "notes",              "relaytokenclaims",                 &relaytokenclaims,              {"id", "entries", "fee"} },
+    { "notes",              "listnotecoins",                    &listnotecoins,                 {"id"} },
     { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
     { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
     { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout", "plain"} },

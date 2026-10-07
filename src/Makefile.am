@@ -147,6 +147,8 @@ BITCOIN_CORE_H = \
   bill.h \
   house.h \
   note.h \
+  cashu.h \
+  token.h \
   deposit.h \
   pool.h \
   settle.h \
@@ -345,6 +347,8 @@ libbitcoin_common_a_SOURCES = \
   bill.cpp \
   house.cpp \
   note.cpp \
+  cashu.cpp \
+  token.cpp \
   deposit.cpp \
   pool.cpp \
   settle.cpp \

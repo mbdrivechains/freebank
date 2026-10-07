@@ -116,6 +116,7 @@ public:
         consensus.vDeferInterestSchedule = {{0, 1000}};
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
         consensus.nDeferSilenceWindow = 4032;  // ~4 weeks after 2 missed cadences
+        consensus.nTokenClaimWindow = 4032;    // the token claim window: ~4 weeks from insolvency
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 347;  // ~5%/day / 144 blocks
         consensus.nOracleBrakeElapsedCap = 144;   // censor-charge bounded to one day's fall
@@ -295,6 +296,7 @@ public:
         consensus.vDeferInterestSchedule = {{0, 1000}};  // same as main (10%/yr from block 0)
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
         consensus.nDeferSilenceWindow = 40;    // gate-testable silence clock (main: 4032)
+        consensus.nTokenClaimWindow = 20;      // gate-testable claim window (main: 4032)
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 100000; // 10%/block: brake behavior testable in few blocks
         consensus.nOracleBrakeElapsedCap = 12;
