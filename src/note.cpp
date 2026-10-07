@@ -123,6 +123,31 @@ uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
     return ss.GetHash();
 }
 
+uint256 NoteLockSigHash(uint32_t nHouseID, uint64_t nUnits, const std::vector<uint64_t>& vChangeUnits,
+                        const uint256& hashPrevouts, const uint256& hashOutputs)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/lock");
+    ss << nHouseID;
+    ss << nUnits;
+    ss << vChangeUnits;
+    ss << hashPrevouts;   // tx-unique -> neither signer's approval is replayable
+    ss << hashOutputs;
+    return ss.GetHash();
+}
+
+uint256 NoteUnlockSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
+                          const uint256& hashPrevouts, const uint256& hashOutputs)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/unlock");
+    ss << nHouseID;
+    ss << vUnits;
+    ss << hashPrevouts;   // tx-unique -> an unlock's approvals are not replayable
+    ss << hashOutputs;
+    return ss.GetHash();
+}
+
 uint32_t DeferInterestBpsAt(const std::vector<Consensus::DeferInterestStep>& vSchedule, uint32_t nHeight)
 {
     uint32_t nBps = 0;
@@ -291,6 +316,8 @@ template bool DecodeNotePayload<NoteRedeem>(const std::vector<unsigned char>&, N
 template bool DecodeNotePayload<NoteClaim>(const std::vector<unsigned char>&, NoteClaim&);
 template bool DecodeNotePayload<NoteDemand>(const std::vector<unsigned char>&, NoteDemand&);
 template bool DecodeNotePayload<NoteProtest>(const std::vector<unsigned char>&, NoteProtest&);
+template bool DecodeNotePayload<NoteLock>(const std::vector<unsigned char>&, NoteLock&);
+template bool DecodeNotePayload<NoteUnlock>(const std::vector<unsigned char>&, NoteUnlock&);
 
 void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight)
 {
@@ -333,6 +360,17 @@ void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fCon
         NoteProtest pro;
         if (DecodeNotePayload(tx.vchNotePayload, pro) && pro.nHouseID != 0 && n < pro.vUnits.size())
             coin.SetNote(pro.nHouseID, pro.vUnits[n], pro.nDemandTag);
+    } else if (tx.nNoteOp == NOTE_OP_LOCK) {
+        // v0.2.20: a lock's change notes go back to the holder, undemanded
+        // (only undemanded notes can be locked).
+        NoteLock l;
+        if (DecodeNotePayload(tx.vchNotePayload, l) && l.nHouseID != 0 && n < l.vChangeUnits.size())
+            coin.SetNote(l.nHouseID, l.vChangeUnits[n], 0);
+    } else if (tx.nNoteOp == NOTE_OP_UNLOCK) {
+        // v0.2.20: released backing becomes ordinary undemanded notes.
+        NoteUnlock u;
+        if (DecodeNotePayload(tx.vchNotePayload, u) && u.nHouseID != 0 && n < u.vUnits.size())
+            coin.SetNote(u.nHouseID, u.vUnits[n], 0);
     } else if (tx.nNoteOp == NOTE_OP_REDEEM && n == 1) {
         // The dynamic-brassage spread (3.5) is an escrow output at vout[1].
         NoteRedeem r;
@@ -377,14 +415,29 @@ static bool CheckNoteOutputs(const CTransaction& tx, size_t nUnits, CValidationS
     return true;
 }
 
+/** The approver-array shape MINT checks inline (non-empty, sized, strictly
+ * ascending, sanely bounded sigs), for LOCK and UNLOCK. Index ranges against the
+ * partner set and the ECDSA are contextual (VerifyHouseApprovers). */
+static bool CheckNoteApproverShape(const std::vector<uint32_t>& vIndex, const std::vector<std::vector<unsigned char>>& vSig)
+{
+    if (vIndex.empty() || vIndex.size() != vSig.size())
+        return false;
+    for (size_t i = 0; i < vIndex.size(); i++) {
+        if (i > 0 && vIndex[i] <= vIndex[i - 1])
+            return false;
+        if (vSig[i].empty() || vSig[i].size() > 80)
+            return false;
+    }
+    return true;
+}
+
 bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
 {
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-note-coinbase");
 
-    // Reserved v1.5 bearer op-codes are inert in v1 (unreachable).
-    if (tx.nNoteOp == NOTE_OP_LOCK || tx.nNoteOp == NOTE_OP_UNLOCK)
-        return state.DoS(100, false, REJECT_INVALID, "bad-note-op-reserved");
+    // v0.2.20: LOCK (4) and UNLOCK (5), reserved inert since v1, are live (the
+    // token mint and burn record, D-2026-10-08-1).
     if (tx.nNoteOp < NOTE_OP_MINT || tx.nNoteOp > NOTE_OP_PROTEST)
         return state.DoS(100, false, REJECT_INVALID, "bad-note-op");
 
@@ -556,6 +609,39 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
         // they need the house record and the insolvency snapshot).
         if (tx.vout.empty() || (claim.fEscrowChange && tx.vout.size() < 2))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-vout");
+    }
+    else if (tx.nNoteOp == NOTE_OP_LOCK) {
+        NoteLock lock;
+        if (!DecodeNotePayload(tx.vchNotePayload, lock))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-payload");
+        if (lock.nUnits == 0 || lock.nUnits > (uint64_t)MAX_MONEY)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-units");
+        // Change is optional; when present it is note outputs at vout[0..] and
+        // the lock + change total stays in the money range.
+        if (!lock.vChangeUnits.empty()) {
+            uint64_t nChange = 0;
+            if (!SumNoteUnits(lock.vChangeUnits, nChange) || nChange > (uint64_t)MAX_MONEY - lock.nUnits)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-change-units");
+            if (!CheckNoteOutputs(tx, lock.vChangeUnits.size(), state))
+                return false;
+        }
+        if (!IsValidNotePubKey(lock.vchHolderPubKey) ||
+                lock.vchHolderSig.empty() || lock.vchHolderSig.size() > 80)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-auth");
+        if (!CheckNoteApproverShape(lock.vApproverIndex, lock.vApproverSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-approvers");
+    }
+    else if (tx.nNoteOp == NOTE_OP_UNLOCK) {
+        NoteUnlock unlock;
+        if (!DecodeNotePayload(tx.vchNotePayload, unlock))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-payload");
+        uint64_t total = 0;
+        if (!SumNoteUnits(unlock.vUnits, total))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-units");
+        if (!CheckNoteOutputs(tx, unlock.vUnits.size(), state))
+            return false;
+        if (!CheckNoteApproverShape(unlock.vApproverIndex, unlock.vApproverSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-approvers");
     }
 
     return true;

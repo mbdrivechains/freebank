@@ -1093,6 +1093,13 @@ public:
      * P2PKH script (a note is a plain P2PKH coin, so any standard address
      * works as the payee — note-ness comes from the tx payload tagging). */
     bool TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
+    /** v0.2.20 token MINT RECORD (NOTE_OP_LOCK): lock nUnits of this wallet's undemanded notes of the house as the
+     *  backing of its Chaumian tokens; change returns to the same holder. The wallet must hold the notes' key AND
+     *  the house's approver keys (both sign). */
+    bool LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    /** v0.2.20 token BURN RECORD (NOTE_OP_UNLOCK): release nUnits of the house's token backing as new notes to the
+     *  recipient (a P2PKH; default a fresh key of this wallet). House M-of-N approved; nUnits <= the backing. */
+    bool UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
     bool RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
     /** DEMAND, one op two modes keyed on house status (B3):
      * - Deferred: the 3.5 option-clause demand (plain; interest from demand).

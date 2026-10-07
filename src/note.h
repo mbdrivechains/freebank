@@ -44,8 +44,11 @@ class Coin;
 static const uint8_t NOTE_OP_MINT     = 1;
 static const uint8_t NOTE_OP_TRANSFER = 2;
 static const uint8_t NOTE_OP_REDEEM   = 3;
-// Reserved INERT for the v1.5 Chaumian bearer layer (D8). Rejected in v1 shape
-// (unreachable) so the op-codes are permanently claimed without behaviour.
+// v0.2.20 (D-2026-10-08-1): the on-chain record of a house's Chaumian tokens.
+// The op codes were reserved inert since v1 (D8) for exactly this. LOCK is the
+// MINT RECORD (notes leave circulation into the house's token backing), UNLOCK
+// the BURN RECORD (backing returns to note coins when tokens are redeemed).
+// Rules: docs-local/MINT_RECORD_SPEC.md.
 static const uint8_t NOTE_OP_LOCK     = 4;
 static const uint8_t NOTE_OP_UNLOCK   = 5;
 // Phase 3.4 insolvency waterfall: holder claims pro-rata from the escrow pot
@@ -314,6 +317,68 @@ struct NoteProtest {
     }
 };
 
+/** LOCK (v0.2.20, the token MINT RECORD): the holder hands note coin(s) of one
+ * house to that house's token backing; the house's Chaumian mint signs the same
+ * amount of bearer tokens off-chain. The spent notes leave circulation:
+ * CHouse.nTokenUnits += nUnits, nMintedUnits unchanged (a token is the same
+ * liability as the note it replaces). vout[0..vChangeUnits.size()-1] are change
+ * notes back to the holder's own P2PKH (tx_verify), so any amount can be locked
+ * in one tx. Approved by BOTH the holder and the house's M-of-N over
+ * NoteLockSigHash (house_id + units + change + inputs + outputs).
+ * Refused for a members-only house (tokens are bearer) and at an effectively
+ * Deferred / Insolvent / wound-down house; only undemanded P2PKH notes. */
+struct NoteLock {
+    uint32_t nHouseID;                                    // leading - guard convention
+    uint64_t nUnits;                                      // units moved into the token backing
+    std::vector<uint64_t> vChangeUnits;                   // parallel to the change note outputs (may be empty)
+    std::vector<unsigned char> vchHolderPubKey;           // must hash to every spent note input
+    std::vector<unsigned char> vchHolderSig;
+    std::vector<uint32_t> vApproverIndex;                 // strictly ascending
+    std::vector<std::vector<unsigned char>> vApproverSig;
+
+    NoteLock() : nHouseID(0), nUnits(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nUnits);
+        READWRITE(vChangeUnits);
+        READWRITE(vchHolderPubKey);
+        READWRITE(vchHolderSig);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
+    }
+};
+
+/** UNLOCK (v0.2.20, the token BURN RECORD): the house releases backing into new
+ * note coins when its mint burns redeemed tokens. vout[0..vUnits.size()-1] are
+ * the note coins (the MINT output shape) to whoever redeemed. Spends no notes.
+ * Rule: sum(vUnits) <= CHouse.nTokenUnits - a burn can never exceed what was
+ * minted, so tokens a mint over-issued off-chain can never be cashed against the
+ * backing. CHouse.nTokenUnits -= sum, nMintedUnits unchanged. Approved by the
+ * house's M-of-N over NoteUnlockSigHash; allowed in every house status, so token
+ * holders can always get their notes back (to redeem, demand or claim). */
+struct NoteUnlock {
+    uint32_t nHouseID;                                    // leading - guard convention
+    std::vector<uint64_t> vUnits;                         // parallel to the note outputs
+    std::vector<uint32_t> vApproverIndex;                 // strictly ascending
+    std::vector<std::vector<unsigned char>> vApproverSig;
+
+    NoteUnlock() : nHouseID(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(vUnits);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
+    }
+};
+
 /** REDEEM: the holder burns note coin(s) of one house (U units total) and is
  * paid base-coin. Holder protection is by SIGNATURE, not a consensus payout
  * floor: the holder signs (house_id + U + hashOutputs) AND supplies the P2PKH
@@ -427,6 +492,13 @@ uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits
 uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
                            const std::vector<unsigned char>& vchPayoutScript);
 uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
+/** v0.2.20 token records. Both bind hashPrevouts (tx-unique: approvals can't be
+ * replayed onto a second, differently-funded tx - the MINT rule) and the outputs.
+ * The holder and the house's approvers sign the SAME lock digest. */
+uint256 NoteLockSigHash(uint32_t nHouseID, uint64_t nUnits, const std::vector<uint64_t>& vChangeUnits,
+                        const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 NoteUnlockSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
+                          const uint256& hashPrevouts, const uint256& hashOutputs);
 
 /** The scheduled suspension-interest rate (bps/yr) at block nHeight: the last
  * step with nHeight <= the block (v0.2.18). 0 for an empty schedule. */

@@ -57,6 +57,12 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
   coin directly from reserves. A protest that rides through a lawful deferral re-arms at the
   recovery height rather than being cleared by it. RPCs: `mintnote`, `transfernote`,
   `redeemnote`, `demandnote`, `protestnote`, `dischargedemands`, `listmynotes`.
+- **Token records** (v0.2.20): a house may run a Chaumian mint (Cashu-style blind-signed bearer
+  tokens, off-chain). The chain keeps the public record: each mint locks the same amount of the
+  house's notes as backing (signed by the notes' holder and the house's partners), and each burn
+  releases backing as notes to the redeemer, never more than was locked. Tokens stay the house's
+  liability in every cap and in the payout if it fails. RPCs: `locknotes`, `unlocknotes`;
+  `gethouse` shows `tokenunits`. The mint and the token wallet are separate software.
 - **Discounting** (credit creation, the point of the whole thing): a house buys a bill of
   exchange from a holder, paying with its **own notes minted in the same operation** under
   the full reserve/leverage discipline, and books the bill as a loan asset — the Scottish
@@ -104,8 +110,17 @@ v0.2.14 lets block producers name their blocks and tightens the mempool to what 
 v0.2.15 keeps deposit crediting going when an unreadable eCash transaction shares a payout's block,
 v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reindex` safe,
 v0.2.17 checks every peg step against eCash itself,
-v0.2.18 brings ECX credit with no closure date, and assets, and
-v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant:
+v0.2.18 brings ECX credit with no closure date, and assets,
+v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant, and
+v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned:
+
+- **Token records** (v0.2.20). **A hard fork on the beta: every node must upgrade** (no `-reindex`, no
+  new flag). Two operations reserved since the first release become valid: the mint record
+  (`locknotes`) and the burn record (`unlocknotes`). A v0.2.19 node stops following the chain at the
+  first block that carries one; until then nothing splits. A burn can never exceed what was minted;
+  members-only houses can't run a mint; a suspended or failed house can't mint new tokens but can
+  always burn. FreeBank mainnet will have these rules from its first block. Details in the release
+  notes.
 
 - **Members-only houses** (v0.2.19). **A consensus change on the beta: every node must upgrade**
   (no `-reindex`, no new flag: a node runs the beta as before). A house can be registered as

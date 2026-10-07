@@ -245,8 +245,8 @@ BOOST_AUTO_TEST_CASE(chouse_v9_reads_v8_and_rewrites_byte_identical)
     BOOST_REQUIRE(!v8.empty());
     BOOST_REQUIRE_EQUAL(v8[0], (unsigned char)HOUSE_SER_VERSION);   // version leads
     v8[0] = 8;
-    BOOST_REQUIRE(v8.size() >= 13);
-    v8.resize(v8.size() - 13);           // drop the v10 flags byte and the three v9 uint32s
+    BOOST_REQUIRE(v8.size() >= 21);
+    v8.resize(v8.size() - 21);           // drop the v11 token u64, the v10 flags byte and the three v9 uint32s
     CHouse fromV8;
     BOOST_REQUIRE(Deser(v8, fromV8));
     BOOST_CHECK_EQUAL(fromV8.nProtestOpen, 0u);
@@ -390,11 +390,12 @@ BOOST_AUTO_TEST_CASE(shape_protest_is_in_range_and_reserved_ops_are_not)
     AddNoteCustodyOutputs(ok, 1);
     BOOST_CHECK_EQUAL(ShapeReject(ok), "");
 
-    // ...without opening the reserved v1.5 bearer codes, which stay inert
+    // v0.2.20: the v1.5 bearer codes (4, 5) are live as the token records, but a
+    // PROTEST payload under them still fails their own decode
     for (uint8_t op : {NOTE_OP_LOCK, NOTE_OP_UNLOCK}) {
         CMutableTransaction bad = NoteTx(op);
         SetNotePayload(bad, p);
-        BOOST_CHECK_EQUAL(ShapeReject(bad), "bad-note-op-reserved");
+        BOOST_CHECK_EQUAL(ShapeReject(bad), op == NOTE_OP_LOCK ? "bad-note-lock-payload" : "bad-note-unlock-payload");
     }
     // and 9 is still out of range - widening the ceiling must not widen it twice
     CMutableTransaction nine = NoteTx(9);

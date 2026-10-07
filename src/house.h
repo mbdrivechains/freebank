@@ -218,7 +218,9 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // exactly what every pre-B1 house has (no discount op existed).
 // v10 (members-only houses, v0.2.19): the house-type flags. A v9 record reads as 0 = open, which every pre-v0.2.19
 // house is (REGISTER_MO did not exist).
-static const uint8_t HOUSE_SER_VERSION = 10;
+// v11 (Chaumian token record, v0.2.20): nTokenUnits. A v10 record reads as 0, which every pre-v0.2.20 house holds
+// (NOTE_OP_LOCK was reserved inert).
+static const uint8_t HOUSE_SER_VERSION = 11;
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -267,6 +269,7 @@ struct CHouse {
     // Outstanding note units (Phase 3.2): the N in the CM-2 cap N + D <= lambda*E
     // and the house's on-chain liability (backs GetHouseLiabilities()). Grown by
     // NOTE_OP_MINT, shrunk by NOTE_OP_REDEEM; reorg-safe via net-delta staging.
+    // Includes nTokenUnits (v0.2.20): locking notes as token backing leaves it unchanged.
     uint64_t nMintedUnits;
     // Reserve attestation state (Phase 3.4). Stressed/Insolvent are DERIVED
     // from these by HouseEffectiveStatus() - status stays 'o' on disk until
@@ -385,6 +388,11 @@ struct CHouse {
     uint32_t nProtestDemandHeight;
     // v10: HOUSE_FLAG_* from HOUSE_OP_REGISTER_MO, immutable (spec 4.0). 0 = an open house.
     uint8_t nFlags;
+    // v11 (v0.2.20, D-2026-10-08-1): note units held as the backing of the house's Chaumian tokens - grown by
+    // NOTE_OP_LOCK (the mint record), shrunk by NOTE_OP_UNLOCK (the burn record), which can never take it below 0.
+    // Part of nMintedUnits, never in addition to it: the locked notes are still the house's liability, so every cap,
+    // the health report, wind-down and the failure payout count tokens as notes.
+    uint64_t nTokenUnits;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -395,7 +403,7 @@ struct CHouse {
                nDepositUnits(0), nDepositWtMatHi(0), nDepositWtMatLo(0),
                nInsolventDepositPrincipal(0), nLastSettleHeight(0),
                nLoanBookFace(0), nLoanWtMatHi(0), nLoanWtMatLo(0),
-               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0) {}
+               nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0), nTokenUnits(0) {}
 
     bool IsMembersOnly() const { return (nFlags & HOUSE_FLAG_MEMBERS_ONLY) != 0; }
     bool IsRedeemOnly() const { return (nFlags & HOUSE_FLAG_REDEEM_ONLY) != 0; }
@@ -521,6 +529,10 @@ struct CHouse {
         // v10: house-type flags. A v9 record is an open house (see HOUSE_SER_VERSION).
         if (nSerVersion >= 10) {
             READWRITE(nFlags);
+        }
+        // v11: the token backing. A v10 record has none (LOCK was inert): 0.
+        if (nSerVersion >= 11) {
+            READWRITE(nTokenUnits);
         }
     }
 

@@ -9,6 +9,7 @@
 
 #include <chainparams.h>
 #include <coins.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <key.h>
 #include <script/standard.h>
@@ -169,7 +170,8 @@ BOOST_AUTO_TEST_CASE(note_shape_rejections)
 {
     CValidationState state;
 
-    // Reserved bearer op-codes are inert (rejected)
+    // v0.2.20: LOCK / UNLOCK are live, but a payload of another op still fails
+    // their decode (each op has exactly one encoding)
     {
         CMutableTransaction mtx = MakeMintTx(1, 100);
         mtx.nNoteOp = NOTE_OP_LOCK;
@@ -506,7 +508,7 @@ BOOST_AUTO_TEST_CASE(note_claim_shape)
         CValidationState s3;
         BOOST_CHECK(!CheckNoteTransactionShape(CTransaction(MakeClaimTx(bad3)), s3));
     }
-    // Reserved bearer ops still rejected; op range now ends at CLAIM
+    // Out-of-range op codes rejected; LOCK with a CLAIM payload fails its decode
     {
         CMutableTransaction mtx = MakeClaimTx(claim);
         mtx.nNoteOp = NOTE_OP_CLAIM + 1;
@@ -903,6 +905,10 @@ static std::vector<CMutableTransaction> TaggerVectors()
     v.push_back(MakeNoteOpTx(NOTE_OP_REDEEM, r, 3));                // vout[1] = brassage escrow
     NoteClaim c; c.nHouseID = 7; c.fEscrowChange = 1;
     v.push_back(MakeNoteOpTx(NOTE_OP_CLAIM, c, 3));                 // vout[1] = escrow change
+    NoteLock lk; lk.nHouseID = 7; lk.nUnits = 50; lk.vChangeUnits = {800};
+    v.push_back(MakeNoteOpTx(NOTE_OP_LOCK, lk, 2));                 // vout[0] = change note, vout[1] = plain
+    NoteUnlock ul; ul.nHouseID = 7; ul.vUnits = {900, 950};
+    v.push_back(MakeNoteOpTx(NOTE_OP_UNLOCK, ul, 3));               // vout[2] = plain change
     return v;
 }
 
@@ -946,6 +952,11 @@ BOOST_AUTO_TEST_CASE(note_coin_tagger_matches_addcoins)
     BOOST_CHECK(!tag(5, 0).fNote && !tag(5, 0).fHouseEscrow);
     BOOST_CHECK(tag(5, 1).fHouseEscrow && tag(5, 1).nHouseID == 7);
     BOOST_CHECK(tag(6, 1).fHouseEscrow && tag(6, 1).nHouseID == 7);
+    // v0.2.20: a lock's change and an unlock's notes are plain undemanded notes
+    BOOST_CHECK(tag(7, 0).fNote && tag(7, 0).nNoteUnits == 800 && tag(7, 0).nDemandHeight == 0);
+    BOOST_CHECK(!tag(7, 1).fNote);
+    BOOST_CHECK(tag(8, 1).fNote && tag(8, 1).nNoteUnits == 950 && tag(8, 1).nDemandHeight == 0);
+    BOOST_CHECK(!tag(8, 2).fNote);
 }
 
 BOOST_AUTO_TEST_CASE(note_mempool_view_tags)
@@ -979,6 +990,283 @@ BOOST_AUTO_TEST_CASE(note_mempool_view_tags)
     BOOST_CHECK_EQUAL(coin.nDemandHeight, NoteDemandTag(60, NOTE_DEMAND_MODE_PREAUTH_QUEUE));
     BOOST_CHECK(view.GetCoin(COutPoint(v[5].GetHash(), 1), coin));       // escrow: house id 0, nothing chains
     BOOST_CHECK(coin.fHouseEscrow && coin.nHouseID == 0);
+}
+
+
+// ---------------------------------------------------------------------------
+// v0.2.20 Chaumian token records (D-2026-10-08-1, docs-local/MINT_RECORD_SPEC.md):
+// NOTE_OP_LOCK (the mint record) and NOTE_OP_UNLOCK (the burn record).
+// ---------------------------------------------------------------------------
+
+namespace {
+struct TokenHouse {
+    CKey keyPartner, keyHolder, keyOther;
+    std::vector<unsigned char> pubPartner, pubHolder, pubOther;
+    CHouse house;
+    TokenHouse()
+    {
+        pubPartner = FreshPubKey(keyPartner);
+        pubHolder = FreshPubKey(keyHolder);
+        pubOther = FreshPubKey(keyOther);
+        house.nHouseID = 3;
+        house.houseID = uint256S("70c3");
+        house.nTier = HOUSE_TIER_MULTI_PARTNER;
+        house.nThresholdM = 1;
+        house.strClassID = "tokens";
+        house.nDenomMgGold = 1000;
+        house.status = HOUSE_STATUS_OPEN;
+        house.nRegisteredHeight = 1000;
+        house.nLastAttestHeight = 1599;               // effectively Open at 1600
+        house.amountLastAttestReserves = 100 * COIN;
+        house.nMintedUnits = 1000000;
+        HousePartner p;
+        p.vchPubKey = pubPartner;
+        p.amountPledge = 10 * COIN;
+        p.status = HOUSE_PARTNER_ACTIVE;
+        house.vPartner.push_back(p);
+    }
+    std::function<bool(uint32_t, CHouse&)> Get() const
+    {
+        const CHouse h = house;
+        return [h](uint32_t id, CHouse& out) { if (id != h.nHouseID) return false; out = h; return true; };
+    }
+};
+
+// LOCK nUnits out of one note coin of nIn units (change back to the holder), with a plain fee input; both signers
+// sign the same digest unless told to forge.
+static CMutableTransaction MakeLockTx(const TokenHouse& t, uint64_t nUnits, uint64_t nIn,
+                                      bool fGoodHolder = true, bool fGoodHouse = true)
+{
+    NoteLock lock;
+    lock.nHouseID = t.house.nHouseID;
+    lock.nUnits = nUnits;
+    lock.vchHolderPubKey = t.pubHolder;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_LOCK;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0a"), 0)));   // the note
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0b"), 1)));   // fee
+    if (nIn > nUnits) {
+        lock.vChangeUnits.push_back(nIn - nUnits);
+        mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(t.pubHolder)));
+    }
+    const uint256 h = NoteLockSigHash(lock.nHouseID, lock.nUnits, lock.vChangeUnits,
+                                      NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    BOOST_REQUIRE((fGoodHolder ? t.keyHolder : t.keyOther).Sign(h, lock.vchHolderSig));
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE((fGoodHouse ? t.keyPartner : t.keyOther).Sign(h, sig));
+    lock.vApproverIndex.push_back(0);
+    lock.vApproverSig.push_back(sig);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << lock;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+
+static CMutableTransaction MakeUnlockTx(const TokenHouse& t, uint64_t nUnits, bool fGoodHouse = true)
+{
+    NoteUnlock unlock;
+    unlock.nHouseID = t.house.nHouseID;
+    unlock.vUnits.push_back(nUnits);
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_UNLOCK;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0c"), 0)));   // fee
+    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(t.pubHolder)));
+    const uint256 h = NoteUnlockSigHash(unlock.nHouseID, unlock.vUnits,
+                                        NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE((fGoodHouse ? t.keyPartner : t.keyOther).Sign(h, sig));
+    unlock.vApproverIndex.push_back(0);
+    unlock.vApproverSig.push_back(sig);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << unlock;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+
+static std::string TokenOp(const CMutableTransaction& mtx, const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                           CHouse* pOut = nullptr, int nHeight = 1600)
+{
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+    CValidationState state;
+    CHouse houseOut;
+    bool fChanged = false;
+    if (!CheckNoteOperation(CTransaction(mtx), state, nHeight, 1000, fnGetHouse, fnNoCoin, fnNoCoin, fnNoBlock,
+            houseOut, fChanged))
+        return state.GetRejectReason();
+    if (!fChanged)
+        return "unchanged";
+    if (pOut)
+        *pOut = houseOut;
+    return "OK";
+}
+
+static std::string TokenShape(const CMutableTransaction& mtx)
+{
+    CValidationState state;
+    return CheckNoteTransactionShape(CTransaction(mtx), state) ? "OK" : state.GetRejectReason();
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(token_record_shape)
+{
+    TokenHouse t;
+    BOOST_CHECK_EQUAL(TokenShape(MakeLockTx(t, 300, 300)), "OK");     // no change
+    BOOST_CHECK_EQUAL(TokenShape(MakeLockTx(t, 300, 1000)), "OK");    // change note at vout[0]
+    BOOST_CHECK_EQUAL(TokenShape(MakeUnlockTx(t, 200)), "OK");
+
+    auto withLock = [](CMutableTransaction mtx, const std::function<void(NoteLock&)>& f) {
+        NoteLock l; BOOST_REQUIRE(DecodeNotePayload(mtx.vchNotePayload, l)); f(l);
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << l;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        return mtx;
+    };
+    BOOST_CHECK_EQUAL(TokenShape(withLock(MakeLockTx(t, 300, 300), [](NoteLock& l) { l.nUnits = 0; })), "bad-note-lock-units");
+    BOOST_CHECK_EQUAL(TokenShape(withLock(MakeLockTx(t, 300, 300), [](NoteLock& l) { l.vchHolderPubKey.pop_back(); })), "bad-note-lock-auth");
+    BOOST_CHECK_EQUAL(TokenShape(withLock(MakeLockTx(t, 300, 300), [](NoteLock& l) { l.vApproverIndex.clear(); l.vApproverSig.clear(); })), "bad-note-lock-approvers");
+    BOOST_CHECK_EQUAL(TokenShape(withLock(MakeLockTx(t, 300, 300), [](NoteLock& l) { l.vChangeUnits = {0}; })), "bad-note-lock-change-units");
+    {
+        CMutableTransaction mtx = MakeLockTx(t, 300, 1000);
+        mtx.vout[0].nValue = NOTE_DUST_VALUE + 1;            // a change note must be dust-valued
+        BOOST_CHECK_EQUAL(TokenShape(mtx), "bad-note-output-value");
+    }
+    {
+        CMutableTransaction mtx = MakeUnlockTx(t, 200);
+        mtx.vout.clear();
+        BOOST_CHECK_EQUAL(TokenShape(mtx), "bad-note-vout-size");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(token_lock_and_unlock_records)
+{
+    TokenHouse t;
+    // The mint record: 300 of a 1000-unit note into the backing; the notes stay a liability.
+    CHouse after;
+    BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get(), &after), "OK");
+    BOOST_CHECK_EQUAL(after.nTokenUnits, 300U);
+    BOOST_CHECK_EQUAL(after.nMintedUnits, t.house.nMintedUnits);
+
+    // The burn record, against that backing: 200 out, then not more than the 100 left.
+    t.house = after;
+    CHouse after2;
+    BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get(), &after2), "OK");
+    BOOST_CHECK_EQUAL(after2.nTokenUnits, 100U);
+    BOOST_CHECK_EQUAL(after2.nMintedUnits, t.house.nMintedUnits);
+    t.house = after2;
+    BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 101), t.Get()), "bad-note-unlock-over-locked");
+    BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 100), t.Get()), "OK");
+    // Nothing locked: nothing to burn.
+    t.house.nTokenUnits = 0;
+    BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 1), t.Get()), "bad-note-unlock-over-locked");
+}
+
+BOOST_AUTO_TEST_CASE(token_records_need_their_signatures)
+{
+    TokenHouse t;
+    // A lock needs BOTH the holder and the house (Q1).
+    BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000, false, true), t.Get()), "bad-note-lock-sig");
+    BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000, true, false), t.Get()), "bad-note-lock-approver");
+    // An unlock needs the house.
+    t.house.nTokenUnits = 500;
+    BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200, false), t.Get()), "bad-note-unlock-approver");
+    // Approvals are bound to the exact tx: the lock's signatures don't carry to another input set.
+    CMutableTransaction mtx = MakeLockTx(t, 300, 1000);
+    mtx.vin[1].prevout = COutPoint(uint256S("0d"), 0);
+    BOOST_CHECK_EQUAL(TokenOp(mtx, t.Get()), "bad-note-lock-sig");
+}
+
+BOOST_AUTO_TEST_CASE(token_lock_house_rules)
+{
+    // Members-only houses can't run a mint (Q2).
+    {
+        TokenHouse t;
+        t.house.nFlags = HOUSE_FLAG_MEMBERS_ONLY;
+        BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-members-only");
+    }
+    // No new tokens while suspended or failed; burns still allowed (Q3).
+    {
+        TokenHouse t;
+        t.house.nDeferInvokedHeight = 1590;
+        t.house.nTokenUnits = 500;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(t.house, 1600), HOUSE_STATUS_DEFERRED);
+        BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-house-status");
+        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "OK");
+    }
+    {
+        TokenHouse t;
+        t.house.status = HOUSE_STATUS_INSOLVENT;
+        t.house.nTokenUnits = 500;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(t.house, 1600), HOUSE_STATUS_INSOLVENT);
+        BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-house-status");
+        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 200), t.Get()), "OK");
+    }
+    {
+        TokenHouse t;
+        t.house.status = HOUSE_STATUS_WOUNDDOWN;
+        BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-house-status");
+    }
+    // A stressed house may still convert notes it already issued (a lock issues no new liability).
+    {
+        TokenHouse t;
+        t.house.nStressSinceHeight = 1595;
+        if (HouseEffectiveStatus(t.house, 1600) == HOUSE_STATUS_STRESSED)
+            BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "OK");
+    }
+    // Defence in depth: the backing never exceeds the outstanding notes.
+    {
+        TokenHouse t;
+        t.house.nMintedUnits = 250;
+        BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), t.Get()), "bad-note-lock-over-outstanding");
+    }
+    // Unknown house.
+    {
+        TokenHouse t;
+        auto fnNone = [](uint32_t, CHouse&) { return false; };
+        BOOST_CHECK_EQUAL(TokenOp(MakeLockTx(t, 300, 1000), fnNone), "bad-note-unknown-house");
+        BOOST_CHECK_EQUAL(TokenOp(MakeUnlockTx(t, 1), fnNone), "bad-note-unknown-house");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(token_lock_inputs)
+{
+    // tx_verify: who may spend the notes a lock takes, conservation, and where change may go.
+    TokenHouse t;
+    auto inputs = [&](const CMutableTransaction& mtx, uint32_t nTag, const std::vector<unsigned char>& pubNote,
+                      uint64_t nNoteUnits) {
+        CCoinsView base;
+        CCoinsViewCache cache(&base);
+        Coin note(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(pubNote)), 100, false, false, false, uint256());
+        note.SetNote(t.house.nHouseID, nNoteUnits, nTag);
+        cache.AddCoin(COutPoint(uint256S("0a"), 0), std::move(note), false);
+        Coin fee(CTxOut(100000, GetScriptForDestination(CPubKey(t.pubHolder).GetID())), 100, false, false, false, uint256());
+        cache.AddCoin(COutPoint(uint256S("0b"), 1), std::move(fee), false);
+        CValidationState state;
+        CAmount nFee = 0;
+        return Consensus::CheckTxInputs(CTransaction(mtx), state, cache, 200, nFee) ? std::string("OK") : state.GetRejectReason();
+    };
+    BOOST_CHECK_EQUAL(inputs(MakeLockTx(t, 300, 1000), 0, t.pubHolder, 1000), "OK");
+    BOOST_CHECK_EQUAL(inputs(MakeLockTx(t, 1000, 1000), 0, t.pubHolder, 1000), "OK");
+    // in != locked + change
+    BOOST_CHECK_EQUAL(inputs(MakeLockTx(t, 300, 1000), 0, t.pubHolder, 900), "bad-note-lock-conservation");
+    // someone else's note
+    BOOST_CHECK_EQUAL(inputs(MakeLockTx(t, 300, 1000), 0, t.pubOther, 1000), "bad-note-input-not-holder");
+    // a demanded note carries an interest clock a token can't carry
+    BOOST_CHECK_EQUAL(inputs(MakeLockTx(t, 300, 1000), 1500, t.pubHolder, 1000), "bad-note-lock-demanded");
+    // change only back to the holder (a lock is not a transfer)
+    {
+        CMutableTransaction mtx = MakeLockTx(t, 300, 1000);
+        mtx.vout[0].scriptPubKey = NoteScriptForPubKey(t.pubOther);
+        BOOST_CHECK_EQUAL(inputs(mtx, 0, t.pubHolder, 1000), "bad-note-lock-change-not-holder");
+    }
+    // an unlock spends no notes
+    {
+        CMutableTransaction mtx = MakeUnlockTx(t, 200);
+        mtx.vin[0].prevout = COutPoint(uint256S("0b"), 1);         // the fee coin the view holds
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("0a"), 0)));
+        BOOST_CHECK_EQUAL(inputs(mtx, 0, t.pubHolder, 1000), "bad-txns-spend-note-coin");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

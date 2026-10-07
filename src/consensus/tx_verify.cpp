@@ -315,6 +315,10 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // nothing - the payload key must match the coin's embedded keyid.
             NoteProtest pro;
             if (DecodeNotePayload(tx.vchNotePayload, pro)) vchNoteKey = pro.vchHolderPubKey;
+        } else if (tx.nNoteOp == NOTE_OP_LOCK) {
+            // v0.2.20: the notes handed to the token backing are the holder's
+            NoteLock l;
+            if (DecodeNotePayload(tx.vchNotePayload, l)) vchNoteKey = l.vchHolderPubKey;
         }
         if (!vchNoteKey.empty()) {
             expectedNoteScript = NoteScriptForPubKey(vchNoteKey);
@@ -614,7 +618,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             const bool fNoteOpOK = tx.nVersion == TRANSACTION_NOTE_VERSION &&
                     (tx.nNoteOp == NOTE_OP_TRANSFER || tx.nNoteOp == NOTE_OP_REDEEM ||
                      tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_DEMAND ||
-                     tx.nNoteOp == NOTE_OP_PROTEST);
+                     tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_LOCK);
             const bool fPoolOpOK = tx.nVersion == TRANSACTION_POOL_VERSION &&
                     (tx.nPoolOp == POOL_OP_CREATE || tx.nPoolOp == POOL_OP_ADD_LIQ ||
                      tx.nPoolOp == POOL_OP_SWAP);
@@ -994,6 +998,45 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // min(U, U*pot/units)) is contextual - it needs the insolvency
             // snapshot from the house record. (MINT / TRANSFER spending
             // escrow is already rejected by the coin-loop guard above.)
+        }
+        else if (tx.nNoteOp == NOTE_OP_LOCK) {
+            // v0.2.20 token MINT RECORD. The status / members-only / approver
+            // checks and the nTokenUnits delta are contextual (CheckNoteOperation).
+            NoteLock l;
+            if (!DecodeNotePayload(tx.vchNotePayload, l))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-payload");
+            if (nNoteIn == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-inputs");
+            if (l.nHouseID != nNoteHouseIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-input-house-mismatch");
+            // Only plain par notes become token backing: a demanded note carries
+            // an interest clock (and a pre-auth one a standing payout) that a
+            // bearer token cannot carry. The uniformity rule above makes this
+            // one check cover every input; with tag 0 the holder pin above has
+            // already held each input to the holder's plain P2PKH.
+            if (nDemandHeightIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-demanded");
+            if (nHouseEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-op-spends-escrow");
+            // Conservation: in = locked + change, exactly.
+            uint64_t nChange = 0;
+            if (!l.vChangeUnits.empty() && !SumNoteUnits(l.vChangeUnits, nChange))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-change-units");
+            if (l.nUnits > (uint64_t)MAX_MONEY - nChange || l.nUnits + nChange != nNoteUnitsIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-conservation");
+            // Change goes back to the holder only: a lock must not double as a
+            // transfer to someone else.
+            for (size_t i = 0; i < l.vChangeUnits.size(); i++) {
+                if (!fHaveExpectedNote || tx.vout[i].scriptPubKey != expectedNoteScript)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-change-not-holder");
+            }
+        }
+        else if (tx.nNoteOp == NOTE_OP_UNLOCK) {
+            // v0.2.20 token BURN RECORD: backing returns as NEW note coins from
+            // plain fee inputs; it must not spend notes (the coin-loop guard
+            // already rejects it - this names the reason, like MINT).
+            if (nNoteIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-spends-note");
         }
     }
 

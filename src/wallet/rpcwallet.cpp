@@ -4188,6 +4188,106 @@ UniValue mintnote(const JSONRPCRequest& request)
     return response;
 }
 
+UniValue locknotes(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "locknotes \"id\" units ( fee )\n"
+            "\nRecord a mint of the house's Chaumian tokens on-chain (v0.2.20, NOTE_OP_LOCK): lock this wallet's\n"
+            "undemanded notes of the house as the tokens' backing. Change returns to the same holder. Needs the\n"
+            "notes' key and the house's approver keys in this wallet (both sign). Refused for a members-only house\n"
+            "and while the house is suspended or insolvent.\n"
+            "\nArguments:\n"
+            "1. \"id\"     (numeric, required) the house ID number\n"
+            "2. \"units\"  (numeric, required) note units to lock as token backing\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\" }\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("locknotes", "1 50000")
+            + HelpExampleRpc("locknotes", "1, 50000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3 && !request.params[2].isNull()) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->LockNotes(strFail, txid, nHouseID, nUnits, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
+UniValue unlocknotes(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+        throw std::runtime_error(
+            "unlocknotes \"id\" units ( fee \"address\" )\n"
+            "\nRecord a burn of the house's Chaumian tokens on-chain (v0.2.20, NOTE_OP_UNLOCK): release that many\n"
+            "units of the token backing as new notes, to whoever redeemed the tokens. House M-of-N approved.\n"
+            "Consensus refuses a burn above the backing (gethouse \"tokenunits\"). Allowed in every house status.\n"
+            "\nArguments:\n"
+            "1. \"id\"      (numeric, required) the house ID number\n"
+            "2. \"units\"   (numeric, required) units to release\n"
+            "3. \"fee\"     (numeric or string, optional) default 0.001\n"
+            "4. \"address\" (string, optional) the FreeBank P2PKH address that gets the notes; default a fresh key\n"
+            "               of this wallet\n"
+            "\nResult:\n"
+            "{ \"txid\": \"hex\" }\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("unlocknotes", "1 20000 0.001 \"Xredeemeraddress...\"")
+            + HelpExampleRpc("unlocknotes", "1, 20000")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = request.params[1].get_int64();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3 && !request.params[2].isNull()) nFee = AmountFromValue(request.params[2]);
+    CScript scriptRecipient;
+    if (request.params.size() >= 4 && !request.params[3].get_str().empty()) {
+        CTxDestination dest = DecodeDestination(request.params[3].get_str());
+        if (!boost::get<CKeyID>(&dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "The recipient must be a FreeBank P2PKH address");
+        scriptRecipient = GetScriptForDestination(dest);
+    }
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    uint256 txid;
+    std::string strFail = "";
+    if (!pwallet->UnlockNotes(strFail, txid, nHouseID, nUnits, nFee, scriptRecipient)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
 UniValue transfernote(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -6998,6 +7098,8 @@ static const CRPCCommand commands[] =
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
     { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee", "address"} },
     { "notes",              "transfernote",                     &transfernote,                  {"id", "units", "fee", "toaddress"} },
+    { "notes",              "locknotes",                        &locknotes,                     {"id", "units", "fee"} },
+    { "notes",              "unlocknotes",                      &unlocknotes,                   {"id", "units", "fee", "address"} },
     { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
     { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
     { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout", "plain"} },

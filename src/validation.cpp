@@ -826,10 +826,12 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     }
     // PROTEST (B3 T-b3) writes the CHouse protest fields, so it takes the
     // slot. DEMAND still does not - in either mode it re-issues coins and
-    // writes nothing onto the house record.
+    // writes nothing onto the house record. LOCK / UNLOCK (v0.2.20) write
+    // nTokenUnits, so they take it.
     if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
-             mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST) &&
+             mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
+             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
             mtx.vchNotePayload.size() >= 4) {
         memcpy(&nA, mtx.vchNotePayload.data(), 4);
         return nA != 0;
@@ -1889,7 +1891,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 // permanent-brick class; the guard is the only cure.
                 else if (!fIncomingRegister && mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                         (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
-                         mtx.nNoteOp == NOTE_OP_DEMAND) &&
+                         mtx.nNoteOp == NOTE_OP_DEMAND || mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
                         mtx.vchNotePayload.size() >= 4) {
                     uint32_t nTheirs = 0;
                     memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID leads every note payload
@@ -1973,10 +1975,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 const uint32_t nHouseTouched = houseResult.nHouseID;
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                     const CTransaction& mtx = mi->GetTx();
-                    // Another note mint/redeem/claim/protest for the same house?
+                    // Another note mint/redeem/claim/protest/lock/unlock for the same house?
                     if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
-                             mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST) &&
+                             mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
+                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
                             mtx.vchNotePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID is the leading field
@@ -2061,7 +2064,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4);
                         fTheirsHouseChanging = true;
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
-                            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM) &&
+                            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
+                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -2129,7 +2133,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
                         fTheirsHouseChanging = true;
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
-                            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM) &&
+                            (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
+                             mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -3103,8 +3108,10 @@ static bool CheckMembersOnlyOutputs(const CTransaction& tx, CValidationState& st
     // payload per output, so scanning every output of a large tx was unbounded work before any signature check).
     size_t nScan = 0;
     if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
-        NoteMint m; NoteTransfer x; NoteDemand d; NoteProtest pr;
+        NoteMint m; NoteTransfer x; NoteDemand d; NoteProtest pr; NoteLock lk; NoteUnlock ul;
         if (tx.nNoteOp == NOTE_OP_MINT && DecodeNotePayload(tx.vchNotePayload, m)) nScan = m.vUnits.size();
+        else if (tx.nNoteOp == NOTE_OP_LOCK && DecodeNotePayload(tx.vchNotePayload, lk)) nScan = lk.vChangeUnits.size();
+        else if (tx.nNoteOp == NOTE_OP_UNLOCK && DecodeNotePayload(tx.vchNotePayload, ul)) nScan = ul.vUnits.size();
         else if (tx.nNoteOp == NOTE_OP_TRANSFER && DecodeNotePayload(tx.vchNotePayload, x)) nScan = x.vUnits.size();
         else if (tx.nNoteOp == NOTE_OP_DEMAND && DecodeNotePayload(tx.vchNotePayload, d)) nScan = d.vUnits.size();
         else if (tx.nNoteOp == NOTE_OP_PROTEST && DecodeNotePayload(tx.vchNotePayload, pr)) nScan = pr.vUnits.size();
@@ -5127,6 +5134,68 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         return true;
     }
 
+    if (tx.nNoteOp == NOTE_OP_LOCK) {
+        // v0.2.20 token MINT RECORD (D-2026-10-08-1; docs-local/MINT_RECORD_SPEC.md). tx_verify has already pinned the
+        // inputs to the holder's undemanded P2PKH notes of this house and checked in = locked + change.
+        NoteLock lock;
+        if (!DecodeNotePayload(tx.vchNotePayload, lock))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-payload");
+        CHouse house;
+        if (!fnGetHouse(lock.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        // Tokens are bearer: anyone can hold them, which a members-only house exists to prevent (as for pools).
+        if (house.IsMembersOnly())
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-members-only");
+        // No new tokens at a suspended or failed house (Michael 2026-10-08, Q3); a stressed house may still convert
+        // existing notes, since a lock issues no new liability. Wound down has no notes to lock.
+        // State-dependent, so a low ban score (the member-op precedent): an honest relayer can send a lock across a
+        // status change.
+        const char status = HouseEffectiveStatus(house, nHeight);
+        if (status != HOUSE_STATUS_OPEN && status != HOUSE_STATUS_STRESSED)
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-lock-house-status");
+        // Both the holder and the house approve the exact lock (Q1).
+        const uint256 sighash = NoteLockSigHash(lock.nHouseID, lock.nUnits, lock.vChangeUnits, NoteHashPrevouts(tx), hashOutputs);
+        if (!CPubKey(lock.vchHolderPubKey).VerifyStrict(sighash, lock.vchHolderSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-sig");
+        if (!VerifyHouseApprovers(house, lock.vApproverIndex, lock.vApproverSig, sighash, house.nThresholdM, state,
+                "bad-note-lock-approver"))
+            return false;
+        // The backing is part of the outstanding notes, never more (defence in depth: locked notes existed).
+        if (house.nTokenUnits > house.nMintedUnits || lock.nUnits > house.nMintedUnits - house.nTokenUnits)
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-lock-over-outstanding");
+        house.nTokenUnits += lock.nUnits;
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    if (tx.nNoteOp == NOTE_OP_UNLOCK) {
+        // v0.2.20 token BURN RECORD. Allowed in every status (Q3): token holders can always get their notes back.
+        NoteUnlock unlock;
+        if (!DecodeNotePayload(tx.vchNotePayload, unlock))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-payload");
+        uint64_t total = 0;
+        if (!SumNoteUnits(unlock.vUnits, total))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unlock-units");
+        CHouse house;
+        if (!fnGetHouse(unlock.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        // The rule the record exists for: a burn can never exceed what was minted.
+        if (total > house.nTokenUnits)
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-unlock-over-locked");   // state-dependent
+        // A members-only house can't have locked anything; kept so new notes always pass the one rule.
+        if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
+            return false;
+        if (!VerifyHouseApprovers(house, unlock.vApproverIndex, unlock.vApproverSig,
+                NoteUnlockSigHash(unlock.nHouseID, unlock.vUnits, NoteHashPrevouts(tx), hashOutputs),
+                house.nThresholdM, state, "bad-note-unlock-approver"))
+            return false;
+        house.nTokenUnits -= total;
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
     return state.DoS(100, false, REJECT_INVALID, "bad-note-op");
 }
 
@@ -7130,6 +7199,45 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nMintedUnits -= total;
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write note mint undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nNoteOp == NOTE_OP_LOCK || tx.nNoteOp == NOTE_OP_UNLOCK) {
+                // v0.2.20 token records: the exact inverse of the connect delta, read from the self-contained payload
+                // (LOCK added nUnits to the backing, UNLOCK took sum(vUnits) out).
+                CHouse house;
+                uint32_t nHouse = 0;
+                uint64_t nDelta = 0;
+                bool fOK = false;
+                if (tx.nNoteOp == NOTE_OP_LOCK) {
+                    NoteLock lock;
+                    fOK = DecodeNotePayload(tx.vchNotePayload, lock);
+                    nHouse = lock.nHouseID;
+                    nDelta = lock.nUnits;
+                } else {
+                    NoteUnlock unlock;
+                    fOK = DecodeNotePayload(tx.vchNotePayload, unlock) && SumNoteUnits(unlock.vUnits, nDelta);
+                    nHouse = unlock.nHouseID;
+                }
+                if (!fOK || !phousetree->GetHouse(nHouse, house)) {
+                    error("DisconnectBlock(): Failed to undo note lock/unlock!");
+                    return DISCONNECT_FAILED;
+                }
+                if (tx.nNoteOp == NOTE_OP_LOCK) {
+                    if (house.nTokenUnits < nDelta) {
+                        error("DisconnectBlock(): Note lock undo unit mismatch!");
+                        return DISCONNECT_FAILED;
+                    }
+                    house.nTokenUnits -= nDelta;
+                } else {
+                    if (house.nTokenUnits > (uint64_t)MAX_MONEY - nDelta) {
+                        error("DisconnectBlock(): Note unlock undo unit mismatch!");
+                        return DISCONNECT_FAILED;
+                    }
+                    house.nTokenUnits += nDelta;
+                }
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write note lock/unlock undo!");
                     return DISCONNECT_FAILED;
                 }
             }

@@ -2353,6 +2353,16 @@ void CWallet::AvailableCoins(std::vector<COutput> &vCoins, bool fOnlySafe, const
                     NoteDemand dm;
                     if (DecodeNotePayload(pcoin->tx->vchNotePayload, dm) && i < dm.vUnits.size())
                         continue;
+                } else if (pcoin->tx->nNoteOp == NOTE_OP_LOCK) {
+                    // v0.2.20: a lock's change notes come back to the holder
+                    NoteLock lk;
+                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, lk) && i < lk.vChangeUnits.size())
+                        continue;
+                } else if (pcoin->tx->nNoteOp == NOTE_OP_UNLOCK) {
+                    // v0.2.20: released backing is new note coins
+                    NoteUnlock ul;
+                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, ul) && i < ul.vUnits.size())
+                        continue;
                 }
             }
 
@@ -3806,6 +3816,14 @@ static void CollectWalletNoteCoins(CWallet* pwallet, uint32_t nHouseID,
             // tracked here even though custody outputs are never IsMine.
             NoteProtest p;
             if (DecodeNotePayload(pcoin->tx->vchNotePayload, p)) { nHouse = p.nHouseID; vUnits = p.vUnits; }
+        } else if (pcoin->tx->nNoteOp == NOTE_OP_LOCK) {
+            // v0.2.20: a lock's change notes (vout[0..]) are live notes of the holder
+            NoteLock lk;
+            if (DecodeNotePayload(pcoin->tx->vchNotePayload, lk)) { nHouse = lk.nHouseID; vUnits = lk.vChangeUnits; }
+        } else if (pcoin->tx->nNoteOp == NOTE_OP_UNLOCK) {
+            // v0.2.20: released backing - whoever redeemed tokens holds these notes
+            NoteUnlock ul;
+            if (DecodeNotePayload(pcoin->tx->vchNotePayload, ul)) { nHouse = ul.nHouseID; vUnits = ul.vUnits; }
         } else {
             continue;
         }
@@ -4217,6 +4235,223 @@ bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHou
     CValidationState state;
     if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
         strFail = "Failed to commit note transfer! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    // A lock takes the house's one-per-block slot (it writes nTokenUnits): fail fast like MintNote.
+    if (HouseStateChangePending(nHouseID)) {
+        strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
+        return false;
+    }
+    if (nUnits == 0 || nUnits > (uint64_t)MAX_MONEY) { strFail = "Invalid note units!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    if (house.IsMembersOnly()) { strFail = "A members-only house can't issue tokens (they are bearer)!"; return false; }
+    const char status = HouseEffectiveStatus(house, chainActive.Height() + 1);
+    if (status != HOUSE_STATUS_OPEN && status != HOUSE_STATUS_STRESSED) {
+        strFail = "The house is suspended, insolvent or wound down - no new tokens!"; return false;
+    }
+
+    // One holder's UNDEMANDED notes (consensus refuses demanded or pre-auth coins), as TransferNote picks.
+    std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
+    CollectWalletNoteCoins(this, nHouseID, mapByHolder);
+    // Only CONFIRMED coins on the holder's plain P2PKH: the grouping tag is read from the UTXO set, so an unconfirmed
+    // demand or protest re-issue would group as tag 0 here and build a lock consensus refuses (review 2026-10-08).
+    std::vector<WalletNoteCoin> chosen;
+    for (const auto& kv : mapByHolder) {
+        if (kv.first.second != 0)
+            continue;
+        std::vector<WalletNoteCoin> vOK;
+        uint64_t sum = 0;
+        for (const WalletNoteCoin& nc : kv.second) {
+            Coin coinUtxo;
+            if (IsNotePreAuthScript(nc.script) || !pcoinsTip->GetCoin(nc.outpoint, coinUtxo) || coinUtxo.IsSpent() ||
+                    coinUtxo.nDemandHeight != 0)
+                continue;
+            vOK.push_back(nc);
+            sum += nc.units;
+        }
+        if (sum >= nUnits) { chosen = vOK; break; }
+    }
+    if (chosen.empty()) { strFail = "No single holder in this wallet has enough confirmed, undemanded notes of this house!"; return false; }
+    CKey keyHolder;
+    if (!GetKey(CPubKey(chosen[0].vchHolderPubKey).GetID(), keyHolder)) { strFail = "Holder key missing!"; return false; }
+
+    std::sort(chosen.begin(), chosen.end(), [](const WalletNoteCoin& a, const WalletNoteCoin& b){ return a.units > b.units; });
+    std::vector<WalletNoteCoin> spend;
+    uint64_t spent = 0;
+    for (const WalletNoteCoin& nc : chosen) { spend.push_back(nc); spent += nc.units; if (spent >= nUnits) break; }
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_LOCK;
+    NoteLock lock;
+    lock.nHouseID = nHouseID;
+    lock.nUnits = nUnits;
+    // vout[0] = change note back to the holder's own P2PKH (consensus requires exactly that script)
+    const uint64_t changeUnits = spent - nUnits;
+    if (changeUnits > 0) {
+        mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, chosen[0].script));
+        lock.vChangeUnits.push_back(changeUnits);
+    }
+
+    // Fund the change note's dust + fee (the locked notes' dust becomes fee). A lock of whole coins has no change
+    // note, so it keeps a plain change output instead (a tx needs one output): fund that much more.
+    const bool fNeedPlainOut = lock.vChangeUnits.empty();
+    const CAmount nMinPlain = fNeedPlainOut ? 10 * NOTE_DUST_VALUE : 0;
+    const CAmount nTarget = (CAmount)lock.vChangeUnits.size() * NOTE_DUST_VALUE + nFee;
+    std::vector<COutput> vCoins;
+    AvailableCoins(vCoins, true);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vCoins, nTarget + nMinPlain, setCoins, nAmountRet)) { strFail = "Could not fund the lock's dust + fee!"; return false; }
+    CReserveKey reserveKey(this);
+    const CAmount nChange = nAmountRet - nTarget;
+    if (nChange > 0) {
+        CPubKey vchPubKey;
+        if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
+        CTxOut out(nChange, GetScriptForDestination(vchPubKey.GetID()));
+        if (fNeedPlainOut || !IsDust(out, ::dustRelayFee)) mtx.vout.push_back(out);
+    }
+    if (mtx.vout.empty()) { strFail = "The lock has no output!"; return false; }
+
+    // Inputs before the signatures: the digest binds hashPrevouts (replay).
+    for (const WalletNoteCoin& nc : spend)
+        mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
+    lock.vchHolderPubKey = chosen[0].vchHolderPubKey;
+    const uint256 sighash = NoteLockSigHash(nHouseID, lock.nUnits, lock.vChangeUnits,
+                                            NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    if (!keyHolder.Sign(sighash, lock.vchHolderSig)) { strFail = "Failed to sign the lock as holder!"; return false; }
+    if (!SignHouseApprovers(this, house, sighash, lock.vApproverIndex, lock.vApproverSig, strFail))
+        return false;
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << lock;
+    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+
+    const CTransaction txToSign = mtx;
+    int nIn = 0;
+    for (const WalletNoteCoin& nc : spend) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, NOTE_DUST_VALUE, SIGHASH_ALL), nc.script, sigdata)) {
+            strFail = "Signing the locked note inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+    for (const auto& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL), coin.txout.scriptPubKey, sigdata)) {
+            strFail = "Signing the lock's funding inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit the lock! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+bool CWallet::UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    if (HouseStateChangePending(nHouseID)) {
+        strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
+        return false;
+    }
+    if (nUnits == 0 || nUnits > (uint64_t)MAX_MONEY) { strFail = "Invalid note units!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    if (nUnits > house.nTokenUnits) {
+        strFail = strprintf("Only %u units back this house's tokens - a burn can't exceed what was minted!", house.nTokenUnits);
+        return false;
+    }
+
+    CScript scriptHolder = scriptRecipient;
+    if (scriptHolder.empty()) {
+        CPubKey pubHolder;
+        if (!GetKeyFromPool(pubHolder)) { strFail = "Keypool ran out, please call keypoolrefill first!"; return false; }
+        scriptHolder = NoteScriptForPubKey(std::vector<unsigned char>(pubHolder.begin(), pubHolder.end()));
+    }
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_UNLOCK;
+    NoteUnlock unlock;
+    unlock.nHouseID = nHouseID;
+    unlock.vUnits.push_back(nUnits);
+    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, scriptHolder));
+
+    const CAmount nTarget = NOTE_DUST_VALUE + nFee;
+    std::vector<COutput> vCoins;
+    AvailableCoins(vCoins, true);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vCoins, nTarget, setCoins, nAmountRet)) { strFail = "Could not fund the unlock's dust + fee!"; return false; }
+    CReserveKey reserveKey(this);
+    const CAmount nChange = nAmountRet - nTarget;
+    if (nChange > 0) {
+        CPubKey vchPubKey;
+        if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
+        CTxOut out(nChange, GetScriptForDestination(vchPubKey.GetID()));
+        if (!IsDust(out, ::dustRelayFee)) mtx.vout.push_back(out);
+    }
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
+    if (!SignHouseApprovers(this, house,
+            NoteUnlockSigHash(nHouseID, unlock.vUnits, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+            unlock.vApproverIndex, unlock.vApproverSig, strFail))
+        return false;
+    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
+    ssPayload << unlock;
+    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+
+    const CTransaction txToSign = mtx;
+    int nIn = 0;
+    for (const auto& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL), coin.txout.scriptPubKey, sigdata)) {
+            strFail = "Signing the unlock's funding inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit the unlock! Reject reason: " + FormatStateMessage(state); return false;
     }
     txidOut = walletTx.tx->GetHash();
     return true;
@@ -5849,7 +6084,8 @@ static bool HouseStateChangePending(uint32_t nHouseID)
             memcpy(&nTheirs, mtx.vchHousePayload.data(), 4); fMatch = true;
         } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                 (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
-                 mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST) &&
+                 mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
+                 mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK) &&
                 mtx.vchNotePayload.size() >= 4) {
             // PROTEST (B3 T-b3) writes the house's protest fields = takes the
             // slot; mirrored in GetHouseSlotIDs and the ATMP scan - the

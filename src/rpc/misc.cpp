@@ -1896,6 +1896,9 @@ static UniValue HouseToJSON(const CHouse& house)
     obj.pushKV("lambdax10", (uint64_t)HOUSE_LAMBDA_X10[house.nTier <= MAX_HOUSE_TIER ? house.nTier : 0]);
     obj.pushKV("activeescrow", ValueFromAmount(house.ActiveEscrow()));
     obj.pushKV("mintedunits", house.nMintedUnits);
+    // v0.2.20: the part of mintedunits held as the backing of the house's Chaumian tokens (locked by the mint record,
+    // released by the burn record). Tokens outstanding can't be redeemed against more than this.
+    obj.pushKV("tokenunits", house.nTokenUnits);
     // Term-deposit accounting (Phase 3.8): the D in the shared cap N + D <=
     // lambda*E, and the weighted-average REMAINING term (blocks) of the deposit
     // book - the market's view of the maturity profile (a full bucketed ladder

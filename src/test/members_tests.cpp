@@ -137,11 +137,11 @@ BOOST_AUTO_TEST_CASE(members_chouse_v10_and_v9)
     BOOST_CHECK_EQUAL(back.nFlags, house.nFlags);
     BOOST_CHECK(back.IsMembersOnly() && back.IsRedeemOnly());
 
-    // A v9 record: version byte 9, no flags byte at the end -> an open house
+    // A v9 record: version byte 9, no flags byte (and no v11 token u64) at the end -> an open house
     std::vector<unsigned char> v(ss.begin(), ss.end());
     BOOST_REQUIRE_EQUAL(v[0], HOUSE_SER_VERSION);
     v[0] = 9;
-    v.pop_back();
+    v.resize(v.size() - (1 + sizeof(uint64_t)));
     CDataStream ss9(v, SER_DISK, CLIENT_VERSION);
     CHouse old;
     ss9 >> old;
