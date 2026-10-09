@@ -461,6 +461,9 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state);
  *  not the peer's (net_processing). */
 extern std::atomic<int64_t> g_nLastBmmUnknown;
 
+/** v0.2.23: send the pending withdrawal bundle to the enforcer again while eCash has not seen it (scheduled). */
+void MaybeReproposeWithdrawalBundle();
+
 enum class L1Answer;
 /** v0.2.17 B3 + D1: the pending bundle's outcome on the L1 as of hashMainBlock
  *  (see validation.cpp). Used by ConnectBlock and the block builder. */

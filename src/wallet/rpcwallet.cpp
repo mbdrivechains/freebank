@@ -6624,12 +6624,14 @@ UniValue attesthouse(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
             "attesthouse\n"
             "\nArguments:\n"
-            "1. \"id\"   (numeric, required) the house ID number\n"
-            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "1. \"id\"         (numeric, required) the house ID number\n"
+            "2. \"fee\"        (numeric or string, optional) default 0.001\n"
+            "3. \"allowzero\"  (boolean, optional) default false: attest zero reserves on purpose. Without it the\n"
+            "                 wallet refuses an attestation that would prove zero while the house last proved more\n"
             "\nPublish a reserve attestation: proves this wallet's plain\n"
             "confirmed coins as the house's liquid till. Below the\n"
             "10% floor the house turns Stressed; recovery needs 15%.\n"
@@ -6646,6 +6648,7 @@ UniValue attesthouse(const JSONRPCRequest& request)
     CAmount nFee = 100000;
     if (request.params.size() >= 2)
         nFee = AmountFromValue(request.params[1]);
+    const bool fAllowZero = request.params.size() >= 3 && request.params[2].get_bool();
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -6654,7 +6657,7 @@ UniValue attesthouse(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->AttestHouse(strFail, txid, nHouseID, nFee)) {
+    if (!pwallet->AttestHouse(strFail, txid, nHouseID, nFee, fAllowZero)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -7124,7 +7127,15 @@ UniValue signdiscount(const JSONRPCRequest& request)
             "\nEvery claim in the proposal is re-derived from the chain here; only the\n"
             "price and the expiry are the seller's to set.\n"
             "\nResult:\n"
-            "{ \"hex\": \"...\" }   (string) hand this back to the seller\n"
+            "{\n"
+            "  \"hex\": \"...\",          (string) hand this back to the seller\n"
+            "  \"face\": x.xxx,          (numeric) what the drawee owes at maturity\n"
+            "  \"price\": x.xxx,         (numeric) what the house pays now (new notes to the seller)\n"
+            "  \"bond\": x.xxx,          (numeric) the seller's bond in escrow\n"
+            "  \"max_deficiency\": x.xxx, (numeric) face not covered by the bond\n"
+            "  \"max_loss\": x.xxx       (numeric) price minus bond: the most the house loses if the drawee pays\n"
+            "                            nothing. Recourse to the seller is CAPPED at the bond, not added to it\n"
+            "}\n"
             "\nExamples:\n"
             + HelpExampleCli("signdiscount", "\"<proposalhex>\"")
             + HelpExampleRpc("signdiscount", "\"<proposalhex>\"")
@@ -7145,6 +7156,27 @@ UniValue signdiscount(const JSONRPCRequest& request)
     }
     UniValue response(UniValue::VOBJ);
     response.pushKV("hex", strHexTx);
+    // v0.2.23 (B1a(b)): show what the house takes on, so the bond and the seller's recourse cannot be counted
+    // twice by accident: recourse is capped at the bond (SignDiscount has already decoded and checked both).
+    DiscountProposalV1 prop;
+    CBill bill;
+    try {
+        std::vector<unsigned char> vch = ParseHex(strProposal);
+        CDataStream ss(vch, SER_NETWORK, PROTOCOL_VERSION);
+        ss >> prop;
+    } catch (const std::exception&) {
+        return response;
+    }
+    {
+        LOCK(cs_main);
+        if (!pbilltree->GetBill(prop.nBillID, bill))
+            return response;
+    }
+    response.pushKV("face", ValueFromAmount(bill.amount));
+    response.pushKV("price", ValueFromAmount(prop.amountPrice));
+    response.pushKV("bond", ValueFromAmount(bill.amountEscrow));
+    response.pushKV("max_deficiency", ValueFromAmount(std::max<CAmount>(0, bill.amount - bill.amountEscrow)));
+    response.pushKV("max_loss", ValueFromAmount(std::max<CAmount>(0, prop.amountPrice - bill.amountEscrow)));
     return response;
 }
 
@@ -7996,7 +8028,7 @@ static const CRPCCommand commands[] =
     { "houses",             "admitpartner",                     &admitpartner,                  {"id", "pledge", "fee"} },
     { "houses",             "exitpartner",                      &exitpartner,                   {"id", "partner", "fee"} },
     { "houses",             "winddownhouse",                    &winddownhouse,                 {"id", "fee"} },
-    { "houses",             "attesthouse",                      &attesthouse,                   {"id", "fee"} },
+    { "houses",             "attesthouse",                      &attesthouse,                   {"id", "fee", "allowzero"} },
     { "houses",             "deferhouse",                       &deferhouse,                    {"id", "fee"} },
     { "houses",             "renewdeferral",                    &renewdeferral,                 {"id", "fee"} },
     { "houses",             "releasereserves",                  &releasereserves,               {"id", "fee"} },

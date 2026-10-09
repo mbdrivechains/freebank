@@ -4582,7 +4582,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // key-signed coins - into a rule consensus can actually enforce.
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
                 (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-attest-stale");
+            return state.DoS(10, false, REJECT_INVALID, "bad-house-defer-attest-stale");   // v0.2.23: 10, as every attest-stale (a relay across a cadence boundary)
         if (tx.vout[0].scriptPubKey != HouseEscrowScript(house.houseID))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-lock-script");
         if (tx.vout[0].nValue < house.amountLastAttestReserves)
@@ -4738,7 +4738,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // figure, and a never-attested house has R = 0 and cannot mint.
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
                 (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
-            return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-attest-stale");
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-mint-attest-stale");   // v0.2.23: 10, as every attest-stale (a relay across a cadence boundary)
         // R-i7 (DR-1): the published figure must ALSO be PROVEN LIVE in this very
         // mint. The pre-R-i7 gate trusted the snapshot alone, so a house could
         // attest with flash reserves, spend them the next block, and mint the
@@ -8461,6 +8461,39 @@ void static FlushBlockFile(bool fFinalize = false)
     }
 }
 
+/** The block-index half of FlushStateToDisk: sync the block and undo files, then write the dirty block-file info and
+ *  block-index entries (synced). No coins flush. */
+static bool WriteBlockIndexToDisk(CValidationState& state)
+{
+    LOCK(cs_LastBlockFile);
+    // Depend on nMinDiskSpace to ensure we can write block index
+    if (!CheckDiskSpace(0))
+        return state.Error("out of disk space");
+    // First make sure all block and undo data is flushed to disk.
+    FlushBlockFile();
+    // Then update all block file information (which may refer to block and undo files).
+    std::vector<std::pair<int, const CBlockFileInfo*> > vFiles;
+    vFiles.reserve(setDirtyFileInfo.size());
+    for (int nFile : setDirtyFileInfo)
+        vFiles.push_back(std::make_pair(nFile, &vinfoBlockFile[nFile]));
+    std::vector<const CBlockIndex*> vBlocks;
+    vBlocks.reserve(setDirtyBlockIndex.size());
+    for (CBlockIndex* pindexDirty : setDirtyBlockIndex)
+        vBlocks.push_back(pindexDirty);
+    // v0.2.23 (review): the entries stay dirty until the write succeeded, and a write error (CDBWrapper throws)
+    // stops the node here. Called from ConnectBlock too, outside FlushStateToDisk's catch: before, a failed write
+    // left the entries clean but unwritten, and the side DBs' marker could again name a block missing on disk.
+    try {
+        if (!pblocktree->WriteBatchSync(vFiles, nLastBlockFile, vBlocks))
+            return AbortNode(state, "Failed to write to block index database");
+    } catch (const std::runtime_error& e) {
+        return AbortNode(state, std::string("System error while writing the block index: ") + e.what());
+    }
+    setDirtyFileInfo.clear();
+    setDirtyBlockIndex.clear();
+    return true;
+}
+
 static bool FindUndoPos(CValidationState &state, int nFile, CDiskBlockPos &pos, unsigned int nAddSize);
 
 static bool WriteUndoDataForBlock(const CBlockUndo& blockundo, CValidationState& state, CBlockIndex* pindex, const CChainParams& chainparams)
@@ -8770,6 +8803,57 @@ L1Answer GetBundleOutcomeOnL1(const SidechainWithdrawalBundle& bundle, const CBl
     return L1Answer::YES;
 }
 
+/** v0.2.23 (gateway STUCK_BUNDLE_DESIGN.md, part A; scheduled every 60 s): ConnectBlock sends a new pending bundle
+ *  to the enforcer once. If that enforcer drops it, or refuses it while another bundle for the slot is pending on
+ *  eCash, no node sends it again and it stays CREATED, with every later withdrawal behind it (V0213 D1). So while the
+ *  pending bundle is CREATED and eCash shows no event for it (not even Submitted), send it again every 6 eCash
+ *  blocks. Changes no consensus rule. */
+void MaybeReproposeWithdrawalBundle()
+{
+    static const int RESEND_L1_BLOCKS = 6;
+    static uint256 hashTracked;
+    static int nL1HeightSent = 0;
+    static int nL1HeightUnanswered = -1;
+    // Only the enforcer transport reports bundle events; held answers (a mismatched enforcer) are no answers
+    if (!psidechaintree || IsInitialBlockDownload() || GetL1Transport() != L1Transport::ENFORCER || L1AnswersHeld())
+        return;
+    SidechainWithdrawalBundle bundle;
+    uint256 hashBundle;
+    const CBlockIndex* pindexTip = nullptr;
+    {
+        LOCK(cs_main);
+        if (!psidechaintree->GetLastWithdrawalBundleHash(hashBundle) || hashBundle.IsNull() ||
+                !psidechaintree->GetWithdrawalBundle(hashBundle, bundle) || bundle.status != WITHDRAWAL_BUNDLE_CREATED)
+            return;
+        pindexTip = chainActive.Tip();
+    }
+    const int nL1Height = bmmCache.GetCachedBlockCount();
+    const uint256 hashL1Tip = bmmCache.GetLastMainBlockHash();
+    if (!pindexTip || hashL1Tip.IsNull())
+        return;
+    if (hashBundle != hashTracked) {
+        // First look at this bundle in this process. ConnectBlock sent it (also before a restart: the record
+        // persists): give its M3 6 eCash blocks first. Never sent from here: ask eCash now.
+        hashTracked = hashBundle;
+        nL1HeightSent = bmmCache.HaveBroadcastedWithdrawalBundle(hashBundle) ? nL1Height : nL1Height - RESEND_L1_BLOCKS;
+        nL1HeightUnanswered = -1;
+    }
+    if (nL1Height - nL1HeightSent < RESEND_L1_BLOCKS || nL1Height == nL1HeightUnanswered)
+        return;
+    char cOutcome = 0;
+    if (GetBundleOutcomeOnL1(bundle, pindexTip, hashL1Tip, cOutcome) != L1Answer::YES) {
+        nL1HeightUnanswered = nL1Height;   // can't tell: ask again once eCash has moved
+        return;
+    }
+    nL1HeightSent = nL1Height;
+    if (cOutcome != 0)
+        return;   // eCash has it (Submitted, Succeeded or Failed): nothing to send
+    SidechainClient client;
+    const bool fSent = client.BroadcastWithdrawalBundle(EncodeHexTx(bundle.tx));
+    LogPrintf("%s: pending withdrawal bundle %s is not on eCash as of L1 height %d: %s\n", __func__,
+              hashBundle.ToString(), nL1Height, fSent ? "sent to the enforcer again" : "sending it again failed");
+}
+
 bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
                   CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck, bool fCheckBMM, ConnectTrace* connectTrace,
                   bool fSideDB)
@@ -8942,6 +9026,13 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     // reject this node's own valid block for good; so they are skipped, and the
     // block's effects are not written again.
     bool fSidechainDBReplay = false;
+    // v0.2.23: the side DBs save this block as their best block with its effects (synced); the block index saves
+    // hourly. Write the index first (the periodic write, early), so that after a hard stop the markers always name a
+    // block the node knows. Otherwise VerifyDB's reconnect at startup (check level 4) and every block reconnected from
+    // disk find a marker on an unknown block and stop with "-reindex" (miner2, power cut 2026-10-09; gate
+    // crash_flushed_roundtrip). Not for VerifyDB's throwaway reconnect (fSideDB=false), which writes no side DB.
+    if (!fJustCheck && fSideDB && setDirtyBlockIndex.count(pindex) && !WriteBlockIndexToDisk(state))
+        return false;
     if (!fJustCheck) {
         const auto SideDBReplayStatus = [&](const uint256& hashSideBest, bool& fReplayOut) {
             fReplayOut = false;
@@ -10641,29 +10732,8 @@ bool static FlushStateToDisk(const CChainParams& chainparams, CValidationState &
         fDoFullFlush = (mode == FLUSH_STATE_ALWAYS) || fCacheLarge || fCacheCritical || fPeriodicFlush || fFlushForPrune;
         // Write blocks and block index to disk.
         if (fDoFullFlush || fPeriodicWrite) {
-            // Depend on nMinDiskSpace to ensure we can write block index
-            if (!CheckDiskSpace(0))
-                return state.Error("out of disk space");
-            // First make sure all block and undo data is flushed to disk.
-            FlushBlockFile();
-            // Then update all block file information (which may refer to block and undo files).
-            {
-                std::vector<std::pair<int, const CBlockFileInfo*> > vFiles;
-                vFiles.reserve(setDirtyFileInfo.size());
-                for (std::set<int>::iterator it = setDirtyFileInfo.begin(); it != setDirtyFileInfo.end(); ) {
-                    vFiles.push_back(std::make_pair(*it, &vinfoBlockFile[*it]));
-                    setDirtyFileInfo.erase(it++);
-                }
-                std::vector<const CBlockIndex*> vBlocks;
-                vBlocks.reserve(setDirtyBlockIndex.size());
-                for (std::set<CBlockIndex*>::iterator it = setDirtyBlockIndex.begin(); it != setDirtyBlockIndex.end(); ) {
-                    vBlocks.push_back(*it);
-                    setDirtyBlockIndex.erase(it++);
-                }
-                if (!pblocktree->WriteBatchSync(vFiles, nLastBlockFile, vBlocks)) {
-                    return AbortNode(state, "Failed to write to block index database");
-                }
-            }
+            if (!WriteBlockIndexToDisk(state))
+                return false;
             // Finally remove any pruned files
             if (fFlushForPrune)
                 UnlinkPrunedFiles(setFilesToPrune);
@@ -11048,6 +11118,12 @@ bool CChainState::ActivateBestChainStep(CValidationState& state, const CChainPar
         // If any blocks were disconnected, disconnectpool may be non empty.  Add
         // any disconnected transactions back to the mempool.
         UpdateMempoolForReorg(disconnectpool, true);
+        // v0.2.23 (review): save the chainstate after a reorg. The side DBs
+        // follow every block, so after a reorg and a hard stop they stood on
+        // the new branch while the chainstate's last save was on the old one,
+        // and startup's VerifyDB (level 4) demanded -reindex.
+        if (!FlushStateToDisk(chainparams, state, FLUSH_STATE_ALWAYS))
+            return false;
     }
     mempool.check(pcoinsTip.get());
 
@@ -11238,6 +11314,10 @@ bool CChainState::InvalidateBlock(CValidationState& state, const CChainParams& c
 
     InvalidChainFound(pindex);
     uiInterface.NotifyBlockTip(IsInitialBlockDownload(), pindex->pprev);
+    // v0.2.23 (review): save the chainstate after the disconnects, as after a
+    // reorg (ActivateBestChainStep): the side DBs already stand on the new tip.
+    if (!FlushStateToDisk(chainparams, state, FLUSH_STATE_ALWAYS))
+        return false;
     return true;
 }
 bool InvalidateBlock(CValidationState& state, const CChainParams& chainparams, CBlockIndex *pindex) {

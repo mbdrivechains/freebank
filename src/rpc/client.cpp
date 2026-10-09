@@ -317,6 +317,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "winddownhouse", 1, "fee" },
     { "attesthouse", 0, "id" },
     { "attesthouse", 1, "fee" },
+    { "attesthouse", 2, "allowzero" },
     { "deferhouse", 0, "id" },
     { "deferhouse", 1, "fee" },
     { "releasereserves", 0, "id" },

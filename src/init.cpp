@@ -2173,7 +2173,8 @@ bool AppInitMain()
     // replay won, and a -reindex without a loadable mainblockhash.dat reset
     // the chain to height 0. The replay cases: -reindex (including one resumed
     // from the on-disk flag), -reindex-chainstate or an empty chainstate over
-    // an indexed chain (an interrupted one), -loadblock, bootstrap.dat.
+    // an indexed chain (an interrupted one), -loadblock, bootstrap.dat, and
+    // blocks saved past the chainstate by an unclean stop (v0.2.23).
     // -updatemainblockcache=0 skips this as it skips the refill below.
     bool fUpdateCache = gArgs.GetBoolArg("-updatemainblockcache", true);
     std::string strReplay;
@@ -2187,10 +2188,29 @@ bool AppInitMain()
             strReplay = "-loadblock";
         else if (fs::exists(GetDataDir() / "bootstrap.dat"))
             strReplay = "bootstrap.dat";
+        else if (chainActive.Tip() != nullptr) {
+            // v0.2.23: blocks saved past the chainstate (an unclean stop after
+            // the block index was written, but not the chainstate). ThreadImport
+            // reconnects them from disk as an import, where an L1 block missing
+            // from the cache is a definite bad-mc-prev; without this fill they
+            // met the cache of the last clean stop and were marked invalid for
+            // good (gate crash_flushed_roundtrip).
+            for (const auto& entry : mapBlockIndex) {
+                const CBlockIndex* pindex = entry.second;
+                if ((pindex->nStatus & BLOCK_HAVE_DATA) && pindex->nChainTx && !(pindex->nStatus & BLOCK_FAILED_MASK)
+                        && pindex->nHeight > chainActive.Tip()->nHeight) {
+                    strReplay = "blocks saved past the chainstate (an unclean stop)";
+                    break;
+                }
+            }
+        }
     }
     bool fReplayCacheFilled = false;
     if (fUpdateCache && !strReplay.empty()) {
-        const int64_t nWait = gArgs.GetArg("-replaycachewait", DEFAULT_REPLAY_CACHE_WAIT);
+        // v0.2.23 (review): after an unclean stop the L1 node and the enforcer are often still coming back too (one
+        // power cut stops them all): wait for them until shutdown, unless -replaycachewait says otherwise.
+        const bool fUnclean = strReplay.find("unclean stop") != std::string::npos;
+        const int64_t nWait = gArgs.GetArg("-replaycachewait", fUnclean ? 0 : DEFAULT_REPLAY_CACHE_WAIT);
         uiInterface.InitMessage(_("Filling the mainchain block cache before the block replay..."));
         LogPrintf("%s: block replay pending (%s): filling the mainchain block cache first (-replaycachewait=%d)\n",
                   __func__, strReplay, nWait);
@@ -2202,7 +2222,8 @@ bool AppInitMain()
             if (ShutdownRequested())
                 return false;
             return InitError(strprintf(_("Could not fill the mainchain block cache before the block replay (%s): %s. "
-                                         "Nothing was replayed. A pending -reindex or -reindex-chainstate resumes on the next start; "
+                                         "Nothing was replayed. A pending -reindex or -reindex-chainstate, and blocks saved before an unclean stop, "
+                                         "resume on the next start; "
                                          "-loadblock needs the option again. Check that the enforcer (-enforceraddr) and the mainchain "
                                          "node are up and synced, or raise -replaycachewait (0 = wait until shutdown). If the mainchain "
                                          "was rolled back or restored from an older copy for good, delete mainblockhash.dat in the data "
@@ -2334,6 +2355,8 @@ bool AppInitMain()
     // mainchain to answer again and turn it back on (v0.2.11).
     scheduler.scheduleEvery(&MaybeRestoreMainchainConnection, 30 * 1000);
     scheduler.scheduleEvery(&MaybeVerifyEnforcer, 30 * 1000);
+    // v0.2.23: a pending withdrawal bundle eCash has not seen is sent again (STUCK_BUNDLE_DESIGN part A)
+    scheduler.scheduleEvery(&MaybeReproposeWithdrawalBundle, 60 * 1000);
 
     uiInterface.InitMessage(_("Done loading"));
 

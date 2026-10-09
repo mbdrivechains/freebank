@@ -126,8 +126,15 @@ v0.2.17 checks every peg step against eCash itself,
 v0.2.18 brings ECX credit with no closure date, and assets,
 v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant,
 v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned,
-v0.2.21 lets token holders claim at a failed house without its partners, and
-v0.2.22 lets any number of houses net their notes in one settlement:
+v0.2.21 lets token holders claim at a failed house without its partners,
+v0.2.22 lets any number of houses net their notes in one settlement, and
+v0.2.23 lets a node restart on its own after a power cut:
+
+- **Restart after a power cut, and wallet fixes** (v0.2.23). **No consensus change:** upgrade when it suits you, a
+  binary swap with no `-reindex`. A node that lost power (or crashed) after new blocks, or right after a reorg, now
+  restarts on its own instead of asking for `-reindex`. `attesthouse` refuses an attestation that would prove zero
+  reserves (pass `allowzero=true` to mean it); `getbalance` no longer counts note coins; `signdiscount` shows the most
+  the house can lose; a pending withdrawal bundle is proposed again until eCash has it. Details in the release notes.
 
 - **Netting** (v0.2.22). **A hard fork on the beta: every node must upgrade** (no `-reindex`, no
   new flag). One new operation: a netting round, in which two or more houses hand in each other's

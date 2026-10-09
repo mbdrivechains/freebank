@@ -1886,6 +1886,9 @@ CAmount CWalletTx::GetAvailableCredit(bool fUseCache) const
         {
             if (fUnconfirmedAssetTx || pwallet->IsOutputAssetColoured(*this, i, nDepth))
                 continue;
+            // v0.2.23 (C7(b)): nor are credit-tagged coins, which listunspent hides
+            if (pwallet->IsCreditTaggedOutput(*this, i))
+                continue;
             const CTxOut &txout = tx->vout[i];
             nCredit += pwallet->GetCredit(txout, ISMINE_SPENDABLE);
             if (!MoneyRange(nCredit))
@@ -1933,6 +1936,8 @@ CAmount CWalletTx::GetAvailableWatchOnlyCredit(const bool fUseCache) const
         {
             if (fUnconfirmedAssetTx || pwallet->IsOutputAssetColoured(*this, i, nDepth))
                 continue;    // v0.2.18: asset coins are not ECX
+            if (pwallet->IsCreditTaggedOutput(*this, i))
+                continue;    // v0.2.23: nor are credit-tagged coins
             const CTxOut &txout = tx->vout[i];
             nCredit += pwallet->GetCredit(txout, ISMINE_WATCH_ONLY);
             if (!MoneyRange(nCredit))
@@ -2116,7 +2121,21 @@ std::string CWallet::GetEncryptionWarning() const
 {
     if (IsCrypted())
         return "";
-    return WalletEncryptionWarning(false, GetBalance() + GetUnconfirmedBalance() + GetImmatureBalance());
+    // v0.2.23 (review): the balances leave out credit-tagged coins (notes, receipts, pool coins), but those are value
+    // an unencrypted wallet puts at risk too
+    CAmount nTagged = 0;
+    {
+        LOCK2(cs_main, cs_wallet);
+        for (const auto& entry : mapWallet) {
+            const CWalletTx& wtx = entry.second;
+            if (wtx.GetDepthInMainChain() < 0)
+                continue;
+            for (unsigned int i = 0; i < wtx.tx->vout.size(); i++)
+                if (!IsSpent(entry.first, i) && (IsMine(wtx.tx->vout[i]) & ISMINE_SPENDABLE) && IsCreditTaggedOutput(wtx, i))
+                    nTagged += wtx.tx->vout[i].nValue;
+        }
+    }
+    return WalletEncryptionWarning(false, GetBalance() + GetUnconfirmedBalance() + GetImmatureBalance() + nTagged);
 }
 
 CAmount CWallet::GetImmatureBalance() const
@@ -2236,6 +2255,98 @@ CAmount CWallet::GetAvailableBalance(const CCoinControl* coinControl) const
     return balance;
 }
 
+/** v0.2.23: an output consensus locks to a credit operation (bill title or escrow, notes, term-deposit receipts,
+ *  pool coins). Not ECX: coin selection never offers one (AvailableCoins) and the balance does not count it
+ *  (GetAvailableCredit: before, getbalance counted what listunspent hid, C7(b)). Asset coins are checked apart. */
+bool CWallet::IsCreditTaggedOutput(const CWalletTx& wtx, unsigned int i) const
+{
+    // Skip bill title & escrow outputs - locked to bill operations
+    // Skip consensus-tagged v11 outputs. Decided by the SAME
+    // payload-pure tagger consensus uses, so this skip cannot drift -
+    // the enumerated form here covered ISSUE and ENDORSE only, and a
+    // DISCOUNT's title AND its minted note leg would have been offered
+    // as fee coins: the fifth recurrence of the class documented below.
+    // The seller's whole payment sits in those note outputs.
+    if (wtx.tx->nVersion == TRANSACTION_BILL_VERSION) {
+        Coin coinProbe;
+        ApplyBillCoinTags(*wtx.tx, i, coinProbe);
+        if (coinProbe.fBill || coinProbe.fBillEscrow || coinProbe.fNote)
+            return true;
+    }
+
+    // Skip note outputs - they are P2PKH (IsMine) but consensus locks
+    // them to v13 TRANSFER/REDEEM; spending one as a base fee coin would
+    // build a tx the note guard rejects.
+    if (wtx.tx->nVersion == TRANSACTION_NOTE_VERSION) {
+        if (wtx.tx->nNoteOp == NOTE_OP_MINT) {
+            NoteMint m;
+            if (DecodeNotePayload(wtx.tx->vchNotePayload, m) && i < m.vUnits.size())
+                return true;
+        } else if (wtx.tx->nNoteOp == NOTE_OP_TRANSFER) {
+            NoteTransfer x;
+            if (DecodeNotePayload(wtx.tx->vchNotePayload, x) && i < x.vUnits.size())
+                return true;
+        } else if (wtx.tx->nNoteOp == NOTE_OP_DEMAND) {
+            // A DEMAND RE-ISSUES its notes and AddCoins tags them fNote
+            // (coins.cpp, the nNoteDemandHeight arm) - but this skip
+            // enumerated MINT and TRANSFER only, so a demanded note has
+            // been offered as a fee coin since 3.5. Same class as the
+            // four below, and worse in consequence: a demanded note
+            // carries an interest clock, so losing it to an unminable
+            // spend strands principal AND accrued deferral interest.
+            // Found while closing the v11 instance; the enumerations
+            // here should follow the pool/bill arms onto a shared
+            // payload-pure tagger (NEXT.md A8).
+            NoteDemand dm;
+            if (DecodeNotePayload(wtx.tx->vchNotePayload, dm) && i < dm.vUnits.size())
+                return true;
+        } else if (wtx.tx->nNoteOp == NOTE_OP_LOCK) {
+            // v0.2.20: a lock's change notes come back to the holder
+            NoteLock lk;
+            if (DecodeNotePayload(wtx.tx->vchNotePayload, lk) && i < lk.vChangeUnits.size())
+                return true;
+        } else if (wtx.tx->nNoteOp == NOTE_OP_UNLOCK) {
+            // v0.2.20: released backing is new note coins
+            NoteUnlock ul;
+            if (DecodeNotePayload(wtx.tx->vchNotePayload, ul) && i < ul.vUnits.size())
+                return true;
+        }
+    }
+
+    // Skip term-deposit RECEIPT outputs (same reason as notes): P2PKH and
+    // IsMine, but consensus locks a receipt coin to its house's v14
+    // TRANSFER/WITHDRAW/CLAIM. Offering one as a base fee coin lets a later
+    // funding SelectCoins grab it - the wallet then records the receipt as
+    // spent by a tx the deposit guard rejects, silently STRANDING the
+    // deposit (its liability D stays on the house books but the holder can
+    // no longer find the receipt to withdraw/claim). ORIGINATE receipts are
+    // vout[0..n-1]; a TRANSFER receipt is vout[0]. WITHDRAW/CLAIM outputs
+    // are plain base-coin payouts and stay spendable.
+    if (wtx.tx->nVersion == TRANSACTION_DEPOSIT_VERSION) {
+        if (wtx.tx->nDepositOp == DEPOSIT_OP_ORIGINATE) {
+            DepositOriginate o;
+            if (DecodeDepositPayload(wtx.tx->vchDepositPayload, o) && i < o.vPrincipal.size())
+                return true;
+        } else if (wtx.tx->nDepositOp == DEPOSIT_OP_TRANSFER && i == 0) {
+            return true;
+        }
+    }
+
+    // Skip pool-tagged outputs (Phase 3.7) - LP coins, note payouts and
+    // note/LP change are P2PKH and IsMine, but consensus locks them to
+    // v15 ops; offering one as a base fee coin strands it (the 4th-
+    // recurrence tagged-coin-as-fee-coin class). Decided by the SAME
+    // payload-pure tagger consensus uses, so this skip cannot drift.
+    // Untagged pool outputs (the plain BTX payouts) stay spendable.
+    if (wtx.tx->nVersion == TRANSACTION_POOL_VERSION) {
+        Coin coinProbe;
+        ApplyPoolCoinTags(*wtx.tx, i, coinProbe);
+        if (coinProbe.fNote || coinProbe.fLpShare || coinProbe.fPoolEscrow)
+            return true;
+    }
+    return false;
+}
+
 void CWallet::AvailableCoins(std::vector<COutput> &vCoins, bool fOnlySafe, const CCoinControl *coinControl, const CAmount &nMinimumAmount, const CAmount &nMaximumAmount, const CAmount &nMinimumSumAmount, const uint64_t nMaximumCount, const int nMinDepth, const int nMaxDepth) const
 {
     AssertLockHeld(cs_main);
@@ -2315,90 +2426,9 @@ void CWallet::AvailableCoins(std::vector<COutput> &vCoins, bool fOnlySafe, const
             if (fUnconfirmedAssetTx || IsOutputAssetColoured(*pcoin, i, nDepth))
                 continue;
 
-            // Skip bill title & escrow outputs - locked to bill operations
-            // Skip consensus-tagged v11 outputs. Decided by the SAME
-            // payload-pure tagger consensus uses, so this skip cannot drift -
-            // the enumerated form here covered ISSUE and ENDORSE only, and a
-            // DISCOUNT's title AND its minted note leg would have been offered
-            // as fee coins: the fifth recurrence of the class documented below.
-            // The seller's whole payment sits in those note outputs.
-            if (pcoin->tx->nVersion == TRANSACTION_BILL_VERSION) {
-                Coin coinProbe;
-                ApplyBillCoinTags(*pcoin->tx, i, coinProbe);
-                if (coinProbe.fBill || coinProbe.fBillEscrow || coinProbe.fNote)
-                    continue;
-            }
-
-            // Skip note outputs - they are P2PKH (IsMine) but consensus locks
-            // them to v13 TRANSFER/REDEEM; spending one as a base fee coin would
-            // build a tx the note guard rejects.
-            if (pcoin->tx->nVersion == TRANSACTION_NOTE_VERSION) {
-                if (pcoin->tx->nNoteOp == NOTE_OP_MINT) {
-                    NoteMint m;
-                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, m) && i < m.vUnits.size())
-                        continue;
-                } else if (pcoin->tx->nNoteOp == NOTE_OP_TRANSFER) {
-                    NoteTransfer x;
-                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, x) && i < x.vUnits.size())
-                        continue;
-                } else if (pcoin->tx->nNoteOp == NOTE_OP_DEMAND) {
-                    // A DEMAND RE-ISSUES its notes and AddCoins tags them fNote
-                    // (coins.cpp, the nNoteDemandHeight arm) - but this skip
-                    // enumerated MINT and TRANSFER only, so a demanded note has
-                    // been offered as a fee coin since 3.5. Same class as the
-                    // four below, and worse in consequence: a demanded note
-                    // carries an interest clock, so losing it to an unminable
-                    // spend strands principal AND accrued deferral interest.
-                    // Found while closing the v11 instance; the enumerations
-                    // here should follow the pool/bill arms onto a shared
-                    // payload-pure tagger (NEXT.md A8).
-                    NoteDemand dm;
-                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, dm) && i < dm.vUnits.size())
-                        continue;
-                } else if (pcoin->tx->nNoteOp == NOTE_OP_LOCK) {
-                    // v0.2.20: a lock's change notes come back to the holder
-                    NoteLock lk;
-                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, lk) && i < lk.vChangeUnits.size())
-                        continue;
-                } else if (pcoin->tx->nNoteOp == NOTE_OP_UNLOCK) {
-                    // v0.2.20: released backing is new note coins
-                    NoteUnlock ul;
-                    if (DecodeNotePayload(pcoin->tx->vchNotePayload, ul) && i < ul.vUnits.size())
-                        continue;
-                }
-            }
-
-            // Skip term-deposit RECEIPT outputs (same reason as notes): P2PKH and
-            // IsMine, but consensus locks a receipt coin to its house's v14
-            // TRANSFER/WITHDRAW/CLAIM. Offering one as a base fee coin lets a later
-            // funding SelectCoins grab it - the wallet then records the receipt as
-            // spent by a tx the deposit guard rejects, silently STRANDING the
-            // deposit (its liability D stays on the house books but the holder can
-            // no longer find the receipt to withdraw/claim). ORIGINATE receipts are
-            // vout[0..n-1]; a TRANSFER receipt is vout[0]. WITHDRAW/CLAIM outputs
-            // are plain base-coin payouts and stay spendable.
-            if (pcoin->tx->nVersion == TRANSACTION_DEPOSIT_VERSION) {
-                if (pcoin->tx->nDepositOp == DEPOSIT_OP_ORIGINATE) {
-                    DepositOriginate o;
-                    if (DecodeDepositPayload(pcoin->tx->vchDepositPayload, o) && i < o.vPrincipal.size())
-                        continue;
-                } else if (pcoin->tx->nDepositOp == DEPOSIT_OP_TRANSFER && i == 0) {
-                    continue;
-                }
-            }
-
-            // Skip pool-tagged outputs (Phase 3.7) - LP coins, note payouts and
-            // note/LP change are P2PKH and IsMine, but consensus locks them to
-            // v15 ops; offering one as a base fee coin strands it (the 4th-
-            // recurrence tagged-coin-as-fee-coin class). Decided by the SAME
-            // payload-pure tagger consensus uses, so this skip cannot drift.
-            // Untagged pool outputs (the plain BTX payouts) stay spendable.
-            if (pcoin->tx->nVersion == TRANSACTION_POOL_VERSION) {
-                Coin coinProbe;
-                ApplyPoolCoinTags(*pcoin->tx, i, coinProbe);
-                if (coinProbe.fNote || coinProbe.fLpShare || coinProbe.fPoolEscrow)
-                    continue;
-            }
+            // Skip outputs consensus locks to credit operations (see IsCreditTaggedOutput)
+            if (IsCreditTaggedOutput(*pcoin, i))
+                continue;
 
             if (pcoin->tx->vout[i].nValue < nMinimumAmount || pcoin->tx->vout[i].nValue > nMaximumAmount)
                 continue;
@@ -10498,7 +10528,8 @@ bool CWallet::SubmitOraclePrice(std::string& strFail, uint256& txidOut,
     return true;
 }
 
-bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee)
+bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee,
+                          bool fAllowZero)
 {
     strFail = "Unknown error!";
 
@@ -10600,6 +10631,7 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
     // Fund the fee from coins OUTSIDE the proof set (consensus rejects an
     // attest that spends its own reserves). If the non-proof pool cannot
     // cover the fee, release the smallest proof coins until it can.
+    const size_t nCandidatesFound = vCandidate.size();
     std::set<CInputCoin> setCoins;
     CAmount nAmountRet = CAmount(0);
     while (true) {
@@ -10622,9 +10654,26 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
         }
     }
 
+    // v0.2.23 (C7(d)): releasing proof coins for the fee must not empty the
+    // proof set: the house would publish an attestation of ZERO reserves
+    // from a wallet that holds them.
+    if (nCandidatesFound > 0 && vCandidate.empty() && !fAllowZero) {
+        strFail = "Paying the fee would use every reserve coin, so the attestation would prove zero reserves. Send a "
+                  "separate small coin to this wallet from another wallet, wait for one confirmation, then attest again.";
+        return false;
+    }
+
     CAmount amountReserves = 0;
     for (const ReserveCandidate& cand : vCandidate)
         amountReserves += cand.txout.nValue;
+    // v0.2.23 (review): nor zero while the house last proved reserves, whatever the reason (its reserve coins may be
+    // unconfirmed change, which proves nothing yet). Attesting zero on purpose takes allowzero.
+    if (amountReserves == 0 && house.amountLastAttestReserves > 0 && !fAllowZero) {
+        strFail = strprintf("This attestation would prove zero reserves; the house last proved %s. If its reserve "
+                            "coins are unconfirmed, wait for a confirmation and attest again. To attest zero on purpose, "
+                            "pass allowzero=true.", FormatMoney(house.amountLastAttestReserves));
+        return false;
+    }
 
     // Outputs finalized before the approver signatures (they bind
     // BillHashOutputs).

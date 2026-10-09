@@ -886,6 +886,9 @@ public:
     //! check whether we are allowed to upgrade (or already support) to the named feature
     bool CanSupportFeature(enum WalletFeature wf) const { AssertLockHeld(cs_wallet); return nWalletMaxVersion >= wf; }
 
+    /** An output consensus locks to a credit operation: not ECX for coin selection or the balance. */
+    bool IsCreditTaggedOutput(const CWalletTx& wtx, unsigned int i) const;
+
     /**
      * populate vCoins with vector of available COutputs.
      */
@@ -1270,7 +1273,8 @@ public:
     /** Publish a reserve attestation (Phase 3.4): proves the wallet's plain
      * confirmed coins as the house's liquid till (up to MAX_ATTEST_PROOFS,
      * largest first; fee funded from coins OUTSIDE the proof set). */
-    bool AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+    bool AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee,
+                     bool fAllowZero = false);
     /** Option clause (Phase 3.5): invoke the deferral. RenewDeferral is
      * retired in v0.2.18 (always fails: a suspension has no end date). */
     bool DeferHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
