@@ -24,6 +24,8 @@
 #include <coins.h>
 #include <utilmoneystr.h>
 
+#include <algorithm>
+
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 {
     if (tx.nLockTime == 0)
@@ -385,6 +387,36 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     uint64_t nSettleUnitsAIn = 0;
     uint64_t nSettleUnitsBIn = 0;
 
+    // A settle NET (v0.2.22): the bundles sit at the front of vin, bundle by bundle, each coin P2PKH to its
+    // presenter's key. vNetBundleOfInput maps each bundle input to its bundle. Same fail-closed rule as above.
+    SettleNet settleNet;
+    bool fHaveSettleNet = false;
+    std::vector<size_t> vNetBundleOfInput;
+    std::vector<CScript> vNetBundleScript;
+    std::vector<uint64_t> vNetUnitsIn;
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION && tx.nSettleOp == SETTLE_OP_NET &&
+            DecodeSettlePayload(tx.vchSettlePayload, settleNet) &&
+            settleNet.vPresentKey.size() == settleNet.vHouseID.size()) {
+        bool fOK = true;
+        for (size_t k = 0; k < settleNet.vBundle.size() && fOK; k++) {
+            const auto it = std::lower_bound(settleNet.vHouseID.begin(), settleNet.vHouseID.end(),
+                                             settleNet.vBundle[k].nPresenter);
+            if (it == settleNet.vHouseID.end() || *it != settleNet.vBundle[k].nPresenter) {
+                fOK = false;
+                break;
+            }
+            vNetBundleScript.push_back(NoteScriptForPubKey(settleNet.vPresentKey[it - settleNet.vHouseID.begin()]));
+            for (uint16_t c = 0; c < settleNet.vBundle[k].nCount; c++)
+                vNetBundleOfInput.push_back(k);
+            if (vNetBundleOfInput.size() > tx.vin.size())
+                fOK = false;
+        }
+        if (fOK) {
+            vNetUnitsIn.assign(settleNet.vBundle.size(), 0);
+            fHaveSettleNet = true;
+        }
+    }
+
     // For an oracle BOND (v17, Phase G-1), any spent bond escrow coin must
     // carry THIS submitter's bond script - the registered pubkey is in the
     // script, so re-bond/top-up consolidation is key-pinned by script
@@ -468,6 +500,32 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 if (coin.nNoteUnits > SETTLE_MAX_UNITS || nUnits > SETTLE_MAX_UNITS - coin.nNoteUnits)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-overflow");
                 nUnits += coin.nNoteUnits;
+            } else {
+                if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
+                        coin.fOracleBond)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
+            }
+        }
+
+        // Settle NET bundles (v0.2.22): the exchange's rules, per bundle - a pure note of the bundle's issuer,
+        // undemanded, on its presenter's key; plain funding after the last bundle.
+        if (fHaveSettleNet) {
+            if (i < vNetBundleOfInput.size()) {
+                const size_t k = vNetBundleOfInput[i];
+                if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
+                        coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
+                        coin.fOracleBond)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
+                if (coin.nHouseID != settleNet.vBundle[k].nIssuer)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-issuer");
+                if (coin.nDemandHeight != 0)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-demanded-note");
+                if (coin.out.scriptPubKey != vNetBundleScript[k])
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-input-not-presenter");
+                if (coin.nNoteUnits > SETTLE_MAX_UNITS || vNetUnitsIn[k] > SETTLE_MAX_UNITS - coin.nNoteUnits)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-overflow");
+                vNetUnitsIn[k] += coin.nNoteUnits;
             } else {
                 if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
                         coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
@@ -610,14 +668,15 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // rejected. All note inputs must share one house; note txs cannot
         // spend asset/bill coins, and only CLAIM may spend house escrow
         // (checked above).
-        if (coin.fNote && !coin.fPoolEscrow && !fHaveSettle) {
+        if (coin.fNote && !coin.fPoolEscrow && !fHaveSettle && !fHaveSettleNet) {
             // (fHaveSettle: a decoded v16 EXCHANGE is the third sanctioned
             // spender class of fNote coins; its bundles are fully validated by
             // the positional block above - issuer, tag purity, presenter
             // script, per-side sums - and the single-house/single-holder
             // accumulators here do not apply to a dual-issuer exchange. A v16
             // whose payload did NOT decode has fHaveSettle false and lands
-            // here: neither fNoteOpOK nor fPoolOpOK -> rejected, fail-closed.)
+            // here: neither fNoteOpOK nor fPoolOpOK -> rejected, fail-closed.
+            // A decoded NET round is the same class, validated per bundle.)
             const bool fNoteOpOK = tx.nVersion == TRANSACTION_NOTE_VERSION &&
                     (tx.nNoteOp == NOTE_OP_TRANSFER || tx.nNoteOp == NOTE_OP_REDEEM ||
                      tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_DEMAND ||
@@ -1229,6 +1288,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // can re-issue a unit.
         if (nSettleUnitsAIn != settle.nUnitsANotes || nSettleUnitsBIn != settle.nUnitsBNotes)
             return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-sum");
+    }
+    if (tx.nVersion == TRANSACTION_SETTLE_VERSION && fHaveSettleNet) {
+        for (size_t k = 0; k < settleNet.vBundle.size(); k++) {
+            if (vNetUnitsIn[k] != settleNet.vBundle[k].nUnits)
+                return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-sum");
+        }
     }
 
     // BitAssets (v0.2.18): the one colouring rule - same identity on every

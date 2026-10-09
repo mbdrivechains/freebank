@@ -436,6 +436,12 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           CHouse& houseAOut, CHouse& houseBOut);
+bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                             const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                             std::vector<CHouse>& vHousesOut);
+static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int nHeight,
+                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                          std::vector<CHouse>& vHousesOut);
 
 bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
@@ -962,13 +968,23 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
         memcpy(&nA, mtx.vchPoolPayload.data(), 4);   // nPoolID == nHouseID
         return nA != 0;
     }
-    if (mtx.nVersion == TRANSACTION_SETTLE_VERSION && mtx.nSettleOp == SETTLE_OP_EXCHANGE &&
-            mtx.vchSettlePayload.size() >= 8) {
-        memcpy(&nA, mtx.vchSettlePayload.data(), 4);
-        memcpy(&nB, mtx.vchSettlePayload.data() + 4, 4);
-        return nA != 0 && nB != 0;
-    }
+    // v16 settles take two or more slots: GetHouseSlotSet reads them (SettleSlotHouses).
     return false;
+}
+
+/** Every house slot mtx takes: one for the single-house families, both houses of a settle EXCHANGE, every house of
+ * a settle NET (v0.2.22). Still a plain read of payload bytes, never a decode. Every pooled-side slot scan uses this,
+ * so a NET round is never invisible to a guard. */
+static bool GetHouseSlotSet(const CTransaction& mtx, std::vector<uint32_t>& vHouse)
+{
+    vHouse.clear();
+    if (mtx.nVersion == TRANSACTION_SETTLE_VERSION)
+        return SettleSlotHouses(mtx, vHouse);
+    uint32_t nA = 0, nB = 0;
+    if (!GetHouseSlotIDs(mtx, nA, nB))
+        return false;
+    vHouse.push_back(nA);
+    return true;
 }
 
 /** The J2 displacement whitelist: which pooled slot-taker may an otherwise-
@@ -1212,8 +1228,9 @@ static void EvictStaleHouseNoteOps()
                 // (status / ratio / attest-recency) or plain expiry stales it.
                 // Per the codebase's own lesson: never enumerate staleness
                 // causes - re-run the REAL contextual check at height+1.
-                CHouse houseA, houseB;
-                if (!CheckSettleOperation(mtx, stateStale, nNextHeight, fnGetHouse, houseA, houseB))
+                // (A NET round hangs on every participant's record.)
+                std::vector<CHouse> vSettleHouses;
+                if (!CheckSettleTx(mtx, stateStale, nNextHeight, fnGetHouse, vSettleHouses))
                     fStale = true;
             } else if (fPoolTx) { // a connected pool op moved the priors every
                      // pooled loser bound; a governance op can close the house
@@ -1890,18 +1907,23 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // never enumerated. The mirror direction (incoming slot-taker vs
         // pooled settle, incl. ATTEST-displaces) is guarded after the family
         // blocks below; cross-block staleness heals via the eviction sweep.
+        // A NET round (v0.2.22) takes every participant's slot: the same guard over the whole set.
         if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
             auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
-            CHouse houseA, houseB;
-            if (!CheckSettleOperation(tx, state, GetSpendHeight(view), fnGetHouse, houseA, houseB))
+            std::vector<CHouse> vSettleHouses;
+            if (!CheckSettleTx(tx, state, GetSpendHeight(view), fnGetHouse, vSettleHouses))
                 return error("%s: CheckSettleOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+            std::set<uint32_t> setOurs;
+            for (const CHouse& h : vSettleHouses)
+                setOurs.insert(h.nHouseID);
+            std::vector<uint32_t> vTheirs;
             for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                uint32_t nTheirA = 0, nTheirB = 0;
-                if (!GetHouseSlotIDs(mi->GetTx(), nTheirA, nTheirB))
+                if (!GetHouseSlotSet(mi->GetTx(), vTheirs))
                     continue;
-                if (nTheirA == houseA.nHouseID || nTheirA == houseB.nHouseID ||
-                        (nTheirB != 0 && (nTheirB == houseA.nHouseID || nTheirB == houseB.nHouseID)))
-                    return state.DoS(0, false, REJECT_DUPLICATE, "settle-house-op-in-mempool");
+                for (const uint32_t nTheirs : vTheirs) {
+                    if (setOurs.count(nTheirs))
+                        return state.DoS(0, false, REJECT_DUPLICATE, "settle-house-op-in-mempool");
+                }
             }
         }
 
@@ -2468,12 +2490,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 const bool fAttest = tx.nVersion == TRANSACTION_HOUSE_VERSION &&
                                      tx.nHouseOp == HOUSE_OP_ATTEST;
                 std::vector<CTransactionRef> vDisplace;
+                std::vector<uint32_t> vTheirs;
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                     const CTransaction& mtx = mi->GetTx();
-                    uint32_t nTheirA = 0, nTheirB = 0;
-                    if (!GetHouseSlotIDs(mtx, nTheirA, nTheirB))
+                    if (!GetHouseSlotSet(mtx, vTheirs))
                         continue;
-                    if (nTheirA == nInA || nTheirB == nInA) {
+                    if (std::find(vTheirs.begin(), vTheirs.end(), nInA) != vTheirs.end()) {
                         // DISPLACEABLE = exactly the families whose op is
                         // created by a party OTHER than the house whose slot it
                         // takes, and re-issuable by that party without the
@@ -6320,6 +6342,100 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     return true;
 }
 
+/** Contextual checks for a v16 SETTLE_OP_NET round (v0.2.22, gateway/docs/freebank/NETTING_DESIGN.md s2): the
+ * exchange's checks for every house, with "has attested since its last settle" in place of the cadence. Side-effect
+ * free; on success vHousesOut carries every mutated record (nMintedUnits -= its burn, nLastSettleHeight = nHeight),
+ * parallel to the payload's vHouseID, for the caller to stage. The slots are the caller's (ConnectBlock / ATMP). */
+bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, int nHeight,
+                             const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                             std::vector<CHouse>& vHousesOut)
+{
+    vHousesOut.clear();
+    if (tx.nSettleOp != SETTLE_OP_NET)
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-op");
+    SettleNet n;
+    if (!DecodeSettlePayload(tx.vchSettlePayload, n))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-payload");
+    std::vector<int64_t> vNet;
+    std::vector<uint64_t> vBurn;
+    if (!SettleNetPositions(n, vNet, vBurn) || n.vPrevMintedUnits.size() != n.vHouseID.size() ||
+            n.vPrevLastSettleHeight.size() != n.vHouseID.size() || n.vApproverIndex.size() != n.vHouseID.size() ||
+            n.vApproverSig.size() != n.vHouseID.size() || n.vPresentKey.size() != n.vHouseID.size() ||
+            n.vPresentSig.size() != n.vHouseID.size())
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-net-shape");
+    if (nHeight < 0)
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-net-not-attested");
+
+    std::vector<CHouse> vHouse(n.vHouseID.size());
+    for (size_t i = 0; i < n.vHouseID.size(); i++) {
+        CHouse& h = vHouse[i];
+        if (!fnGetHouse(n.vHouseID[i], h))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-unknown-house");
+        // Par-eligible, as for the exchange: effective Open, attested ratio at/above the floor, attested recently.
+        if (!HouseParEligible(h, nHeight))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-house-ineligible");
+        // Never settled, or attested since its last settle (and this round is above that attestation). This is
+        // also the undo invariant: the stored prior is always below the connect height, so "already undone" and
+        // "to undo" can't collide.
+        if (h.nLastSettleHeight != 0 &&
+                (h.nLastAttestHeight <= h.nLastSettleHeight || (uint32_t)nHeight <= h.nLastAttestHeight))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-net-not-attested");
+        // Priors byte-exact (ATTEST pattern).
+        if (n.vPrevMintedUnits[i] != h.nMintedUnits || n.vPrevLastSettleHeight[i] != h.nLastSettleHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-priors-mismatch");
+        // Defensive, as for the exchange: the input layer's Sum(coins) == counter invariant makes this unreachable.
+        if (vBurn[i] > h.nMintedUnits)
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-exceed-minted");
+    }
+
+    // Each creditor's payment lands on its declared redemption key (shape pinned position, P2PKH and amount).
+    size_t nOut = 0;
+    for (size_t i = 0; i < n.vHouseID.size(); i++) {
+        if (vNet[i] <= 0)
+            continue;
+        if (nOut >= tx.vout.size() ||
+                tx.vout[nOut].scriptPubKey != NoteScriptForPubKey(vHouse[i].vchRedemptionDestPK))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-residual-dest");
+        nOut++;
+    }
+
+    if (n.nExpiryHeight != 0 && (uint32_t)nHeight > n.nExpiryHeight)
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-expired");
+
+    // One digest: every house's M-of-N quorum, and every presenting house's key.
+    const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(tx), BillHashOutputs(tx));
+    for (size_t i = 0; i < n.vHouseID.size(); i++) {
+        if (!VerifyHouseApprovers(vHouse[i], n.vApproverIndex[i], n.vApproverSig[i],
+                sighash, vHouse[i].nThresholdM, state, "bad-settle-approver"))
+            return false;
+        if (!n.vPresentKey[i].empty() &&
+                !CPubKey(n.vPresentKey[i]).VerifyStrict(sighash, n.vPresentSig[i]))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
+    }
+
+    for (size_t i = 0; i < n.vHouseID.size(); i++) {
+        vHouse[i].nMintedUnits -= vBurn[i];
+        vHouse[i].nLastSettleHeight = (uint32_t)nHeight;
+    }
+    vHousesOut = std::move(vHouse);
+    return true;
+}
+
+/** Either settle op: the mutated house records, for the slot-staging callers. */
+static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int nHeight,
+                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                          std::vector<CHouse>& vHousesOut)
+{
+    vHousesOut.clear();
+    if (tx.nSettleOp == SETTLE_OP_NET)
+        return CheckSettleNetOperation(tx, state, nHeight, fnGetHouse, vHousesOut);
+    CHouse houseA, houseB;
+    if (!CheckSettleOperation(tx, state, nHeight, fnGetHouse, houseA, houseB))
+        return false;
+    vHousesOut = {houseA, houseB};
+    return true;
+}
+
 /** Gold oracle contextual checks (Phase G-1, spec v2 s2-s3). Per-tx only -
  * the quorum + median are the CALLER's post-loop business. External linkage
  * for the unit gates (the CheckSettleOperation pattern). */
@@ -7963,15 +8079,30 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         // coins are restored by the generic CTxUndo machinery; nothing
         // pool/bill/deposit-side is touched by any v16 path.
         if (fHouseUndo && tx.nVersion == TRANSACTION_SETTLE_VERSION) {
-            SettleExchange sx;
-            if (!DecodeSettlePayload(tx.vchSettlePayload, sx)) {
-                error("DisconnectBlock(): Failed to decode settle payload!");
-                return DISCONNECT_FAILED;
+            // One side per house: both houses of an exchange, every house of a NET round (v0.2.22), each with the
+            // units of its notes the op burned and its bound last-settle prior.
+            struct SettleUndoSide { uint32_t nID; uint64_t nUnits; uint32_t nPrior; };
+            std::vector<SettleUndoSide> sides;
+            if (tx.nSettleOp == SETTLE_OP_NET) {
+                SettleNet sn;
+                std::vector<int64_t> vNet;
+                std::vector<uint64_t> vBurn;
+                if (!DecodeSettlePayload(tx.vchSettlePayload, sn) || !SettleNetPositions(sn, vNet, vBurn) ||
+                        sn.vPrevLastSettleHeight.size() != sn.vHouseID.size()) {
+                    error("DisconnectBlock(): Failed to decode settle payload!");
+                    return DISCONNECT_FAILED;
+                }
+                for (size_t i = 0; i < sn.vHouseID.size(); i++)
+                    sides.push_back({sn.vHouseID[i], vBurn[i], sn.vPrevLastSettleHeight[i]});
+            } else {
+                SettleExchange sx;
+                if (!DecodeSettlePayload(tx.vchSettlePayload, sx)) {
+                    error("DisconnectBlock(): Failed to decode settle payload!");
+                    return DISCONNECT_FAILED;
+                }
+                sides.push_back({sx.nHouseA, sx.nUnitsANotes, sx.nPrevLastSettleHeightA});
+                sides.push_back({sx.nHouseB, sx.nUnitsBNotes, sx.nPrevLastSettleHeightB});
             }
-            const struct { uint32_t nID; uint64_t nUnits; uint32_t nPrior; } sides[2] = {
-                { sx.nHouseA, sx.nUnitsANotes, sx.nPrevLastSettleHeightA },
-                { sx.nHouseB, sx.nUnitsBNotes, sx.nPrevLastSettleHeightB },
-            };
             for (const auto& side : sides) {
                 CHouse house;
                 if (!phousetree->GetHouse(side.nID, house)) {
@@ -9779,20 +9910,22 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                         if (h.nHouseID == nID) { house = h; return true; }
                     return phousetree->GetHouse(nID, house);
                 };
-                CHouse houseA, houseB;
-                if (!CheckSettleOperation(tx, state, pindex->nHeight, fnGetHouse, houseA, houseB))
+                std::vector<CHouse> vSettleHouses;
+                if (!CheckSettleTx(tx, state, pindex->nHeight, fnGetHouse, vSettleHouses))
                     return error("ConnectBlock(): CheckSettleOperation on %s failed with %s",
                         tx.GetHash().ToString(), FormatStateMessage(state));
 
-                // Both slots, checked against BOTH staging structures. A house
+                // Every slot (both houses of an exchange, every house of a NET round), checked against BOTH
+                // staging structures. A house
                 // registered this block cannot settle (its record is in
                 // vHouseNew, not the DB the payload priors were signed
                 // against); a house already changed this block cannot settle
                 // again. Note the fnGetHouse closure reads staged-first, but
                 // the slot check right here rejects any staged entry before
                 // the closure's answer could matter - staged == parent state
-                // for both houses whenever the op connects.
-                for (const uint32_t nID : {houseA.nHouseID, houseB.nHouseID}) {
+                // for every house whenever the op connects.
+                for (const CHouse& hSettle : vSettleHouses) {
+                    const uint32_t nID = hSettle.nHouseID;
                     for (const CHouse& h : vHouseNew)
                         if (h.nHouseID == nID)
                             return state.DoS(100, error("ConnectBlock(): settle on house %u registered this block",
@@ -9801,8 +9934,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                         return state.DoS(100, error("ConnectBlock(): second house-state change for house %u this block",
                             nID), REJECT_INVALID, "bad-house-multiple-ops");
                 }
-                mapHouseUpdate[houseA.nHouseID] = houseA;
-                mapHouseUpdate[houseB.nHouseID] = houseB;
+                for (const CHouse& hSettle : vSettleHouses)
+                    mapHouseUpdate[hSettle.nHouseID] = hSettle;
             }
         }
 

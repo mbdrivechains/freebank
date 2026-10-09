@@ -220,6 +220,7 @@ std::string CreditOpName(int nVersion, uint8_t nOp)
         {{TRANSACTION_POOL_VERSION, POOL_OP_SWAP}, "swap"},
         {{TRANSACTION_POOL_VERSION, POOL_OP_RETIRE}, "retire"},
         {{TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE}, "exchange"},
+        {{TRANSACTION_SETTLE_VERSION, SETTLE_OP_NET}, "net"},
         {{TRANSACTION_ORACLE_VERSION, ORACLE_OP_BOND}, "bond"},
         {{TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT}, "submit"},
     };

@@ -1230,6 +1230,22 @@ public:
     bool SignSettle(std::string& strFail, std::string& strHexTxOut,
                     const std::string& strHexProposal, const CAmount& nFee);
     bool CompleteSettle(std::string& strFail, uint256& txidOut, const std::string& strHexTx);
+    /** v0.2.22 netting rounds (gateway/docs/freebank/NETTING_DESIGN.md s6), the round blob in settle.h.
+     * CreateNetting starts a round among vHouseID and joins it. JoinNetting adds this house's bundles: the other
+     * houses' undemanded notes it holds, on one presentment key; if they sit on several keys it sends consolidating
+     * transfers (vConsolidate) and fails - re-run once they confirm. FundNetting adds the coins paying this house's
+     * net debt (and the fee, for the starter). SignNetting signs this house's part; the last signature broadcasts
+     * (txidOut set), or with fSend false returns the finished transaction (strHexOut). nNetOut is this house's net
+     * position, nPaysOut what it pays (funding less change). */
+    bool CreateNetting(std::string& strFail, std::string& strRoundOut, std::vector<uint256>& vConsolidate,
+                       uint32_t nOwnHouseID, const std::vector<uint32_t>& vHouseID, uint32_t nExpiryBlocks,
+                       const CAmount& nFee);
+    bool JoinNetting(std::string& strFail, std::string& strRoundOut, std::vector<uint256>& vConsolidate,
+                     uint32_t nOwnHouseID, const std::string& strRound, const CAmount& nFee);
+    bool FundNetting(std::string& strFail, std::string& strRoundOut, uint32_t nOwnHouseID, const std::string& strRound);
+    bool SignNetting(std::string& strFail, std::string& strRoundOut, uint256& txidOut, std::string& strHexOut,
+                     int64_t& nNetOut, CAmount& nPaysOut, uint32_t nOwnHouseID, const std::string& strRound,
+                     bool fSend);
     struct PresentableGroup {
         std::vector<unsigned char> vchHolderPubKey;
         uint64_t nUnits;

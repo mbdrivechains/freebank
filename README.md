@@ -95,6 +95,12 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 - **Clearing pools**: on-chain AMM pools between a house's notes and the base coin —
   swaps, LP shares, and orderly pool retirement. RPCs: `createpool`, `listpools`,
   `swapnote`, `addpoolliquidity`, `removepoolliquidity`, `listmylp`, `retirepool`.
+- **Settlement between houses**, as at the Scottish note exchanges: houses hand back each other's
+  notes at par, the notes are burned, and only the difference is paid, in ECX, to the creditor's
+  declared key. Every house in a settlement signs. Two houses settle bilaterally (`proposesettle`,
+  `signsettle`, `completesettle`); from v0.2.22 any number net in one transaction, the Edinburgh
+  exchange (`createnetting`, `joinnetting`, `fundnetting`, `signnetting`, `decodenetting`).
+  `listsettlements` shows both.
 - **Assets** (v0.2.18): anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in
   the coins that carry it, for example a token for gold a custodian holds. The asset's id is the
   txid that created it; tickers are not unique, and a token is only as good as its issuer. RPCs:
@@ -119,8 +125,15 @@ v0.2.16 lets BitWindow bid for FreeBank blocks and makes a restart with `-reinde
 v0.2.17 checks every peg step against eCash itself,
 v0.2.18 brings ECX credit with no closure date, and assets,
 v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant,
-v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned, and
-v0.2.21 lets token holders claim at a failed house without its partners:
+v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned,
+v0.2.21 lets token holders claim at a failed house without its partners, and
+v0.2.22 lets any number of houses net their notes in one settlement:
+
+- **Netting** (v0.2.22). **A hard fork on the beta: every node must upgrade** (no `-reindex`, no
+  new flag). One new operation: a netting round, in which two or more houses hand in each other's
+  notes, all are burned, and only net positions are paid, at par. Every house in a round signs; no
+  limit on the number of houses. A v0.2.21 node stops following the chain at the first block that
+  carries one. FreeBank mainnet will have this from its first block. Details in the release notes.
 
 - **The token holders' claim** (v0.2.21). **A hard fork on the beta: every node must upgrade** (no
   `-reindex`, no new flag). Four new operations (keysets, the mint's posts, claims, collects); a burn

@@ -28,6 +28,7 @@
 #include <uint256.h>
 
 #include <stdint.h>
+#include <string>
 #include <vector>
 
 class CTransaction;
@@ -35,6 +36,9 @@ class CTransaction;
 static const uint8_t SETTLE_OP_EXCHANGE = 1;   // bilateral co-signed par-exchange (Phase A)
 // static const uint8_t SETTLE_OP_PRESENT = 2; // RESERVED - Phase B unilateral presentment
 // static const uint8_t SETTLE_OP_DRAW    = 3; // RESERVED - Phase B escrowed-reserve response
+// v0.2.22: multilateral netting, the Edinburgh exchange opt-in (gateway/docs/freebank/NETTING_DESIGN.md, signed off
+// 2026-10-09). Two or more houses, every one signs; only net positions pay. No cap on the number of houses.
+static const uint8_t SETTLE_OP_NET = 4;
 
 // The residual band around par, basis points. Par is 1 unit = 1 sat; a mode-1
 // residual must satisfy |dU|*(10^4 - band) <= residual*10^4 <= |dU|*(10^4 + band).
@@ -170,6 +174,83 @@ uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevou
 bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
                           uint8_t nMode, CAmount amountResidual);
 
+/** One bundle of a NET round: nUnits of nIssuer's notes handed in by nPresenter (both in the round, never the same
+ * house), spent as nCount consecutive inputs on the presenter's key. */
+struct SettleNetBundle {
+    uint32_t nPresenter;
+    uint32_t nIssuer;
+    uint64_t nUnits;
+    uint16_t nCount;
+
+    SettleNetBundle() : nPresenter(0), nIssuer(0), nUnits(0), nCount(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nPresenter);
+        READWRITE(nIssuer);
+        READWRITE(nUnits);
+        READWRITE(nCount);
+    }
+};
+
+/** SETTLE_OP_NET payload (v0.2.22). Every per-house vector is parallel to vHouseID, which is strictly ascending and
+ * LEADS the payload, so the slot guards read the house set from its first bytes (SettleSlotHouses).
+ *
+ * A house's net = units it presents - units of its notes presented. Every bundle burns; each issuer's nMintedUnits
+ * falls by what was presented of it. Each net creditor is paid vReceive[i] (par +/- SETTLE_PAR_BAND_BPS of its net,
+ * net >= SETTLE_MIN_RESIDUAL) at the front of the outputs, ascending house order, to its vchRedemptionDestPK; every
+ * other vReceive is 0. Which debtor's coins fund which creditor is the signers' business, as in the exchange.
+ *
+ * Priors as in the exchange (ATTEST pattern): undo restores from the payload alone. A house may join a round only if
+ * it has never settled or has attested since its last settle, so every round starts from freshly proven reserves.
+ *
+ * One digest (SettleNetSigHash) covers every value field plus prevouts and outputs; it is signed by every house's
+ * M-of-N approvers and by every presenting house's key. vPresentKey[i] is empty for a house that presents nothing. */
+struct SettleNet {
+    std::vector<uint32_t> vHouseID;                                  // LEADING; >= 2, strictly ascending
+    std::vector<CAmount> vReceive;                                   // per house: its creditor payment, else 0
+    std::vector<uint64_t> vPrevMintedUnits;                          // per house: priors
+    std::vector<uint32_t> vPrevLastSettleHeight;
+    std::vector<std::vector<unsigned char>> vPresentKey;             // per house: 33B, or empty
+    std::vector<SettleNetBundle> vBundle;                            // ascending (presenter, issuer), unique pairs
+    uint32_t nExpiryHeight;                                          // 0 = none
+    std::vector<std::vector<unsigned char>> vPresentSig;             // per house (excluded from digest)
+    std::vector<std::vector<uint32_t>> vApproverIndex;               // per house (excluded from digest)
+    std::vector<std::vector<std::vector<unsigned char>>> vApproverSig;
+
+    SettleNet() : nExpiryHeight(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(vHouseID);
+        READWRITE(vReceive);
+        READWRITE(vPrevMintedUnits);
+        READWRITE(vPrevLastSettleHeight);
+        READWRITE(vPresentKey);
+        READWRITE(vBundle);
+        READWRITE(nExpiryHeight);
+        READWRITE(vPresentSig);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
+    }
+};
+
+/** The digest every NET signature covers: domain tag, every value field in declaration order (signatures and
+ * approver indices excluded), hashPrevouts, hashOutputs. */
+uint256 SettleNetSigHash(const SettleNet& n, const uint256& hashPrevouts, const uint256& hashOutputs);
+
+/** Each house's net position and burn (units of its notes presented), parallel to vHouseID. False if a bundle names
+ * a house outside the round, or a house's presented or presented-of total leaves SETTLE_MAX_UNITS. */
+bool SettleNetPositions(const SettleNet& n, std::vector<int64_t>& vNet, std::vector<uint64_t>& vBurn);
+
+/** The house slots a v16 tx takes: both houses of an EXCHANGE, every house of a NET. Reads only the payload's
+ * leading bytes, never a full decode (the slot guards' contract). False for anything else or a short payload. */
+bool SettleSlotHouses(const CTransaction& tx, std::vector<uint32_t>& vHouse);
+
 template <typename T>
 bool DecodeSettlePayload(const std::vector<unsigned char>& vch, T& payload);
 
@@ -214,6 +295,79 @@ struct SettleProposalV1 {
         READWRITE(nExpiryHeight);
     }
 };
+
+/** A netting round as it passes between houses (v0.2.22). WALLET PROTOCOL, NOT CONSENSUS - versioned so it can
+ * change. createnetting starts it, each house joins (its bundles), then funds (debtors, and the starter for the fee),
+ * then signs; every house builds the identical transaction from this blob and the chain, and the last signature
+ * broadcasts it. Bundle and funding coins must be confirmed, so every house reads the same values. */
+struct SettleNetRoundBundle {
+    uint32_t nIssuer;
+    uint64_t nUnits;
+    std::vector<COutPoint> vCoin;
+
+    SettleNetRoundBundle() : nIssuer(0), nUnits(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nIssuer);
+        READWRITE(nUnits);
+        READWRITE(vCoin);
+    }
+};
+
+struct SettleNetRoundPart {
+    uint32_t nHouseID;
+    std::vector<unsigned char> vchPresentKey;     // empty: presents nothing
+    std::vector<SettleNetRoundBundle> vBundle;    // ascending issuer
+    bool fFunded;
+    std::vector<COutPoint> vFunding;              // plain coins paying its net debt (and the starter's fee)
+    CScript scriptChange;
+
+    SettleNetRoundPart() : nHouseID(0), fFunded(false) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(vchPresentKey);
+        READWRITE(vBundle);
+        READWRITE(fFunded);
+        READWRITE(vFunding);
+        READWRITE(*(CScriptBase*)(&scriptChange));
+    }
+};
+
+struct SettleNetRoundV1 {
+    uint8_t nVersion;                             // = 1
+    std::vector<uint32_t> vHouseID;               // the round's houses, ascending
+    uint32_t nStarter;                            // pays the fee
+    uint32_t nExpiryHeight;
+    CAmount nFee;
+    std::vector<SettleNetRoundPart> vPart;        // ascending house id, one per house that has joined
+    std::vector<unsigned char> vchTx;             // the transaction being signed (empty before the first signature)
+
+    SettleNetRoundV1() : nVersion(1), nStarter(0), nExpiryHeight(0), nFee(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nVersion);
+        READWRITE(vHouseID);
+        READWRITE(nStarter);
+        READWRITE(nExpiryHeight);
+        READWRITE(nFee);
+        READWRITE(vPart);
+        READWRITE(vchTx);
+    }
+};
+
+/** The round's bundles in transaction order (ascending presenter, then issuer) and each house's net position,
+ * parallel to vHouseID. False if a part or bundle is malformed or a house is outside the round. */
+bool SettleNetRoundBundles(const SettleNetRoundV1& r, SettleNet& n, std::vector<int64_t>& vNet, std::string& strFail);
 
 /** Context-free shape rules for v16 settle txs (no DB, no ECDSA - priors,
  * eligibility, cadence, approver ranges and all signature verification run

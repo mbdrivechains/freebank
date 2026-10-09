@@ -5843,6 +5843,347 @@ UniValue completesettle(const JSONRPCRequest& request)
     return response;
 }
 
+// v0.2.22 netting rounds (gateway/docs/freebank/NETTING_DESIGN.md s6).
+
+static UniValue NettingConsolidating(const std::vector<uint256>& vConsolidate, const std::string& strHint)
+{
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", "consolidating");
+    UniValue txids(UniValue::VARR);
+    for (const uint256& txid : vConsolidate)
+        txids.push_back(txid.ToString());
+    response.pushKV("txids", txids);
+    response.pushKV("hint", strHint);
+    return response;
+}
+
+UniValue createnetting(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+        throw std::runtime_error(
+            "createnetting ownid [houses,...] ( expiryblocks fee )\n"
+            "\nStarts a netting round (the Edinburgh exchange): every house in it hands in the other houses' notes\n"
+            "it holds, all are burned, and only net positions are paid, at par. Every house signs. This house joins\n"
+            "at once and pays the transaction fee. Pass the returned round to each other house's joinnetting, then\n"
+            "fundnetting, then signnetting; the last signature sends it.\n"
+            "\nArguments:\n"
+            "1. ownid          (numeric, required) this wallet's house\n"
+            "2. houses         (array, required) the other houses in the round\n"
+            "3. expiryblocks   (numeric, optional, default 72, at most 144) the round expires this many blocks from now\n"
+            "4. fee            (numeric or string, optional, default 0.001, at most -maxtxfee) the transaction fee, and\n"
+            "                  the fee of any transfer moving notes onto one presentment key\n"
+            "\nResult:\n"
+            "{ \"status\": \"created\", \"round\": \"hex\" }, or { \"status\": \"consolidating\", \"txids\": [...] }:\n"
+            "notes were moved onto one key; run it again once those confirm.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("createnetting", "1 \"[2,3]\"")
+            + HelpExampleRpc("createnetting", "1, [2,3]")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nOwn = request.params[0].get_int();
+    std::vector<uint32_t> vHouse;
+    const UniValue& houses = request.params[1].get_array();
+    for (size_t i = 0; i < houses.size(); i++)
+        vHouse.push_back(houses[i].get_int());
+    uint32_t nExpiryBlocks = 72;
+    if (request.params.size() >= 3) nExpiryBlocks = request.params[2].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 4) nFee = AmountFromValue(request.params[3]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::string strRound, strFail;
+    std::vector<uint256> vConsolidate;
+    if (!pwallet->CreateNetting(strFail, strRound, vConsolidate, nOwn, vHouse, nExpiryBlocks, nFee)) {
+        if (!vConsolidate.empty())
+            return NettingConsolidating(vConsolidate, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", "created");
+    response.pushKV("round", strRound);
+    return response;
+}
+
+UniValue joinnetting(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "joinnetting ownid \"round\" ( fee )\n"
+            "\nAdds this house to a netting round: every undemanded, confirmed note of the round's other houses that\n"
+            "this wallet holds, on one presentment key. Running it again replaces this house's part (until funding\n"
+            "starts).\n"
+            "\nArguments:\n"
+            "1. ownid   (numeric, required) this wallet's house\n"
+            "2. round   (string, required) the round, from createnetting or the previous house\n"
+            "3. fee     (numeric or string, optional, default 0.001) the fee of any transfer moving notes onto one key\n"
+            "\nResult:\n"
+            "{ \"status\": \"joined\", \"round\": \"hex\" }, or { \"status\": \"consolidating\", \"txids\": [...] }.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("joinnetting", "2 \"<round>\"")
+            + HelpExampleRpc("joinnetting", "2, \"<round>\"")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nOwn = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::string strRound, strFail;
+    std::vector<uint256> vConsolidate;
+    if (!pwallet->JoinNetting(strFail, strRound, vConsolidate, nOwn, request.params[1].get_str(), nFee)) {
+        if (!vConsolidate.empty())
+            return NettingConsolidating(vConsolidate, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", "joined");
+    response.pushKV("round", strRound);
+    return response;
+}
+
+UniValue fundnetting(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() != 2)
+        throw std::runtime_error(
+            "fundnetting ownid \"round\"\n"
+            "\nOnce every house has joined: adds the confirmed coins paying this house's net debt at par (and the fee,\n"
+            "for the house that started the round), with change back to this wallet. A house that owes nothing still\n"
+            "runs it, to mark its part funded.\n"
+            "\nArguments:\n"
+            "1. ownid   (numeric, required) this wallet's house\n"
+            "2. round   (string, required) the round\n"
+            "\nResult:\n"
+            "{ \"status\": \"funded\", \"round\": \"hex\" }\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("fundnetting", "2 \"<round>\"")
+            + HelpExampleRpc("fundnetting", "2, \"<round>\"")
+        );
+
+    ObserveSafeMode();
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::string strRound, strFail;
+    if (!pwallet->FundNetting(strFail, strRound, request.params[0].get_int(), request.params[1].get_str()))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", "funded");
+    response.pushKV("round", strRound);
+    return response;
+}
+
+UniValue signnetting(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "signnetting ownid \"round\" ( send )\n"
+            "\nOnce every house has funded: builds the round's transaction from the round and the chain, checks every\n"
+            "bundle against the chain and this house's own part, and signs for this house (its partners' quorum, its\n"
+            "presentment key, its inputs). The last house to sign sends it. Check the round with decodenetting first:\n"
+            "signing agrees to every bundle, net and payment in it. Refused if the round doesn't expire within 144\n"
+            "blocks, or if this house started it and its fee is above -maxtxfee.\n"
+            "\nArguments:\n"
+            "1. ownid   (numeric, required) this wallet's house\n"
+            "2. round   (string, required) the round\n"
+            "3. send    (boolean, optional, default true) false: when this is the last signature, return the finished\n"
+            "           transaction as hex instead of sending it\n"
+            "\nResult:\n"
+            "{ \"status\": \"signed\", \"sent\" or \"complete\", \"net\": n (this house's net position), \"pays\": x (ECX this\n"
+            "  house's coins pay: its net debt, plus the fee if it started the round), \"fee\": x, \"expiryheight\": n,\n"
+            "  \"round\": \"hex\", \"txid\": \"hex\" (when sent), \"hex\": \"hex\" (when complete and not sent) }\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("signnetting", "2 \"<round>\"")
+            + HelpExampleRpc("signnetting", "2, \"<round>\"")
+        );
+
+    ObserveSafeMode();
+    const bool fSend = request.params.size() < 3 || request.params[2].get_bool();
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+
+    std::string strRound, strFail, strHex;
+    uint256 txid;
+    int64_t nNet = 0;
+    CAmount nPays = 0;
+    if (!pwallet->SignNetting(strFail, strRound, txid, strHex, nNet, nPays, request.params[0].get_int(),
+                              request.params[1].get_str(), fSend))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    SettleNetRoundV1 r;
+    {
+        CDataStream ss(ParseHex(strRound), SER_NETWORK, PROTOCOL_VERSION);
+        ss >> r;
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("status", !txid.IsNull() ? "sent" : (!strHex.empty() ? "complete" : "signed"));
+    response.pushKV("net", nNet);
+    response.pushKV("pays", ValueFromAmount(nPays));
+    response.pushKV("fee", ValueFromAmount(r.nFee));
+    response.pushKV("expiryheight", (int64_t)r.nExpiryHeight);
+    response.pushKV("round", strRound);
+    if (!txid.IsNull())
+        response.pushKV("txid", txid.ToString());
+    if (!strHex.empty())
+        response.pushKV("hex", strHex);
+    return response;
+}
+
+UniValue decodenetting(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "decodenetting \"round\"\n"
+            "\nShows a netting round: its houses, each house's bundles, the nets once everyone has joined, the\n"
+            "payments, and who has funded and signed.\n"
+            "\nArguments:\n"
+            "1. round   (string, required) the round\n"
+            "\nExamples:\n"
+            + HelpExampleCli("decodenetting", "\"<round>\"")
+            + HelpExampleRpc("decodenetting", "\"<round>\"")
+        );
+
+    const std::string strHex = request.params[0].get_str();
+    if (!IsHex(strHex))
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "The round is not hex");
+    SettleNetRoundV1 r;
+    try {
+        std::vector<unsigned char> vch = ParseHex(strHex);
+        CDataStream ss(vch, SER_NETWORK, PROTOCOL_VERSION);
+        ss >> r;
+        if (!ss.empty())
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Trailing bytes in the round");
+    } catch (const std::ios_base::failure&) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Undecodable round");
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("version", (int)r.nVersion);
+    UniValue houses(UniValue::VARR);
+    for (const uint32_t nID : r.vHouseID)
+        houses.push_back((int64_t)nID);
+    result.pushKV("houses", houses);
+    result.pushKV("starter", (int64_t)r.nStarter);
+    result.pushKV("expiryheight", (int64_t)r.nExpiryHeight);
+    result.pushKV("fee", ValueFromAmount(r.nFee));
+
+    LOCK(cs_main);   // funding values come from the UTXO set
+    bool fAllFunded = r.vPart.size() == r.vHouseID.size();
+    UniValue parts(UniValue::VARR);
+    for (const SettleNetRoundPart& part : r.vPart) {
+        UniValue p(UniValue::VOBJ);
+        p.pushKV("house", (int64_t)part.nHouseID);
+        p.pushKV("presentkey", HexStr(part.vchPresentKey));
+        UniValue bundles(UniValue::VARR);
+        for (const SettleNetRoundBundle& rb : part.vBundle) {
+            UniValue b(UniValue::VOBJ);
+            b.pushKV("issuer", (int64_t)rb.nIssuer);
+            b.pushKV("units", (int64_t)rb.nUnits);
+            b.pushKV("coins", (int64_t)rb.vCoin.size());
+            bundles.push_back(b);
+        }
+        p.pushKV("bundles", bundles);
+        p.pushKV("funded", part.fFunded);
+        p.pushKV("fundingcoins", (int64_t)part.vFunding.size());
+        CAmount nFunding = 0;
+        bool fFound = true;
+        for (const COutPoint& out : part.vFunding) {
+            Coin coin;
+            if (pcoinsTip->GetCoin(out, coin))
+                nFunding += coin.out.nValue;
+            else
+                fFound = false;
+        }
+        if (fFound)
+            p.pushKV("fundingvalue", ValueFromAmount(nFunding));   // what it pays is this less its change
+        CTxDestination dest;
+        p.pushKV("changeaddress", ExtractDestination(part.scriptChange, dest) ? EncodeDestination(dest) : "");
+        parts.push_back(p);
+        fAllFunded = fAllFunded && part.fFunded;
+    }
+    result.pushKV("parts", parts);
+
+    std::string stage = r.vPart.size() < r.vHouseID.size() ? "joining" : (fAllFunded ? "signing" : "funding");
+    if (r.vPart.size() == r.vHouseID.size()) {
+        SettleNet n;
+        std::vector<int64_t> vNet;
+        std::string strFail;
+        if (SettleNetRoundBundles(r, n, vNet, strFail)) {
+            UniValue nets(UniValue::VARR);
+            for (size_t i = 0; i < r.vHouseID.size(); i++) {
+                UniValue e(UniValue::VOBJ);
+                e.pushKV("house", (int64_t)r.vHouseID[i]);
+                e.pushKV("net", vNet[i]);
+                e.pushKV("receives", vNet[i] > 0 ? vNet[i] : 0);
+                e.pushKV("pays", vNet[i] < 0 ? -vNet[i] : 0);
+                nets.push_back(e);
+            }
+            result.pushKV("nets", nets);
+        } else {
+            result.pushKV("error", strFail);
+        }
+    }
+
+    UniValue signedBy(UniValue::VARR);
+    bool fComplete = false;
+    if (!r.vchTx.empty()) {
+        try {
+            CMutableTransaction mtx;
+            CDataStream ss(r.vchTx, SER_NETWORK, PROTOCOL_VERSION);
+            ss >> mtx;
+            SettleNet n;
+            if (DecodeSettlePayload(mtx.vchSettlePayload, n) && n.vApproverSig.size() == n.vHouseID.size() &&
+                    n.vPresentSig.size() == n.vHouseID.size()) {
+                fComplete = true;
+                for (size_t i = 0; i < n.vHouseID.size(); i++) {
+                    const bool fSigned = !n.vApproverSig[i].empty() &&
+                                         (n.vPresentKey[i].empty() || !n.vPresentSig[i].empty());
+                    if (fSigned)
+                        signedBy.push_back((int64_t)n.vHouseID[i]);
+                    fComplete = fComplete && fSigned;
+                }
+                for (const CTxIn& in : mtx.vin)
+                    fComplete = fComplete && !in.scriptSig.empty();
+                if (fComplete)
+                    result.pushKV("txid", mtx.GetHash().ToString());
+            }
+        } catch (const std::ios_base::failure&) {
+            result.pushKV("error", "Undecodable transaction in the round");
+        }
+    }
+    result.pushKV("signed", signedBy);
+    result.pushKV("stage", fComplete ? "complete" : stage);
+    return result;
+}
+
 UniValue listpresentable(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -5899,11 +6240,37 @@ UniValue listsettlements(const JSONRPCRequest& request)
         const CWalletTx* pcoin = &entry.second;
         if (pcoin->tx->nVersion != TRANSACTION_SETTLE_VERSION)
             continue;
+        if (pcoin->tx->nSettleOp == SETTLE_OP_NET) {
+            // v0.2.22 netting round: per house, the units of its notes retired, its net and what it received.
+            SettleNet n;
+            std::vector<int64_t> vNet;
+            std::vector<uint64_t> vBurn;
+            if (!DecodeSettlePayload(pcoin->tx->vchSettlePayload, n) || !SettleNetPositions(n, vNet, vBurn) ||
+                    n.vReceive.size() != n.vHouseID.size())
+                continue;
+            UniValue o(UniValue::VOBJ);
+            o.pushKV("txid", entry.first.ToString());
+            o.pushKV("op", "net");
+            UniValue houses(UniValue::VARR);
+            for (size_t i = 0; i < n.vHouseID.size(); i++) {
+                UniValue h(UniValue::VOBJ);
+                h.pushKV("house", (uint64_t)n.vHouseID[i]);
+                h.pushKV("units_retired", vBurn[i]);
+                h.pushKV("net", vNet[i]);
+                h.pushKV("received_sats", n.vReceive[i]);
+                houses.push_back(h);
+            }
+            o.pushKV("houses", houses);
+            o.pushKV("confirmations", pcoin->GetDepthInMainChain());
+            response.push_back(o);
+            continue;
+        }
         SettleExchange x;
         if (!DecodeSettlePayload(pcoin->tx->vchSettlePayload, x))
             continue;
         UniValue o(UniValue::VOBJ);
         o.pushKV("txid", entry.first.ToString());
+        o.pushKV("op", "exchange");
         o.pushKV("house_a", (uint64_t)x.nHouseA);
         o.pushKV("house_b", (uint64_t)x.nHouseB);
         o.pushKV("units_a_retired", x.nUnitsANotes);
@@ -7614,6 +7981,11 @@ static const CRPCCommand commands[] =
     { "settle",             "proposesettle",                    &proposesettle,                 {"ownid", "counterparty", "maxunits", "expiryblocks", "fee"} },
     { "settle",             "signsettle",                       &signsettle,                    {"proposal", "fee"} },
     { "settle",             "completesettle",                   &completesettle,                {"hex"} },
+    { "settle",             "createnetting",                    &createnetting,                 {"ownid", "houses", "expiryblocks", "fee"} },
+    { "settle",             "joinnetting",                      &joinnetting,                   {"ownid", "round", "fee"} },
+    { "settle",             "fundnetting",                      &fundnetting,                   {"ownid", "round"} },
+    { "settle",             "signnetting",                      &signnetting,                   {"ownid", "round", "send"} },
+    { "settle",             "decodenetting",                    &decodenetting,                 {"round"} },
     { "settle",             "listpresentable",                  &listpresentable,               {"id"} },
     { "settle",             "listsettlements",                  &listsettlements,               {} },
     { "houses",             "registerhouse",                    &registerhouse,                 {"tier", "threshold", "classid", "denommg", "pledges", "fee", "type"} },

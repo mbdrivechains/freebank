@@ -6509,13 +6509,11 @@ static bool HouseStateChangePending(uint32_t nHouseID)
             // template that ConnectBlock's one-op-per-house rule will refuse,
             // and the wallet records a phantom txid.
             memcpy(&nTheirs, mtx.vchBillPayload.data() + 4, 4); fMatch = true;
-        } else if (mtx.nVersion == TRANSACTION_SETTLE_VERSION &&
-                mtx.vchSettlePayload.size() >= 8) {
-            // Dual-slot: a pooled settle takes BOTH houses' slots.
-            uint32_t nTheirA = 0, nTheirB = 0;
-            memcpy(&nTheirA, mtx.vchSettlePayload.data(), 4);
-            memcpy(&nTheirB, mtx.vchSettlePayload.data() + 4, 4);
-            if (nTheirA == nHouseID || nTheirB == nHouseID)
+        } else if (mtx.nVersion == TRANSACTION_SETTLE_VERSION) {
+            // A pooled settle takes both houses' slots (exchange) or every house's (NET round).
+            std::vector<uint32_t> vTheirs;
+            if (SettleSlotHouses(mtx, vTheirs) &&
+                    std::find(vTheirs.begin(), vTheirs.end(), nHouseID) != vTheirs.end())
                 return true;
         }
         if (fMatch && nTheirs == nHouseID)
@@ -7249,13 +7247,14 @@ static void AbandonDisplacedSettles(CWallet* pwallet, uint32_t nHouseA, uint32_t
         }
         if (wtx.GetDepthInMainChain() != 0 || wtx.InMempool() || wtx.isAbandoned())
             continue;
-        uint32_t nA = 0, nB = 0;
-        if (wtx.tx->vchSettlePayload.size() >= 8) {
-            memcpy(&nA, wtx.tx->vchSettlePayload.data(), 4);
-            memcpy(&nB, wtx.tx->vchSettlePayload.data() + 4, 4);
+        std::vector<uint32_t> vTheirs;
+        SettleSlotHouses(*wtx.tx, vTheirs);
+        for (const uint32_t nTheirs : vTheirs) {
+            if (nTheirs == nHouseA || nTheirs == nHouseB) {
+                vAbandon.push_back(entry.first);
+                break;
+            }
         }
-        if (nA == nHouseA || nA == nHouseB || nB == nHouseA || nB == nHouseB)
-            vAbandon.push_back(entry.first);
     }
     for (const uint256& txid : vAbandon) {
         LogPrintf("%s: abandoning displaced settle %s\n", __func__, txid.ToString());
@@ -7647,6 +7646,581 @@ bool CWallet::CompleteSettle(std::string& strFail, uint256& txidOut, const std::
     CValidationState state;
     if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
         strFail = "Failed to commit settle! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Netting rounds (v0.2.22, gateway/docs/freebank/NETTING_DESIGN.md s6). Wallet protocol, not consensus: the round
+// blob (SettleNetRoundV1, settle.h) passes between houses; each builds the same transaction from it and the chain.
+
+// Change below this goes to the fee: every house must build the identical transaction, so no node-local dust rule.
+static const CAmount NETTING_MIN_CHANGE = 1000;
+// A house signs only a round that expires, and soon: a signed round can be sent again after an attestation displaces
+// it, so it must not stay usable for long.
+static const uint32_t NETTING_MAX_EXPIRY_BLOCKS = 144;
+
+static bool DecodeNettingRound(const std::string& strHex, SettleNetRoundV1& r, std::string& strFail)
+{
+    if (!IsHex(strHex)) { strFail = "The round is not hex!"; return false; }
+    try {
+        std::vector<unsigned char> vch = ParseHex(strHex);
+        CDataStream ss(vch, SER_NETWORK, PROTOCOL_VERSION);
+        ss >> r;
+        if (!ss.empty()) { strFail = "Trailing bytes in the round!"; return false; }
+    } catch (const std::exception&) { strFail = "Undecodable round!"; return false; }
+    if (r.nVersion != 1) { strFail = "Unknown round version!"; return false; }
+    if (r.vHouseID.size() < 2) { strFail = "A round needs at least two houses!"; return false; }
+    return true;
+}
+
+static std::string EncodeNettingRound(const SettleNetRoundV1& r)
+{
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << r;
+    return HexStr(ss.begin(), ss.end());
+}
+
+static bool IsPlainCoin(const Coin& coin)
+{
+    return !coin.fNote && !coin.fPoolEscrow && !coin.fLpShare && !coin.fHouseEscrow && !coin.fBill &&
+           !coin.fBillEscrow && !coin.fDeposit && !coin.IsAssetColoured() && !coin.fOracleBond;
+}
+
+static bool IsPresentableNoteCoin(const Coin& coin, uint32_t nIssuer)
+{
+    return coin.fNote && !coin.fPoolEscrow && !coin.fLpShare && !coin.fHouseEscrow && !coin.fBill &&
+           !coin.fBillEscrow && !coin.fDeposit && !coin.IsAssetColoured() && !coin.fOracleBond &&
+           coin.nHouseID == nIssuer && coin.nDemandHeight == 0;
+}
+
+/** Advisory pre-flight at the next block for the given houses (the connect-time checks are the real gate):
+ * par-eligible, attested since the last settle, no house-slot op pending. Fills mapHouse. */
+static bool NettingPreflight(const std::vector<uint32_t>& vHouseID, std::map<uint32_t, CHouse>& mapHouse,
+                             std::string& strFail)
+{
+    const int nNextHeight = chainActive.Height() + 1;
+    for (const uint32_t nID : vHouseID) {
+        CHouse h;
+        if (!phousetree->GetHouse(nID, h)) { strFail = strprintf("Unknown house %u!", nID); return false; }
+        if (!HouseParEligible(h, nNextHeight)) {
+            strFail = strprintf("House %u is not par-eligible (it must be Open, at or above the reserve floor, and "
+                                "attested within one cadence)!", nID);
+            return false;
+        }
+        if (h.nLastSettleHeight != 0 &&
+                (h.nLastAttestHeight <= h.nLastSettleHeight || (uint32_t)nNextHeight <= h.nLastAttestHeight)) {
+            strFail = strprintf("House %u settled at height %u and has not attested since - it must attest first!",
+                                nID, h.nLastSettleHeight);
+            return false;
+        }
+        if (HouseStateChangePending(nID)) {
+            strFail = strprintf("A house-state-changing op for house %u is already pending - retry next block!", nID);
+            return false;
+        }
+        mapHouse[nID] = h;
+    }
+    return true;
+}
+
+/** The round's transaction, exactly as every house builds it: bundle coins (ascending presenter, then issuer), then
+ * funding coins (ascending house); creditor payments first in the outputs (ascending house), then change. No
+ * signatures. vInputHouse names the house that signs each input. With fFunding false the funding and change are
+ * left out (to work out the nets before anyone funds). */
+static bool BuildNettingTx(const SettleNetRoundV1& r, const std::map<uint32_t, CHouse>& mapHouse, bool fFunding,
+                           CMutableTransaction& mtx, SettleNet& n, std::vector<int64_t>& vNet,
+                           std::vector<uint32_t>& vInputHouse, std::string& strFail)
+{
+    if (r.vPart.size() != r.vHouseID.size()) { strFail = "Not every house has joined the round yet!"; return false; }
+    if (!SettleNetRoundBundles(r, n, vNet, strFail))
+        return false;
+    if (n.vBundle.empty()) { strFail = "Nobody in the round holds any other house's notes!"; return false; }
+    const size_t nHouses = r.vHouseID.size();
+    auto fnIndex = [&r](uint32_t nID) {
+        return (size_t)(std::lower_bound(r.vHouseID.begin(), r.vHouseID.end(), nID) - r.vHouseID.begin());
+    };
+    std::vector<bool> vActive(nHouses, false);
+    for (const SettleNetBundle& b : n.vBundle) {
+        vActive[fnIndex(b.nPresenter)] = true;
+        vActive[fnIndex(b.nIssuer)] = true;
+    }
+    for (size_t i = 0; i < nHouses; i++) {
+        if (!vActive[i]) {
+            strFail = strprintf("House %u neither presents notes nor has its notes presented - start a round "
+                                "without it!", r.vHouseID[i]);
+            return false;
+        }
+    }
+
+    mtx = CMutableTransaction();
+    mtx.nVersion = TRANSACTION_SETTLE_VERSION;
+    mtx.nSettleOp = SETTLE_OP_NET;
+    vInputHouse.clear();
+    for (const SettleNetRoundPart& part : r.vPart) {
+        for (const SettleNetRoundBundle& rb : part.vBundle) {
+            for (const COutPoint& out : rb.vCoin) {
+                mtx.vin.push_back(CTxIn(out, CScript()));
+                vInputHouse.push_back(part.nHouseID);
+            }
+        }
+    }
+
+    n.vReceive.assign(nHouses, 0);
+    n.vPrevMintedUnits.assign(nHouses, 0);
+    n.vPrevLastSettleHeight.assign(nHouses, 0);
+    for (size_t i = 0; i < nHouses; i++) {
+        const auto it = mapHouse.find(r.vHouseID[i]);
+        if (it == mapHouse.end()) { strFail = strprintf("No record for house %u!", r.vHouseID[i]); return false; }
+        n.vPrevMintedUnits[i] = it->second.nMintedUnits;
+        n.vPrevLastSettleHeight[i] = it->second.nLastSettleHeight;
+        if (vNet[i] > 0) {
+            if (vNet[i] < SETTLE_MIN_RESIDUAL) {
+                strFail = strprintf("House %u would receive %d, below the %d minimum - move some of the notes it "
+                                    "presents off its presentment key and join again!",
+                                    r.vHouseID[i], vNet[i], SETTLE_MIN_RESIDUAL);
+                return false;
+            }
+            n.vReceive[i] = (CAmount)vNet[i];   // exact par
+            mtx.vout.push_back(CTxOut(n.vReceive[i], NoteScriptForPubKey(it->second.vchRedemptionDestPK)));
+        }
+    }
+
+    if (fFunding) {
+        for (const SettleNetRoundPart& part : r.vPart) {
+            const int64_t nNet = vNet[fnIndex(part.nHouseID)];
+            const CAmount nNeed = (nNet < 0 ? (CAmount)(-nNet) : 0) + (part.nHouseID == r.nStarter ? r.nFee : 0);
+            if (!part.fFunded) { strFail = strprintf("House %u has not funded its part yet!", part.nHouseID); return false; }
+            CAmount nIn = 0;
+            for (const COutPoint& out : part.vFunding) {
+                Coin coin;
+                if (!pcoinsTip->GetCoin(out, coin) || !IsPlainCoin(coin)) {
+                    strFail = strprintf("House %u's funding coin %s is spent, unconfirmed or not a plain coin!",
+                                        part.nHouseID, out.ToString());
+                    return false;
+                }
+                nIn += coin.out.nValue;
+                mtx.vin.push_back(CTxIn(out, CScript()));
+                vInputHouse.push_back(part.nHouseID);
+            }
+            if (nIn < nNeed) {
+                strFail = strprintf("House %u's funding (%s) does not cover the %s it owes!", part.nHouseID,
+                                    FormatMoney(nIn), FormatMoney(nNeed));
+                return false;
+            }
+            if (nIn - nNeed >= NETTING_MIN_CHANGE) {
+                if (part.scriptChange.empty()) { strFail = strprintf("House %u gave no change address!", part.nHouseID); return false; }
+                mtx.vout.push_back(CTxOut(nIn - nNeed, part.scriptChange));
+            }
+        }
+        // A round where every net is zero pays no one: the starter's change must then be there (fundnetting
+        // funds it), since a transaction needs an output.
+        if (mtx.vout.empty()) {
+            strFail = "The round would have no outputs - the starter must fund it again (fundnetting)!";
+            return false;
+        }
+    }
+
+    n.nExpiryHeight = r.nExpiryHeight;
+    n.vPresentSig.assign(nHouses, std::vector<unsigned char>());
+    n.vApproverIndex.assign(nHouses, std::vector<uint32_t>());
+    n.vApproverSig.assign(nHouses, std::vector<std::vector<unsigned char>>());
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << n;
+    mtx.vchSettlePayload.assign(ss.begin(), ss.end());
+    return true;
+}
+
+/** This house's part: every other round house's undemanded, confirmed notes it holds, on one presentment key (the
+ * key holding the most). Notes on other keys, or a bundle over the input limit, are first moved there by transfers
+ * (vConsolidate), and the call fails until they confirm. */
+static bool JoinNettingPart(CWallet* pwallet, SettleNetRoundV1& r, uint32_t nOwn, const CAmount& nFee,
+                            std::vector<uint256>& vConsolidate, std::string& strFail)
+{
+    std::map<CKeyID, std::map<uint32_t, std::vector<WalletNoteCoin>>> mapByKey;   // holder -> issuer -> coins
+    std::map<CKeyID, uint64_t> mapKeyUnits;
+    for (const uint32_t nIssuer : r.vHouseID) {
+        if (nIssuer == nOwn)
+            continue;
+        std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
+        CollectWalletNoteCoins(pwallet, nIssuer, mapByHolder);
+        for (const auto& kv : mapByHolder) {
+            if (kv.first.second != 0)
+                continue;   // demanded notes can't be presented
+            for (const WalletNoteCoin& c : kv.second) {
+                Coin coin;
+                if (!pcoinsTip->GetCoin(c.outpoint, coin) || !IsPresentableNoteCoin(coin, nIssuer))
+                    continue;   // unconfirmed, or not a plain undemanded note
+                mapByKey[kv.first.first][nIssuer].push_back(c);
+                mapKeyUnits[kv.first.first] += c.units;
+            }
+        }
+    }
+
+    SettleNetRoundPart part;
+    part.nHouseID = nOwn;
+    if (!mapByKey.empty()) {
+        CKeyID keyPresent = mapKeyUnits.begin()->first;
+        for (const auto& kv : mapKeyUnits)
+            if (kv.second > mapKeyUnits[keyPresent])
+                keyPresent = kv.first;
+        const CScript scriptPresent = GetScriptForDestination(keyPresent);
+        for (const auto& kv : mapByKey) {
+            for (const auto& iss : kv.second) {
+                if (kv.first == keyPresent && iss.second.size() <= SETTLE_MAX_BUNDLE_INPUTS)
+                    continue;
+                uint64_t nUnits = 0;
+                for (const WalletNoteCoin& c : iss.second)
+                    nUnits += c.units;
+                uint256 txid;
+                if (!pwallet->TransferNote(strFail, txid, iss.first, nUnits, nFee, scriptPresent, &kv.first))
+                    return false;
+                vConsolidate.push_back(txid);
+            }
+        }
+        if (!vConsolidate.empty()) {
+            strFail = "Moving notes onto one presentment key - run this again once the transfers confirm.";
+            return false;
+        }
+        const std::map<uint32_t, std::vector<WalletNoteCoin>>& mapIssuer = mapByKey[keyPresent];
+        part.vchPresentKey = mapIssuer.begin()->second[0].vchHolderPubKey;
+        for (const auto& iss : mapIssuer) {   // ascending issuer
+            SettleNetRoundBundle rb;
+            rb.nIssuer = iss.first;
+            for (const WalletNoteCoin& c : iss.second) {
+                rb.nUnits += c.units;
+                rb.vCoin.push_back(c.outpoint);
+            }
+            part.vBundle.push_back(rb);
+        }
+    }
+
+    auto it = std::lower_bound(r.vPart.begin(), r.vPart.end(), nOwn,
+                               [](const SettleNetRoundPart& p, uint32_t nID) { return p.nHouseID < nID; });
+    if (it != r.vPart.end() && it->nHouseID == nOwn)
+        *it = part;
+    else
+        r.vPart.insert(it, part);
+    return true;
+}
+
+bool CWallet::CreateNetting(std::string& strFail, std::string& strRoundOut, std::vector<uint256>& vConsolidate,
+                            uint32_t nOwnHouseID, const std::vector<uint32_t>& vHouseID, uint32_t nExpiryBlocks,
+                            const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    strRoundOut.clear();
+    vConsolidate.clear();
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    if (nFee < 0 || nFee > maxTxFee) { strFail = strprintf("The fee must be between 0 and %s (-maxtxfee)!", FormatMoney(maxTxFee)); return false; }
+    if (nExpiryBlocks == 0 || nExpiryBlocks > NETTING_MAX_EXPIRY_BLOCKS) {
+        strFail = strprintf("The round must expire within 1 to %u blocks!", NETTING_MAX_EXPIRY_BLOCKS); return false;
+    }
+
+    SettleNetRoundV1 r;
+    std::set<uint32_t> setHouse(vHouseID.begin(), vHouseID.end());
+    setHouse.insert(nOwnHouseID);
+    if (setHouse.count(0) || setHouse.size() < 2) { strFail = "A round needs at least two houses!"; return false; }
+    r.vHouseID.assign(setHouse.begin(), setHouse.end());
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    std::map<uint32_t, CHouse> mapHouse;
+    if (!NettingPreflight(r.vHouseID, mapHouse, strFail))
+        return false;
+    r.nStarter = nOwnHouseID;
+    r.nExpiryHeight = (uint32_t)chainActive.Height() + nExpiryBlocks;
+    r.nFee = nFee;
+    if (!JoinNettingPart(this, r, nOwnHouseID, nFee, vConsolidate, strFail))
+        return false;
+    strRoundOut = EncodeNettingRound(r);
+    return true;
+}
+
+bool CWallet::JoinNetting(std::string& strFail, std::string& strRoundOut, std::vector<uint256>& vConsolidate,
+                          uint32_t nOwnHouseID, const std::string& strRound, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    strRoundOut.clear();
+    vConsolidate.clear();
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    SettleNetRoundV1 r;
+    if (!DecodeNettingRound(strRound, r, strFail))
+        return false;
+    if (!std::binary_search(r.vHouseID.begin(), r.vHouseID.end(), nOwnHouseID)) {
+        strFail = strprintf("House %u is not in this round!", nOwnHouseID); return false;
+    }
+    if (!r.vchTx.empty()) { strFail = "Signing has started - start a new round to change the bundles!"; return false; }
+    for (const SettleNetRoundPart& part : r.vPart) {
+        if (part.fFunded) { strFail = "Funding has started - start a new round to change the bundles!"; return false; }
+    }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    if (r.nExpiryHeight != 0 && (uint32_t)chainActive.Height() >= r.nExpiryHeight) { strFail = "The round has expired!"; return false; }
+    std::map<uint32_t, CHouse> mapHouse;
+    if (!NettingPreflight({nOwnHouseID}, mapHouse, strFail))
+        return false;
+    if (!JoinNettingPart(this, r, nOwnHouseID, nFee, vConsolidate, strFail))
+        return false;
+    strRoundOut = EncodeNettingRound(r);
+    return true;
+}
+
+bool CWallet::FundNetting(std::string& strFail, std::string& strRoundOut, uint32_t nOwnHouseID,
+                          const std::string& strRound)
+{
+    strFail = "Unknown error!";
+    strRoundOut.clear();
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    SettleNetRoundV1 r;
+    if (!DecodeNettingRound(strRound, r, strFail))
+        return false;
+    if (!r.vchTx.empty()) { strFail = "Signing has started - start a new round to change the funding!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    if (r.nExpiryHeight != 0 && (uint32_t)chainActive.Height() >= r.nExpiryHeight) { strFail = "The round has expired!"; return false; }
+    std::map<uint32_t, CHouse> mapHouse;
+    if (!NettingPreflight(r.vHouseID, mapHouse, strFail))
+        return false;
+    CMutableTransaction mtx;
+    SettleNet n;
+    std::vector<int64_t> vNet;
+    std::vector<uint32_t> vInputHouse;
+    if (!BuildNettingTx(r, mapHouse, false, mtx, n, vNet, vInputHouse, strFail))
+        return false;
+    auto it = std::lower_bound(r.vPart.begin(), r.vPart.end(), nOwnHouseID,
+                               [](const SettleNetRoundPart& p, uint32_t nID) { return p.nHouseID < nID; });
+    if (it == r.vPart.end() || it->nHouseID != nOwnHouseID) { strFail = strprintf("House %u has not joined!", nOwnHouseID); return false; }
+    const int64_t nNet = vNet[std::lower_bound(r.vHouseID.begin(), r.vHouseID.end(), nOwnHouseID) - r.vHouseID.begin()];
+    const bool fStarter = nOwnHouseID == r.nStarter;
+    if (fStarter && (r.nFee < 0 || r.nFee > maxTxFee)) {
+        strFail = strprintf("The round's fee %s is above -maxtxfee (%s)!", FormatMoney(r.nFee), FormatMoney(maxTxFee)); return false;
+    }
+    const CAmount nNeed = (nNet < 0 ? (CAmount)(-nNet) : 0) + (fStarter ? r.nFee : 0);
+    // A round where every net is zero has no payments: the starter's change is then its one output, so fund enough
+    // for change to be kept.
+    const bool fNoPayments = std::none_of(vNet.begin(), vNet.end(), [](int64_t v) { return v > 0; });
+    const CAmount nTarget = nNeed + (fStarter && fNoPayments ? NETTING_MIN_CHANGE : 0);
+
+    for (const COutPoint& out : it->vFunding)
+        UnlockCoin(out);
+    it->vFunding.clear();
+    it->scriptChange = CScript();
+    if (nTarget > 0) {
+        // Confirmed coins only: every house looks the funding up in its own UTXO set.
+        std::vector<COutput> vCoins, vConfirmed;
+        AvailableCoins(vCoins, true);
+        for (const COutput& o : vCoins)
+            if (o.nDepth >= 1)
+                vConfirmed.push_back(o);
+        std::set<CInputCoin> setCoins;
+        CAmount nValueRet = 0;
+        if (!SelectCoins(vConfirmed, nTarget, setCoins, nValueRet)) {
+            strFail = strprintf("Could not fund %s from confirmed coins!", FormatMoney(nTarget)); return false;
+        }
+        CPubKey pubChange;
+        if (!GetKeyFromPool(pubChange)) { strFail = "Keypool ran out!"; return false; }
+        it->scriptChange = GetScriptForDestination(pubChange.GetID());
+        for (const CInputCoin& c : setCoins) {
+            it->vFunding.push_back(c.outpoint);
+            LockCoin(c.outpoint);   // in memory only: a restart (or lockunspent) frees them if the round is dropped
+        }
+    }
+    it->fFunded = true;
+    strRoundOut = EncodeNettingRound(r);
+    return true;
+}
+
+bool CWallet::SignNetting(std::string& strFail, std::string& strRoundOut, uint256& txidOut, std::string& strHexOut,
+                          int64_t& nNetOut, CAmount& nPaysOut, uint32_t nOwnHouseID, const std::string& strRound,
+                          bool fSend)
+{
+    strFail = "Unknown error!";
+    strRoundOut.clear();
+    txidOut.SetNull();
+    strHexOut.clear();
+    nNetOut = 0;
+    nPaysOut = 0;
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    SettleNetRoundV1 r;
+    if (!DecodeNettingRound(strRound, r, strFail))
+        return false;
+    const auto itOwn = std::lower_bound(r.vHouseID.begin(), r.vHouseID.end(), nOwnHouseID);
+    if (itOwn == r.vHouseID.end() || *itOwn != nOwnHouseID) { strFail = strprintf("House %u is not in this round!", nOwnHouseID); return false; }
+    const size_t nOwn = itOwn - r.vHouseID.begin();
+    if (!std::binary_search(r.vHouseID.begin(), r.vHouseID.end(), r.nStarter)) { strFail = "The round's starter is not in the round!"; return false; }
+
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+
+    // The round file passes through other hands, so bound what it can make this house sign: it must expire soon (a
+    // signed round can be sent again after an attestation displaces it), and the fee it pays as starter is capped.
+    const uint32_t nTip = (uint32_t)chainActive.Height();
+    if (r.nExpiryHeight == 0 || r.nExpiryHeight <= nTip || r.nExpiryHeight > nTip + NETTING_MAX_EXPIRY_BLOCKS) {
+        strFail = strprintf("The round must expire within %u blocks (expiry height %u, tip %u)!",
+                            NETTING_MAX_EXPIRY_BLOCKS, r.nExpiryHeight, nTip);
+        return false;
+    }
+    if (nOwnHouseID == r.nStarter && (r.nFee < 0 || r.nFee > maxTxFee)) {
+        strFail = strprintf("The round's fee %s is above -maxtxfee (%s)!", FormatMoney(r.nFee), FormatMoney(maxTxFee));
+        return false;
+    }
+    for (const uint32_t nID : r.vHouseID)
+        AbandonDisplacedSettles(this, nID, nID);
+    std::map<uint32_t, CHouse> mapHouse;
+    if (!NettingPreflight(r.vHouseID, mapHouse, strFail))
+        return false;
+    CMutableTransaction mtx;
+    SettleNet n;
+    std::vector<int64_t> vNet;
+    std::vector<uint32_t> vInputHouse;
+    if (!BuildNettingTx(r, mapHouse, true, mtx, n, vNet, vInputHouse, strFail))
+        return false;
+    nNetOut = vNet[nOwn];
+
+    // Every bundle must be what the chain holds: real undemanded notes of its issuer on its presenter's key.
+    for (const SettleNetRoundPart& part : r.vPart) {
+        const CScript scriptPresent = NoteScriptForPubKey(part.vchPresentKey);
+        for (const SettleNetRoundBundle& rb : part.vBundle) {
+            uint64_t nUnits = 0;
+            for (const COutPoint& out : rb.vCoin) {
+                Coin coin;
+                if (!pcoinsTip->GetCoin(out, coin) || !IsPresentableNoteCoin(coin, rb.nIssuer) ||
+                        coin.out.scriptPubKey != scriptPresent) {
+                    strFail = strprintf("House %u's bundle of house %u's notes doesn't match the chain!",
+                                        part.nHouseID, rb.nIssuer);
+                    return false;
+                }
+                nUnits += coin.nNoteUnits;
+            }
+            if (nUnits != rb.nUnits) {
+                strFail = strprintf("House %u's bundle of house %u's notes sums to %u, not %u!", part.nHouseID,
+                                    rb.nIssuer, (unsigned)nUnits, (unsigned)rb.nUnits);
+                return false;
+            }
+        }
+    }
+    // Our own part: our presentment key, our funding coins and our change are ours.
+    const SettleNetRoundPart& own = r.vPart[nOwn];
+    CKey keyPresent;
+    if (!own.vchPresentKey.empty() && !GetKey(CPubKey(own.vchPresentKey).GetID(), keyPresent)) {
+        strFail = "This wallet does not hold our presentment key!"; return false;
+    }
+    CAmount nFundingIn = 0;
+    for (const COutPoint& out : own.vFunding) {
+        Coin coin;
+        if (!pcoinsTip->GetCoin(out, coin) || !(::IsMine(*this, coin.out.scriptPubKey) & ISMINE_SPENDABLE)) {
+            strFail = "A funding coin in our part is not ours!"; return false;
+        }
+        nFundingIn += coin.out.nValue;
+    }
+    if (!own.scriptChange.empty() && !(::IsMine(*this, own.scriptChange) & ISMINE_SPENDABLE)) {
+        strFail = "The change address in our part is not ours!"; return false;
+    }
+    // What this house pays: its funding less the change it gets back (BuildNettingTx keeps change >= the minimum).
+    nPaysOut = nFundingIn;
+    for (const CTxOut& out : mtx.vout)
+        if (!own.scriptChange.empty() && out.scriptPubKey == own.scriptChange)
+            nPaysOut -= out.nValue;
+
+    // Continue on the transaction others have signed, if it is the same one we built.
+    if (!r.vchTx.empty()) {
+        CMutableTransaction mtxPrev;
+        SettleNet prev;
+        try {
+            CDataStream ss(r.vchTx, SER_NETWORK, PROTOCOL_VERSION);
+            ss >> mtxPrev;
+        } catch (const std::exception&) { strFail = "Undecodable transaction in the round!"; return false; }
+        if (!DecodeSettlePayload(mtxPrev.vchSettlePayload, prev)) { strFail = "Undecodable payload in the round!"; return false; }
+        bool fSame = mtxPrev.nVersion == mtx.nVersion && mtxPrev.nSettleOp == mtx.nSettleOp &&
+                     mtxPrev.nLockTime == mtx.nLockTime && mtxPrev.vin.size() == mtx.vin.size() &&
+                     mtxPrev.vout == mtx.vout;
+        for (size_t i = 0; fSame && i < mtx.vin.size(); i++)
+            fSame = mtxPrev.vin[i].prevout == mtx.vin[i].prevout && mtxPrev.vin[i].nSequence == mtx.vin[i].nSequence;
+        SettleNet prevTerms = prev;
+        prevTerms.vPresentSig.assign(n.vHouseID.size(), std::vector<unsigned char>());
+        prevTerms.vApproverIndex.assign(n.vHouseID.size(), std::vector<uint32_t>());
+        prevTerms.vApproverSig.assign(n.vHouseID.size(), std::vector<std::vector<unsigned char>>());
+        CDataStream ssA(SER_NETWORK, PROTOCOL_VERSION), ssB(SER_NETWORK, PROTOCOL_VERSION);
+        ssA << prevTerms;
+        ssB << n;
+        if (!fSame || prev.vHouseID.size() != n.vHouseID.size() || ssA.str() != ssB.str()) {
+            strFail = "The round's transaction no longer matches the chain (a house's record changed since "
+                      "signing began) - start a new round!";
+            return false;
+        }
+        mtx = mtxPrev;
+        n = prev;
+    }
+
+    const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    n.vApproverIndex[nOwn].clear();
+    n.vApproverSig[nOwn].clear();
+    if (!SignSettleApprovers(this, mapHouse[nOwnHouseID], sighash, n.vApproverIndex[nOwn], n.vApproverSig[nOwn], strFail))
+        return false;
+    if (!own.vchPresentKey.empty() && !keyPresent.Sign(sighash, n.vPresentSig[nOwn])) {
+        strFail = "Failed to sign as presenter!"; return false;
+    }
+    {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << n;
+        mtx.vchSettlePayload.assign(ss.begin(), ss.end());
+    }
+
+    // Our inputs (the legacy sighash leaves out the payload trailer, so the order of signing doesn't matter).
+    const CTransaction txToSign(mtx);
+    for (size_t i = 0; i < mtx.vin.size(); i++) {
+        if (vInputHouse[i] != nOwnHouseID)
+            continue;
+        Coin coin;
+        if (!pcoinsTip->GetCoin(mtx.vin[i].prevout, coin)) { strFail = "One of our inputs is spent!"; return false; }
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, (unsigned int)i, coin.out.nValue, SIGHASH_ALL),
+                              coin.out.scriptPubKey, sigdata)) {
+            strFail = "Signing our inputs failed!"; return false;
+        }
+        UpdateTransaction(mtx, (unsigned int)i, sigdata);
+    }
+    {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << mtx;
+        r.vchTx.assign(ss.begin(), ss.end());
+    }
+    strRoundOut = EncodeNettingRound(r);
+
+    // The last signature sends it.
+    bool fComplete = true;
+    for (size_t i = 0; i < n.vHouseID.size() && fComplete; i++)
+        fComplete = !n.vApproverSig[i].empty() && (n.vPresentKey[i].empty() || !n.vPresentSig[i].empty());
+    for (size_t i = 0; i < mtx.vin.size() && fComplete; i++)
+        fComplete = !mtx.vin[i].scriptSig.empty();
+    if (!fComplete)
+        return true;
+    if (!fSend) {
+        strHexOut = EncodeHexTx(CTransaction(mtx));
+        return true;
+    }
+
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CReserveKey reserveKey(this);
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state) || !state.IsValid()) {
+        strFail = "Failed to send the round! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    {
+        LOCK(mempool.cs);
+        if (!mempool.exists(walletTx.tx->GetHash())) {
+            strFail = "The round was refused by the mempool: " + FormatStateMessage(state); return false;
+        }
     }
     txidOut = walletTx.tx->GetHash();
     return true;

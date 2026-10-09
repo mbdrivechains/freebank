@@ -68,6 +68,7 @@ BITCOIN_TESTS =\
   test/deposit_tests.cpp \
   test/pool_tests.cpp \
   test/settle_tests.cpp \
+  test/settle_net_tests.cpp \
   test/oracle_tests.cpp \
   test/bmmcache_tests.cpp \
   test/bswap_tests.cpp \
