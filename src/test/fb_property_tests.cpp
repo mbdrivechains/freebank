@@ -71,7 +71,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged);
+                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(fb_property_tests, BasicTestingSetup)
 

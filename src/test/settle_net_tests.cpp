@@ -32,10 +32,10 @@
 
 bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                              const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                             std::vector<CHouse>& vHousesOut);
+                             std::vector<CHouse>& vHousesOut, bool fMempool = false);
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                          CHouse& houseAOut, CHouse& houseBOut);
+                          CHouse& houseAOut, CHouse& houseBOut, bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(settle_net_tests, BasicTestingSetup)
 

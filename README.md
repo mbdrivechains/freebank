@@ -127,8 +127,14 @@ v0.2.18 brings ECX credit with no closure date, and assets,
 v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in the code, dormant,
 v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned,
 v0.2.21 lets token holders claim at a failed house without its partners,
-v0.2.22 lets any number of houses net their notes in one settlement, and
-v0.2.23 lets a node restart on its own after a power cut:
+v0.2.22 lets any number of houses net their notes in one settlement,
+v0.2.23 lets a node restart on its own after a power cut, and
+v0.2.24 tightens disk safety and peer scoring:
+
+- **Disk safety, peer scoring, `getbalance "*"`** (v0.2.24). **No consensus change:** upgrade when it suits you, a
+  binary swap with no `-reindex`. Undo data is synced before the block index names it; a relay of an attestation,
+  mint, discount, suspension or settlement that just went out of date no longer counts against the peer; `getbalance
+  "*"` leaves out note and asset coins. Details in the release notes.
 
 - **Restart after a power cut, and wallet fixes** (v0.2.23). **No consensus change:** upgrade when it suits you, a
   binary swap with no `-reindex`. A node that lost power (or crashed) after new blocks, or right after a reorg, now

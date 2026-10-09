@@ -2207,6 +2207,13 @@ CAmount CWallet::GetLegacyBalance(const isminefilter& filter, int minDepth, cons
 {
     LOCK2(cs_main, cs_wallet);
 
+    // v0.2.24: credit-tagged and asset coins are not ECX, on both sides: an output is not added, and an input spending
+    // one is not debited (getbalance without "*" leaves them out since v0.2.23; this one counted the coin when it came
+    // in and again when it went out, so only the in-side could not be dropped alone).
+    const auto fnNotECX = [this](const CWalletTx& w, unsigned int n) {
+        const int d = w.GetDepthInMainChain();
+        return IsCreditTaggedOutput(w, n) || (d <= 0 && IsUnconfirmedAssetTx(w)) || IsOutputAssetColoured(w, n, d);
+    };
     CAmount balance = 0;
     for (const auto& entry : mapWallet) {
         const CWalletTx& wtx = entry.second;
@@ -2217,9 +2224,20 @@ CAmount CWallet::GetLegacyBalance(const isminefilter& filter, int minDepth, cons
 
         // Loop through tx outputs and add incoming payments. For outgoing txs,
         // treat change outputs specially, as part of the amount debited.
-        CAmount debit = wtx.GetDebit(filter);
+        CAmount debit = 0;
+        for (const CTxIn& txin : wtx.tx->vin) {
+            const auto mi = mapWallet.find(txin.prevout.hash);
+            if (mi == mapWallet.end() || txin.prevout.n >= mi->second.tx->vout.size())
+                continue;
+            if ((IsMine(mi->second.tx->vout[txin.prevout.n]) & filter) && !fnNotECX(mi->second, txin.prevout.n))
+                debit += mi->second.tx->vout[txin.prevout.n].nValue;
+        }
         const bool outgoing = debit > 0;
-        for (const CTxOut& out : wtx.tx->vout) {
+        for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
+            const CTxOut& out = wtx.tx->vout[i];
+            if (fnNotECX(wtx, i)) {
+                continue;
+            }
             if (outgoing && IsChange(out)) {
                 debit -= out.nValue;
             } else if (IsMine(out) & filter && depth >= minDepth && (!account || *account == GetAccountName(out.scriptPubKey))) {

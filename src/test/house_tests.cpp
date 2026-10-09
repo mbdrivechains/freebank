@@ -31,7 +31,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(const std::string&)>& fnHaveClassID,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                         CHouse& houseOut);
+                         CHouse& houseOut, bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(house_tests, BasicTestingSetup)
 

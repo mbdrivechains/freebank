@@ -34,7 +34,7 @@
 // gates can be exercised directly with real ECDSA (the pool_tests pattern).
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                          CHouse& houseAOut, CHouse& houseBOut);
+                          CHouse& houseAOut, CHouse& houseBOut, bool fMempool = false);
 
 // The shared overflow envelope must stay shared (settle.h documents equality).
 static_assert(SETTLE_MAX_UNITS == POOL_MAX_AMOUNT,

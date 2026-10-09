@@ -32,7 +32,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                        CHouse& houseOut, bool& fHouseChanged);
+                        CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(note_tests, BasicTestingSetup)
 

@@ -406,7 +406,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(const std::string&)>& fnHaveClassID,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                         CHouse& houseOut);
+                         CHouse& houseOut, bool fMempool = false);
 
 static bool CheckHouseMemberOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                                       const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
@@ -419,7 +419,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                        CHouse& houseOut, bool& fHouseChanged);
+                        CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
@@ -435,13 +435,13 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
                         CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired);
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                          CHouse& houseAOut, CHouse& houseBOut);
+                          CHouse& houseAOut, CHouse& houseBOut, bool fMempool = false);
 bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                              const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                             std::vector<CHouse>& vHousesOut);
+                             std::vector<CHouse>& vHousesOut, bool fMempool = false);
 static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                          std::vector<CHouse>& vHousesOut);
+                          std::vector<CHouse>& vHousesOut, bool fMempool = false);
 
 bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
@@ -465,7 +465,7 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
     const std::vector<AttestProof>& vProofs, const std::vector<CTxIn>& vin, int nHeight,
     const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
     const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-    CAmount& amountOut, CValidationState& state, const std::string& prefix)
+    CAmount& amountOut, CValidationState& state, const std::string& prefix, bool fMempool)
 {
     // The proving tx must not consume the reserves it proves.
     std::set<COutPoint> setProof;
@@ -478,7 +478,7 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
 
     uint256 hashAsOf;
     if (!fnGetBlockHash(nAsOfHeight, hashAsOf))
-        return state.DoS(10, false, REJECT_INVALID, prefix + "-asof-unknown");
+        return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, prefix + "-asof-unknown");
 
     CAmount amountSum = 0;
     for (const AttestProof& p : vProofs) {
@@ -597,7 +597,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged);
+                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 
 enum FlushStateMode {
     FLUSH_STATE_NONE,
@@ -1181,7 +1181,7 @@ static void EvictStaleHouseNoteOps()
                 bool fHouseChanged = false;
                 if (!CheckBillOperation(mtx, stateStale, nNextHeight, mi->GetFee(), fnGetBill,
                         fnHaveBillHash, fnGetHouse, fnGetProofCoin, fnGetBlockHash,
-                        billResult, houseResult, fHouseChanged))
+                        billResult, houseResult, fHouseChanged, true))
                     fStale = true;
             } else if (fHouseTx && IsHouseMemberOp(mtx.nHouseOp)) {
                 // v0.2.19: a member op's priors are against the confirmed records, which the block just changed
@@ -1193,7 +1193,7 @@ static void EvictStaleHouseNoteOps()
             } else if (fHouseTx) {
                 CHouse houseResult;
                 if (!CheckHouseOperation(mtx, stateStale, nNextHeight, fnGetHouse, fnHaveHouseHash,
-                        fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult))
+                        fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult, true))
                     fStale = true;
             } else if (fNoteTx) {
                 uint64_t nNoteUnitsIn = 0;
@@ -1215,7 +1215,7 @@ static void EvictStaleHouseNoteOps()
                             eff, houseResult, fHouseChanged))
                         fStale = true;
                 } else if (!CheckNoteOperation(mtx, stateStale, nNextHeight, nNoteUnitsIn, fnGetHouse,
-                        fnGetCoin, fnGetProofCoin, fnGetBlockHash, houseResult, fHouseChanged))
+                        fnGetCoin, fnGetProofCoin, fnGetBlockHash, houseResult, fHouseChanged, true))
                     fStale = true;
             } else if (fDepositTx) {
                 CHouse houseResult;
@@ -1230,7 +1230,7 @@ static void EvictStaleHouseNoteOps()
                 // causes - re-run the REAL contextual check at height+1.
                 // (A NET round hangs on every participant's record.)
                 std::vector<CHouse> vSettleHouses;
-                if (!CheckSettleTx(mtx, stateStale, nNextHeight, fnGetHouse, vSettleHouses))
+                if (!CheckSettleTx(mtx, stateStale, nNextHeight, fnGetHouse, vSettleHouses, true))
                     fStale = true;
             } else if (fPoolTx) { // a connected pool op moved the priors every
                      // pooled loser bound; a governance op can close the house
@@ -1798,7 +1798,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             CHouse houseResult;
             bool fHouseChanged = false;
             if (!CheckBillOperation(tx, state, GetSpendHeight(view), nFees, fnGetBill, fnHaveBillHash,
-                    fnGetHouse, fnGetProofCoin, fnGetBlockHash, billResult, houseResult, fHouseChanged))
+                    fnGetHouse, fnGetProofCoin, fnGetBlockHash, billResult, houseResult, fHouseChanged, true))
                 return error("%s: CheckBillOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             // PER-BILL EXCLUSIVITY: at most ONE pooled v11 op per bill. Runs
@@ -1911,7 +1911,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
             auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
             std::vector<CHouse> vSettleHouses;
-            if (!CheckSettleTx(tx, state, GetSpendHeight(view), fnGetHouse, vSettleHouses))
+            if (!CheckSettleTx(tx, state, GetSpendHeight(view), fnGetHouse, vSettleHouses, true))
                 return error("%s: CheckSettleOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
             std::set<uint32_t> setOurs;
             for (const CHouse& h : vSettleHouses)
@@ -1980,7 +1980,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return true;
             };
             CHouse houseResult;
-            if (!CheckHouseOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnHaveHouseHash, fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult))
+            if (!CheckHouseOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnHaveHouseHash, fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult, true))
                 return error("%s: CheckHouseOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             // A non-register incoming op targets an EXISTING house (dense id
@@ -2142,7 +2142,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 if (!CheckTokenOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, ConfirmedTokenView(),
                         eff, houseResult, fHouseChanged))
                     return error("%s: CheckTokenOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
-            } else if (!CheckNoteOperation(tx, state, GetSpendHeight(view), nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin, fnGetBlockHash, houseResult, fHouseChanged))
+            } else if (!CheckNoteOperation(tx, state, GetSpendHeight(view), nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin, fnGetBlockHash, houseResult, fHouseChanged, true))
                 return error("%s: CheckNoteOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             if (fHouseChanged) {
@@ -3409,7 +3409,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged)
+                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged, bool fMempool)
 {
     fHouseChanged = false;
 
@@ -3613,7 +3613,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return false;
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
                 (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
-            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-attest-stale");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-bill-discount-attest-stale");
         // The title must land on the house's consensus-known custody key, not on
         // any key the approvers feel like naming - that is what makes HRETIRE's
         // "pay the pinned custody key" a real constraint later.
@@ -3656,13 +3656,13 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // live reserves, binding on the minimum of the two. Anything less and a
         // house could discount an entire book against reserves it has spent.
         if (d.nAsOfHeight >= (uint32_t)nHeight)
-            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-reserve-future");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-bill-discount-reserve-future");
         if ((uint32_t)nHeight - d.nAsOfHeight > HOUSE_ATTEST_STALENESS)
-            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-reserve-stale");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-bill-discount-reserve-stale");
         CAmount amountLiveReserves = 0;
         if (!VerifyReserveProofs(house.houseID, d.nAsOfHeight, d.vReserveProofs, tx.vin,
                 nHeight, fnGetProofCoin, fnGetBlockHash, amountLiveReserves, state,
-                "bad-bill-discount-reserve"))
+                "bad-bill-discount-reserve", fMempool))
             return false;
         const CAmount amountEffReserves = std::min(house.amountLastAttestReserves, amountLiveReserves);
         const uint64_t nReserveCap = ((uint64_t)amountEffReserves * 100) / HOUSE_RESERVE_FLOOR_PCT;
@@ -3698,7 +3698,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // -- 23: expiry ------------------------------------------------------
         if ((uint32_t)nHeight > d.nExpiryHeight)
-            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-expired");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-bill-discount-expired");   // v0.2.24: timing
         if ((uint64_t)d.nExpiryHeight > (uint64_t)nHeight + BILL_DISCOUNT_MAX_EXPIRY_AHEAD)
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-expiry-far");
 
@@ -3972,7 +3972,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(const std::string&)>& fnHaveClassID,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                         CHouse& houseOut)
+                         CHouse& houseOut, bool fMempool)
 {
     // v0.2.19: member-list ops change no house record; their callers route them to CheckHouseMemberOperation
     if (IsHouseMemberOp(tx.nHouseOp))
@@ -4463,10 +4463,13 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // window, and strictly after the last accepted attestation (monotone -
         // with the priors check below this makes any replay structurally
         // invalid without binding prevouts).
+        // v0.2.24: every as-of / cadence timing reject (here, DEFER, MINT, DISCOUNT and the reserve proofs) scores 0
+        // in the mempool and 100 at connect, as the oracle's do. A peer relaying an op across a cadence boundary, or
+        // one block ahead of us, is honest; at 10 per tx (v0.2.23) ten such relays still banned it.
         if (att.nAsOfHeight >= (uint32_t)nHeight)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-attest-future");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-attest-future");
         if ((uint32_t)nHeight - att.nAsOfHeight > HOUSE_ATTEST_STALENESS)
-            return state.DoS(10, false, REJECT_INVALID, "bad-house-attest-stale");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-attest-stale");
         if (att.nAsOfHeight <= house.nLastAttestHeight)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-attest-monotone");
 
@@ -4487,7 +4490,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // proof primitive is shared with NOTE_OP_MINT (R-i7).
         CAmount amountSum = 0;
         if (!VerifyReserveProofs(house.houseID, att.nAsOfHeight, att.vProofs, tx.vin,
-                nHeight, fnGetProofCoin, fnGetBlockHash, amountSum, state, "bad-house-attest"))
+                nHeight, fnGetProofCoin, fnGetBlockHash, amountSum, state, "bad-house-attest", fMempool))
             return false;
         if (amountSum != att.amountReserves)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-attest-sum");
@@ -4582,7 +4585,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // key-signed coins - into a rule consensus can actually enforce.
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
                 (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
-            return state.DoS(10, false, REJECT_INVALID, "bad-house-defer-attest-stale");   // v0.2.23: 10, as every attest-stale (a relay across a cadence boundary)
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-defer-attest-stale");
         if (tx.vout[0].scriptPubKey != HouseEscrowScript(house.houseID))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-lock-script");
         if (tx.vout[0].nValue < house.amountLastAttestReserves)
@@ -4683,7 +4686,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
-                        CHouse& houseOut, bool& fHouseChanged)
+                        CHouse& houseOut, bool& fHouseChanged, bool fMempool)
 {
     fHouseChanged = false;
     const uint256 hashOutputs = BillHashOutputs(tx);
@@ -4738,7 +4741,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // figure, and a never-attested house has R = 0 and cannot mint.
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
                 (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
-            return state.DoS(10, false, REJECT_INVALID, "bad-note-mint-attest-stale");   // v0.2.23: 10, as every attest-stale (a relay across a cadence boundary)
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-note-mint-attest-stale");
         // R-i7 (DR-1): the published figure must ALSO be PROVEN LIVE in this very
         // mint. The pre-R-i7 gate trusted the snapshot alone, so a house could
         // attest with flash reserves, spend them the next block, and mint the
@@ -4749,9 +4752,9 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // that attested reserves it has since spent cannot mint against the stale
         // published number. No oracle - the reserve coins are on-chain base value.
         if (mint.nAsOfHeight >= (uint32_t)nHeight)
-            return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-reserve-future");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-note-mint-reserve-future");
         if ((uint32_t)nHeight - mint.nAsOfHeight > HOUSE_ATTEST_STALENESS)
-            return state.DoS(10, false, REJECT_INVALID, "bad-note-mint-reserve-stale");
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-note-mint-reserve-stale");
         // The reserve proof resolves against PARENT-CHAIN state (fnGetProofCoin),
         // NOT the note-input view (fnGetCoin): exactly as HOUSE_OP_ATTEST does. A
         // mempool or same-block spend of a proven reserve coin (which the mint
@@ -4762,7 +4765,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // invalidation trap, re-opened. R-i7 review finding.
         CAmount amountLiveReserves = 0;
         if (!VerifyReserveProofs(house.houseID, mint.nAsOfHeight, mint.vReserveProofs, tx.vin,
-                nHeight, fnGetProofCoin, fnGetBlockHash, amountLiveReserves, state, "bad-note-mint-reserve"))
+                nHeight, fnGetProofCoin, fnGetBlockHash, amountLiveReserves, state, "bad-note-mint-reserve", fMempool))
             return false;
         const CAmount amountEffReserves = std::min(house.amountLastAttestReserves, amountLiveReserves);
         const uint64_t reserveCap = ((uint64_t)amountEffReserves * 100) / HOUSE_RESERVE_FLOOR_PCT;
@@ -6253,7 +6256,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
  * the ATMP guard matrix (T-s5). */
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                          CHouse& houseAOut, CHouse& houseBOut)
+                          CHouse& houseAOut, CHouse& houseBOut, bool fMempool)
 {
     if (tx.nSettleOp != SETTLE_OP_EXCHANGE)
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-op");
@@ -6312,7 +6315,7 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     // tip+72 - under HOUSE_ATTEST_STALENESS, so a floating settle can never
     // straddle an attestation deadline).
     if (x.nExpiryHeight != 0 && (nHeight < 0 || (uint32_t)nHeight > x.nExpiryHeight))
-        return state.DoS(100, false, REJECT_INVALID, "bad-settle-expired");
+        return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-settle-expired");   // v0.2.24: timing, 0 in the mempool
 
     // (13) Four signatures over ONE shared digest - atomic mutual consent:
     // both houses' M-of-N approver quorums (corporate consent) and both
@@ -6348,7 +6351,7 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
  * parallel to the payload's vHouseID, for the caller to stage. The slots are the caller's (ConnectBlock / ATMP). */
 bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                              const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                             std::vector<CHouse>& vHousesOut)
+                             std::vector<CHouse>& vHousesOut, bool fMempool)
 {
     vHousesOut.clear();
     if (tx.nSettleOp != SETTLE_OP_NET)
@@ -6400,7 +6403,7 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
     }
 
     if (n.nExpiryHeight != 0 && (uint32_t)nHeight > n.nExpiryHeight)
-        return state.DoS(100, false, REJECT_INVALID, "bad-settle-expired");
+        return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-settle-expired");   // v0.2.24: timing, 0 in the mempool
 
     // One digest: every house's M-of-N quorum, and every presenting house's key.
     const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(tx), BillHashOutputs(tx));
@@ -6424,13 +6427,13 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
 /** Either settle op: the mutated house records, for the slot-staging callers. */
 static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                          std::vector<CHouse>& vHousesOut)
+                          std::vector<CHouse>& vHousesOut, bool fMempool)
 {
     vHousesOut.clear();
     if (tx.nSettleOp == SETTLE_OP_NET)
-        return CheckSettleNetOperation(tx, state, nHeight, fnGetHouse, vHousesOut);
+        return CheckSettleNetOperation(tx, state, nHeight, fnGetHouse, vHousesOut, fMempool);
     CHouse houseA, houseB;
-    if (!CheckSettleOperation(tx, state, nHeight, fnGetHouse, houseA, houseB))
+    if (!CheckSettleOperation(tx, state, nHeight, fnGetHouse, houseA, houseB, fMempool))
         return false;
     vHousesOut = {houseA, houseB};
     return true;
@@ -8471,6 +8474,19 @@ static bool WriteBlockIndexToDisk(CValidationState& state)
         return state.Error("out of disk space");
     // First make sure all block and undo data is flushed to disk.
     FlushBlockFile();
+    // v0.2.24: and the undo file of every older block file the entries below point into. A block's undo data goes into
+    // the undo file of the block file holding the block, an older file than nLastBlockFile when connecting lags behind
+    // downloading (a node catching up, -reindex); FlushBlockFile syncs only nLastBlockFile's, so the index could be
+    // synced naming undo data that was not (inherited; upstream fixed it in Core 0.20, #17994). An older block file
+    // itself was synced when it was left (FindBlockPos).
+    for (int nFile : setDirtyFileInfo) {
+        if (nFile == nLastBlockFile)
+            continue;
+        if (FILE* file = OpenUndoFile(CDiskBlockPos(nFile, 0))) {
+            FileCommit(file);
+            fclose(file);
+        }
+    }
     // Then update all block file information (which may refer to block and undo files).
     std::vector<std::pair<int, const CBlockFileInfo*> > vFiles;
     vFiles.reserve(setDirtyFileInfo.size());
