@@ -46,6 +46,22 @@ static const std::string DEFAULT_MAINCHAIN_REST = "127.0.0.1:38332";
  */
 bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch = nullptr);
 
+/** v0.2.25: the same identity checks with no REST endpoint (-mainchainrest=
+ *  empty), asked of the enforcer alone: its network (GetChainInfo) for
+ *  -mainchainchain and the L1 family (A9), and the pinned block at its height
+ *  (GetBlockHeaderInfo). That the pin is on the enforcer's main chain is
+ *  proved by the main block cache walk, which must link to it. Block checks
+ *  need no REST: deposits are checked against the enforcer's peg events
+ *  (CheckDepositWithL1). The builder adds no deposits in this mode
+ *  (UpdateDeposits reads each tx from its eCash block over REST). Same
+ *  retry contract as ProbeMainchainRest. */
+bool ProbeMainchainEnforcerOnly(std::string& strError, bool* pfIdentityMismatch = nullptr);
+
+/** v0.2.25: the L1 chain name ("main", "test", "signet", "regtest") for an
+ *  enforcer GetChainInfo reply's network field (proto3 JSON: the enum's name,
+ *  or its number). Empty if absent or unknown. Pure. */
+std::string ChainNameFromEnforcerChainInfo(const UniValue& response);
+
 /** A9: the L1 family observed by the REST pin at init. True iff the mainchain reports
  *  chain=main (a forknet such as eCash alphanet, or mainnet). Read by base58's mainchain
  *  address decoding (withdrawal destinations, consumed at bundle build/validate), so it
@@ -326,6 +342,13 @@ bool ParseEnforcerHeaderInfos(const UniValue& response, std::vector<L1BlockHeade
  * fHaveCommitment: an h* commitment for this sidechain exists in the block.
  */
 bool ParseEnforcerBmmCommitment(const UniValue& response, bool& fBlockFound, bool& fHaveCommitment, uint256& hashCommitment);
+
+/** v0.2.25: a GetBmmHStarCommitment reply asked with max_ancestors, newest
+ *  first: [0] for the block asked about, then its ancestors, each (has a
+ *  commitment, the commitment) read as ParseEnforcerBmmCommitment reads one.
+ *  Stops before the first entry it cannot read. False if the block was not
+ *  found or the reply is unreadable. Pure. */
+bool ParseEnforcerBmmCommitments(const UniValue& response, std::vector<std::pair<bool, uint256>>& vCommitment);
 
 /** Parse a GetBlockInfo response: collect deposit txids for the first (requested) block. */
 bool ParseEnforcerBlockDepositTxids(const UniValue& response, std::vector<uint256>& vTxid);

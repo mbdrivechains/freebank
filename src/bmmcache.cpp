@@ -235,6 +235,14 @@ void BMMCache::CacheMainBlockHash(const uint256& hash)
 
 void BMMCache::CacheMainBlockHashLocked(const uint256& hash)
 {
+    // v0.2.25: a null hash holds the place of an L1 block below the pin that
+    // was never fetched (the list stays indexed by L1 height). It is not
+    // indexed, so no lookup ever finds it.
+    if (hash.IsNull()) {
+        vMainBlockHash.push_back(hash);
+        return;
+    }
+
     // Don't re-cache the genesis block
     if (vMainBlockHash.size() == 1 && hash == vMainBlockHash.front())
         return;
@@ -404,6 +412,10 @@ void BMMCache::ReplaceMainBlockCache(const std::deque<uint256>& deqHash)
     std::map<uint256, MainBlockIndex> mapIndex;
     vHash.reserve(deqHash.size());
     for (const uint256& u : deqHash) {
+        if (u.IsNull()) {   // v0.2.25: a placeholder below the pin (CacheMainBlockHashLocked)
+            vHash.push_back(u);
+            continue;
+        }
         if (mapIndex.count(u))
             continue;
         MainBlockIndex index;

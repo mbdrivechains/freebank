@@ -609,6 +609,11 @@ void LoadBMMCache();
 //! required version exceeds CLIENT_VERSION, so every cache was written on
 //! shutdown and silently never read back.
 static const int FREEBANK_CACHE_MIN_VERSION = 20500;
+//! v0.2.25: a main-block cache filled from the pin holds null placeholders
+//! below it, which a v0.2.24 or older binary would misread (it drops the
+//! second of two equal leading hashes, shifting every height by one). Such a
+//! file requires v0.2.25, so an older binary skips it and refills from genesis.
+static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
 
 void DumpMainBlockCache();
 

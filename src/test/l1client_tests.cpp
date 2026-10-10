@@ -1105,4 +1105,67 @@ BOOST_AUTO_TEST_CASE(l1client_find_l1_tx_in_block)
     BOOST_CHECK(FindL1TxInBlock(vchBlock, vtx[2].GetHash(), tx, nTx) == L1TxFetch::UNDECODABLE);
 }
 
+BOOST_AUTO_TEST_CASE(v0225_parse_bmm_commitments_batch)
+{
+    // v0.2.25: a reply asked with max_ancestors: the block's own commitment,
+    // then its ancestors newest first. ConsensusHex as in the single reply.
+    std::vector<std::pair<bool, uint256>> v;
+    UniValue batch(UniValue::VOBJ);
+    BOOST_REQUIRE(batch.read(
+        "{\"commitment\": {\"commitment\": {\"hex\": \"0100000000000000000000000000000000000000000000000000000000000000\"},"
+        " \"ancestorCommitments\": [{}, {\"commitment\": {\"hex\": \"0200000000000000000000000000000000000000000000000000000000000000\"}}, {}]}}"));
+    BOOST_REQUIRE(ParseEnforcerBmmCommitments(batch, v));
+    BOOST_REQUIRE_EQUAL(v.size(), 4U);
+    BOOST_CHECK(v[0].first && v[0].second == uint256S("01"));
+    BOOST_CHECK(!v[1].first && v[1].second.IsNull());
+    BOOST_CHECK(v[2].first && v[2].second == uint256S("02"));
+    BOOST_CHECK(!v[3].first);
+
+    // No ancestors asked: the block alone, as the single reply
+    UniValue single(UniValue::VOBJ);
+    BOOST_REQUIRE(single.read("{\"commitment\": {}}"));
+    BOOST_REQUIRE(ParseEnforcerBmmCommitments(single, v));
+    BOOST_REQUIRE_EQUAL(v.size(), 1U);
+    BOOST_CHECK(!v[0].first);
+
+    // An unreadable ancestor ends the list before it (the ones after are
+    // asked one at a time); an unreadable first entry, or an unknown block,
+    // is no answer at all
+    UniValue badAncestor(UniValue::VOBJ);
+    BOOST_REQUIRE(badAncestor.read("{\"commitment\": {\"ancestorCommitments\": [{}, {\"commitment\": {\"hex\": \"zz\"}}, {}]}}"));
+    BOOST_REQUIRE(ParseEnforcerBmmCommitments(badAncestor, v));
+    BOOST_CHECK_EQUAL(v.size(), 2U);
+    for (const char* bad : {"{\"commitment\": {\"commitment\": {\"hex\": \"0100\"}}}",
+                            "{\"blockNotFound\": {\"blockHash\": {\"hex\": \"00\"}}}",
+                            "{\"commitment\": {\"ancestorCommitments\": 3}}",
+                            "{\"unexpected\": 1}"}) {
+        UniValue reply(UniValue::VOBJ);
+        BOOST_REQUIRE(reply.read(bad));
+        BOOST_CHECK_MESSAGE(!ParseEnforcerBmmCommitments(reply, v), bad);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v0225_chain_name_from_enforcer)
+{
+    // v0.2.25: the enforcer's network, for -mainchainchain and the L1 family
+    // when no REST endpoint is set. proto3 JSON writes the enum's name.
+    const std::pair<const char*, const char*> cases[] = {
+        {"{\"network\": \"NETWORK_MAINNET\"}", "main"},
+        {"{\"network\": \"NETWORK_TESTNET\"}", "test"},
+        {"{\"network\": \"NETWORK_SIGNET\"}", "signet"},
+        {"{\"network\": \"NETWORK_REGTEST\"}", "regtest"},
+        {"{\"network\": 2}", "main"},
+        {"{\"network\": 3}", "regtest"},
+        {"{\"network\": \"NETWORK_UNKNOWN\"}", ""},
+        {"{\"network\": 1}", ""},
+        {"{\"bip300Constants\": {}}", ""},
+    };
+    for (const auto& c : cases) {
+        UniValue reply(UniValue::VOBJ);
+        BOOST_REQUIRE(reply.read(c.first));
+        BOOST_CHECK_MESSAGE(ChainNameFromEnforcerChainInfo(reply) == c.second, c.first);
+    }
+    BOOST_CHECK(ChainNameFromEnforcerChainInfo(UniValue(UniValue::VARR)).empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -89,6 +89,21 @@ static void RefuseEnforcer(const std::string& strWhy)
     StartShutdown();
 }
 
+/** v0.2.25: the identity check MaybeVerifyEnforcer repeats. With no REST
+ *  endpoint the enforcer is checked against the pin by itself
+ *  (ProbeMainchainEnforcerOnly); with one, against the REST node
+ *  (ProbeEnforcerIdentity), as before. */
+static EnforcerIdentity CheckEnforcerIdentity(std::string& strDetail)
+{
+    if (gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST).empty()) {
+        bool fWrongL1 = false;
+        if (ProbeMainchainEnforcerOnly(strDetail, &fWrongL1))
+            return ENFORCER_IDENTITY_MATCH;
+        return fWrongL1 ? ENFORCER_IDENTITY_MISMATCH : ENFORCER_IDENTITY_NOTREADY;
+    }
+    return ProbeEnforcerIdentity(strDetail);
+}
+
 /** v0.2.17 D5 (every 30 s): verify an enforcer that could not be verified at
  *  startup, as startup would have: its identity (a mismatch must persist, as
  *  over startup's 60 s window), then its settings (D2). Before, a node started
@@ -111,13 +126,13 @@ static void MaybeVerifyEnforcer()
         if (nMismatch == 0 && ++nTick % nEvery != 0)
             return;
         std::string strDetail;
-        const EnforcerIdentity r = ProbeEnforcerIdentity(strDetail);
+        const EnforcerIdentity r = CheckEnforcerIdentity(strDetail);
         if (r == ENFORCER_IDENTITY_MISMATCH) {
             SetL1AnswersHeld(true);
-            LogPrintf("mainchain enforcer re-check: it indexes a different L1 than the pinned REST node (%d in a row): %s\n",
+            LogPrintf("mainchain enforcer re-check: it indexes a different L1 than the pinned one (%d in a row): %s\n",
                       nMismatch + 1, strDetail);
             if (++nMismatch >= 12)
-                RefuseEnforcer(strprintf("it indexes a different L1 than the pinned REST node (%s)", strDetail));
+                RefuseEnforcer(strprintf("it indexes a different L1 than the pinned one (%s)", strDetail));
             return;
         }
         nMismatch = 0;
@@ -126,14 +141,14 @@ static void MaybeVerifyEnforcer()
     }
     SetL1AnswersHeld(true);
     std::string strDetail;
-    const EnforcerIdentity r = ProbeEnforcerIdentity(strDetail);
+    const EnforcerIdentity r = CheckEnforcerIdentity(strDetail);
     if (r == ENFORCER_IDENTITY_NOTREADY) {
         nMismatch = 0; // "in a row": an unanswered check breaks the run
         return;
     }
     if (r == ENFORCER_IDENTITY_MISMATCH) {
         if (++nMismatch >= 12)
-            RefuseEnforcer(strprintf("it indexes a different L1 than the pinned REST node (%s)", strDetail));
+            RefuseEnforcer(strprintf("it indexes a different L1 than the pinned one (%s)", strDetail));
         return;
     }
     nMismatch = 0;
@@ -1082,18 +1097,28 @@ bool AppInitParameterInteraction()
     // to be set AND answering. Probe with retries — orchestrated installs
     // (BitWindow) start the mainchain node moments before this one, so tolerate
     // its RPC/REST warm-up.
+    //
+    // v0.2.25: -mainchainrest= (empty) runs with the enforcer alone, no eCash
+    // node (the app's demo light mode). Block checks never needed REST since
+    // v0.2.19: deposits are checked against the enforcer's peg events
+    // (CheckDepositWithL1). The identity checks then ask the enforcer
+    // (ProbeMainchainEnforcerOnly), and this node builds no deposits.
     if (strMainchainTransport == "enforcer") {
         const std::string strMainchainRest = gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST);
-        if (strMainchainRest.empty())
-            return InitError(_("-mainchaintransport=enforcer requires -mainchainrest=<host:port> "
-                               "(the mainchain node's REST endpoint; the node needs bitcoind -rest -txindex). "
-                               "Without it this node would reject deposit-bearing blocks and fork off the network."));
+        const bool fNoRest = strMainchainRest.empty();
+        if (fNoRest)
+            LogPrintf("No mainchain REST endpoint (-mainchainrest is empty): eCash facts come from the enforcer alone; "
+                      "this node adds no deposits to the blocks it builds\n");
         std::string strProbeError;
         bool fRestUp = false, fWrongL1 = false;
         for (int i = 0; i < 12 && !fRestUp && !fWrongL1; i++) {
             if (i > 0) MilliSleep(5000);
-            fRestUp = ProbeMainchainRest(strProbeError, &fWrongL1);
+            fRestUp = fNoRest ? ProbeMainchainEnforcerOnly(strProbeError, &fWrongL1)
+                              : ProbeMainchainRest(strProbeError, &fWrongL1);
         }
+        if (fNoRest && !fWrongL1 && !fRestUp)
+            return InitError(strprintf(_("%s (after 60s of retries). With -mainchainrest empty, the enforcer at "
+                                         "-enforceraddr is this node's only source of eCash facts."), strProbeError));
         // A wrong-L1 answer is deterministic, so stop immediately and say only
         // that. Appending the "-rest -txindex" advice would be actively
         // misleading: the node IS serving REST, it is simply the wrong node.
@@ -1132,9 +1157,11 @@ bool AppInitParameterInteraction()
         // ~60s and refuses; a transient skew (e.g. an unscripted restart during
         // a chain reset) self-heals to a pass. Never bricks on an UNREACHABLE
         // enforcer - that failure is loud at runtime (BMM simply cannot proceed).
+        // With no REST endpoint the enforcer is the only L1 source, and the
+        // probe above already checked it against the pin.
         {
             g_fEnforcerPinned = true;
-            bool fVerified = false, fRefuse = false;
+            bool fVerified = fNoRest, fRefuse = false;
             std::string strIdErr;
             int nNotReady = 0, nMismatch = 0;
             for (int i = 0; i < 12 && !fVerified && !fRefuse; i++) {

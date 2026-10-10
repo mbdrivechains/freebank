@@ -152,7 +152,11 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
 
         // By default assume that the signatures in ancestors of this block are valid.
-        consensus.defaultAssumeValid = uint256S("0x359d17fc7cc60653fb72bbec271efab88af16ba9f15a55b060fe632c7de5e978");
+        // v0.2.25: beta block 992, reached by a fresh sync from the seed with
+        // v0.2.24 (every signature checked) on 2026-10-09 and the explorer's
+        // hash at 992 on 2026-10-10 (docs-local/sync-speed-2026-10-10). Was the
+        // genesis block: nothing skipped. Set again at each release.
+        consensus.defaultAssumeValid = uint256S("0xa939cbd9118b7f5d0ffccaa3a3a7d3f447349e09a892a518c14df7ddb0eaef7b");
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -314,8 +318,9 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
 
-        // By default assume that the signatures in ancestors of this block are valid.
-        consensus.defaultAssumeValid = uint256S("0x6fb2c5081b13ecf369b324db61406244c7df519b4676e28b536a4ef546e387eb");
+        // v0.2.25: none on regtest, every script checked (was a hash inherited
+        // from BitAssets, harmless while nothing skipped; a gate sets -assumevalid)
+        consensus.defaultAssumeValid = uint256();
 
         // LOCKED (S-5, v0.1.0 M1 package, 2026-07-11)
         pchMessageStart[0] = 0xfb;

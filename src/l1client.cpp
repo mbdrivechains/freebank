@@ -4,6 +4,7 @@
 
 #include <l1client.h>
 
+#include <bmmcache.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <core_io.h>
@@ -117,6 +118,7 @@ public:
 
     /* The init-time REST reachability probe borrows the private RestGet. */
     friend bool ::ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch);
+    friend bool ::ProbeMainchainEnforcerOnly(std::string& strError, bool* pfIdentityMismatch);
     friend EnforcerIdentity (::ProbeEnforcerIdentity)(std::string& strError, bool* pfStale);
     friend EnforcerSettingsCheck (::CheckEnforcerSettings)(std::string& strError);
 
@@ -169,6 +171,10 @@ private:
 
     /* GetChainTip convenience wrapper */
     bool GetChainTip(L1BlockHeader& header);
+
+    /* v0.2.25: BMM answers for a run of L1 blocks from hashMainBlock up, in
+     * two calls, kept by L1 hash (see FetchBmmAhead) */
+    bool FetchBmmAhead(const uint256& hashMainBlock);
 
     /* GetBlockHeaderInfo for hashBlock plus up to nMaxAncestors ancestors */
     bool GetHeaderInfos(const uint256& hashBlock, uint32_t nMaxAncestors, std::vector<L1BlockHeader>& vHeader);
@@ -335,6 +341,48 @@ bool ParseEnforcerBmmCommitment(const UniValue& response, bool& fBlockFound, boo
     hashCommitment = Uint256FromConsensusHex(strHex);
     fHaveCommitment = !hashCommitment.IsNull();
 
+    return true;
+}
+
+// One commitment field, as ParseEnforcerBmmCommitment reads it: absent is
+// "none"; present but unreadable is "can't tell" (false).
+static bool ReadCommitmentField(const UniValue& field, bool& fHave, uint256& hash)
+{
+    fHave = false;
+    hash.SetNull();
+    if (field.isNull())
+        return true;
+    std::string strHex;
+    if (!GetHexField(field, strHex) || strHex.size() != 64)
+        return false;
+    hash = Uint256FromConsensusHex(strHex);
+    fHave = !hash.IsNull();
+    return true;
+}
+
+bool ParseEnforcerBmmCommitments(const UniValue& response, std::vector<std::pair<bool, uint256>>& vCommitment)
+{
+    vCommitment.clear();
+    if (!response.isObject())
+        return false;
+    const UniValue& commitment = find_value(response, "commitment");
+    if (!commitment.isObject())
+        return false;
+    bool fHave = false;
+    uint256 hash;
+    if (!ReadCommitmentField(find_value(commitment, "commitment"), fHave, hash))
+        return false;
+    vCommitment.emplace_back(fHave, hash);
+    const UniValue& ancestors = find_value(commitment, "ancestorCommitments");
+    if (ancestors.isNull())
+        return true;
+    if (!ancestors.isArray())
+        return false;
+    for (size_t i = 0; i < ancestors.size(); i++) {
+        if (!ancestors[i].isObject() || !ReadCommitmentField(find_value(ancestors[i], "commitment"), fHave, hash))
+            break;
+        vCommitment.emplace_back(fHave, hash);
+    }
     return true;
 }
 
@@ -1236,6 +1284,122 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
     return true;
 }
 
+std::string ChainNameFromEnforcerChainInfo(const UniValue& response)
+{
+    if (!response.isObject())
+        return "";
+    const UniValue& network = find_value(response, "network");
+    std::string strName;
+    if (network.isStr()) {
+        strName = network.get_str();
+    } else if (network.isNum()) {
+        // proto enum Network (cusf/mainchain/v1/validator.proto)
+        switch (network.get_int()) {
+        case 2: strName = "NETWORK_MAINNET"; break;
+        case 3: strName = "NETWORK_REGTEST"; break;
+        case 4: strName = "NETWORK_SIGNET"; break;
+        case 5: strName = "NETWORK_TESTNET"; break;
+        }
+    }
+    if (strName == "NETWORK_MAINNET") return "main";
+    if (strName == "NETWORK_TESTNET") return "test";
+    if (strName == "NETWORK_SIGNET") return "signet";
+    if (strName == "NETWORK_REGTEST") return "regtest";
+    return "";
+}
+
+bool ProbeMainchainEnforcerOnly(std::string& strError, bool* pfIdentityMismatch)
+{
+    if (pfIdentityMismatch) *pfIdentityMismatch = false;
+    const std::string strAddr = gArgs.GetArg("-enforceraddr", "127.0.0.1:50051");
+    EnforcerL1Client client;
+
+    UniValue info(UniValue::VOBJ);
+    if (!client.CallValidator("GetChainInfo", "{}", info)) {
+        strError = strprintf("the enforcer at %s did not answer GetChainInfo", strAddr);
+        return false;
+    }
+    const std::string strChain = ChainNameFromEnforcerChainInfo(info);
+    if (strChain.empty()) {
+        strError = strprintf("the enforcer at %s did not say which network it follows", strAddr);
+        return false;
+    }
+
+    const std::string strWantChain = gArgs.GetArg("-mainchainchain", "");
+    if (!strWantChain.empty() && strChain != strWantChain) {
+        strError = strprintf("mainchain identity mismatch: -mainchainchain=%s but the enforcer at %s follows %s. "
+                             "Refusing to start against the wrong L1.", strWantChain, strAddr, strChain);
+        if (pfIdentityMismatch) *pfIdentityMismatch = true;
+        return false;
+    }
+
+    // A signet is told apart by its challenge, which only the eCash node's
+    // REST reports
+    if (!gArgs.GetArg("-mainchainchallenge", "").empty()) {
+        strError = "-mainchainchallenge needs -mainchainrest=<host:port> (the enforcer does not report a signet's challenge)";
+        if (pfIdentityMismatch) *pfIdentityMismatch = true;
+        return false;
+    }
+
+    const std::string strWantPin = gArgs.GetArg("-mainchainblockpin", "");
+    if (!strWantPin.empty()) {
+        int nPinHeight = 0;
+        uint256 hashPin;
+        if (!ParseMainchainBlockPin(strWantPin, nPinHeight, hashPin)) {
+            strError = strprintf("-mainchainblockpin=%s is malformed (expected <height>:<64-hex blockhash>)", strWantPin);
+            if (pfIdentityMismatch) *pfIdentityMismatch = true;
+            return false;
+        }
+        L1BlockHeader tip;
+        if (!client.GetChainTip(tip)) {
+            strError = strprintf("the enforcer at %s did not answer GetChainTip", strAddr);
+            return false;
+        }
+        if (tip.nHeight < nPinHeight) {
+            strError = strprintf("the enforcer at %s is at height %d, below the pinned height %d - still syncing",
+                                 strAddr, tip.nHeight, nPinHeight);
+            return false;
+        }
+        // The enforcer answers an unknown hash with an empty reply: past the
+        // pinned height that is a different chain, not "not ready"
+        UniValue hdr(UniValue::VOBJ);
+        if (!client.CallValidator("GetBlockHeaderInfo", "{\"block_hash\": {\"hex\": \"" + hashPin.ToString() + "\"}}", hdr)) {
+            strError = strprintf("the enforcer at %s did not answer GetBlockHeaderInfo", strAddr);
+            return false;
+        }
+        std::vector<L1BlockHeader> vHeader;
+        ParseEnforcerHeaderInfos(hdr, vHeader);
+        if (vHeader.empty() || vHeader.front().hashBlock != hashPin || vHeader.front().nHeight != nPinHeight) {
+            strError = strprintf("mainchain identity mismatch: -mainchainblockpin pins block %s at height %d, which "
+                                 "the enforcer at %s %s. This is a DIFFERENT chain - refusing to start against the "
+                                 "wrong L1.", hashPin.ToString(), nPinHeight, strAddr,
+                                 vHeader.empty() ? std::string("does not have")
+                                                 : strprintf("has at height %d", vHeader.front().nHeight));
+            if (pfIdentityMismatch) *pfIdentityMismatch = true;
+            return false;
+        }
+        // That the pin is on the enforcer's main chain is checked by the main
+        // block cache walk, every time it passes the pin height
+    }
+
+    // A9: the L1 family from the L1's own answer, as ProbeMainchainRest does,
+    // once every check above passed. It decides how withdrawal addresses
+    // decode, so it is set once (the first pass, at init) and never changes
+    // while the node runs: a later answer that would change it is another L1.
+    static std::atomic<int> nFamilySet{-1};
+    const int nFamily = strChain == "main" ? 1 : 0;
+    int nExpected = -1;
+    if (nFamilySet.compare_exchange_strong(nExpected, nFamily)) {
+        g_fMainchainMainFamily = nFamily == 1;
+    } else if (nExpected != nFamily) {
+        strError = strprintf("mainchain identity mismatch: the enforcer at %s now follows %s, a different L1 family "
+                             "than at startup", strAddr, strChain);
+        if (pfIdentityMismatch) *pfIdentityMismatch = true;
+        return false;
+    }
+    return true;
+}
+
 bool ParseEnforcerChainInfo(const UniValue& response, EnforcerSettings& settings)
 {
     settings = EnforcerSettings();
@@ -1629,8 +1793,114 @@ bool EnforcerL1Client::VerifyDeposit(const uint256& hashMainBlock, const uint256
     return vTxid[nTx] == txid;
 }
 
+// v0.2.25: BMM answers fetched ahead, during a sync. A block check asks the
+// enforcer whether L1 block E carries the bid, then for E's header time: two
+// calls, one after another, for every block (three with the tip check), which
+// was most of a fresh sync over a slow link (5.5 of 12 minutes rebuilding
+// beta on DEV over the tailnet). Both calls take max_ancestors, so one pair of
+// calls answers for up to BMM_AHEAD_BATCH L1 blocks: from E up our list of L1
+// main-chain blocks. Same answers: what an L1 block commits and its header
+// time never change for its hash, and only blocks the enforcer has (a
+// commitment record, a header that is our list's block at that height) are
+// kept. A block near our list's tip (a node in step with eCash) is asked one
+// at a time, as before.
+namespace {
+struct BmmAhead {
+    bool fCommitment;
+    uint256 hashCommitment;
+    uint32_t nTime;
+};
+std::mutex g_csBmmAhead;
+std::map<uint256, BmmAhead> g_mapBmmAhead;
+std::atomic<int64_t> g_nBmmAheadFailed{0};
+static const size_t BMM_AHEAD_BATCH = 1000;
+static const size_t MAX_BMM_AHEAD = 20000;
+
+bool LookupBmmAhead(const uint256& hashMainBlock, BmmAhead& answer)
+{
+    std::lock_guard<std::mutex> lock(g_csBmmAhead);
+    auto it = g_mapBmmAhead.find(hashMainBlock);
+    if (it == g_mapBmmAhead.end())
+        return false;
+    answer = it->second;
+    return true;
+}
+} // namespace
+
+bool EnforcerL1Client::FetchBmmAhead(const uint256& hashMainBlock)
+{
+    // A batch that failed is not tried again for a minute: each block would
+    // pay for the failed batch and then its own calls
+    if (GetTime() - g_nBmmAheadFailed.load() < 60)
+        return false;
+
+    size_t nPos = 0, nPosAgain = 0;
+    if (!bmmCache.GetMainBlockPositions(hashMainBlock, hashMainBlock, nPos, nPosAgain))
+        return false;
+    const int nCached = bmmCache.GetCachedBlockCount();
+    if (nCached <= 0 || nPos + 2 > (size_t)(nCached - 1))
+        return false;
+    const size_t nEnd = std::min<size_t>(nCached - 1, nPos + BMM_AHEAD_BATCH - 1);
+    std::vector<uint256> vList; // oldest first, [0] == hashMainBlock
+    if (!bmmCache.GetMainBlockHashesFrom(nPos, nEnd - nPos + 1, vList) || vList.empty() || vList.front() != hashMainBlock)
+        return false;
+    const uint256 hashEnd = vList.back();
+    const uint32_t nAncestors = nEnd - nPos;
+
+    const std::string strRequest = "{\"block_hash\": {\"hex\": \"" + hashEnd.ToString() + "\"}, \"sidechain_id\": " +
+        std::to_string(THIS_SIDECHAIN) + ", \"max_ancestors\": " + std::to_string(nAncestors) + "}";
+    UniValue result(UniValue::VOBJ);
+    std::vector<std::pair<bool, uint256>> vCommitment;
+    std::vector<L1BlockHeader> vHeader;
+    if (!CallValidator("GetBmmHStarCommitment", strRequest, result) || !ParseEnforcerBmmCommitments(result, vCommitment) ||
+            !GetHeaderInfos(hashEnd, nAncestors, vHeader)) {
+        g_nBmmAheadFailed = GetTime();
+        LogPrintf("Enforcer client: BMM answers for L1 blocks %s..%s in one batch failed; one at a time for a minute\n",
+                  hashMainBlock.ToString(), hashEnd.ToString());
+        return false;
+    }
+
+    // Newest first, both from the enforcer's walk down from hashEnd; each
+    // header must be our list's block at that height
+    const size_t n = std::min({vCommitment.size(), vHeader.size(), vList.size()});
+    std::vector<std::pair<uint256, BmmAhead>> vNew;
+    for (size_t i = 0; i < n; i++) {
+        const uint256& hashOurs = vList[vList.size() - 1 - i];
+        if (vHeader[i].hashBlock != hashOurs || vHeader[i].nTime == 0)
+            break;
+        vNew.push_back({hashOurs, {vCommitment[i].first, vCommitment[i].second, vHeader[i].nTime}});
+    }
+    if (vNew.empty())
+        return false;
+    // The enforcer's walk can stop short of hashMainBlock (blocks it has no
+    // record for): keep what came, and ask one at a time for a minute rather
+    // than pay for a batch per block
+    const bool fReached = vNew.back().first == hashMainBlock;
+    if (!fReached)
+        g_nBmmAheadFailed = GetTime();
+
+    std::lock_guard<std::mutex> lock(g_csBmmAhead);
+    if (g_mapBmmAhead.size() + vNew.size() > MAX_BMM_AHEAD)
+        g_mapBmmAhead.clear();
+    for (const auto& entry : vNew)
+        g_mapBmmAhead[entry.first] = entry.second;
+    LogPrint(BCLog::NET, "Enforcer client: BMM answers for %u L1 blocks from %s, in one batch%s\n", vNew.size(),
+             hashMainBlock.ToString(), fReached ? "" : " (short of it)");
+    return fReached;
+}
+
 bool EnforcerL1Client::VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime)
 {
+    BmmAhead ahead;
+    if (LookupBmmAhead(hashMainBlock, ahead) || (FetchBmmAhead(hashMainBlock) && LookupBmmAhead(hashMainBlock, ahead))) {
+        if (!ahead.fCommitment || ahead.hashCommitment != hashBMM)
+            return false;
+        nTime = ahead.nTime;
+        txid.SetNull();
+        LogPrintf("Enforcer client found BMM for h*: %s\n", hashBMM.ToString());
+        return true;
+    }
+
     std::string strRequest = "{\"block_hash\": {\"hex\": \"" + hashMainBlock.ToString() +
         "\"}, \"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) + "}";
 
@@ -1665,6 +1935,14 @@ bool EnforcerL1Client::VerifyBMM(const uint256& hashMainBlock, const uint256& ha
 L1Client::Commitment EnforcerL1Client::ReadBmmCommitment(const uint256& hashMainBlock, uint256& hashCommitment)
 {
     hashCommitment.SetNull();
+
+    BmmAhead ahead;
+    if (LookupBmmAhead(hashMainBlock, ahead) || (FetchBmmAhead(hashMainBlock) && LookupBmmAhead(hashMainBlock, ahead))) {
+        if (!ahead.fCommitment)
+            return Commitment::NONE;
+        hashCommitment = ahead.hashCommitment;
+        return Commitment::COMMITTED;
+    }
 
     std::string strRequest = "{\"block_hash\": {\"hex\": \"" + hashMainBlock.ToString() +
         "\"}, \"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) + "}";

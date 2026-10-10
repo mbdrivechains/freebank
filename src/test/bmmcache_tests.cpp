@@ -872,4 +872,45 @@ BOOST_AUTO_TEST_CASE(bmmcache_replace_tip)
     BOOST_CHECK(vOrphan == vOrphanCheck);
 }
 
+BOOST_AUTO_TEST_CASE(v0225_bmmcache_from_pin)
+{
+    // v0.2.25: a list filled from the pin holds null placeholders below it.
+    // Positions stay L1 heights; a placeholder is never found by a lookup.
+    BMMCache cache;
+    const int nPin = 50;
+    std::deque<uint256> deq = GenerateRandomHashChain(20); // heights nPin-1 .. nPin+18
+    std::deque<uint256> deqFull = deq;
+    deqFull.insert(deqFull.begin(), (size_t)(nPin - 1), uint256());
+    cache.ReplaceMainBlockCache(deqFull);
+    BOOST_CHECK_EQUAL(cache.GetCachedBlockCount(), nPin - 1 + 20);
+    BOOST_CHECK(!cache.HaveMainBlock(uint256()));
+    size_t nA = 0, nB = 0;
+    BOOST_REQUIRE(cache.GetMainBlockPositions(deq[1], deq[0], nA, nB));
+    BOOST_CHECK_EQUAL(nA, (size_t)nPin);
+    BOOST_CHECK_EQUAL(nB, (size_t)nPin - 1);
+    BOOST_CHECK(cache.GetMainPrevBlockHash(deq[1]) == deq[0]);
+    BOOST_CHECK(cache.GetMainChildBlockHash(deq[0]) == deq[1]);
+    BOOST_CHECK(cache.GetLastMainBlockHash() == deq.back());
+
+    // The same list loaded hash by hash (mainblockhash.dat): every
+    // placeholder kept, not only the first (the genesis rule drops a second
+    // copy of the first hash)
+    BMMCache loaded;
+    for (const uint256& u : deqFull)
+        loaded.CacheMainBlockHash(u);
+    BOOST_CHECK_EQUAL(loaded.GetCachedBlockCount(), nPin - 1 + 20);
+    BOOST_REQUIRE(loaded.GetMainBlockPositions(deq[1], deq[1], nA, nB));
+    BOOST_CHECK_EQUAL(nA, (size_t)nPin);
+    BOOST_CHECK(!loaded.HaveMainBlock(uint256()));
+
+    // New L1 blocks append as before
+    std::deque<uint256> deqNew = GenerateRandomHashChain(3);
+    deqNew.push_front(deq.back());
+    bool fReorg = false;
+    std::vector<uint256> vOrphan;
+    BOOST_REQUIRE(loaded.UpdateMainBlockCache(deqNew, fReorg, vOrphan));
+    BOOST_CHECK(!fReorg);
+    BOOST_CHECK_EQUAL(loaded.GetCachedBlockCount(), nPin - 1 + 23);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

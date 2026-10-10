@@ -8911,7 +8911,29 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
 
     nBlocksTotal++;
 
+    // v0.2.25: assumevalid, as in Bitcoin Core 0.16 (the BitAssets chassis
+    // came without the skip; -assumevalid was read and logged, and nothing was
+    // skipped). Signatures and scripts are not checked for a block that is an
+    // ancestor of the -assumevalid block (each release sets a recent block of
+    // its network as the default) and of the best header. Everything else in
+    // the block is checked as before: amounts, FreeBank's own rules, BMM.
+    // Core's further conditions are left out: a minimum chain work and two
+    // weeks of work on top mean nothing on a chain whose blocks are won by
+    // BMM bids (every block's work is the same, so they asked for 2,016
+    // blocks above it, more than beta has). Unset, or 0, checks everything.
     bool fScriptChecks = true;
+    if (!hashAssumeValid.IsNull() && pindexBestHeader) {
+        BlockMap::const_iterator it = mapBlockIndex.find(hashAssumeValid);
+        if (it != mapBlockIndex.end() && it->second->GetAncestor(pindex->nHeight) == pindex &&
+                pindexBestHeader->GetAncestor(pindex->nHeight) == pindex)
+            fScriptChecks = false;
+    }
+    static bool fSkipLogged = false;
+    if (!fScriptChecks && !fSkipLogged && !fJustCheck) {
+        fSkipLogged = true;
+        LogPrintf("assumevalid: script checks skipped for block %s (height %d) and the other ancestors of %s\n",
+                  pindex->GetBlockHash().ToString(), pindex->nHeight, hashAssumeValid.ToString());
+    }
 
     int64_t nTime1 = GetTimeMicros(); nTimeCheck += nTime1 - nTimeStart;
     LogPrint(BCLog::BENCH, "    - Sanity checks: %.2fms [%.2fs (%.2fms/blk)]\n", MILLI * (nTime1 - nTimeStart), nTimeCheck * MICRO, nTimeCheck * MILLI / nBlocksTotal);
@@ -12533,17 +12555,25 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CVali
     return true;
 }
 
+static bool MainBlockCacheFresh();
+
 bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock> pblock, bool fForceProcessing, bool *fNewBlock, bool fUnitTest)
 {
-    bool fReorg = false;
-    std::vector<uint256> vOrphan;
-    if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
-        LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
-        if (!fUnitTest)
-            return false;
+    // v0.2.25: no refresh of our L1 list for a block anchored in an L1 block on
+    // it when the list was brought to the L1's tip under L1_ANSWER_FRESH_MS ago
+    // (see there). A block anchored in an L1 block not on the list still
+    // refreshes it.
+    if (fUnitTest || !bmmCache.HaveMainBlock(pblock->hashMainchainBlock) || !MainBlockCacheFresh()) {
+        bool fReorg = false;
+        std::vector<uint256> vOrphan;
+        if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
+            LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
+            if (!fUnitTest)
+                return false;
+        }
+        if (fReorg)
+            HandleMainchainReorg(vOrphan);
     }
-    if (fReorg)
-        HandleMainchainReorg(vOrphan);
     ReconsiderSideBlocksOfReturnedL1Blocks();
 
     AssertLockNotHeld(cs_main);
@@ -14129,8 +14159,11 @@ void DumpMainBlockCache()
         return;
     }
 
+    // v0.2.25: a list filled from the pin starts with null placeholders
+    const bool fFromPin = vHash.size() > 1 && vHash.front().IsNull();
+
     try {
-        fileout << FREEBANK_CACHE_MIN_VERSION; // minimum client version able to read this
+        fileout << (fFromPin ? MAIN_BLOCK_CACHE_PIN_MIN_VERSION : FREEBANK_CACHE_MIN_VERSION); // minimum client version able to read this
         fileout << CLIENT_VERSION; // version that wrote the file
         fileout << count; // Number of Withdrawal Bundle hashes in file
 
@@ -14732,16 +14765,47 @@ bool SortDeposits(const std::vector<SidechainDeposit>& vDeposit, std::vector<Sid
     return true;
 }
 
+//! v0.2.25: how long an L1 answer counts as fresh. During a sync each block
+//! asked the L1 for its tip about six times (CheckBlock's connection check runs
+//! several times per block, and each refresh of the L1 list reads the tip
+//! twice): 5,839 calls for 990 blocks, each a round trip, and over the internet
+//! (a light-mode node through a gateway) about a second per block. An L1 block
+//! comes every ten minutes, so a few seconds of staleness changes nothing: an L1
+//! reorg is met at the next refresh, as one just after a refresh always was.
+static const int64_t L1_ANSWER_FRESH_MS = 5000;
+//! When the L1 last answered a tip call; 0 after a failure.
+static std::atomic<int64_t> g_nL1AnsweredMs{0};
+//! When our L1 list was last brought to the L1's tip; 0 after a failure.
+static std::atomic<int64_t> g_nMainCacheAtTipMs{0};
+
+static bool IsFresh(const std::atomic<int64_t>& nMs)
+{
+    const int64_t n = nMs.load();
+    const int64_t nAge = GetTimeMillis() - n;
+    // a clock set back makes the age negative: not fresh
+    return n != 0 && nAge >= 0 && nAge < L1_ANSWER_FRESH_MS;
+}
+
+static bool MainBlockCacheFresh()
+{
+    return IsFresh(g_nMainCacheAtTipMs);
+}
+
 bool CheckMainchainConnection()
 {
+    if (IsFresh(g_nL1AnsweredMs))
+        return true;
+
     SidechainClient client;
 
     int nMainchainBlocks = 0;
     if (!client.GetBlockCount(nMainchainBlocks)) {
+        g_nL1AnsweredMs = 0;
         LogPrintf("%s: Mainchain connection not detected!\n", __func__);
         return false;
     }
 
+    g_nL1AnsweredMs = GetTimeMillis();
     return true;
 }
 
@@ -14758,6 +14822,9 @@ void MaybeRestoreMainchainConnection()
 
 void DisableNetworkForMainchain(const std::string& strReason)
 {
+    // v0.2.25: the next check asks the L1 again
+    g_nL1AnsweredMs = 0;
+    g_nMainCacheAtTipMs = 0;
     if (!g_connman)
         return;
     // Only a disable this code makes is one it may undo later: if the operator
@@ -14830,6 +14897,25 @@ void HandleQueuedMainchainReorgs()
 // The walk itself; mainBlockCacheMutex is held. fFresh (v0.2.16): ignore the
 // cache, walk down to the genesis block and swap the result in whole
 // (BMMCache::ReplaceMainBlockCache); on a failure the cache is left as it was.
+/** v0.2.25: the main block list holds real hashes from one below this L1
+ *  height up (placeholders below): the -mainchainblockpin height, or this
+ *  network's fork height if that is lower. Nothing FreeBank anchors or credits
+ *  can be below a network's fork block, so a pin set higher (any block works
+ *  as an identity pin) does not move the floor above it. 0: none, the list
+ *  goes down to genesis (mainnet until its build sets the fork height). On
+ *  regtest the pin is the floor (the gates choose it). */
+static int MainCacheStopHeight(int nPinHeight)
+{
+    if (nPinHeight <= 0)
+        return 0;
+    const std::string strNetwork = Params().NetworkIDString();
+    if (strNetwork == CBaseChainParams::REGTEST)
+        return nPinHeight;
+    if (strNetwork == CBaseChainParams::BETA)
+        return std::min(nPinHeight, 967680);   // eCash betanet's fork block
+    return 0;
+}
+
 static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& vDisconnected, MainBlockCacheWalk* pWalk, bool fFresh)
 {
     //
@@ -14925,6 +15011,34 @@ static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& v
         pWalk->nCursor = nCursor;
     };
 
+    // v0.2.25: the walk stops one block below MainCacheStopHeight (the pin, or
+    // this network's fork height if that is lower). Nothing in FreeBank reads
+    // an L1 block below it, and walking down to the L1's genesis cost a fresh
+    // node ~970,000 hashes (two minutes over the tailnet, far more over the
+    // internet). The list stays indexed by L1 height: the heights below are
+    // null placeholders, never looked up. Whenever a walk passes the pin height
+    // the block there must be the pinned hash, so an L1 without the pin (a
+    // wrong network, or an enforcer moved to another chain) is refused here,
+    // before the list changes, with or without a REST endpoint. With no pin
+    // (regtest, a signet), no known fork height (mainnet until its build), or
+    // an L1 still below the pin, the walk goes down to genesis as before.
+    int nPinHeight = 0;
+    uint256 hashPin;
+    const bool fPin = ParseMainchainBlockPin(gArgs.GetArg("-mainchainblockpin", ""), nPinHeight, hashPin) &&
+                      nPinHeight > 0 && nPinHeight <= nMainBlocks;
+    const int nStop = fPin ? MainCacheStopHeight(nPinHeight) : 0;
+    bool fPinStop = false;
+    const auto RefuseWrongL1 = [&](const uint256& hashAtPin) {
+        LogPrintf("ERROR: %s: the mainchain has block %s at the pinned height %d, not the pinned %s: "
+                  "this is a different L1 (-mainchainblockpin). The cache is left as it was.\n",
+                  __func__, hashAtPin.ToString(), nPinHeight, hashPin.ToString());
+        if (pWalk)
+            pWalk->deqHash.clear();
+        return false;
+    };
+    if (fPin && nMainBlocks == nPinHeight && hashMainTip != hashPin)
+        return RefuseWrongL1(hashMainTip);
+
     unsigned int nBatches = 0;
     while (nCursor > 0) {
         // Refill the batch when exhausted. The batch starts AT the cursor
@@ -14936,7 +15050,11 @@ static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& v
                 SaveWalk();
                 return false;
             }
-            if (!client.GetAncestorHashes(hashCursor, nCursor, MAIN_BLOCK_CACHE_BATCH, vBatch) || vBatch.size() < 2) {
+            // Ask for no more than the walk needs to reach one below the stop
+            uint32_t nWant = MAIN_BLOCK_CACHE_BATCH;
+            if (nStop > 0 && nCursor >= nStop && (uint32_t)(nCursor - nStop + 2) < nWant)
+                nWant = nCursor - nStop + 2;
+            if (!client.GetAncestorHashes(hashCursor, nCursor, nWant, vBatch) || vBatch.size() < 2) {
                 LogPrintf("%s: Failed to get to mainchain block: %u\n", __func__, nCursor - 1);
                 SaveWalk();
                 return false;
@@ -14955,6 +15073,12 @@ static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& v
         // continues from there.
         hashCursor = hashPrevBlock;
         nCursor--;
+
+        // Passing the pin height: the block there must be the pin (before the
+        // cached-block check, so a list already holding older blocks does not
+        // skip it)
+        if (fPin && nCursor == nPinHeight && hashPrevBlock != hashPin)
+            return RefuseWrongL1(hashPrevBlock);
 
         // Check if the prevblock is in our cache. Once we find a prevblock in
         // our cache we can update our cache from that block up to the new
@@ -14978,12 +15102,45 @@ static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& v
             fSplice = false;
             LogPrintf("%s: resuming at mainchain block %d (%u hashes kept)\n", __func__, nCursor, deqHashNew.size());
         }
+
+        // Reached one below the stop
+        if (nStop > 0 && nCursor == nStop - 1) {
+            fPinStop = true;
+            break;
+        }
     }
     if (pWalk)
         pWalk->deqHash.clear();
 
     // Also add the new mainchain tip
     deqHashNew.push_back(hashMainTip);
+
+    // v0.2.25: a walk that reached the pin without meeting a cached block
+    // replaces the whole list. Fresh or cold (an empty list), that is the
+    // refill. A list with entries that never linked to this L1 above the pin
+    // is what a walk to genesis met before: then every cached block is
+    // disconnected, as UpdateMainBlockCache did when only genesis linked.
+    if (fPinStop) {
+        if (!fFresh && bmmCache.GetCachedBlockCount() > 0) {
+            // Only the heights the new list holds (a v0.2.24 list also has
+            // every block below the stop, the same on any L1 that has the pin)
+            const std::vector<uint256> vOld = bmmCache.GetMainBlockHashCache();
+            const std::set<uint256> setNew(deqHashNew.begin(), deqHashNew.end());
+            for (size_t i = vOld.size(); i-- > (size_t)(nStop - 1);) {
+                if (!vOld[i].IsNull() && !setNew.count(vOld[i]))
+                    vDisconnected.push_back(vOld[i]);
+            }
+            fReorg = !vDisconnected.empty();
+            LogPrintf("%s: the mainchain did not link to the cached L1 blocks above the pin; %u cached blocks disconnected\n",
+                      __func__, vDisconnected.size());
+        }
+        const size_t nWalked = deqHashNew.size();
+        deqHashNew.insert(deqHashNew.begin(), (size_t)(nStop - 1), uint256());
+        bmmCache.ReplaceMainBlockCache(deqHashNew);
+        LogPrintf("%s: main block cache filled from the pin: %u hashes from mainchain block %d (tip %s)\n", __func__,
+                  nWalked, nStop - 1, hashMainTip.ToString());
+        return true;
+    }
 
     if (fFresh) {
         if (nCursor != 0) {
@@ -14999,10 +15156,21 @@ static bool UpdateMainBlockHashCacheLocked(bool& fReorg, std::vector<uint256>& v
     return bmmCache.UpdateMainBlockCache(deqHashNew, fReorg, vDisconnected);
 }
 
+//! v0.2.25: an update that notes when the list was last brought to the L1's
+//! tip (the tip is read at its start), for MainBlockCacheFresh.
+static bool UpdateMainBlockHashCacheNoted(bool& fReorg, std::vector<uint256>& vDisconnected, MainBlockCacheWalk* pWalk)
+{
+    const int64_t nStart = GetTimeMillis();
+    const bool fOK = UpdateMainBlockHashCacheLocked(fReorg, vDisconnected, pWalk, false);
+    g_nMainCacheAtTipMs = fOK ? nStart : 0;
+    g_nL1AnsweredMs = fOK ? nStart : 0;
+    return fOK;
+}
+
 bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected, MainBlockCacheWalk* pWalk)
 {
     std::lock_guard<std::timed_mutex> lock(mainBlockCacheMutex);
-    return UpdateMainBlockHashCacheLocked(fReorg, vDisconnected, pWalk, false);
+    return UpdateMainBlockHashCacheNoted(fReorg, vDisconnected, pWalk);
 }
 
 bool TryUpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected, int nWaitSeconds, bool& fBusy)
@@ -15013,7 +15181,7 @@ bool TryUpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnect
         fBusy = true;
         return false;
     }
-    return UpdateMainBlockHashCacheLocked(fReorg, vDisconnected, nullptr, false);
+    return UpdateMainBlockHashCacheNoted(fReorg, vDisconnected, nullptr);
 }
 
 static bool RefillMainBlockCacheFresh()
@@ -15157,7 +15325,14 @@ bool VerifyMainBlockCache(std::string& strError, MainBlockCacheCheck* pCheck)
         return Finish(false);
     }
 
-    const uint32_t nWant = std::min<uint32_t>(nHeight + 1, MAIN_BLOCK_CACHE_VERIFY_TAIL);
+    uint32_t nWant = std::min<uint32_t>(nHeight + 1, MAIN_BLOCK_CACHE_VERIFY_TAIL);
+    // v0.2.25: not below one under the stop, where the list holds placeholders
+    int nPinHeight = 0;
+    uint256 hashPin;
+    const int nStop = ParseMainchainBlockPin(gArgs.GetArg("-mainchainblockpin", ""), nPinHeight, hashPin)
+                          ? MainCacheStopHeight(nPinHeight) : 0;
+    if (nStop > 0 && nHeight >= nStop - 1)
+        nWant = std::min<uint32_t>(nWant, nHeight - (nStop - 1) + 1);
     std::vector<uint256> vL1;
     if (!client.GetAncestorHashes(hashAtHeight, nHeight, nWant, vL1) || vL1.size() != nWant) {
         strError = "Failed to request mainchain ancestor hashes!";

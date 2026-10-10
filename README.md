@@ -128,8 +128,14 @@ v0.2.19 adds members-only houses and a security batch, with FreeBank mainnet in 
 v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burned,
 v0.2.21 lets token holders claim at a failed house without its partners,
 v0.2.22 lets any number of houses net their notes in one settlement,
-v0.2.23 lets a node restart on its own after a power cut, and
-v0.2.24 tightens disk safety and peer scoring:
+v0.2.23 lets a node restart on its own after a power cut,
+v0.2.24 tightens disk safety and peer scoring, and
+v0.2.25 makes a new node's first start faster:
+
+- **Faster first start, light mode, `-assumevalid`** (v0.2.25). **No consensus change:** upgrade when it suits you, a
+  binary swap with no `-reindex`. The eCash hash list starts at the pinned block; BMM answers come in batches; signature
+  checks are skipped below beta block 992; `-mainchainrest=` (empty) runs with only an enforcer. Details in the release
+  notes.
 
 - **Disk safety, peer scoring, `getbalance "*"`** (v0.2.24). **No consensus change:** upgrade when it suits you, a
   binary swap with no `-reindex`. Undo data is synced before the block index names it; a relay of an attestation,
