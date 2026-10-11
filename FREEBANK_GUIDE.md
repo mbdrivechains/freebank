@@ -6,8 +6,8 @@ This file is meant to be *complete enough on its own* that you can hand it to an
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
 you through running FreeBank, standing up a bank, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
-or from the source of the shipped release (v0.2.8 for the section-3 quick start; the current release is v0.2.16), and the quick start in
-section 3 was run verbatim against the release binaries. Where something is designed but
+or from the source of the shipped release (the current release is v0.2.25), and the quick start in
+section 3 was run verbatim against the v0.2.25 release binaries. Where something is designed but
 not built, it says so.
 
 > **Status, always:** FreeBank is experimental, pre-audit software for **test networks
@@ -78,15 +78,16 @@ ECX notes, are planned for a later release. They open only once ECX markets are 
 | Instrument | What it is | Built? |
 |---|---|---|
 | **Bill of exchange** | A unique, stateful IOU between a drawer (seller), a drawee/acceptor (buyer, who posts an escrow bond) and a holder (current owner). Matures at a block height; endorsable; defaulted bills pay the bond to the holder; liable parties can be pursued by recourse. | Yes |
-| **Discount house** | A registered, escrow-bonded, M-of-N-governed issuer of notes and term deposits. Proves its liquid reserves on-chain every ~144 blocks. Lifecycle: Open → Stressed → Deferred → Insolvent / Wound-down. | Yes |
+| **Discount house** | A registered, escrow-bonded, M-of-N-governed issuer of notes and term deposits. Proves its liquid reserves on-chain every ~144 blocks. Lifecycle: Open → Stressed → Suspended (`deferred` in the RPCs) → Insolvent / Wound-down. Open to anyone, or (v0.2.19) members-only or redeem-only, for co-ops. | Yes |
 | **Notes** | The money. Per-house credit claims minted against reserves, transferred bearer-style, redeemed at par (1 unit = 1 sat). Holders can formally demand par; houses discharge demands unilaterally; a lapsed demand can be protested. | Yes |
 | **Discounting** | A house buys a bill from its holder, paying with notes minted in the same operation — the act of credit creation. Books the bill as a loan asset under a match-funding rule. | Yes |
 | **Term deposits** | Time-locked loans to a house at a per-receipt rate; transferable whole; junior to notes. | Yes |
 | **Clearing pool** | One constant-product AMM per house between its notes and the base coin — the secondary market that prices stressed paper. | Yes |
-| **Bilateral settlement** | Two houses present each other's notes and settle the net at par ±0.5% in one co-signed transaction. | Yes (bilateral only) |
-| **Gold oracle** | Bonded submitters post a gold price; the fix is a braked lower median. **Consensus-inert**: nothing in consensus reads it yet. | Yes, inert |
-| **Gram display** | RPCs show a `_grams` companion beside amounts at a fixed launch scale that tracks no market. Presentation only — notes redeem for ECX, not gold. Removed in v0.2.17. | Display only (being removed) |
-| Two-wallet bill issuance tooling, multi-house clearing, Chaumian bearer layer, gold notes, cash-credit lines | — | **Not built** (section 8 says which are designed) |
+| **Settlement between houses** | Houses present each other's notes, the notes are burned, and only the net is paid at par in ECX. Two houses settle bilaterally (±0.5%); from v0.2.22 any number net in one round (the Edinburgh exchange). Every house signs. | Yes |
+| **Token records** | A house may run a Chaumian mint (Cashu-style bearer tokens, off-chain). The chain records each mint (notes locked as backing) and each burn (backing released as notes), and from v0.2.21 token holders can claim at a failed house without its partners. The mint and the token wallet are separate software. | Yes (the on-chain records) |
+| **Assets** | Anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in the coins that carry it (v0.2.18). A token is only as good as its issuer; tickers are not unique. | Yes |
+| **Gold oracle** | Bonded submitters post a gold price; the fix is a braked lower median. **Consensus-inert**: nothing in consensus reads it. | Yes, inert |
+| Two-wallet bill issuance tooling, automatic clearing sweeps, gold notes, cash-credit lines | — | **Not built** (section 8 says which are designed) |
 
 ---
 
@@ -177,26 +178,22 @@ alpha L1: https://explorer.alpha.ecash.ninja/.
 
 ### 2.4 Verifying what you download
 
-Releases: https://github.com/mbdrivechains/freebank/releases — Linux x86-64 and macOS
-arm64 static tarballs plus `SHA256SUMS`. **Current release: v0.2.16** (three new RPCs for
-BitWindow's BMM engine to bid for FreeBank blocks, §8; a `-reindex` that fills the eCash block cache
-before it replays; withdrawal bundles that need no enforcer wallet; all with no consensus change.
-v0.2.15 kept deposit crediting going when an unreadable eCash transaction shares a withdrawal
-payout's L1 block; v0.2.14 added `coinbasetag=` so block producers can name their blocks, §5.2;
-v0.2.13 moved the fixed seed to `163.47.9.132:8455`):
-`freebank-0.2.16-x86_64-linux-gnu.tar.gz`, sha256
-`b19da93fcf2ea3195e90ea441acbdd16f669f43fdecc225721ddc48d152ee253`; its source is the
-commit the public tag `v0.2.16` points at (`git rev-parse 'v0.2.16^{commit}'`). The Linux
-binaries are static except for glibc and libgcc, so they need glibc 2.38 or later (Ubuntu 22.04
-and Debian 12 are too old). They report `v0.2.16.0-2afa30c`: `2afa30c` is the maintainer's build
-commit, whose `src/` and `depends/` trees match the public tag (README,
-[Verify your download](README.md#verify-your-download)). The commands below check the alpha
-proposal's v0.2.8 card (history); substitute `0.2.16` to verify the current binaries the same way.
+Releases: https://github.com/mbdrivechains/freebank/releases — a Linux x86-64 tarball, macOS
+tarballs for Apple Silicon and Intel, and `SHA256SUMS`. **Current release: v0.2.25** (a faster
+first start, light mode and a working `-assumevalid`, with no consensus change; see 5.2, 5.3 and 8.
+What each release since v0.2.16 changed is in the README's Robustness section and the release
+notes): `freebank-0.2.25-x86_64-linux-gnu.tar.gz`, sha256
+`e7470085270772991eb2aac59c77168fdf16cdb5323636e8c784a67fca2859a3`. Its source is the commit the
+public tag `v0.2.25` points at (`git rev-parse 'v0.2.25^{commit}'`, `14acea2`), and the binaries
+report it: `v0.2.25.0-g14acea2…`. From v0.2.18 the Linux tarball is a reproducible Guix build of
+that tag, matched byte for byte by the maintainer's own build, and needs glibc 2.27 or later; the
+macOS builds need macOS 15 or later. The commands below check the alpha proposal's v0.2.8 card
+(history); substitute `0.2.25` to verify the current binaries the same way.
 
 From v0.2.16, `SHA256SUMS` is also signed with the FreeBank release key (`SHA256SUMS.sig`; key
-fingerprint `SHA256:1d0zm9Qb9ZtzDnQHH593fgjAkk7nPqMDG79XyWlyeeY`), and the macOS tarball carries a
-GitHub build attestation. The key and the commands that check both are in the README's
-[Verify your download](README.md#verify-your-download) section.
+fingerprint `SHA256:1d0zm9Qb9ZtzDnQHH593fgjAkk7nPqMDG79XyWlyeeY`), and the macOS tarballs (and,
+from v0.2.18, the Linux one) carry GitHub build attestations. The key and the commands that check
+them are in the README's [Verify your download](README.md#verify-your-download) section.
 
 The sidechain proposal (M1) that activated slot 130 on the **beta** (block 968,020) carries the
 hash ids of an earlier, retired FreeBank build. No software checks them, and they do not change which
@@ -239,16 +236,18 @@ not a browser, so Gatekeeper's quarantine flag never attaches to the unsigned bi
 > on the **live** network, see section 5 — the commands are identical, but each operation advances
 > only as your BMM blocks land, and live state is wiped at each network reset.
 
-Three processes, all local: a regtest **Bitcoin node** (the Core build bundled with
-BitWindow — a v31 "eCash drynet4" build at the 2026-08-28 run below; any recent Core with `-rest -txindex
--zmqpubsequence` works, which is why the enforcer is started with
-`--bitcoin-core-skip-version-check`), the **CUSF enforcer** (`bip300301-enforcer`), and
-**`freebankd`**. FreeBank talks to the mainchain only through the enforcer's gRPC (via
-`grpcurl`) plus the node's REST interface.
+Three processes, all local: a regtest **mainchain node** (eCash's beta build, *Bitcoin Core
+(eCash betanet) v31.1.0*, started with `-regtest`; another recent BIP 300/301 Core build with `-rest -txindex
+-zmqpubsequence` works too, given the enforcer flag for its drivechain opcode (3.2), which is why
+the enforcer is started with `--bitcoin-core-skip-version-check`), the **CUSF enforcer** (`bip300301-enforcer`), and
+**`freebankd`**. `freebankd` talks to the enforcer directly (from v0.2.17; older releases called
+`grpcurl`) and reads the node's REST interface. You use `grpcurl` yourself below, to drive the
+enforcer.
 
-The whole quick start takes about three minutes of wall-clock. It was last run verbatim
-on 2026-08-28 against the v0.2.8 release binaries and the enforcer bundled with BitWindow
-(bip300301_enforcer v0.3.4). All snippets assume **bash**; `python3` and `xxd` are also used.
+The whole quick start takes a minute or two of wall-clock (78 s on its last run). It was last run verbatim
+on 2026-10-11 against the v0.2.25 release binaries, eCash's betanet v31.1.0 build and LayerTwo
+Labs' enforcer (master `6e5f79f` with two local changes: a patched `cusf-enforcer-mempool` and a
+longer node RPC timeout). All snippets assume **bash**; `python3` and `xxd` are also used.
 
 > **The one debugging fact to know before you start:** a wallet RPC that returns a txid
 > has *built* a transaction, not necessarily had it *accepted* — a mempool rejection is
@@ -264,8 +263,8 @@ on 2026-08-28 against the v0.2.8 release binaries and the enforcer bundled with 
    it bundles both binaries. On Linux they land in
    `~/.local/share/bitwindow/assets/bin/` (`bitcoind`, `bitcoin-cli`,
    `bip300301-enforcer`). You never need to open BitWindow itself. If you cannot find
-   them, download the L1 build from https://releases.drivechain.info/ and the enforcer
-   from https://github.com/LayerTwo-Labs/bip300301_enforcer.
+   them, download eCash's beta build from https://releases.ecash.com/L1-ecash-bitcoin/betanet/
+   and the enforcer from https://github.com/LayerTwo-Labs/bip300301_enforcer.
 3. **`grpcurl`** on your `PATH` (https://github.com/fullstorydev/grpcurl/releases). The
    enforcer serves gRPC reflection, so no `.proto` files are needed.
 4. **bash, python3, xxd.**
@@ -297,7 +296,7 @@ until $BC getblockcount >/dev/null 2>&1; do sleep 1; done
 "$BIN/bip300301-enforcer" --data-dir "$W/enf" \
   --node-rpc-addr=127.0.0.1:19443 --node-rpc-user=bench --node-rpc-pass=bench \
   --node-zmq-addr-sequence=tcp://127.0.0.1:29332 --serve-grpc-addr=127.0.0.1:50151 \
-  --bitcoin-core-skip-version-check \
+  --bitcoin-core-skip-version-check --op-drivechain=nop8 \
   --enable-wallet --wallet-sync-source=disabled --wallet-auto-create \
   > "$W/enf/enf.log" 2>&1 &
 
@@ -307,7 +306,12 @@ until grpcurl -plaintext -d '{}' $EA cusf.mainchain.v1.ValidatorService/GetChain
 
 The enforcer needs the node's `-txindex`, `-rest` and a live `-zmqpubsequence`; it exits
 if any is missing. `--wallet-sync-source=disabled` is fine on regtest because the enforcer
-mines to its own wallet.
+mines to its own wallet. `--op-drivechain=nop8` (a flag the enforcer's `--help` does not list)
+is there because eCash's beta build moved the drivechain opcode from `OP_NOP5` to `OP_NOP8`, and on
+regtest no network preset tells the enforcer so. Without it the deposit in 3.6 is refused
+(`failed to broadcast tx: … scriptpubkey`). Leave it out only with an L1 build that keeps `OP_NOP5`.
+The flag is in LayerTwo Labs' enforcer from 2026-09-16 (commit `7abe92c`); an older build refuses
+to start with it, so take a current enforcer.
 
 ### 3.3 Mine, propose slot 130, activate
 
@@ -352,14 +356,8 @@ it must be given explicitly on regtest, whose default transport is the legacy `j
 mode; `-enforceraddr` is that gRPC address (default `127.0.0.1:50051`); `-mainchainrest`
 is the node's REST endpoint (default `127.0.0.1:38332`; used to credit deposits);
 `-cusfbundleformat=1` builds withdrawal bundles in the enforcer's layout (regtest-only
-flag); `-minwithdrawal=1` lets a single withdrawal form a bundle (default 10 — v0.2.8 does
-not list this flag in `freebankd -help`, but it is real). On regtest the signet-challenge
-pin is not required.
-
-v0.2.8 prints `Warning: mainchain enforcer L1 identity UNVERIFIED at startup ...` and
-pauses about five seconds before continuing. On regtest that is expected and harmless —
-the node carries on and `getmainchainblockcount` tracks the mainchain. (It is a bug in
-the enforcer identity probe, fixed in the next release.)
+flag); `-minwithdrawal=1` lets a single withdrawal form a bundle (default 10). On regtest no
+L1 identity pin is required.
 
 ### 3.5 Advancing the sidechain: the `bmm` helper
 
@@ -400,8 +398,9 @@ $FB getbalance     # 5.00 (the 0.01 fee_sats is paid by the enforcer's wallet, n
 
 Then split the balance into several coins. This matters: a house proves its reserves
 coin-by-coin, and the proving coins cannot also pay the fee, so a wallet whose only
-spendable coin is one big one would attest *nothing* — and that empty attestation still
-succeeds and **replaces** the previous good one (`reservecapunits` drops to 0), so check
+spendable coin is one big one would attest *nothing*. From v0.2.23 the wallet refuses such an
+attestation when the house last proved more (pass `allowzero=true` to mean it); before, it
+succeeded and **replaced** the previous good one (`reservecapunits` dropped to 0). Check
 `gethouse` after every attest:
 
 ```bash
@@ -413,8 +412,8 @@ $FB listunspent 1 | grep -c '"amount"'    # several confirmed coins
 ### 3.7 Your first bank: register → attest → mint → redeem
 
 ```bash
-# registerhouse <tier 0-3> <threshold M> "<classid, 1-16 chars [a-z0-9], unique>" <denommg> "<pledges, coin amounts>" <fee>
-#   denommg: a label in milligrams of gold, must be >0, consensus-inert - notes still redeem 1 unit = 1 sat
+# registerhouse <tier 0-3> <threshold M> "<classid, 1-16 chars [a-z0-9], unique>" <denommg> "<pledges, coin amounts>" <fee> [type]
+#   denommg: a recorded number, must be >0; nothing in consensus reads it - notes redeem 1 unit = 1 sat of ECX
 $FB registerhouse 0 1 "mybank" 1000 "[1.0]" 0.001      # prints {"txid": "..."}
 bmm 6
 $FB listhouses          # note the "id" of classid mybank; below it is $H
@@ -531,7 +530,18 @@ $FB registerhouse 3 2 "club"    1000 "[0.3,0.3,0.3]"  0.001   # tier 3: multi-pa
 
 - Tiers set the issuance multiplier on pledged escrow: 1.0× / 1.5× / 2.0× / 3.0×. Minimum
   pledge 0.1 coin; up to 64 partners. Duplicate `classid` is refused. The fourth argument
-  (`denommg`) is a recorded label only; nothing in consensus reads it.
+  (`denommg`) is a recorded number only; nothing in consensus reads it.
+- **Members-only houses (v0.2.19)**, for co-ops: an optional seventh argument to
+  `registerhouse` sets the type for the life of the house: `"open"` (default), `"members"`
+  (notes and term-deposit receipts go only to members' keys) or `"redeem"` (members-only, and
+  notes pass only between the house and the holder, never member to member). The partners
+  approve `addhousemembers` / `removehousemembers` / `purgehousemembers <id> '["<address>",...]'`;
+  `listhousemembers <id>` shows the list, which is public on-chain, so use keys dedicated to the
+  house. An added member counts from the next block; a removal takes effect three blocks after
+  it confirms. A holder's exits are never gated: a removed member can still redeem, demand,
+  protest, claim and pass notes to a member. `mintnote`, `originatedeposit` and
+  `transferdeposit` take an optional address (a member's) as their last argument. Such houses
+  have no pool and cannot run a token mint (4.11).
 - **Attestation.** `attesthouse <id> <fee>` publishes this wallet's confirmed coins as the
   till. An attestation proves the till *as of* a recent block (its as-of height); it must
   land within 72 blocks of that height and later than the previous attestation.
@@ -540,14 +550,14 @@ $FB registerhouse 3 2 "club"    1000 "[0.3,0.3,0.3]"  0.001   # tier 3: multi-pa
   Stressed. One attestation every 144 blocks keeps a house Open; every ~72 leaves margin.
   A house that has never attested has `reservecapunits = 0` and cannot mint.
 - `topuphouse <id> <partner index> <amount> <fee>` — add escrow (allowed while Stressed or
-  Deferred: it is recovery capital).
+  suspended: it is recovery capital).
 - `admitpartner <id> <pledge> <fee>` (tier 3), `exitpartner <id> <partner index> <fee>`
   (tier 3; a leaving partner's pledge is tail-locked ~3 years), `winddownhouse <id> <fee>`
   (effective-Open only; refused while `mintedunits + depositunits > 0` — a chartered
   pool's note reserve still counts, so `retirepool` first), then
   `reclaimpledge <id> <partner index> <fee>`.
 - Read: `listhouses`, `gethouse <id>`. `status` holds only what is stored (`open`,
-  `wounddown`); **read `effective_status`**, which derives Stressed, Deferred and
+  `wounddown`); **read `effective_status`**, which derives Stressed, Deferred (suspended, 4.5) and
   Insolvent at the tip. Other useful fields: `activeescrow`, `mintedunits`,
   `depositunits`, `mintcapunits`, `reservecapunits`, `attestedratiobps`, `brassagebps`,
   `lastattestheight`, `stress_since`, `partners[]`.
@@ -575,11 +585,11 @@ $FB claimbillescrow "$ID2" 0.001; bmm 6             # the holder takes the bond;
 $FB recoursebill "$ID2" 0.001; bmm 6
 ```
 
-Bill status letters: `a` active, `r` retired, `d` defaulted. In v0.2.8 `issuebill` is a
-*single-wallet handshake*: the issuing wallet plays drawer, acceptor and initial holder
+Bill status letters: `a` active, `r` retired, `d` defaulted. `issuebill` is still a
+*single-wallet handshake* (v0.2.25): the issuing wallet plays drawer, acceptor and initial holder
 with fresh keys (so above, the same wallet later claims the bond). Consensus already
-requires two distinct signatures (drawer and acceptor) — the tooling for two independent
-wallets to draw and accept is the next item on the build queue.
+requires two distinct signatures (drawer and acceptor); the tooling for two independent
+wallets to draw and accept is not built yet.
 
 ### 4.3 Discounting a bill to a house (credit creation)
 
@@ -627,6 +637,10 @@ $HOUSE redeemnote $H 30000000 0.001                    # the ISSUING house burns
   own paper uses it). A bearer in another wallet gets par by `demandnote` (below) or sells
   into the house's pool (4.6). `redeemnote`/`demandnote`/`claimnote` units must equal one
   holder-key's coins exactly — split first with a self `transfernote` if needed.
+- **A bearer must not run `redeemnote` on v0.2.25 or earlier.** It pays from the calling
+  wallet's own coins, and consensus checks the payout, not who funds it. From a wallet
+  without the house's keys it burns the notes and pays you out of your own coins, so the
+  notes are lost. v0.2.26 refuses it, and `listmynotes` gains `house_keys`.
 - **Formal demand (bearer redemption at par)** — with 4.0's state, `$HOLDER` = `$W2`
   holding `mybank` notes and `$HOUSE` = `$W1`:
 
@@ -642,37 +656,52 @@ $FB gethouse $H1                          # mintedunits down by 1,000,000; $W2 n
   If the house lets a demand lapse past the demand window (1008 blocks on main, 12 on
   regtest), the holder **protests**: `$W2 protestnote $H1 0.001`. A live protest makes
   the house Stressed (`protest_open` in `gethouse`); attesting does not clear it — only
-  discharging does. Demanded notes cannot be transferred.
+  discharging does. A lapsed demand earns 10% a year from the lapse (from v0.2.18; 5%
+  before). Pre-authorised (demanded) notes cannot be transferred.
 - **Insolvency claim:** once a house is effectively Insolvent, each bearer claims pro-rata
   from the escrow pot: `claimnote $H <units> 0.001`. The first claim materialises the
   snapshot (`insolventpot`, `insolventunits`). Partners recover any residual afterwards
   with `reclaimpledge`.
 - Read: `listmynotes` → per house `units`, `demanded_units`, `redeemable`, `demandable`,
   `house_status` (a single letter here — `o/s/d/i/w`; `gethouse` gives the full word).
+  In v0.2.25 `redeemable` says only that the house is redeeming, not that this wallet can.
+  From v0.2.26 it is true only when the wallet holds the house's keys (`house_keys`).
 
-### 4.5 The option clause (deferral)
+### 4.5 The option clause (suspension)
 
-A **Stressed** house may suspend redemption for a bounded window rather than fail:
+A **Stressed** house may suspend redemption rather than fail. From v0.2.18 a suspension has
+no end date: it lasts until the house reopens or its silence makes it insolvent.
 
 ```bash
-$HOUSE deferhouse $H 0.001         # Stressed only (refused at Open); needs an attestation <= 144 blocks old and locks at least the attested till into the claim pot; effective_status: deferred
-$HOUSE renewdeferral $H 0.001      # once, extends the window
+$HOUSE deferhouse $H 0.001          # Stressed only (refused at Open and at Insolvent); needs an attestation <= 144 blocks old and locks at least the attested till into the claim pot; effective_status: deferred
+$HOLDER demandnote $H <units> 0.001             # join the queue; pre-authorised by default, so the house can pay it alone
+$HOLDER demandnote $H <units> 0.001 "" true     # or a plain demand: the notes stay on your key and stay transferable
+$HOLDER upgradedemand $H <units> 0.001          # turn a plain demand into a pre-authorised one; its interest clock keeps running
+$HOUSE dischargedemands $H 0.001                # the house pays the oldest pre-authorised demand: principal + interest, less the spread
 # ...recover: add capital (topuphouse / a deposit from the mainchain), then
-$HOUSE attesthouse $H 0.001; bmm 4  # at >= 15% the house returns to open
-$HOUSE releasereserves $H 0.001     # unlocks the till again
+$HOUSE attesthouse $H 0.001; bmm 4  # at >= 15% the house reopens: effective_status: open
+$HOUSE releasereserves $H 0.001     # unlocks the till again (refused while suspended)
 ```
 
-While deferred: `redeemnote`, `mintnote` and `reclaimpledge` are refused; holders may
-`demandnote` (queued; interest accrues at 5%/yr from the demand date); `topuphouse` is
-accepted. The window is 12,960 blocks (~90 days) with one renewal. Invoking deferral
-**replaces** the 1008-block Stressed → Insolvent clock with the deferral window; it does
-not reset `stress_since` — only a ≥15% attestation does — and an open protest is not
-cleared by it. A house that has not recovered when the window ends derives Insolvent. A
-house that became Stressed by *missing* its cadence must re-attest (truthfully, below the
-floor) before it can defer. A second deferral inside ~36 months, or cumulative suspension
-beyond ~9 months (the renewal is refused at that point too), is barred
-(`confidence_dead` in `gethouse`). To try it on regtest, advance ~290 blocks without
-attesting (7.1) or restart `freebankd` with `-attestcadence=4`.
+While suspended: `mintnote`, `reclaimpledge` and the redemption of undemanded notes are
+refused, and `topuphouse` is accepted. Demanded notes earn 10% a year from the demand
+(`defer_interest_bps` in `gethouse`) and can be paid while the house is suspended
+(`dischargedemands`, or `redeemnote` on demanded notes: at least principal plus interest, less
+the normal spread). A suspension ends one of two ways:
+
+- **Reopen:** an attestation at ≥ 15% lifts it. A demand made while suspended then earns
+  interest up to the reopen if it is paid within a week, and never past that week; after the
+  week a pre-authorised holder may protest (4.4).
+- **Silence:** a suspended house that misses two attestation cadences and then stays silent
+  until `defer_silence_insolvent_height` (shown while suspended; 4,032 blocks, about four
+  weeks, on main) derives Insolvent.
+
+Suspending does not reset `stress_since` (only a ≥ 15% attestation does), and an open protest
+is not cleared by it. A house that became Stressed by *missing* its cadence must re-attest
+(truthfully, below the floor) before it can suspend. A house may suspend again;
+`defer_activations` in `gethouse` counts every suspension. `renewdeferral` is retired (it
+always returns an error) and `-deferwindow` is refused at startup. To try it on regtest,
+advance ~290 blocks without attesting (7.1) or restart `freebankd` with `-attestcadence=4`.
 
 ### 4.6 Term deposits
 
@@ -686,6 +715,11 @@ $FB claimdeposit     $H 40000000 0.001              # in insolvency: after noteh
 
 Notes and deposits share one cap: N + D ≤ λ·E. Deposits are never redeemable early (early
 liquidity means selling the receipt) and are junior to notes in the waterfall.
+
+`withdrawdeposit` pays from the calling wallet's coins, like `redeemnote`. Run it only in
+the house's wallet. On v0.2.25 and earlier, a saver whose receipt sits in another wallet
+loses the receipt and is paid from their own coins. v0.2.26 refuses it there. Such a saver
+cashes out through the house (`transferdeposit` the receipt to it) or by selling the receipt.
 
 ### 4.7 Clearing pool (AMM)
 
@@ -734,6 +768,33 @@ $W2 listsettlements    # (a wallet RPC) both houses' mintedunits fall by the pre
 The debtor house's wallet must hold the residual in spendable coin (here `mybank`'s
 wallet pays it).
 
+**Netting among any number of houses (v0.2.22), the Edinburgh exchange.** Every house in a
+round hands in the other houses' notes it holds, all of them are burned, and only each house's
+net position is paid, in ECX at par, to each net creditor's redemption key. If A holds B's
+notes, B holds C's and C holds A's, one round clears all three where no pair could settle. Each
+house must be able to settle bilaterally and must have attested since its last settlement. The
+round is a hex string the houses' wallets pass along; every house signs, so nothing is
+compulsory:
+
+```bash
+# three houses, $H1..$H3 in wallets $W1..$W3 (4.0's pattern with a third wallet), each holding another's notes
+rnd() { python3 -c "import json,sys; print(json.load(sys.stdin)['round'])"; }
+R=$($W1 createnetting $H1 "[$H2,$H3]" | rnd)    # [expiryblocks, default 72, max 144] [fee]; this house pays the fee
+R=$($W2 joinnetting $H2 "$R" | rnd)             # each other house adds the notes it presents
+R=$($W3 joinnetting $H3 "$R" | rnd)
+$FB decodenetting "$R"                          # houses, bundles, nets, payments, who has funded and signed
+R=$($W1 fundnetting $H1 "$R" | rnd)             # once all have joined, every house funds (one that owes nothing too)
+R=$($W2 fundnetting $H2 "$R" | rnd); R=$($W3 fundnetting $H3 "$R" | rnd)
+R=$($W1 signnetting $H1 "$R" | rnd)             # once all have funded, every house signs
+R=$($W2 signnetting $H2 "$R" | rnd); $W3 signnetting $H3 "$R"   # the last signature sends it: {"txid", "net", "pays", ...}
+```
+
+`createnetting` and `joinnetting` may answer `"status": "consolidating"` (notes moved onto one
+key): run the call again once those transfers confirm. Check the round with `decodenetting` before signing: a signature agrees to every
+bundle, net and payment in it. Nodes relay a round up to 100,000 bytes, about 24 houses that
+all hold each other's notes. `listsettlements` shows rounds too. (Signatures as in `help`; the
+`settle_net_roundtrip` integration gate runs a three-house round.)
+
 If `proposesettle` answers `"status": "consolidating"`, wait for that txid to confirm and
 re-run. One settlement per **house** per cadence window (144 blocks on main, 12 on
 regtest) — the stamp lives on each house record, so a house that just settled with B
@@ -749,7 +810,6 @@ $FB listoraclesubmitters                         # re-read the id from here once
 SUB=$($FB listoraclesubmitters | python3 -c "import json,sys; print(json.load(sys.stdin)[-1]['id'])")
 $W1 submitoracleprice $SUB 800000000 0.001       # <submitter id> <milligrams of gold per 1000 ECX> <fee>; the number is an arbitrary example
 $FB getgoldfix                                   # {"raw": lower median, "braked", "fixheight", "ageblocks"}; prints nothing (JSON null) before the first fix
-$FB getgramrate                                  # the fixed display scale used for the _grams fields (unrelated to the oracle)
 ```
 
 A fix forms only when a quorum of distinct submitter ids (3) submits in the same block.
@@ -763,6 +823,60 @@ See 3.8. `createwithdrawal <mainchain address> <sidechain refund address> <amoun
 `createwithdrawalrefundrequest <id>` to cancel a still-Unspent withdrawal;
 `refundallwithdrawals` for all of them. The mainchain destination can be P2PKH, P2SH, P2WPKH, P2WSH or P2TR;
 only the refund address (on FreeBank) must be a legacy P2PKH address.
+
+### 4.11 Token records: a house's Chaumian mint (v0.2.20, v0.2.21)
+
+A house may run a Chaumian mint: Cashu-style bearer tokens, blind-signed and held off-chain.
+The mint and the token wallet are separate software, not part of `freebankd`. What the chain
+keeps is the public record, so the tokens stay the house's liability in every cap and in the
+payout if it fails:
+
+```bash
+$HOUSE locknotes $H 1000000 0.001               # a mint: lock 1,000,000 units of undemanded notes as token backing; the notes' holder and the partners sign
+$HOUSE unlocknotes $H 400000 0.001 "<address>"  # a burn: release backing as ordinary notes to whoever redeemed tokens; never more than is locked
+$FB gethouse $H                                 # tokenunits: the backing outstanding (600,000 here)
+# the one-step lock from two wallets (v0.2.21): the customer builds and signs, the house approves and sends
+HEX=$($HOLDER createnotelock $H 500000 0.001 | python3 -c "import json,sys; print(json.load(sys.stdin)['hex'])")
+$HOUSE sendrawtransaction "$($HOUSE approvenotelock "$HEX" | python3 -c "import json,sys; print(json.load(sys.stdin)['hex'])")"
+```
+
+No new tokens while a house is suspended or has failed, and from v0.2.21 no burns from
+suspension on, so the partners cannot turn the backing into their own notes before a failure.
+(v0.2.25's `help unlocknotes` still says burns are allowed in every status; consensus refuses them
+from suspension on, `bad-note-unlock-house-status`. Here the help is wrong.)
+Members-only houses cannot run a mint (tokens are bearer). `listnotecoins` lists the wallet's note
+coins one by one, and `transfernote`, `locknotes` and `createnotelock` take an optional
+`fromaddress` to spend only one holder's notes.
+
+**The token holders' claim at a failed house (v0.2.21).** The partners record the mint's keysets
+(`registertokenkeyset`), and the mint posts what it issues and what it marks spent (`posttokens`,
+signed with the keyset's posting key). For four weeks from insolvency any holder can claim with
+their tokens (`claimtokens`), with no partner signature: each token is checked against the
+recorded keys, must have been posted as issued before the failure and not posted as spent, and the
+claim is signed with the token's own blinding factor. A phone can sign offline
+(`signtokenclaims`) and any node can relay the claim and pay its fee (`relaytokenclaims`). After
+the window anyone collects (`collecttokens`): claims are paid in ECX from the escrow at a note's
+share, never more than the token backing, so note holders' share is untouched.
+`gettokenclaims <id>` shows the window, keysets, claims and totals. Signatures are in 9.2 and
+`help`; the integration gates `token_records_roundtrip`, `token_lock_two_party` and
+`token_claim_roundtrip` run them.
+
+### 4.12 Assets (v0.2.18)
+
+Anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in the coins that carry
+it, for example a token for goods a custodian holds. The asset's id is the txid that created it;
+**tickers are not unique**, and a token is only as good as its issuer.
+
+```bash
+$FB createasset "WHEAT" "1 unit = 1 kg in <custodian>'s store" 100000 "<32-byte hash hex of the custodian's attestation>"   # [decimals] [fee] [controladdress] [supplyaddress]; prints {"txid", "asset_id"} (the same)
+$FB transferasset <asset_id> "<address>" 2500 0.001
+$FB listmyassets                                # this wallet's assets and units
+$FB listassets                                  # every asset on the chain
+```
+
+Units can't be created after the genesis, only burned (sent to `OP_RETURN`), and two assets can't
+be mixed in one transaction. Balances and coin selection never spend asset coins as ECX.
+`transferassetcontrol <asset_id> <address>` moves the control coin.
 
 ---
 
@@ -816,7 +930,7 @@ The live network (2.3). Your own stack is the section-3 shape on the live chain:
   `--wallet-sync-source=disabled` unless you point it at a beta Esplora server with
   `--wallet-esplora-url` (see the alpha notes below on what `disabled` means for funding). The
   wallet also lets the enforcer accept v0.2.16's withdrawal bundles (section 8).
-- **`freebankd` (the current release)** on its `main` network (no `-regtest`), pinned to the beta
+- **`freebankd` (the current release)** on its default network (no `-regtest`; `beta` from v0.2.19), pinned to the beta
   fork block — the flags the project's seed runs with; substitute your node's REST port and your
   credentials:
 
@@ -830,6 +944,16 @@ The live network (2.3). Your own stack is the section-3 shape on the live chain:
 
   Then bid with `refreshbmm 0.001` on a timer, funded by the enforcer's wallet, and name your blocks
   with `coinbasetag=` (both below).
+
+  **The first start (v0.2.25).** A new node has its first block within about a minute. Its list of
+  eCash block hashes starts at the pinned block (about 3,900 hashes, a second's work, where earlier
+  releases fetched 971,000), and it asks the enforcer about BMM 1,000 eCash blocks per call.
+  Signature checks are skipped for blocks at or below beta block 992 (`a939cbd9…`) when that block is
+  on the chain the node follows (`-assumevalid`; `-assumevalid=0` checks every signature); every
+  other check still runs. The rest of a fresh sync is the download from the seed: on 2026-10-10 a new
+  light-mode node took the beta's ~1,000 blocks (about 1.4 GB, much of it test load) from the
+  Singapore seed to Australia in 6.3 minutes, once the seed ran BBR congestion control (28.7 minutes
+  without it).
 
 **The alpha recipe (history, August–September 2026).** The rest of this section is how the alpha
 stack was run, kept as a record. What carries over to the beta unchanged: the full-node rule
@@ -942,7 +1066,7 @@ Followable by `freebankd` from v0.2.9 (section 2.3). The L1 side first, then the
   initial sidechain sync verifies every block's BMM commitment through the enforcer — roughly 7 s per
   header plus ~15 s per block with the enforcer reached across a network, faster on localhost — so a
   few hundred blocks is minutes (measured 2026-09-29: about 400 blocks took 17.5 minutes from one peer), and RPC calls
-  block while it runs. Both are on the list to fix.
+  block while it runs. v0.2.25 removes most of both costs (the beta's first start, above).
 - **Name your blocks (`coinbasetag=`, v0.2.14 or later).** When your `refreshbmm` bid wins, the
   FreeBank block is yours: your `freebankd` built it and earns its fees. Add one line to
   `freebank.conf` (or pass `-coinbasetag=` on the command line) and restart, so explorers can credit
@@ -975,8 +1099,8 @@ FreeBank live is to drop a downloaded `freebankd` on top of it and let it find t
 own. As of **September 2026 the beta network is producing FreeBank blocks continuously**, so there is
 a live chain to sync.
 
-From **v0.2.10**, `freebankd` ships a DNS seed (`seed.ecxfreebank.com`) baked into its `main` chain
-params, so it discovers a peer with **no `-addnode`** — that is the whole point of this test. (Verified
+From **v0.2.10**, `freebankd` ships a DNS seed (`seed.ecxfreebank.com`) baked into its default chain
+params (`beta` from v0.2.19, `main` before), so it discovers a peer with **no `-addnode`** — that is the whole point of this test. (Verified
 end-to-end on alpha, on an Apple-Silicon Mac against a BitWindow stack and from a fresh US cloud box,
 on 2026-09-04.)
 
@@ -988,8 +1112,14 @@ If that lookup returns nothing the node logs `0 addresses found from DNS seeds`,
 still comes away with a persistent peer. So that log line followed by `New outbound peer connected` is
 the fallback working, not a failure. Two more things the fresh-box run confirmed: the release tarball
 verifies against `SHA256SUMS`, and **`freebankd` will not run without an L1** — with no enforcer/REST
-reachable it exits after 60 s with an explicit `mainchain REST endpoint … did not answer` error. There
-is no light or follower mode; section 5.2's node and enforcer are required.
+reachable it exits after 60 s with an explicit `mainchain REST endpoint … did not answer` error.
+
+**Light mode (v0.2.25).** `-mainchainrest=` (empty) runs `freebankd` with an enforcer and no eCash node
+REST endpoint. At start it checks the enforcer's network, `-mainchainchain` and the pinned block through
+the enforcer, and stops if no enforcer answers within 60 s. It checks deposits exactly as a full node
+does (against the enforcer's peg events, since v0.2.19), but it adds no deposits to blocks it builds.
+Light mode removes the REST endpoint, not the trust question below: the enforcer is the node's only
+source of eCash facts, so an enforcer you do not run is a party you trust.
 
 On alpha, the same fresh cloud box, given a private network route to a *remote* L1 (an enforcer and REST endpoint
 on another machine) and a pre-built `mainblockhash.dat`, then did the whole thing: `1 addresses found
@@ -1004,19 +1134,18 @@ testing, nothing more. For real money, run your own validated stack (5.2).
    attaches to the unsigned binary:
    ```bash
    # Linux:
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.16/freebank-0.2.16-x86_64-linux-gnu.tar.gz
-   # macOS (Apple Silicon):
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.16/freebank-0.2.16-arm64-apple-darwin.tar.gz
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.25/freebank-0.2.25-x86_64-linux-gnu.tar.gz
+   # macOS (Apple Silicon; for Intel, x86_64-apple-darwin):
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.25/freebank-0.2.25-arm64-apple-darwin.tar.gz
 
-   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.16/SHA256SUMS
+   curl -LO https://github.com/mbdrivechains/freebank/releases/download/v0.2.25/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing        # macOS: shasum -a 256 -c  -> OK
-   tar -xzf freebank-0.2.16-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
+   tar -xzf freebank-0.2.25-*.tar.gz               # -> freebank/bin/{freebankd,freebank-cli,freebank-tx}
    xattr -dr com.apple.quarantine freebank 2>/dev/null   # macOS only: clear quarantine if present
    ```
-   To also check the signature on `SHA256SUMS` (and the macOS build attestation), follow the README's
+   To also check the signature on `SHA256SUMS` (and the build attestations), follow the README's
    [Verify your download](README.md#verify-your-download) section.
-   `freebankd` shells out to `grpcurl` for the enforcer transport — install it (`brew install grpcurl`,
-   or your package manager).
+   From v0.2.17 `freebankd` talks to the enforcer itself; it needs no `grpcurl`.
 
 2. **Point it at BitWindow's beta stack.** Find BitWindow's enforcer gRPC (usually `127.0.0.1:50051`)
    and its mainchain bitcoind's **REST** port (the README's example uses `18302`). The node must have
@@ -1033,9 +1162,9 @@ testing, nothing more. For real money, run your own validated stack (5.2).
      -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 \
      -mainchainrest=127.0.0.1:<REST_PORT> -mainchainchain=main \
      -mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042 \
-     -grpcurlbin=$(which grpcurl) -daemon
+     -daemon
    ```
-   BitWindow also ships `grpcurl` in its `assets/bin`, so `-grpcurlbin` can point there instead. Don't
+   With no REST port at hand, `-mainchainrest=` (empty) runs the same node in light mode (above). Don't
    also start FreeBank from BitWindow's Sidechains tab: released BitWindow versions (0.2.231 and
    earlier, the current release as of 2026-09-26) launch it with the command line of an earlier,
    retired FreeBank build, and this node will not start that way.
@@ -1448,13 +1577,15 @@ enforce:
   automatically, and a stressed bank's notes were still accepted — at a visible discount.
   FreeBank's principle is the same: *the discount is information, not friction.* The pools
   show a house's discount in real time; the settlement op lets two houses present and net
-  at par. (Multi-house clearing sweeps are designed, not yet built.)
+  at par, and a netting round (v0.2.22) lets any number do it at once, as at the Edinburgh
+  exchange. (Automatic clearing sweeps are designed, not yet built.)
 - **The option clause.** Scottish notes of 1730–1765 promised payment on demand *or, at
   the directors' option, six months later with 5% interest* — turning a run into an
-  orderly adjustment. FreeBank builds the analogue as consensus (4.5): a 90-day window,
-  one renewal, 5%/yr from the date of demand, and a confidence-death guard so it cannot
-  become a way of life. The historical verdict on the clause is contested (Adam Smith
-  supported its ban) and the market is expected to price it visibly.
+  orderly adjustment. FreeBank builds the analogue as consensus (4.5): from v0.2.18 a
+  suspension has no end date, demanded notes earn 10% a year from the demand, a suspended
+  house that stops attesting becomes insolvent, and every suspension is counted on-chain.
+  The historical verdict on the clause is contested (Adam Smith supported its ban) and the
+  market is expected to price it visibly.
 - **Unlimited liability, translated into bonds.** Partners in the provincial and private
   Scottish banks were liable to the last penny (only the three chartered banks had limited
   liability). A chain cannot reach a personal estate, so FreeBank substitutes what it can
@@ -1479,10 +1610,12 @@ touches it.
 
 ### 7.1 Houses and attestation
 
-- **A house attests zero reserves from a single-coin wallet, silently.** Symptom:
-  `attesthouse` returns a txid; then `reservecapunits = 0` and `mintnote` refuses. Cause: an
-  attest may not spend its own proven coins, so the fee is taken from coins *outside* the
-  proof set, and with one coin everything is released. Fix: keep at least two confirmed
+- **A house attests zero reserves from a single-coin wallet.** Symptom: from v0.2.23
+  `attesthouse` refuses because the attestation would prove zero while the house last proved
+  more (before v0.2.23 it returned a txid, then `reservecapunits = 0` and `mintnote` refused).
+  Cause: an attest may not spend its own proven coins, so the fee is taken from coins *outside*
+  the proof set, and with one coin everything is released. (`attesthouse <id> <fee> true`
+  attests zero on purpose.) Fix: keep at least two confirmed
   spendable coins in the house wallet (`sendtoaddress <own address> 0.05`, wait a block,
   check with `listunspent 1`), then run `attesthouse` again — the new attestation lands at
   a later height, which is fine; attestations only need to be monotone.
@@ -1527,26 +1660,27 @@ touches it.
 - The redemption spread (*brassage*) is exactly 0 while the house is Open and rises
   quadratically to 4% as the attested ratio falls toward 2.5% once impaired — a run-tax
   paid into the pot the stayers will claim from.
-- Deferral: see 4.5.
+- Suspension (the option clause): see 4.5.
 
 ### 7.3 The peg
 
-- **Give the enforcer a plain `getnewaddress` address for deposits**, not the
-  `formatdepositaddress` (`s130_…`) form — the sidechain cannot parse the wrapper and the
-  deposit never credits (`invalid-deposit-missing-output` in the log).
-  `getdepositaddress`/`formatdepositaddress` exist for tools that expect the wrapper; the
-  enforcer wants the plain address.
+- **Give the enforcer a plain `getnewaddress` address for deposits.** From v0.2.17 a deposit made
+  out to the full `getdepositaddress` string (`s130_<address>_<checksum>`) is paid too, but a
+  wrong slot or checksum in that form is recorded and paid to no one, so the bare address is the
+  safest thing to give the enforcer. (v0.2.16 and earlier paid only the bare address.)
 - A deposit needs a mainchain block *and then* a sidechain block to credit.
-- **On a snapshot-bootstrapped mainchain node, deposits silently never credit until `txindex`
-  catches up.** `freebankd` fetches each deposit's raw transaction over REST
-  (`getrawtransaction`) to build the credit output; an assumeutxo node's `txindex` only covers
-  its still-validating *background* chainstate, so `getrawtransaction` for a recent deposit
-  returns *not found*, `freebankd` fails the whole deposit batch closed, and every block
-  credits `0 deposits`. The only clue is `REST raw-tx fetch failed for deposit <txid> (batch
-  failed closed)` in `debug.log` — the enforcer itself knows the deposit (`GetCtip` shows it);
-  only the raw-tx fetch is missing. Fix: wait for the node's background validation (and
-  `txindex`) to pass the deposit's block, or run the mainchain node from a full `txindex` (no
-  snapshot).
+- **A deposit is only what eCash recorded** (v0.2.17): every node checks each deposit against
+  eCash (the same transaction, address, amount and running number; from v0.2.19 through the
+  enforcer's peg events alone), and refuses a block whose deposit eCash does not list
+  (`bad-deposit-l1`). "Can't tell yet" (the enforcer
+  behind or unreachable) makes the node wait; it never rejects a block for that.
+- **The node that builds a block reads each new deposit from its own eCash block** over REST
+  (`/rest/block/<hash>`, from v0.2.17), so it needs `-mainchainrest`; a light-mode node (5.3)
+  adds no deposits to the blocks it builds. If a read fails, the whole batch waits (`treasury
+  change … could not read it from its L1 block … (batch failed closed)` in `debug.log`) and the
+  block is built without them. (v0.2.16 and earlier fetched the deposit with
+  `getrawtransaction`, which on an assumeutxo mainchain node found nothing until its background
+  `txindex` passed the deposit's block; 5.2's alpha notes describe that.)
 - A lone withdrawal never bundles unless `-minwithdrawal=1` (default 10).
 - Withdrawal destinations (v0.2.13 and later): P2PKH, P2SH, P2WPKH, P2WSH or P2TR (taproot)
   addresses of the L1 the node follows. Other witness versions and payouts below the L1 dust limit
@@ -1604,10 +1738,19 @@ touches it.
 
 ### 7.5 Build and upgrade
 
+- **Which upgrades need what.** v0.2.23, v0.2.24 and v0.2.25 have no consensus change: a binary
+  swap. v0.2.19 to v0.2.22 are consensus changes on the beta (every node must upgrade; a binary
+  swap, no `-reindex`). v0.2.17 and v0.2.18 are consensus changes that also need one restart with
+  `-reindex`. A node on an older release does not know a newer rule: it stops at the first block
+  that uses a new operation, and where a release only made a rule stricter (v0.2.19) it would
+  accept blocks the network refuses. Upgrade every node you rely on. The README's Robustness
+  section lists each release.
+- **Restarts:** from v0.2.17 a hard stop (a crash, `kill -9`) needs no `-reindex`, and from
+  v0.2.23 neither does a power cut after new blocks or right after a reorg: the node replays what it
+  had not saved.
 - **v0.2.8 is a consensus change** (rejects transaction version 10; enforces
-  one-payout-per-burn on withdrawals). Upgrade before the chain you follow does. No disk
-  format change — a binary swap. (v0.2.7 *did* change the disk format: a datadir written
-  by ≤ v0.2.6 needs a one-time `-reindex`.)
+  one-payout-per-burn on withdrawals). No disk format change — a binary swap. (v0.2.7 *did*
+  change the disk format: a datadir written by ≤ v0.2.6 needs a one-time `-reindex`.)
 - Native builds are not portable; use the static release tarball or a `depends` static
   build. For **v0.2.8**, build the static path from `master`, not the `v0.2.8` tag: that tag is missing
   `depends/Makefile` (a gitignore accident fixed right after the release; the tag was left as-is
@@ -1615,34 +1758,41 @@ touches it.
   those directly.
 - Re-running `./configure` can leave stale archives (`undefined reference to
   boost::system::generic_category()`): remove `src/libbitcoin_util.a` and rebuild.
-- **`freebankd` has two chains of its own:** `regtest` (follows a regtest L1) and `main`
-  (follows any non-regtest L1 — a signet pinned by `-mainchainchallenge`, or, from
-  v0.2.9, a mainnet-family forknet such as the eCash beta, or alpha before it, pinned by
-  `-mainchainblockpin`). There is no separate testnet or signet mode. Address prefix `X…`; bech32 HRP `fbk` (`fbkrt`
+- **`freebankd` runs one public network per build:** `regtest` (with `-regtest`, follows a
+  regtest L1) or, with no flag, the build's public network, `beta` from v0.2.19 (`main` before),
+  which follows any non-regtest L1: a signet pinned by `-mainchainchallenge`, or, from v0.2.9, a
+  mainnet-family forknet such as the eCash beta, or alpha before it, pinned by
+  `-mainchainblockpin`. FreeBank mainnet is in the code, dormant; no flag selects it, and a separate
+  mainnet release will run it. There is no separate testnet or signet mode. Address prefix `X…`; bech32 HRP `fbk` (`fbkrt`
   on regtest).
 
 ---
 
-## 8. Built vs designed — as of v0.2.16
+## 8. Built vs designed — as of v0.2.25
 
 | Area | Status |
 |---|---|
 | Two-way peg (deposits, withdrawal bundles, payout) | Built; verified end-to-end against the enforcer on an eCash betanet regtest (deposit and withdrawal also exercised on the project's signet) |
+| Every peg step checked against eCash (deposits, BMM commitments, bundle status, bundle contents) | Built (v0.2.17); deposits through the enforcer's peg events alone from v0.2.19 |
 | Bills: issue / endorse / retire / default claim / recourse | Built |
 | Bill discounting to a house, house-side retire/claim, match-funding rule | Built |
-| Independent two-wallet issuance tooling (A draws on B who accepts) | **Not built** (planned next) — consensus already requires two keys; the RPC plays all roles |
+| Independent two-wallet issuance tooling (A draws on B who accepts) | **Not built** — consensus already requires two keys; the RPC plays all roles |
 | Houses: register / topup / admit / exit / wind-down / reclaim, tiers 0–3 | Built |
+| Members-only and redeem-only houses, for co-ops | Built (v0.2.19) |
 | Reserve attestation; Open → Stressed → Insolvent machine; claim waterfall | Built; insolvency absorbing |
-| Option clause: defer / renew / release; brassage | Built; dials provisional |
+| Option clause: suspend with no end date, reopen, release; brassage | Built (no end date from v0.2.18); dials provisional |
 | Notes: mint / transfer / redeem at par | Built |
 | Bearer redemption: pre-authorised demand, unilateral discharge, protest | Built |
 | Term deposits | Built |
 | Clearing pools (AMM) | Built |
 | Bilateral settlement-to-par | Built |
-| Multi-house clearing sweeps / par-attractor | **Not built** (designed) |
+| Multilateral netting (any number of houses in one round) | Built (v0.2.22) |
+| Automatic clearing sweeps / par-attractor | **Not built** (designed) |
+| Token records for a house's Chaumian mint (mint and burn records) | Built (v0.2.20); the mint and the token wallet are separate software, not in this release |
+| Token holders' claim at a failed house, without its partners | Built (v0.2.21) |
+| Assets (fixed batches of units, 1 unit = 1 sat of ECX) | Built (v0.2.18) |
 | Gold oracle | Built, **consensus-inert** |
-| Gold notes (grams of gold, backed by wrapped gold, kept apart from ECX notes) | **Planned** for a later release; they open only once ECX markets are deep enough. Today notes redeem 1:1 for ECX; grams are display only |
-| Chaumian bearer layer over notes | **Not built** (designed; op codes reserved) |
+| Gold notes (grams of gold, backed by wrapped gold, kept apart from ECX notes) | **Planned** for a later release; they open only once ECX markets are deep enough. Today notes redeem 1:1 for ECX |
 | Cash-credit lines | **Not built** (designed) |
 | Strict-DER / low-S payload signatures; L1 identity pin | Built |
 | Forknet (alpha/beta/mainnet-style L1) support in `freebankd` | Built (v0.2.9): `-mainchainblockpin` + address prefix from the L1 family; verified live on alpha and on the eCash beta |
@@ -1650,19 +1800,23 @@ touches it.
 | Explorer RPCs (`getblockstats`, `getindexinfo`, per-transaction weight) | Built (v0.2.13) |
 | Block-producer name in the coinbase (`coinbasetag=`) | Built (v0.2.14); self-declared, not consensus |
 | BMM bidding from BitWindow's engine (`get_block_template`, `connect_block`, `get_bmm_inclusions`; `-bmmbidder=engine`, `-bmmblockmaxweight`, `setcoinbasetag`) | Built in `freebankd` (v0.2.16); BitWindow's side is under review upstream ([LayerTwo Labs drivechain-frontends PR #2402](https://github.com/LayerTwo-Labs/drivechain-frontends/pull/2402)), not yet in a BitWindow release |
-| Withdrawal bundles proposed with no enforcer wallet (`BlockProducerService/ProposeWithdrawalBundle`) | Built (v0.2.16); the enforcer must serve `BlockProducerService`: `--enable-wallet`, or without a wallet `--enable-mempool --enable-block-template-server --coinbase-recipient=<address>`; falls back to the wallet call when the enforcer answers Unimplemented |
+| Withdrawal bundles proposed with no enforcer wallet (`BlockProducerService/ProposeWithdrawalBundle`) | Built (v0.2.16); the enforcer must serve `BlockProducerService`: `--enable-wallet`, or without a wallet `--enable-mempool --enable-block-template-server --coinbase-recipient=<address>`; falls back to the wallet call when the enforcer answers Unimplemented. A pending bundle is proposed again until eCash has it (v0.2.23) |
 | `-reindex` that fills the eCash block cache before replaying and waits for a lagging enforcer (`-replaycachewait`) | Built (v0.2.16) |
-| Third-party audit; mutation testing | **Not done** |
+| The enforcer reached directly (the Connect protocol), no `grpcurl` | Built (v0.2.17); `-enforcertransport=grpcurl` keeps the old way |
+| Restart with no `-reindex` after a hard stop (v0.2.17) or a power cut (v0.2.23) | Built |
+| Fast first start (hash list from the pinned block, BMM answers in batches), working `-assumevalid`, light mode (`-mainchainrest=` empty) | Built (v0.2.25) |
+| Reproducible Linux build (Guix) | Built (v0.2.18) |
+| Third-party audit | **Not done** |
 
-Test posture (v0.2.16): the full suite passes, 48 of 48, on the release tree. That is the unit
-suite (495 cases; it needs no L1), 44 end-to-end integration gates on an eCash betanet v31.1.0
-regtest L1 with LayerTwo Labs' bip300301_enforcer master `6e5f79f` with our local fixes
-(`73d239a`) and `-mainchaintransport=enforcer`, and 3 legacy gates on a legacy BIP 300/301 regtest
-L1 over the older `jsonrpc` transport. The suite includes two-node byte-compare convergence against
-a never-connected control node, reorg coverage across every operation family, `-reindex`
-reproduction, and a property harness for bills. `make check` passes on the public source tree,
-and the macOS build workflow runs the unit suite and its portability checks. Three inherited consensus-critical defects
-(from the chassis) were found and fixed in v0.2.8; more inherited issues may exist.
+Test posture (v0.2.25, run 2026-10-10 on the release commit): the unit suite (647 cases; it needs
+no L1) and 68 end-to-end integration gates on an eCash betanet v31.1.0 regtest L1 with LayerTwo
+Labs' bip300301_enforcer master `6e5f79f` with our local fixes (`73d239a`) and
+`-mainchaintransport=enforcer` all pass. The 3 legacy gates for the older `jsonrpc` transport on a
+legacy BIP 300/301 L1 were not run for this release. The suite includes two-node byte-compare
+convergence against a never-connected control node, reorg coverage across every operation family,
+crash and power-cut restarts, `-reindex` reproduction, and a property harness for bills. The Linux
+and macOS build workflows run `make check` on the public tree. Three inherited consensus-critical
+defects (from the chassis) were found and fixed in v0.2.8; more inherited issues may exist.
 
 **Producer caveat (the enforcer, not FreeBank; seen on alpha, not yet re-checked on the beta):**
 *self-mining* a busy chain (5.4) needs a watchdog around the enforcer. Under sustained mempool
@@ -1683,7 +1837,8 @@ mempool and restart the enforcer on a bad read. *Following* the chain (5.2/5.3) 
 | Attestation max age (as-of height) | 72 blocks | 72 |
 | Reserve floor / recovery | 10% / 15% | same |
 | Stressed → Insolvent window | 1008 blocks | 1008 (override `-stressedwindow=<n>`) |
-| Deferral window / renewals / interest | 12,960 blocks / 1 / 5% per year from demand | 12,960 (override `-deferwindow=<n>`) |
+| Suspension | No end date; ends at a reopen (≥ 15%) or by silence: 2 missed cadences, then 4,032 blocks (~4 weeks) | silence 40 blocks |
+| Suspension and lapsed-demand interest | 10% per year from the demand (a lapsed demand: from the lapse); a height schedule, `defer_interest_bps` in `gethouse` | same |
 | Demand window | 1008 blocks | 12 |
 | Brassage | 0 while Open; up to 4% at a 2.5% attested ratio once impaired | same |
 | Issuance multiplier by tier | 1.0 / 1.5 / 2.0 / 3.0 × active escrow | same |
@@ -1693,7 +1848,8 @@ mempool and restart the enforcer on a bad read. *Following* the chain (5.2/5.3) 
 | Settlement cadence per house | 144 blocks; residual band ±0.5% | 12 |
 | Pool fee | 1–100 bps, default 30; 1000 LP units locked | same |
 | Oracle quorum | 3 submitters in one block | 3 |
-| Gram display scale | 4,822,613 sats per gram (presentation only) | 4,822,613 (override `-launchsatspergram=<n>`, regtest only) |
+| Token holders' claim window | 4,032 blocks (~4 weeks) from insolvency | 20 |
+| Netting round expiry | default 72 blocks, at most 144 | same |
 | Withdrawal bundle minimum | 10 (`-minwithdrawal`) | same |
 
 ### 9.2 RPC reference
@@ -1704,7 +1860,7 @@ arguments (default 0.001 coin). "Wallet" RPCs run in a wallet (`-rpcwallet=<name
 
 | RPC | side | arguments | see |
 |---|---|---|---|
-| `getdepositaddress` | wallet | — | 7.3 |
+| `getdepositaddress` | wallet | `[verbose]` (`true` also returns the bare address) | 7.3 |
 | `formatdepositaddress` | node | `address` | 7.3 |
 | `createwithdrawal` | wallet | `address refundaddress amount fee mainchainfee` | 3.8, 4.10 |
 | `createwithdrawalrefundrequest` | wallet | `id` | 4.10 |
@@ -1722,19 +1878,26 @@ arguments (default 0.001 coin). "Wallet" RPCs run in a wallet (`-rpcwallet=<name
 | `signdiscount` | wallet | `proposalhex [fee]` | 4.3 |
 | `completediscount` | wallet | `signedhex` | 4.3 |
 | `listloanbook` | node | `houseid` | 4.3 |
-| `registerhouse` | wallet | `tier threshold classid denommg pledgesjson [fee]` | 3.7, 4.1 |
+| `registerhouse` | wallet | `tier threshold classid denommg pledgesjson [fee] [type]` | 3.7, 4.1 |
+| `addhousemembers` · `removehousemembers` · `purgehousemembers` | wallet | `id ["address",...] [fee]` | 4.1 |
+| `listhousemembers` | node | `id [start] [count]` | 4.1 |
 | `topuphouse` | wallet | `id partnerindex amount [fee]` | 4.1 |
 | `admitpartner` | wallet | `id pledge [fee]` | 4.1 |
 | `exitpartner` · `reclaimpledge` | wallet | `id partnerindex [fee]` | 4.1 |
-| `winddownhouse` · `attesthouse` · `deferhouse` · `renewdeferral` · `releasereserves` | wallet | `id [fee]` | 4.1, 4.5 |
+| `winddownhouse` · `deferhouse` · `releasereserves` | wallet | `id [fee]` | 4.1, 4.5 |
+| `attesthouse` | wallet | `id [fee] [allowzero]` | 4.1, 7.1 |
 | `listhouses` · `gethouse` | node | `gethouse id` | 4.1 |
-| `mintnote` · `redeemnote` · `claimnote` | wallet | `houseid units [fee]` | 4.4 |
-| `transfernote` | wallet | `houseid units [fee] [toaddress]` | 4.4 |
-| `demandnote` | wallet | `houseid units [fee] [payoutaddress]` | 4.4 |
+| `mintnote` | wallet | `houseid units [fee] [address]` | 4.4 |
+| `redeemnote` · `claimnote` | wallet | `houseid units [fee]` | 4.4 |
+| `transfernote` | wallet | `houseid units [fee] [toaddress] [fromaddress]` | 4.4 |
+| `demandnote` | wallet | `houseid units [fee] [payoutaddress] [plain]` | 4.4, 4.5 |
+| `upgradedemand` | wallet | `houseid units [fee] [payoutaddress]` | 4.5 |
+| `listnotecoins` | wallet | `[houseid]` | 4.11 |
 | `protestnote` · `dischargedemands` | wallet | `houseid [fee]` | 4.4 |
 | `listmynotes` | wallet | — | 4.4 |
-| `originatedeposit` | wallet | `houseid principal ratebps maturityheight [fee]` | 4.6 |
-| `transferdeposit` · `withdrawdeposit` · `claimdeposit` | wallet | `houseid principal [fee]` | 4.6 |
+| `originatedeposit` | wallet | `houseid principal ratebps maturityheight [fee] [address]` | 4.6 |
+| `transferdeposit` | wallet | `houseid principal [fee] [address]` | 4.6 |
+| `withdrawdeposit` · `claimdeposit` | wallet | `houseid principal [fee]` | 4.6 |
 | `createpool` | wallet | `houseid noteunits btxsats [feebps] [fee]` | 4.7 |
 | `swapnote` | wallet | `poolid direction amountin minout [fee]` | 4.7 |
 | `addpoolliquidity` | wallet | `poolid noteunits btxsats [fee]` | 4.7 |
@@ -1747,21 +1910,42 @@ arguments (default 0.001 coin). "Wallet" RPCs run in a wallet (`-rpcwallet=<name
 | `completesettle` | wallet | `signedhex` | 4.8 |
 | `listpresentable` | wallet | `houseid` | 4.8 |
 | `listsettlements` | wallet | — | 4.8 |
+| `createnetting` | wallet | `ownid [houses,...] [expiryblocks] [fee]` | 4.8 |
+| `joinnetting` | wallet | `ownid round [fee]` | 4.8 |
+| `fundnetting` | wallet | `ownid round` | 4.8 |
+| `signnetting` | wallet | `ownid round [send]` | 4.8 |
+| `decodenetting` | node | `round` | 4.8 |
+| `locknotes` · `createnotelock` | wallet | `houseid units [fee] [fromaddress]` | 4.11 |
+| `approvenotelock` | wallet | `hex` | 4.11 |
+| `unlocknotes` | wallet | `houseid units [fee] [address]` | 4.11 |
+| `registertokenkeyset` | wallet | `houseid [{amount,pubkey},...] postingpubkey [fee]` | 4.11 |
+| `posttokens` | wallet | `houseid keysetid [{B_,amount},...] ["Y",...] [fee]` | 4.11 |
+| `claimtokens` | wallet | `houseid [proofs] payoutaddress [feebps] [relayeraddress] [fee]` | 4.11 |
+| `signtokenclaims` | wallet | `houseid [proofs] payoutaddress [feebps] [relayeraddress]` | 4.11 |
+| `relaytokenclaims` | wallet | `houseid ["entry",...] [fee]` | 4.11 |
+| `collecttokens` | wallet | `houseid [["Y",...]] [fee]` | 4.11 |
+| `gettokenclaims` | node | `houseid [start] [count]` | 4.11 |
+| `createasset` | wallet | `ticker headline supply [payload] [decimals] [fee] [controladdress] [supplyaddress]` | 4.12 |
+| `transferasset` | wallet | `asset_id address units [fee]` | 4.12 |
+| `transferassetcontrol` | wallet | `asset_id address [fee]` | 4.12 |
+| `listmyassets` | wallet | `[asset_id]` | 4.12 |
+| `listassets` | node | `[from_asset_id] [count]` | 4.12 |
 | `bondoraclesubmitter` | wallet | `[id] [bond] [fee]` | 4.9 |
 | `submitoracleprice` | wallet | `submitterid price [fee]` | 4.9 |
-| `getgoldfix` · `listoraclesubmitters` · `getgramrate` | node | — | 4.9 |
+| `getgoldfix` · `listoraclesubmitters` | node | — | 4.9 |
+| `get_block_template` · `connect_block` · `get_bmm_inclusions` · `setcoinbasetag` | node | `connect_block block main_block_hash`; `get_bmm_inclusions critical_hash`; `setcoinbasetag name` | 7.4, 8 |
+| `getmainchaininfo` · `verifymainblockcache` · `updatemainblockcache` | node | — | — |
 
-Retired in v0.2.8: `createasset`, `transferasset`, `transferassetcontrol` (the chassis's
-colored-coin subsystem; transaction version 10 is rejected by consensus). They still
-appear in `help` but refuse with "… is retired: the BitAsset subsystem (tx v10) was
-removed"; the read-only `listassets` / `listmyassets` remain callable.
+Retired: `renewdeferral` (v0.2.18; a suspension has no end date, so it always returns an error)
+and `getgramrate` (v0.2.17, with the `*_grams` fields). The asset RPCs, retired in v0.2.8 with the
+chassis's colored-coin subsystem, came back in v0.2.18 rebuilt under new rules (4.12).
 
 ### 9.3 Glossary
 
 | Term | Meaning |
 |---|---|
 | **ECX** | The base coin as it exists inside the sidechain — mainchain coin deposited through the peg. 1 ECX = 10⁸ sats. Not a new token. Appears as `btx` in some RPC field names (`btx_reserve`, `btxfornote`) — same thing. |
-| **unit / sat / gram** | A note unit is a claim on exactly 1 sat at par. A gram is a display companion at a fixed scale, removed in v0.2.17; a gold unit is planned for a later release. |
+| **unit / sat** | A note unit is a claim on exactly 1 sat of ECX at par. |
 | **BIP 300 / 301** | The drivechain proposals: 300 = sidechain escrow, deposits and withdrawal voting on the mainchain; 301 = blind merged mining. |
 | **CUSF / enforcer** | The drivechain rules running as a separate process (`bip300301_enforcer`) beside a Bitcoin node. FreeBank drives it over gRPC. |
 | **BMM** | Blind merged mining: a mainchain miner commits the next sidechain block's hash in a coinbase for a fee. `refreshbmm` posts the request. |
@@ -1771,8 +1955,8 @@ removed"; the read-only `listassets` / `listmyassets` remain callable.
 | **house / partner / pledge / tier** | A discount house is a registered issuer; partners are its co-owner keys; a pledge is a partner's locked coin; the tier fixes governance shape and leverage. |
 | **till** | A house's liquid reserve — the specific coins it attests. Distinct from pledged escrow (capital). |
 | **attestation** | `attesthouse`: proving the till coin-by-coin against the UTXO set. |
-| **Stressed / Deferred / Insolvent / Wound-down** | House statuses; the first three are derived at the tip. |
-| **option clause / defer** | A Stressed house queues redemption for 90 days with interest. |
+| **Stressed / Deferred (suspended) / Insolvent / Wound-down** | House statuses; the first three are derived at the tip. |
+| **option clause / defer / suspension** | A Stressed house suspends redemption (`deferhouse`, status `deferred`) with no end date; demanded notes earn interest until it pays, reopens or fails. |
 | **brassage** | The consensus redemption spread — historically the mint's coining fee. |
 | **discount** | A house buying a bill below face with its own freshly minted notes. |
 | **endorsement** | Transferring a bill by a signed link; each endorser becomes liable. |
@@ -1780,6 +1964,11 @@ removed"; the read-only `listassets` / `listmyassets` remain callable.
 | **demand / discharge / protest** | Formal pre-authorised request for par / the house paying it / the holder marking a lapsed demand. |
 | **waterfall** | Insolvency loss order: noteholders, then term depositors, then partners' residual. |
 | **presentable / settle** | Notes a house could present to their issuer; the bilateral par exchange. |
+| **netting round** | The multilateral par exchange (v0.2.22): any number of houses burn each other's notes and pay only net positions. |
+| **token / mint record / burn record** | A house's Chaumian bearer token, held off-chain; the chain records each mint (`locknotes`, notes locked as backing) and burn (`unlocknotes`). |
+| **asset** | A fixed batch of units, 1 unit = 1 sat of ECX locked in its coins; identified by the txid that created it. |
+| **members-only / redeem-only house** | A house whose notes and deposit receipts go only to its members' keys; redeem-only also stops notes passing between members. |
+| **light mode** | `freebankd` with an enforcer and no eCash node REST endpoint (`-mainchainrest=` empty, v0.2.25). |
 | **λ, ρ, θ** | Leverage multiplier by tier; 10% liquid-reserve floor; 2.5%, the far end of the brassage ramp. |
 
 ### 9.4 Reading a drivechain's footprint from coinbases
