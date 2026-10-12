@@ -16,7 +16,7 @@ proves.
 | The source at the tag is what you reviewed | `git checkout <tag>` | every release |
 | The Linux binary was built from that source | rebuild with Guix, compare the sha256 (step 3) | v0.2.18 and later |
 | The Linux binary is the one GitHub built from the public tag | GitHub attestation (step 4) | v0.2.18 and later |
-| The macOS binary is the one GitHub built from the public tag | GitHub attestation (step 4) | releases built by the `macos-arm64` workflow (check with step 4) |
+| The macOS binaries (Apple Silicon and Intel) are the ones GitHub built from the public tag | GitHub attestation (step 4) | releases built by the `macos` workflow (check with step 4) |
 | The files are the ones the maintainer published | signed `SHA256SUMS` (step 4) | every release since signing began |
 | The code is free of exploits | nobody can prove this; review reduces the risk (step 2) | |
 
@@ -28,7 +28,7 @@ guarantee.
 ```sh
 git clone https://github.com/mbdrivechains/freebank
 cd freebank
-git checkout v0.2.18            # the release you are checking
+git checkout v0.2.25            # the release you are checking
 git rev-parse HEAD              # note the commit; from v0.2.18 the binaries report it (freebankd -version)
 ```
 
@@ -48,8 +48,8 @@ concentrates on what FreeBank changed:
   `src/note.*`, `src/deposit.*`, `src/pool.*`, `src/settle.*`, `src/oracle.*`), and the wallet
   (`src/wallet/wallet.cpp`, `src/wallet/rpcwallet.cpp`).
 - **Third-party libraries** are built from source tarballs pinned by sha256 in `depends/packages/*.mk` (at
-  v0.2.18: Boost 1.64.0, OpenSSL 1.0.1k, Berkeley DB 4.8.30, libevent 2.1.13, ZeroMQ 4.3.5; the `.mk` files at
-  your tag are authoritative). They are compiled into the binary
+  v0.2.25, unchanged since v0.2.18: Boost 1.64.0, OpenSSL 1.0.1k, Berkeley DB 4.8.30, libevent 2.1.13, ZeroMQ
+  4.3.5; the `.mk` files at your tag are authoritative). They are compiled into the binary
   as published upstream. Review them or trust their upstreams. Several are old; see findings L8-L10 (build pins) in
   the source review, and the release notes. Finding M3 (ZeroMQ 4.2.2) is fixed in v0.2.18 by the move to 4.3.5.
 - Earlier reviews and their findings are in `doc/`. The [`SECURITY.md`](SECURITY.md) file says how to report a
@@ -108,7 +108,7 @@ and Guix's own bootstrap seeds.
 
 - **Signature:** `SHA256SUMS` is signed with the FreeBank release key. The key and the commands are in the
   README under [Verify your download](README.md#verify-your-download).
-- **GitHub attestation:** this repository's `guix-linux` (Linux) and `macos-arm64` (macOS) workflows build each
+- **GitHub attestation:** this repository's `guix-linux` (Linux) and `macos` (macOS: Apple Silicon and Intel) workflows build each
   release tag on GitHub, and GitHub records a signed attestation naming the workflow, the commit and the file's
   hash. With GitHub CLI 2.49 or later, logged in (`gh auth login`; without a login, use the `--bundle` route in
   the README's Verify your download section):
@@ -117,6 +117,7 @@ and Guix's own bootstrap seeds.
   gh attestation verify freebank-<version>-x86_64-linux-gnu.tar.gz --repo mbdrivechains/freebank \
     --signer-workflow mbdrivechains/freebank/.github/workflows/guix.yml
   gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank
+  gh attestation verify freebank-<version>-x86_64-apple-darwin.tar.gz --repo mbdrivechains/freebank
   ```
 
   Every Linux release is built on two different machines, GitHub's runner and the maintainer's, with the same
@@ -129,7 +130,7 @@ and Guix's own bootstrap seeds.
   still be reviewed, or built yourself (doc/SOURCE_REVIEW_V0216.md section 6.3).
 - **macOS** builds come from GitHub's workflow (step 4) but are not yet reproducible: you trust GitHub's macOS
   runner for them.
-- **Other software you run with FreeBank** (the eCash node, the CUSF enforcer, BitWindow, `grpcurl`) is not
-  covered here.
+- **Other software you run with FreeBank** (the eCash node, the CUSF enforcer, BitWindow; `grpcurl` for releases
+  before v0.2.17, which needed it) is not covered here.
 - **Review limits:** inherited Bitcoin Core 0.16 and BitAssets code has not been fully re-audited, and security
   fixes Bitcoin Core made after early 2018 are only present where backported.

@@ -483,11 +483,11 @@ ssh-keygen -Y verify -f allowed_signers -I freebank-release -n file -s SHA256SUM
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-The macOS tarball is built by this repository's GitHub workflow from the tagged source, and GitHub
-records a signed build attestation for it. Check it with GitHub CLI 2.49 or later, logged in
+The macOS tarballs (Apple Silicon `arm64`, Intel `x86_64`) are built by this repository's GitHub workflow from
+the tagged source, and GitHub records a signed build attestation for each. Check it with GitHub CLI 2.49 or later, logged in
 (`gh auth login`):
-`gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank`.
-Without a login, fetch the attestation from GitHub's API, take the bundle out of the wrapper the API
+`gh attestation verify freebank-<version>-arm64-apple-darwin.tar.gz --repo mbdrivechains/freebank` (or
+`x86_64-apple-darwin` for Intel). Without a login, fetch the attestation from GitHub's API, take the bundle out of the wrapper the API
 returns (`jq`), and pass that file with `--bundle`:
 
 ```
