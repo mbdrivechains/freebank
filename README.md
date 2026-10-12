@@ -30,8 +30,8 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
   credits deposits (M5), produces withdrawal bundles (M3) and completes the withdrawal
   payout (M6) — the full peg-out cycle.
 - **CUSF enforcer transport**: FreeBank talks to the mainchain through the CUSF
-  `bip300301_enforcer` gRPC surface, invoked at runtime via `grpcurl` (nothing of the
-  enforcer is vendored or linked). BMM, deposit crediting and the **full withdrawal
+  `bip300301_enforcer` gRPC surface, spoken directly since v0.2.17 (the Connect protocol;
+  earlier releases invoked `grpcurl`). Nothing of the enforcer is vendored or linked. BMM, deposit crediting and the **full withdrawal
   peg-out** are verified end-to-end on this path (revalidated against upstream
   `135115b`, July 2026); withdrawal bundles use the enforcer's `BlindedM6` wire layout.
 - **Bills of exchange** (the credit primitive): a unique, stateful instrument with
@@ -365,14 +365,13 @@ v0.2.25 makes a new node's first start faster:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-28 integration gates and 446 unit tests. All must pass to merge.
+As of v0.2.25: 647 unit test cases and 68 integration gates, run on an eCash L1 (eCash's beta
+build on regtest with the L2L enforcer). All must pass to merge.
 
 ## Wallet (preview)
 
 A wallet GUI — desktop and browser (PWA) — is in development against a running
-`freebankd`: notes, houses, clearing pools and bills, with balances led in grams.
-
-![FreeBank wallet preview](doc/wallet-preview.png)
+`freebankd`: notes, houses, clearing pools and bills, with balances in ECX.
 
 Wallet code: [mbdrivechains/freebank-gui](https://github.com/mbdrivechains/freebank-gui).
 
@@ -437,14 +436,13 @@ Two things worth knowing before you start:
   fork block with `-mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
   The signet walkthrough below still describes the stack's shape.
 - **Next to BitWindow.** A BitWindow set to the eCash network already runs the beta L1 (with
-  the REST and txindex FreeBank needs) and the enforcer, and ships `grpcurl` in its `assets/bin`.
+  the REST and txindex FreeBank needs) and the enforcer.
   Once both are fully synced, run the release binary beside them. It finds the seed by itself:
 
   ```
   freebankd -mainchaintransport=enforcer -enforceraddr=127.0.0.1:50051 \
     -mainchainrest=127.0.0.1:18302 -mainchainchain=main \
-    -mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042 \
-    -grpcurlbin=<BitWindow data dir>/assets/bin/grpcurl
+    -mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042
   ```
 
   Don't also start FreeBank from BitWindow's Sidechains tab. Released BitWindow versions
