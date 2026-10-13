@@ -95,6 +95,7 @@ class CBlockIndex;
 class CCoinControl;
 class COutput;
 struct CBill;
+struct CHouse;
 struct NoteLock;
 #include <cashu.h>   // v0.2.21 token claim: CashuScalar
 #include <token.h>   // v0.2.21 token claim: TokenKey, TokenIssued
@@ -1148,6 +1149,10 @@ public:
     /** v0.2.20 token BURN RECORD (NOTE_OP_UNLOCK): release nUnits of the house's token backing as new notes to the
      *  recipient (a P2PKH; default a fresh key of this wallet). House M-of-N approved; nUnits <= the backing. */
     bool UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient = CScript());
+    /** True if this wallet holds the key of one of the house's ACTIVE partners. A redeem and a matured deposit's
+     *  withdrawal pay from the house's own reserves (this wallet's coins in single-wallet v1), so a wallet
+     *  without the house's keys would burn its paper and pay itself (v0.2.26, the app's 2026-10-11 find). */
+    bool HoldsHouseKey(const CHouse& house) const;
     bool RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
     /** DEMAND, one op two modes keyed on house status (B3):
      * - Deferred: the 3.5 option-clause demand (plain; interest from demand).

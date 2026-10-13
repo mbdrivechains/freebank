@@ -129,8 +129,14 @@ v0.2.20 records a house's Chaumian tokens on-chain when they are minted and burn
 v0.2.21 lets token holders claim at a failed house without its partners,
 v0.2.22 lets any number of houses net their notes in one settlement,
 v0.2.23 lets a node restart on its own after a power cut,
-v0.2.24 tightens disk safety and peer scoring, and
-v0.2.25 makes a new node's first start faster:
+v0.2.24 tightens disk safety and peer scoring,
+v0.2.25 makes a new node's first start faster, and
+v0.2.26 stops a note holder burning their own notes by mistake:
+
+- **`redeemnote` and `withdrawdeposit` need the house's keys** (v0.2.26). **No consensus change:** upgrade when it
+  suits you, a binary swap with no `-reindex`. From a holder's wallet both burned the notes or receipt and paid the
+  holder out of their own coins; now they refuse, and a note holder is pointed to `demandnote`. `listmynotes` gains
+  `house_keys`. Signature checks are skipped up to beta block 1950. Details in the release notes.
 
 - **Faster first start, light mode, `-assumevalid`** (v0.2.25). **No consensus change:** upgrade when it suits you, a
   binary swap with no `-reindex`. The eCash hash list starts at the pinned block; BMM answers come in batches; signature
@@ -365,7 +371,7 @@ v0.2.25 makes a new node's first start faster:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-As of v0.2.25: 647 unit test cases and 68 integration gates, run on an eCash L1 (eCash's beta
+As of v0.2.26: 647 unit test cases and 72 integration gates, run on an eCash L1 (eCash's beta
 build on regtest with the L2L enforcer). All must pass to merge.
 
 ## Wallet (preview)

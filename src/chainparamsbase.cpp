@@ -13,6 +13,7 @@
 const std::string CBaseChainParams::MAIN = "main";
 const std::string CBaseChainParams::BETA = "beta";
 const std::string CBaseChainParams::REGTEST = "regtest";
+const std::string CBaseChainParams::EASYNET = "easynet";
 
 void AppendParamsHelpMessages(std::string& strUsage, bool debugHelp)
 {
@@ -43,6 +44,8 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain
         return MakeUnique<CBaseChainParams>("", 8454);
     else if (chain == CBaseChainParams::REGTEST)
         return MakeUnique<CBaseChainParams>("regtest", 18457);
+    else if (chain == CBaseChainParams::EASYNET)    // own ports, so it can run beside a beta node
+        return MakeUnique<CBaseChainParams>("easynet", 28454);
     else
         throw std::runtime_error(strprintf("%s: Unknown chain %s.", __func__, chain));
 }
@@ -62,5 +65,17 @@ std::string ChainNameFromCommandLine()
     if (fRegTest)
         return CBaseChainParams::REGTEST;
 
+    return PublicNetworkOfThisBuild();
+}
+
+const std::string& PublicNetworkOfThisBuild()
+{
+    // An easynet build (configure --with-easynet) is the same source as the beta
+    // release it is cut from, with easynet as its one public network: that is how
+    // easynet tracks each FreeBank release (Michael, 2026-10-12).
+#ifdef FREEBANK_EASYNET_BUILD
+    return CBaseChainParams::EASYNET;
+#else
     return CBaseChainParams::BETA;
+#endif
 }

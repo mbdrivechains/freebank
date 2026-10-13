@@ -429,8 +429,8 @@ void OnRPCStopped()
 
 std::string HelpMessage(HelpMessageMode mode)
 {
-    const auto defaultBaseParams = CreateBaseChainParams(CBaseChainParams::BETA);
-    const auto defaultChainParams = CreateChainParams(CBaseChainParams::BETA);
+    const auto defaultBaseParams = CreateBaseChainParams(PublicNetworkOfThisBuild());
+    const auto defaultChainParams = CreateChainParams(PublicNetworkOfThisBuild());
     const bool showDebug = gArgs.GetBoolArg("-help-debug", false);
 
     // When adding new options to the categories, please keep and ensure alphabetical ordering.

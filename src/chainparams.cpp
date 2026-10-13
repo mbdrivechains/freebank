@@ -152,11 +152,12 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
 
         // By default assume that the signatures in ancestors of this block are valid.
-        // v0.2.25: beta block 992, reached by a fresh sync from the seed with
-        // v0.2.24 (every signature checked) on 2026-10-09 and the explorer's
-        // hash at 992 on 2026-10-10 (docs-local/sync-speed-2026-10-10). Was the
-        // genesis block: nothing skipped. Set again at each release.
-        consensus.defaultAssumeValid = uint256S("0xa939cbd9118b7f5d0ffccaa3a3a7d3f447349e09a892a518c14df7ddb0eaef7b");
+        // v0.2.26: beta block 1950: every signature to it checked by the seed
+        // (v0.2.24 to 1091, then v0.2.25 above its own 992) and by this
+        // release's -assumevalid=0 rehearsal; same hash on the seed and the
+        // explorer on 2026-10-13. v0.2.25: block 992 (a939cbd9...). v0.2.24 and
+        // before: the genesis block, nothing skipped. Set again at each release.
+        consensus.defaultAssumeValid = uint256S("0xa34134c10326fa624822c1b3c0947e277292aae90933d038b4d163ae1b831191");
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -266,6 +267,45 @@ public:
         assert(consensus.hashGenesisBlock == uint256S("0x6e5a41bcc2793325e79d952de3766989f70181294e32f19b10d4968b74d919fc"));
         assert(genesis.hashMerkleRoot == uint256S("0xd0a6ddf613dfbf632067bed8386ee4f2afbb0d142a32ad413b283b53f5e3011e"));
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
+        checkpointData = {
+            {
+                { 0, consensus.hashGenesisBlock },
+            }
+        };
+        chainTxData = ChainTxData{0, 0, 0};
+    }
+};
+
+/**
+ * FreeBank on easynet (mbdrivechains' CPU-mined eCash-rules test network,
+ * github.com/mbdrivechains/bitcoin branch easynet; slot 130 there). Beta's rules,
+ * its own identity: magic, genesis, ports and data directory ("easynet"), so it
+ * never mixes with beta or mainnet and can run beside a beta node. Fixed seed
+ * 163.47.9.132:28455, no DNS seed. An easynet build (configure --with-easynet) runs
+ * it with no flag. When easynet's L1 resets, the magic's last byte follows it.
+ */
+class CEasynetParams : public CBetaParams {
+public:
+    CEasynetParams() {
+        strNetworkID = "easynet";
+
+        // Its own network; the last byte follows easynet's L1 magic (ea5e4e03, reset 2026-10-13)
+        pchMessageStart[0] = 0xfb;
+        pchMessageStart[1] = 0x4b;
+        pchMessageStart[2] = 0xea;
+        pchMessageStart[3] = 0x03;
+        nDefaultPort = 28455;
+
+        genesis = CreateGenesisBlock("FreeBank easynet genesis: easynet slot 130, 2026-10-12",
+                                     CScript() << OP_RETURN,
+                                     1791800000, 1, 0);
+        consensus.hashGenesisBlock = genesis.GetHash();
+        assert(consensus.hashGenesisBlock == uint256S("0xbd474c68aeeeb97dcc82df8d54d5f7461ce1e7ad6b8c372df190343573e6daf9"));
+        consensus.defaultAssumeValid = consensus.hashGenesisBlock;
+
+        vSeeds.clear();
+        // The easynet seed on freebanktest (no DNS seed): see pnSeed6_easynet.
+        vFixedSeeds = std::vector<SeedSpec6>(pnSeed6_easynet, pnSeed6_easynet + ARRAYLEN(pnSeed6_easynet));
         checkpointData = {
             {
                 { 0, consensus.hashGenesisBlock },
@@ -387,6 +427,8 @@ std::unique_ptr<CChainParams> CreateChainParams(const std::string& chain)
         return std::unique_ptr<CChainParams>(new CBetaParams());
     else if (chain == CBaseChainParams::REGTEST)
         return std::unique_ptr<CChainParams>(new CRegTestParams());
+    else if (chain == CBaseChainParams::EASYNET)
+        return std::unique_ptr<CChainParams>(new CEasynetParams());
     throw std::runtime_error(strprintf("%s: Unknown chain %s.", __func__, chain));
 }
 

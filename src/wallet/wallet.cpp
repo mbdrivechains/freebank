@@ -5443,6 +5443,20 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     return true;
 }
 
+// A redeem and a matured deposit's withdrawal pay from the house's own reserves,
+// which in single-wallet v1 are this wallet's plain coins. Consensus checks the
+// payout, not who funds it, so from a wallet without the house's keys the op
+// burns the holder's paper and pays the holder out of the holder's own coins
+// (the app found this on regtest, 2026-10-11). HaveKey works on a locked wallet.
+bool CWallet::HoldsHouseKey(const CHouse& house) const
+{
+    LOCK(cs_wallet);
+    for (const HousePartner& p : house.vPartner)
+        if (p.status == HOUSE_PARTNER_ACTIVE && HaveKey(CPubKey(p.vchPubKey).GetID()))
+            return true;
+    return false;
+}
+
 bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee)
 {
     strFail = "Unknown error!";
@@ -5472,6 +5486,13 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
         fDeferredHouse = (chEff == HOUSE_STATUS_DEFERRED);
         if (!fDeferredHouse && chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
             strFail = "House is insolvent or wound down - use the claim path, not redemption!";
+            return false;
+        }
+        if (!HoldsHouseKey(house)) {
+            strFail = "Redeem pays from the house's own reserves, so it needs the house's keys, and this wallet holds "
+                      "none: here it would burn your notes and pay you out of your own coins. Lodge a demand instead "
+                      "(demandnote; upgradedemand turns a plain demand into one the house can pay alone), and the "
+                      "house pays you.";
             return false;
         }
     }
@@ -6123,6 +6144,11 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
     if (HouseEffectiveStatus(house, nNextHeight) != HOUSE_STATUS_OPEN) {
         strFail = "House is not effectively open - a matured deposit queues behind notes until recovery (or claim at insolvency)!"; return false;
+    }
+    if (!HoldsHouseKey(house)) {
+        strFail = "Withdrawal pays from the house's own reserves, so it needs the house's keys, and this wallet holds "
+                  "none: here it would burn your receipt and pay you out of your own coins. A holder cashes out through "
+                  "the house (transferdeposit the receipt to it) or sells the receipt."; return false;
     }
 
     WalletDepositCoin dc;

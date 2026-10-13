@@ -20,6 +20,8 @@ public:
     static const std::string MAIN;
     static const std::string BETA;
     static const std::string REGTEST;
+    /** easynet: mbdrivechains' CPU-mined eCash-rules test network (FreeBank slot 130 there) */
+    static const std::string EASYNET;
 
     const std::string& DataDir() const { return strDataDir; }
     int RPCPort() const { return nRPCPort; }
@@ -58,6 +60,9 @@ void SelectBaseParams(const std::string& chain);
  * Looks for -regtest and returns the appropriate chain name: this build's
  * public network (BETA) by default.
  */
+/** The one public network of this build: beta, or easynet in an easynet build (configure --with-easynet). */
+const std::string& PublicNetworkOfThisBuild();
+
 std::string ChainNameFromCommandLine();
 
 #endif // BITCOIN_CHAINPARAMSBASE_H

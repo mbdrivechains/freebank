@@ -4688,7 +4688,8 @@ UniValue unlocknotes(const JSONRPCRequest& request)
             "unlocknotes \"id\" units ( fee \"address\" )\n"
             "\nRecord a burn of the house's Chaumian tokens on-chain (v0.2.20, NOTE_OP_UNLOCK): release that many\n"
             "units of the token backing as new notes, to whoever redeemed the tokens. House M-of-N approved.\n"
-            "Consensus refuses a burn above the backing (gethouse \"tokenunits\"). Allowed in every house status.\n"
+            "Consensus refuses a burn above the backing (gethouse \"tokenunits\"), and from v0.2.21 any burn while\n"
+            "the house is suspended or insolvent (bad-note-unlock-house-status).\n"
             "\nArguments:\n"
             "1. \"id\"      (numeric, required) the house ID number\n"
             "2. \"units\"   (numeric, required) units to release\n"
@@ -4809,6 +4810,9 @@ UniValue redeemnote(const JSONRPCRequest& request)
             "2. \"units\"  (numeric, required) note units to redeem (a holder's coins must sum exactly to this)\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
             "\nBurn notes and receive base-coin 1:1 from the house reserves.\n"
+            "The payout comes from this wallet's coins (the house's reserves in this version), so the wallet\n"
+            "must hold one of the house's active partner keys; from v0.2.26 it refuses otherwise. A holder\n"
+            "without the keys lodges a demand (demandnote) and the house pays it.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("redeemnote", "1 25000")
@@ -5149,10 +5153,13 @@ UniValue listmynotes(const JSONRPCRequest& request)
             "    \"demanded_units\": n,       (numeric) units stamped with a demand (option clause)\n"
             "    \"coins\": n,                (numeric) number of note UTXOs\n"
             "    \"house_status\": \"x\",       (string) effective status: o/s/d/i/w\n"
-            "    \"redeemable\": true|false,  (bool) some of these units can be redeemed now: all of them while the house\n"
-            "                                 is open or stressed; while it is suspended (d), only demanded units\n"
-            "    \"redeemable_units\": n,      (numeric) how many units can be redeemed now\n"
-            "    \"demandable\": true|false   (bool) a demand can be lodged now (house suspended)\n"
+            "    \"house_keys\": true|false,  (bool) this wallet holds one of the house's active partner keys (v0.2.26)\n"
+            "    \"redeemable\": true|false,  (bool) redeemnote in this wallet would pay some of these units now: the\n"
+            "                                 wallet holds the house's keys (house_keys), and the house is open or\n"
+            "                                 stressed (all units) or suspended (d, demanded units only). A holder\n"
+            "                                 without the keys is paid through a demand (demandable)\n"
+            "    \"redeemable_units\": n,      (numeric) how many units redeemnote in this wallet would pay now\n"
+            "    \"demandable\": true|false   (bool) a demand can be lodged now (house open, stressed or suspended)\n"
             "  }, ...\n"
             "]\n"
             "\nExamples:\n"
@@ -5179,7 +5186,6 @@ UniValue listmynotes(const JSONRPCRequest& request)
         UniValue obj(UniValue::VOBJ);
         obj.pushKV("house_id", (uint64_t)kv.first);
         obj.pushKV("units", kv.second.units);
-        // Presentation-only gram view of the holding (units are base-native sats).
         obj.pushKV("demanded_units", kv.second.demandedUnits);
         // B3: the formal-demand view - custody units, protested units, and the
         // oldest pre-auth demand height (the discharge deadline's anchor).
@@ -5193,8 +5199,14 @@ UniValue listmynotes(const JSONRPCRequest& request)
         // Par redemption is open through Stressed. v0.2.18 (operator Q6): while
         // the house is suspended (Deferred), demanded notes are redeemable too -
         // at principal + interest; undemanded ones are not. Insolvent: none.
+        // v0.2.26: the payout comes from this wallet's coins, so only a wallet
+        // holding the house's keys can redeem (CWallet::HoldsHouseKey).
+        const bool fHouseKeys = haveHouse && pwallet->HoldsHouseKey(house);
+        obj.pushKV("house_keys", fHouseKeys);
         uint64_t nRedeemableUnits = 0;
-        if (eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED)
+        if (!fHouseKeys)
+            nRedeemableUnits = 0;
+        else if (eff == HOUSE_STATUS_OPEN || eff == HOUSE_STATUS_STRESSED)
             nRedeemableUnits = kv.second.units;
         else if (eff == HOUSE_STATUS_DEFERRED)
             nRedeemableUnits = kv.second.demandedUnits;
@@ -5411,6 +5423,8 @@ UniValue withdrawdeposit(const JSONRPCRequest& request)
             "3. \"fee\"       (numeric or string, optional) default 0.001\n"
             "\nAt/after maturity and while the house is open, burn a matured receipt\n"
             "and receive principal + accrued interest (consensus floor) from the house.\n"
+            "The payout comes from this wallet's coins (the house's reserves in this version), so the wallet\n"
+            "must hold one of the house's active partner keys; from v0.2.26 it refuses otherwise.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("withdrawdeposit", "1 1000000")

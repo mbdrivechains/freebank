@@ -358,8 +358,10 @@ struct NoteLock {
  * Rule: sum(vUnits) <= CHouse.nTokenUnits - a burn can never exceed what was
  * minted, so tokens a mint over-issued off-chain can never be cashed against the
  * backing. CHouse.nTokenUnits -= sum, nMintedUnits unchanged. Approved by the
- * house's M-of-N over NoteUnlockSigHash; allowed in every house status, so token
- * holders can always get their notes back (to redeem, demand or claim). */
+ * house's M-of-N over NoteUnlockSigHash. v0.2.20 allowed it in every house
+ * status; from v0.2.21 it is refused while the house is suspended or insolvent
+ * (bad-note-unlock-house-status), and a failed house's token holders claim
+ * instead (TOKEN_CLAIM_DESIGN.md). */
 struct NoteUnlock {
     uint32_t nHouseID;                                    // leading - guard convention
     std::vector<uint64_t> vUnits;                         // parallel to the note outputs

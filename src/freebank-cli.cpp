@@ -30,7 +30,7 @@ static const int CONTINUE_EXECUTION=-1;
 
 std::string HelpMessageCli()
 {
-    const auto defaultBaseParams = CreateBaseChainParams(CBaseChainParams::BETA);
+    const auto defaultBaseParams = CreateBaseChainParams(PublicNetworkOfThisBuild());
     std::string strUsage;
     strUsage += HelpMessageGroup(_("Options:"));
     strUsage += HelpMessageOpt("-?", _("This help message"));

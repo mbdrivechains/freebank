@@ -2,7 +2,7 @@ dnl require autoconf 2.60 (AS_ECHO/AS_ECHO_N)
 AC_PREREQ([2.60])
 define(_CLIENT_VERSION_MAJOR, 0)
 define(_CLIENT_VERSION_MINOR, 2)
-define(_CLIENT_VERSION_REVISION, 25)
+define(_CLIENT_VERSION_REVISION, 26)
 define(_CLIENT_VERSION_BUILD, 0)
 define(_CLIENT_VERSION_IS_RELEASE, false)
 define(_COPYRIGHT_YEAR, 2023)
@@ -100,6 +100,16 @@ fi
 AM_CONDITIONAL([HAVE_DOXYGEN], [test -n "$DOXYGEN"])
 
 AC_ARG_VAR(PYTHONPATH, Augments the default search path for python module files)
+
+# easynet build: the same source with easynet as the one public network (Michael, 2026-10-12)
+AC_ARG_WITH([easynet],
+  [AS_HELP_STRING([--with-easynet],
+  [build for easynet, mbdrivechains' test network, instead of the eCash beta (default is no)])],
+  [use_easynet=$withval],
+  [use_easynet=no])
+if test x$use_easynet = xyes; then
+  AC_DEFINE([FREEBANK_EASYNET_BUILD], [1], [Define to 1 for an easynet build])
+fi
 
 # Enable wallet
 AC_ARG_ENABLE([wallet],
