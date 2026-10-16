@@ -7,6 +7,7 @@
 #include <bill.h>            // MAX_BILL_TENOR_BLOCKS, LOAN_BOOK_MAX_FACE (B1)
 #include <chainparams.h>     // SelectParams / CreateChainParams (v0.2.18 silence clock)
 #include <coins.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <deposit.h>         // MAX_DEPOSIT_TERM_BLOCKS (B1 max-magnitude vectors)
 #include <key.h>
@@ -779,14 +780,23 @@ BOOST_AUTO_TEST_CASE(house_deferral_derivation)
     // ...and the 1008-block stress clock no longer bites while deferring.
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1100 + HOUSE_STRESSED_WINDOW + 1), HOUSE_STATUS_DEFERRED);
 
-    // NO EXPIRY: a house that keeps attesting stays suspended far past the old
-    // 90-day end (1200 + 12,960) and past the old renewed end (+ 25,920) - and
-    // indefinitely (100 years of blocks here).
-    for (const uint32_t nAt : {1200u + 12960u, 1200u + 2u * 12960u, 1200u + 100u * BLOCKS_PER_YEAR}) {
+    // v0.2.28 (FAILED_HOUSE_DESIGN.md C, Michael 2026-10-16 "12 months"): a house that keeps attesting stays
+    // suspended up to nSuspensionCap after DEFER - and no further. (v0.2.18-v0.2.27 had no end date.)
+    const uint32_t nCapAt = 1200u + Params().GetConsensus().nSuspensionCap;
+    BOOST_CHECK_EQUAL(HouseDeferCapInsolventHeight(house), nCapAt);
+    for (const uint32_t nAt : {1200u + 50u, nCapAt - 101u}) {
         CHouse h = house;
         h.nLastAttestHeight = nAt - 1;        // attesting on cadence
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, (int)nAt), HOUSE_STATUS_DEFERRED);
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, (int)nAt + 100), HOUSE_STATUS_DEFERRED);
+    }
+    {
+        CHouse h = house;
+        h.nLastAttestHeight = nCapAt - 1;     // attested the block before: the cap still ends it
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, (int)nCapAt - 1), HOUSE_STATUS_DEFERRED);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, (int)nCapAt), HOUSE_STATUS_INSOLVENT);
+        BOOST_CHECK_EQUAL(HouseInsolventSince(h, (int)nCapAt), nCapAt);
+        BOOST_CHECK_EQUAL(HouseDeferInsolventHeight(h), nCapAt);
     }
 
     // Recovery (the ATTEST effect) lifts it: cleared origin + cleared invocation
@@ -1599,6 +1609,148 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
     CHouse bad;
     CDataStream ssBad(vch, SER_NETWORK, PROTOCOL_VERSION);
     BOOST_CHECK_THROW(ssBad >> bad, std::ios_base::failure);
+}
+
+// ===========================================================================
+// v0.2.28 (FAILED_HOUSE_DESIGN.md B, E): collect then pay; CLOSE; the mutual fund lock
+// ===========================================================================
+namespace {
+// The guard house, failed: stored Insolvent with a snapshot of 100 note units against a pot of `pot`, and its two
+// partners' pledge coins a0 / a1 live at pot/2 each.
+static CHouse MakeFailedHouse(CAmount pot)
+{
+    CHouse house = MakeGuardHouse();
+    house.status = HOUSE_STATUS_INSOLVENT;
+    house.nInsolventHeight = 1500;
+    house.nInsolventUnits = 100;
+    house.nMintedUnits = 40;                     // 60 units already claimed or burned
+    house.amountInsolventPot = pot;
+    house.vPartner[0].amountInsolventPledge = pot / 2;
+    house.vPartner[1].amountInsolventPledge = pot / 2;
+    return house;
+}
+
+static CMutableTransaction MakeCloseTx(uint32_t nHouseID, const std::vector<COutPoint>& vIn,
+                                       const std::vector<CTxOut>& vOut)
+{
+    HouseClose cl;
+    cl.nHouseID = nHouseID;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+    mtx.nHouseOp = HOUSE_OP_CLOSE;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << cl;
+    mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    for (const COutPoint& o : vIn)
+        mtx.vin.push_back(CTxIn(o));
+    mtx.vout = vOut;
+    return mtx;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(house_collection_gate)
+{
+    CHouse house = MakeFailedHouse(60);
+    const uint32_t nE = HouseInsolventSince(house, 1000000);
+    BOOST_REQUIRE(nE != 0);
+    const uint32_t nWin = Params().GetConsensus().nCollectWindow;
+    house.nLoanBookFace = 5000;                  // the book has not run off
+    BOOST_CHECK(!HouseCollectionDone(house, (int)(nE + nWin - 1)));
+    BOOST_CHECK(HouseCollectionDone(house, (int)(nE + nWin)));
+    house.nLoanBookFace = 0;                     // ...or it has: payouts open at once
+    BOOST_CHECK(HouseCollectionDone(house, (int)nE));
+    BOOST_CHECK(!HouseCollectionDone(MakeGuardHouse(), 1000));   // not insolvent: never
+}
+
+BOOST_AUTO_TEST_CASE(house_close_after_the_claim_window)
+{
+    const COutPoint a0(uint256S("a0"), 0), a1(uint256S("a1"), 0);
+    auto run = [&](const CHouse& house, int nHeight, const CMutableTransaction& mtx, CHouse& houseOut) {
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
+            if (o == a0 || o == a1) { c = GuardEscrowCoin(house.nHouseID, house.amountInsolventPot / 2); return true; }
+            if (o == COutPoint(uint256S("e9"), 0)) { c = GuardEscrowCoin(house.nHouseID, 7); return true; }  // unlisted
+            return false;
+        };
+        CValidationState state;
+        const bool f = CheckHouseOperation(CTransaction(mtx), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
+                                           fnGetCoin, GuardNoBlock, houseOut);
+        return f ? std::string("OK") : state.GetRejectReason();
+    };
+    // Under par (pot 60 < 100 units): partners get nothing, the fund gets all 60.
+    {
+        const CHouse house = MakeFailedHouse(60);
+        const int nOpen = (int)HouseClaimWindowCloses(house, 1000000);
+        BOOST_REQUIRE(nOpen > 0);
+        const CMutableTransaction good = MakeCloseTx(house.nHouseID, {a0, a1}, {CTxOut(60, MutualFundScript())});
+        CHouse out;
+        BOOST_CHECK_EQUAL(run(house, nOpen - 1, good, out), "bad-house-close-window-open");
+        BOOST_CHECK_EQUAL(run(house, nOpen, good, out), "OK");
+        BOOST_CHECK(HouseClosed(out));
+        // A second CLOSE, and every claim after it, refuse.
+        BOOST_CHECK_EQUAL(run(out, nOpen + 1, good, out), "bad-house-close-closed");
+        // Pinned: every live escrow coin, the exact fund value, nothing escrow-shaped after.
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0}, {CTxOut(30, MutualFundScript())}), out),
+                          "bad-house-close-incomplete");
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0, a1}, {CTxOut(59, MutualFundScript())}), out),
+                          "bad-house-close-fund");
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0, a1},
+                          {CTxOut(60, MutualFundScript()), CTxOut(1, MutualFundScript())}), out), "bad-house-close-stray");
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0, a1},
+                          {CTxOut(60, MutualFundScript()), CTxOut(1, HouseEscrowScript(house.houseID))}), out),
+                          "bad-house-close-stray");
+        // Not insolvent: never.
+        BOOST_CHECK_EQUAL(run(MakeGuardHouse(), 1000, good, out), "bad-house-close-not-insolvent");
+        // A bill still in the book would be stuck for good once closed: clear it first (op 11, anyone).
+        CHouse hBook = house;
+        hBook.nLoanBookFace = 5000;
+        BOOST_CHECK_EQUAL(run(hBook, nOpen, good, out), "bad-house-close-book-open");
+        // An escrow coin the house does not list may not ride along (its value would leave as change).
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0, a1, COutPoint(uint256S("e9"), 0)},
+                          {CTxOut(60, MutualFundScript())}), out), "bad-house-close-unlisted-escrow");
+    }
+    // Over par (pot 160 > 100 units): partners get EXACTLY the residual 60 (30 each), the fund the other 100.
+    {
+        const CHouse house = MakeFailedHouse(160);
+        const int nOpen = (int)HouseClaimWindowCloses(house, 1000000);
+        const CScript p0 = NoteScriptForPubKey(house.vPartner[0].vchPubKey);
+        const CScript p1 = NoteScriptForPubKey(house.vPartner[1].vchPubKey);
+        CHouse out;
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0, a1},
+                          {CTxOut(30, p0), CTxOut(30, p1), CTxOut(100, MutualFundScript())}), out), "OK");
+        // No sweep: the partners may not take the fund's share.
+        BOOST_CHECK_EQUAL(run(house, nOpen, MakeCloseTx(house.nHouseID, {a0, a1},
+                          {CTxOut(30, p0), CTxOut(130, p1), CTxOut(0, MutualFundScript())}), out),
+                          "bad-house-close-payout");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(mutual_fund_output_is_locked)
+{
+    // Open at the script layer, locked by consensus: no transaction of any kind spends it.
+    CCoinsView base;
+    CCoinsViewCache cache(&base);
+    const COutPoint fundOut(uint256S("f0f0"), 0);
+    cache.AddCoin(fundOut, Coin(CTxOut(5 * COIN, MutualFundScript()), 100, false, false, false, uint256()), false);
+    for (int nVersion : {1, TRANSACTION_HOUSE_VERSION}) {
+        CMutableTransaction mtx;
+        mtx.nVersion = nVersion;
+        if (nVersion == TRANSACTION_HOUSE_VERSION) {
+            mtx.nHouseOp = HOUSE_OP_CLOSE;
+            HouseClose cl; cl.nHouseID = 7;
+            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+            ss << cl;
+            mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        }
+        mtx.vin.push_back(CTxIn(fundOut));
+        mtx.vout.push_back(CTxOut(4 * COIN, GetScriptForDestination(CKeyID())));
+        CValidationState state;
+        CAmount fee = 0;
+        BOOST_CHECK(!Consensus::CheckTxInputs(CTransaction(mtx), state, cache, 200, fee));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-spend-mutual-fund");
+    }
+    // It can never pass for an escrow script either.
+    BOOST_CHECK(!IsHouseEscrowScript(MutualFundScript()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

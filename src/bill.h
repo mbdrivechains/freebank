@@ -55,6 +55,14 @@ static const uint8_t BILL_OP_HCLAIM   = 8;
 // house's OWN notes, burned at par (1 unit = 1 sat). The notes a house minted to
 // buy the bill come home as the loan is repaid - the law of reflux.
 static const uint8_t BILL_OP_HRETIRE_NOTES = 9;
+// v0.2.28 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md A, signed off 2026-10-16): once the owning house is Deferred
+// or Insolvent, a house-held bill's money goes into the house's ESCROW, where the holders it stopped paying can reach
+// it - never to the operator's custody key. Ops 7/8/9 refuse there; these two take their place.
+//   10 HRETIRE_ESCROW: the drawee retires it, face into escrow (optionally part in the house's own notes, burned);
+//                      payload = BillHRetireNotes (nUnitsBurned may be 0), its own digest tag.
+//   11 HCLAIM_ESCROW:  after maturity + grace, ANYONE moves its bond into escrow - no quorum, the destination is fixed.
+static const uint8_t BILL_OP_HRETIRE_ESCROW = 10;
+static const uint8_t BILL_OP_HCLAIM_ESCROW  = 11;
 
 // On-chain bill status (Issued / Endorsed collapse to active)
 static const char BILL_STATUS_ACTIVE    = 'a';
@@ -476,6 +484,34 @@ struct BillHRetireNotes {
     }
 };
 
+/** HCLAIM_ESCROW (op 11, v0.2.28): op 8's fields without approvers - at a Deferred/Insolvent house anyone may move a
+ * defaulted bill's bond into the house's escrow (vout[0], pinned; the fee comes from the submitter's own coins). */
+struct BillHClaimEscrow {
+    uint32_t nBillID;                                     // LEADING
+    uint32_t nOwnerHouseID;                               // == bill.nOwnerHouseID (slot key, bytes 4..8)
+    CAmount amountFace;
+    uint32_t nBillMaturityHeight;
+    uint64_t nPrevLoanBookFace;
+    uint64_t nPrevLoanWtMatHi;
+    uint64_t nPrevLoanWtMatLo;
+
+    BillHClaimEscrow() : nBillID(0), nOwnerHouseID(0), amountFace(0), nBillMaturityHeight(0),
+                         nPrevLoanBookFace(0), nPrevLoanWtMatHi(0), nPrevLoanWtMatLo(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nBillID);
+        READWRITE(nOwnerHouseID);
+        READWRITE(amountFace);
+        READWRITE(nBillMaturityHeight);
+        READWRITE(nPrevLoanBookFace);
+        READWRITE(nPrevLoanWtMatHi);
+        READWRITE(nPrevLoanWtMatLo);
+    }
+};
+
 /** HCLAIM: the owning house takes the escrow on default. The house quorum
  * REPLACES the single holder signature - the custody key alone must never direct
  * the escrow payout, nor take a bill out of the book. */
@@ -582,6 +618,9 @@ uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
                             const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
                                 const uint256& hashPrevouts, const uint256& hashOutputs);
+/** Op 10's digest: op 9's fields under its own tag, so neither op's signature verifies as the other's. */
+uint256 BillHRetireEscrowSigHash(const BillHRetireNotes& x, const uint256& billID,
+                                 const uint256& hashPrevouts, const uint256& hashOutputs);
 
 /** The escrow output script: <bill_id> OP_DROP OP_TRUE - open at script
  * layer, locked by the consensus spend rules on fBillEscrow coins. */

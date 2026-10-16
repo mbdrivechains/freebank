@@ -124,11 +124,11 @@ uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
     return ss.GetHash();
 }
 
-uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
-                                const uint256& hashPrevouts, const uint256& hashOutputs)
+static uint256 BillHRetireTaggedSigHash(const std::string& strTag, const BillHRetireNotes& x, const uint256& billID,
+                                        const uint256& hashPrevouts, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankBill/hretire-notes");   // its own tag: an op 7 retire sig never verifies here
+    ss << strTag;   // its own tag per op: an op 7 retire sig never verifies here, nor op 9's as op 10's
     ss << x.nBillID;
     ss << billID;
     ss << x.nOwnerHouseID;
@@ -140,8 +140,20 @@ uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID
     ss << x.nPrevLoanWtMatHi;
     ss << x.nPrevLoanWtMatLo;
     ss << hashPrevouts;           // R-i6: the acceptor authorizes exactly these notes and this escrow
-    ss << hashOutputs;            // pins any sECX part to the custody key
+    ss << hashOutputs;            // pins the sECX part (custody key for op 9, the house escrow for op 10)
     return ss.GetHash();
+}
+
+uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
+                                const uint256& hashPrevouts, const uint256& hashOutputs)
+{
+    return BillHRetireTaggedSigHash("FreeBankBill/hretire-notes", x, billID, hashPrevouts, hashOutputs);
+}
+
+uint256 BillHRetireEscrowSigHash(const BillHRetireNotes& x, const uint256& billID,
+                                 const uint256& hashPrevouts, const uint256& hashOutputs)
+{
+    return BillHRetireTaggedSigHash("FreeBankBill/hretire-escrow", x, billID, hashPrevouts, hashOutputs);
 }
 
 CScript BillEscrowScript(const uint256& billID)
@@ -184,6 +196,7 @@ template bool DecodeBillPayload<BillDiscount>(const std::vector<unsigned char>&,
 template bool DecodeBillPayload<BillRecourse>(const std::vector<unsigned char>&, BillRecourse&);
 template bool DecodeBillPayload<BillHRetire>(const std::vector<unsigned char>&, BillHRetire&);
 template bool DecodeBillPayload<BillHRetireNotes>(const std::vector<unsigned char>&, BillHRetireNotes&);
+template bool DecodeBillPayload<BillHClaimEscrow>(const std::vector<unsigned char>&, BillHClaimEscrow&);
 template bool DecodeBillPayload<BillHClaim>(const std::vector<unsigned char>&, BillHClaim&);
 
 void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin)
@@ -217,6 +230,17 @@ void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin)
             return;
         if (n >= 1 && (size_t)(n - 1) < d.vUnits.size() && n <= (uint32_t)d.nNoteOutputs)
             coin.SetNote(d.nHouseID, d.vUnits[n - 1], 0);
+        return;
+    }
+    // v0.2.28: ops 10/11 put the money into the owning HOUSE's escrow at vout[0] (consensus pins the exact script and
+    // value) - tagged here from the payload alone (bytes 4..8 = the house id), like every other tagger.
+    if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+        if (n == 0 && tx.vchBillPayload.size() >= 8) {
+            uint32_t nHouseID = 0;
+            memcpy(&nHouseID, tx.vchBillPayload.data() + 4, 4);
+            if (nHouseID != 0)
+                coin.SetHouseEscrow(nHouseID);
+        }
         return;
     }
     // RECOURSE / HRETIRE / HCLAIM create no tagged output: recourse pays the
@@ -286,7 +310,7 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-bill-coinbase");
 
-    if (tx.nBillOp < BILL_OP_ISSUE || tx.nBillOp > BILL_OP_HRETIRE_NOTES)
+    if (tx.nBillOp < BILL_OP_ISSUE || tx.nBillOp > BILL_OP_HCLAIM_ESCROW)
         return state.DoS(100, false, REJECT_INVALID, "bad-bill-op");
 
     // Per-op payload ceilings. Ops 1-4 keep the shipped bound exactly (an ISSUE
@@ -502,6 +526,36 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-units");
         if (!IsCanonicalBillSig(h.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-sig-encoding");
+    }
+    else
+    if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW) {
+        BillHRetireNotes h;
+        if (!DecodeBillPayload(tx.vchBillPayload, h))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-payload");
+        if (h.nBillID == 0 || h.nOwnerHouseID == 0 ||
+                h.amountFace <= 0 || h.amountFace > MAX_MONEY ||
+                h.nBillMaturityHeight == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-fields");
+        // Notes are optional here (0 = all in sECX), never more than face.
+        if (h.nUnitsBurned > (uint64_t)h.amountFace)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-units");
+        if (!IsCanonicalBillSig(h.vchAcceptorSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-sig-encoding");
+        // vout[0] is the house escrow (the exact script and value are contextual).
+        if (tx.vout.empty() || !IsBillEscrowScript(tx.vout[0].scriptPubKey))   // the shared <32-byte id> OP_DROP OP_TRUE shape
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-vout");
+    }
+    else
+    if (tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+        BillHClaimEscrow h;
+        if (!DecodeBillPayload(tx.vchBillPayload, h))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaimescrow-payload");
+        if (h.nBillID == 0 || h.nOwnerHouseID == 0 ||
+                h.amountFace <= 0 || h.amountFace > MAX_MONEY ||
+                h.nBillMaturityHeight == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaimescrow-fields");
+        if (tx.vout.empty() || !IsBillEscrowScript(tx.vout[0].scriptPubKey))   // the shared <32-byte id> OP_DROP OP_TRUE shape
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaimescrow-vout");
     }
     else
     if (tx.nBillOp == BILL_OP_HCLAIM) {

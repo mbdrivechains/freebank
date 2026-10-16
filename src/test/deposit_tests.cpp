@@ -578,6 +578,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
         CHouse h = MakeOpenDepositHouse(H);
         h.houseID = houseID;
         h.status = HOUSE_STATUS_INSOLVENT;      // stored terminal -> effective Insolvent
+        h.nInsolventHeight = 900;               // v0.2.28: E for the collect-then-pay gate (the book is empty: open)
         h.nMintedUnits = 0; h.nInsolventUnits = 0;
         h.amountInsolventPot = 1000000;
         h.nDepositUnits = P; h.nInsolventDepositPrincipal = P;
@@ -627,6 +628,31 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnGetCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-claim-over-entitlement");
+    }
+    // v0.2.28 (FAILED_HOUSE_DESIGN.md B, E): collect, then pay - a claim waits while the book has not run off, and
+    // none is taken once the house is CLOSEd.
+    {
+        CHouse h = insolventHouse();
+        h.nLoanBookFace = 1000;                 // a bill still in the book; 1000 < E (900) + nCollectWindow
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == H) { out = h; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
+            if (o == rOut) { c = receipt; return true; } if (o == eOut) { c = makeEscrow(P); return true; } return false; };
+        CMutableTransaction mtx = build((CAmount)P, sig);
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnGetCoin, houseOut, fChanged));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-claim-collecting");
+    }
+    {
+        CHouse h = insolventHouse();
+        if (h.vPartner.empty()) h.vPartner.push_back(HousePartner());
+        for (HousePartner& pt : h.vPartner) pt.status = HOUSE_PARTNER_SETTLED;
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == H) { out = h; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
+            if (o == rOut) { c = receipt; return true; } if (o == eOut) { c = makeEscrow(P); return true; } return false; };
+        CMutableTransaction mtx = build((CAmount)P, sig);
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnGetCoin, houseOut, fChanged));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-claim-house-closed");
     }
     // The junior-tranche math: with notes senior (nInsolventUnits > 0), the deposit
     // pot is only the residual pot - notePar, so deposits provably cannot reach the

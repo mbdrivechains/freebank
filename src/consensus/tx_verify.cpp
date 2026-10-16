@@ -422,7 +422,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     // rejects every note input.
     BillHRetireNotes hretireNotes;
     bool fHaveHRetireNotes = false;
-    if (tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp == BILL_OP_HRETIRE_NOTES &&
+    // v0.2.28: op 10 (retire into escrow) carries the same payload and the same note rules, with notes optional.
+    if (tx.nVersion == TRANSACTION_BILL_VERSION &&
+            (tx.nBillOp == BILL_OP_HRETIRE_NOTES || tx.nBillOp == BILL_OP_HRETIRE_ESCROW) &&
             DecodeBillPayload(tx.vchBillPayload, hretireNotes))
         fHaveHRetireNotes = true;
     unsigned int nHRetireNoteIn = 0;
@@ -563,6 +565,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nHRetireNoteIn++;
         }
 
+        // v0.2.28 (FAILED_HOUSE_DESIGN.md E): the noteholders' mutual fund output is LOCKED. It is open at the script
+        // layer, so this rule is its whole protection: nothing spends it until CM-3's fund (Phase B) defines a
+        // spender, whatever the transaction (anything sent there by anyone is locked the same way).
+        if (IsMutualFundScript(coin.out.scriptPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-mutual-fund");
+
         vSpentCoins.push_back(&coin);
 
         // Bill spend guard: title / escrow coins are locked to their bill's
@@ -590,7 +598,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // holders FROM the escrow pot). House txs cannot spend asset- or
         // bill-colored coins.
         if (coin.fHouseEscrow) {
-            const bool fReclaim = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RECLAIM;
+            const bool fReclaim = tx.nVersion == TRANSACTION_HOUSE_VERSION &&
+                    (tx.nHouseOp == HOUSE_OP_RECLAIM || tx.nHouseOp == HOUSE_OP_CLOSE);   // v0.2.28: CLOSE takes it all
             const bool fRelease = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RELEASE;
             // v0.2.21: a token COLLECT pays token holders from the same pot.
             const bool fClaim = tx.nVersion == TRANSACTION_NOTE_VERSION &&
@@ -885,6 +894,25 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nHRetireNoteIn == 0 || nHRetireUnitsIn != hretireNotes.nUnitsBurned)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-burn-mismatch");
         }
+        else if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW) {
+            // v0.2.28: op 9's structure with the notes optional - any notes spent are exactly the units declared.
+            if (!fHaveHRetireNotes)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-payload");
+            nBillIDPayload = hretireNotes.nBillID;
+            if (nBillTitleIn != 0 || nBillEscrowIn != 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-inputs");
+            if (nHRetireUnitsIn != hretireNotes.nUnitsBurned || (nHRetireNoteIn == 0) != (hretireNotes.nUnitsBurned == 0))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-burn-mismatch");
+        }
+        else if (tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+            // v0.2.28: exactly the bill's escrow (plus the submitter's plain fee coins).
+            BillHClaimEscrow h;
+            if (!DecodeBillPayload(tx.vchBillPayload, h))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaimescrow-payload");
+            nBillIDPayload = h.nBillID;
+            if (nBillTitleIn != 0 || nBillEscrowIn != 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hclaimescrow-inputs");
+        }
         else if (tx.nBillOp == BILL_OP_HCLAIM) {
             BillHClaim h;
             if (!DecodeBillPayload(tx.vchBillPayload, h))
@@ -921,6 +949,14 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nHouseEscrowIn == 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-inputs");
             if (rec.nHouseID != nHouseIDIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-input-id-mismatch");
+        } else if (tx.nHouseOp == HOUSE_OP_CLOSE) {
+            // v0.2.28: every live escrow coin of the house (CheckHouseOperation checks none is missing); a house with
+            // none left still closes, spending plain coins only.
+            HouseClose cl;
+            if (!DecodeHousePayload(tx.vchHousePayload, cl))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payload");
+            if (nHouseEscrowIn != 0 && cl.nHouseID != nHouseIDIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-input-id-mismatch");
         } else if (tx.nHouseOp == HOUSE_OP_RELEASE) {
             HouseRelease rel;

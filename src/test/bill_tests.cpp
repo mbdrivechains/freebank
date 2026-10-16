@@ -758,14 +758,14 @@ static CMutableTransaction MakeDiscountTx(BillDiscount& dOut, DiscountKeys& k)
 
 BOOST_AUTO_TEST_CASE(bill_op_range_and_payload_caps)
 {
-    // The op range widens to 1..9 (v0.2.27: op 9, repay in kind) and no further.
+    // The op range widens to 1..11 (v0.2.27: op 9 repay in kind; v0.2.28: ops 10/11 into escrow) and no further.
     BillDiscount d; DiscountKeys k;
     CMutableTransaction mtx = MakeDiscountTx(d, k);
     {
         CValidationState state;
         BOOST_CHECK(CheckBillTransactionShape(CTransaction(mtx), state));
     }
-    for (uint8_t op : {(uint8_t)0, (uint8_t)10, (uint8_t)255}) {
+    for (uint8_t op : {(uint8_t)0, (uint8_t)12, (uint8_t)255}) {
         CMutableTransaction bad = mtx;
         bad.nBillOp = op;
         CValidationState state;
@@ -782,7 +782,7 @@ BOOST_AUTO_TEST_CASE(bill_op_range_and_payload_caps)
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-coinbase");
     }
 
-    // Per-op payload ceilings: 16384 for a discount, 4096 for ops 6-9, and ops
+    // Per-op payload ceilings: 16384 for a discount, 4096 for ops 6-11, and ops
     // 1-4 unchanged at MAX_BILL_BODY_BYTES + 1024.
     {
         CMutableTransaction bad = mtx;
@@ -791,7 +791,8 @@ BOOST_AUTO_TEST_CASE(bill_op_range_and_payload_caps)
         BOOST_CHECK(!CheckBillTransactionShape(CTransaction(bad), state));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-payload-oversize");
     }
-    for (uint8_t op : {BILL_OP_RECOURSE, BILL_OP_HRETIRE, BILL_OP_HCLAIM, BILL_OP_HRETIRE_NOTES}) {
+    for (uint8_t op : {BILL_OP_RECOURSE, BILL_OP_HRETIRE, BILL_OP_HCLAIM, BILL_OP_HRETIRE_NOTES,
+                       BILL_OP_HRETIRE_ESCROW, BILL_OP_HCLAIM_ESCROW}) {
         CMutableTransaction bad = mtx;
         bad.nBillOp = op;
         bad.vchBillPayload.resize(MAX_BILL_OP_PAYLOAD + 1, 0x00);

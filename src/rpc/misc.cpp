@@ -2001,9 +2001,23 @@ static UniValue HouseToJSON(const CHouse& house)
             // house is Insolvent unless it attests before then (missed
             // MISS_N cadences + nDeferSilenceWindow). Moves on every attest.
             obj.pushKV("defer_silence_insolvent_height", (uint64_t)HouseDeferSilenceInsolventHeight(house));
+            // v0.2.28: no suspension outlasts nSuspensionCap; the house is Insolvent at the earlier of the two.
+            obj.pushKV("defer_cap_insolvent_height", (uint64_t)HouseDeferCapInsolventHeight(house));
+            obj.pushKV("defer_insolvent_height", (uint64_t)HouseDeferInsolventHeight(house));
         }
         obj.pushKV("defer_renewals", (uint64_t)house.nDeferRenewals);
         obj.pushKV("defer_activations", (uint64_t)house.nDeferActivations);
+        // v0.2.28 (FAILED_HOUSE_DESIGN.md B, E): a failed house's timeline - when it counts as insolvent, whether its
+        // book has run off (payouts open), when anyone may CLOSE it, and whether it is closed.
+        {
+            const uint32_t nE = HouseInsolventSince(house, nTipHeight + 1);
+            if (nE != 0) {
+                obj.pushKV("insolvent_since", (uint64_t)nE);
+                obj.pushKV("collection_done", HouseCollectionDone(house, nTipHeight + 1));
+                obj.pushKV("claim_window_closes", (uint64_t)HouseClaimWindowCloses(house, nTipHeight + 1));
+            }
+            obj.pushKV("closed", HouseClosed(house));
+        }
         // The scheduled rate (bps/yr) on queued and lapsed-B3 demands, as the
         // NEXT block accrues it (the schedule is per block).
         obj.pushKV("defer_interest_bps", (uint64_t)DeferInterestBpsAt(

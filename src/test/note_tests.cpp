@@ -549,6 +549,50 @@ static CHouse MakeDeferredHouse(uint32_t nHouseID)
 }
 } // namespace
 
+BOOST_AUTO_TEST_CASE(note_claim_waits_for_collection_and_refuses_closed)
+{
+    // v0.2.28 (FAILED_HOUSE_DESIGN.md B, E): an insolvent house's holders are paid once its loan book has run off (or
+    // the collection window has passed), and never once it is CLOSEd. The gates fire before the holder signature.
+    CHouse house = MakeDeferredHouse(1);
+    house.nDeferInvokedHeight = 0;
+    house.status = HOUSE_STATUS_INSOLVENT;
+    house.nInsolventHeight = 1500;
+    HousePartner pt;
+    pt.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    pt.status = HOUSE_PARTNER_ACTIVE;
+    house.vPartner.push_back(pt);
+
+    NoteClaim c;
+    c.nHouseID = 1;
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    c.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+    c.vchHolderSig = std::vector<unsigned char>(70, 0x30);
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_CLAIM;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(c.vchHolderPubKey)));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << c;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+
+    auto reason = [&](const CHouse& h) {
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 1) { out = h; return true; } return false; };
+        auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+        auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        CheckNoteOperation(CTransaction(mtx), state, 1600, 100, fnGetHouse, fnNoCoin, fnNoCoin, fnNoBlock, houseOut, fChanged);
+        return state.GetRejectReason();
+    };
+    CHouse hCollecting = house;
+    hCollecting.nLoanBookFace = 5000;                  // a bill still in the book, inside the window
+    BOOST_CHECK_EQUAL(reason(hCollecting), "bad-note-claim-collecting");
+    BOOST_CHECK_EQUAL(reason(house), "bad-note-claim-sig");   // book empty: the gates open, the junk sig fails
+    CHouse hClosed = house;
+    hClosed.vPartner[0].status = HOUSE_PARTNER_SETTLED;
+    BOOST_CHECK_EQUAL(reason(hClosed), "bad-note-claim-house-closed");
+}
+
 BOOST_AUTO_TEST_CASE(note_mint_rejected_when_house_not_open)
 {
     // A suspended (Deferred) house may not issue: no new liabilities while it has

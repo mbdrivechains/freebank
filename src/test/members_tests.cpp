@@ -226,9 +226,9 @@ BOOST_AUTO_TEST_CASE(members_op_shape)
         op.nHouseID = 0;
         BOOST_CHECK_EQUAL(ShapeReject(MemberTx(nOp, op)), "bad-house-member-house");
     }
-    // Op codes past the last member op are refused
+    // Op codes past the last house op are refused (v0.2.28: CLOSE, 15, is the last)
     CMutableTransaction mtx = MemberTx(HOUSE_OP_MEMBER_PURGE, ValidMemberOp(1));
-    mtx.nHouseOp = HOUSE_OP_MEMBER_PURGE + 1;
+    mtx.nHouseOp = HOUSE_OP_CLOSE + 1;
     BOOST_CHECK_EQUAL(ShapeReject(mtx), "bad-house-op");
 }
 

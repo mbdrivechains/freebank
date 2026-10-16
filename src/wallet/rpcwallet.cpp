@@ -6965,6 +6965,53 @@ UniValue reclaimpledge(const JSONRPCRequest& request)
     return response;
 }
 
+UniValue closehouse(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "closehouse\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) the house ID number\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.001, paid from this wallet\n"
+            "\nClose a failed house once its claim window has closed (v0.2.28): two years after it became insolvent\n"
+            "(gethouse: insolvent_since, claim_window_closes). Anyone may close it. The partners get exactly their\n"
+            "residual (if the escrow covered notes and deposits at par); everything else in its escrow goes to the\n"
+            "noteholders' mutual fund output, locked until the fund is built. Claims are refused from then on.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nResult:\n"
+            "{ \"txid\": \"hex\", \"to_mutual_fund\": x.xxx }\n"
+            "\nExamples:\n"
+            + HelpExampleCli("closehouse", "3")
+            + HelpExampleRpc("closehouse", "3")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2 && !request.params[1].isNull())
+        nFee = AmountFromValue(request.params[1]);
+
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    uint256 txid;
+    CAmount amountFund = 0;
+    std::string strFail = "";
+    if (!pwallet->CloseHouse(strFail, txid, amountFund, nHouseID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    response.pushKV("to_mutual_fund", ValueFromAmount(amountFund));
+    return response;
+}
+
 UniValue retirebill(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -8070,6 +8117,7 @@ static const CRPCCommand commands[] =
     { "houses",             "renewdeferral",                    &renewdeferral,                 {"id", "fee"} },
     { "houses",             "releasereserves",                  &releasereserves,               {"id", "fee"} },
     { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee"} },
+    { "houses",             "closehouse",                       &closehouse,                    {"id", "fee"} },
 
     { "oracle",             "bondoraclesubmitter",              &bondoraclesubmitter,           {"id", "bond", "fee"} },
     { "oracle",             "submitoracleprice",                &submitoracleprice,             {"id", "price", "fee"} },

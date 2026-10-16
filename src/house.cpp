@@ -275,6 +275,17 @@ bool IsHouseEscrowScript(const CScript& script)
            script[33] == OP_DROP && script[34] == OP_TRUE;
 }
 
+CScript MutualFundScript()
+{
+    static const std::string strTag = "FreeBank mutual fund v1";
+    return CScript() << std::vector<unsigned char>(strTag.begin(), strTag.end()) << OP_DROP << OP_TRUE;
+}
+
+bool IsMutualFundScript(const CScript& script)
+{
+    return script == MutualFundScript();
+}
+
 bool IsValidHouseClassID(const std::string& strClassID)
 {
     if (strClassID.empty() || strClassID.size() > MAX_HOUSE_CLASS_ID_BYTES)
@@ -347,9 +358,12 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
     // attestation cadences starts nDeferSilenceWindow (~4 weeks), and when that
     // runs out it is Insolvent. Attesting before then keeps it Deferred (the
     // deadline is derived from nLastAttestHeight). Still fully lazy.
+    // v0.2.28 (FAILED_HOUSE_DESIGN.md C, Michael 2026-10-16 "12 months"): and
+    // no suspension outlasts nSuspensionCap - HouseDeferInsolventHeight is the
+    // earlier of the two.
     if (house.nDeferInvokedHeight != 0) {
-        if (nHeight >= 0 && (uint32_t)nHeight >= HouseDeferSilenceInsolventHeight(house))
-            return HOUSE_STATUS_INSOLVENT;   // went silent while suspended
+        if (nHeight >= 0 && (uint32_t)nHeight >= HouseDeferInsolventHeight(house))
+            return HOUSE_STATUS_INSOLVENT;   // went silent, or ran out its 12 months, while suspended
         return HOUSE_STATUS_DEFERRED;
     }
 
@@ -373,12 +387,66 @@ uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house)
     return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
 }
 
+uint32_t HouseDeferCapInsolventHeight(const CHouse& house)
+{
+    if (house.nDeferInvokedHeight == 0)
+        return 0;
+    const uint64_t n = (uint64_t)house.nDeferInvokedHeight + (uint64_t)Params().GetConsensus().nSuspensionCap;
+    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+}
+
+uint32_t HouseDeferInsolventHeight(const CHouse& house)
+{
+    if (house.nDeferInvokedHeight == 0)
+        return 0;
+    return std::min(HouseDeferSilenceInsolventHeight(house), HouseDeferCapInsolventHeight(house));
+}
+
+// E for the v0.2.28 windows: HouseInsolventSince, or - for a materialized house whose derivation inputs no longer
+// yield an origin - the height it was materialized (never EARLIER than the true E, so no window closes early).
+static uint32_t HouseWindowE(const CHouse& house, int nHeight)
+{
+    const uint32_t nE = HouseInsolventSince(house, nHeight);
+    if (nE == 0 && house.status == HOUSE_STATUS_INSOLVENT)
+        return house.nInsolventHeight;
+    return nE;
+}
+
+bool HouseCollectionDone(const CHouse& house, int nHeight)
+{
+    const uint32_t nE = HouseWindowE(house, nHeight);
+    if (nE == 0)
+        return false;
+    if (house.nLoanBookFace == 0)
+        return true;
+    return nHeight >= 0 && (uint64_t)nHeight >= (uint64_t)nE + Params().GetConsensus().nCollectWindow;
+}
+
+uint32_t HouseClaimWindowCloses(const CHouse& house, int nHeight)
+{
+    const uint32_t nE = HouseWindowE(house, nHeight);
+    if (nE == 0)
+        return 0;
+    const uint64_t n = (uint64_t)nE + Params().GetConsensus().nInsolventClaimWindow;
+    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+}
+
+bool HouseClosed(const CHouse& house)
+{
+    if (house.status != HOUSE_STATUS_INSOLVENT || house.vPartner.empty())
+        return false;
+    for (const HousePartner& p : house.vPartner)
+        if (p.status != HOUSE_PARTNER_SETTLED)
+            return false;
+    return true;
+}
+
 uint32_t HouseInsolventSince(const CHouse& house, int nHeight)
 {
     if (house.status == HOUSE_STATUS_WOUNDDOWN || HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
         return 0;
     if (house.nDeferInvokedHeight != 0)
-        return HouseDeferSilenceInsolventHeight(house);
+        return HouseDeferInsolventHeight(house);
     // The ordinary stress path: insolvent at the stress origin + the window (HouseEffectiveStatus). The origin is
     // stable for heights past the attestation deadline, which an insolvent house is.
     const uint32_t nStress = HouseStressOrigin(house, nHeight);
@@ -671,7 +739,7 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-house-coinbase");
 
-    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_MEMBER_PURGE)
+    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_CLOSE)
         return state.DoS(100, false, REJECT_INVALID, "bad-house-op");
 
     // Register: 64 partners x (33B key + 72B sig + amount) + declaration
@@ -737,6 +805,12 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
 
         if (!CheckApproverShape(wd.vApproverIndex, wd.vApproverSig) || wd.vApproverIndex.empty())
             return state.DoS(100, false, REJECT_INVALID, "bad-house-winddown-approvers");
+    }
+    else
+    if (tx.nHouseOp == HOUSE_OP_CLOSE) {
+        HouseClose cl;
+        if (!DecodeHousePayload(tx.vchHousePayload, cl) || cl.nHouseID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payload");
     }
     else
     if (tx.nHouseOp == HOUSE_OP_RECLAIM) {

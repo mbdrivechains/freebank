@@ -1099,7 +1099,9 @@ public:
      * the private SelectCoins. */
     bool HouseHeldRetireBill(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
     bool HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut, uint64_t& nUnitsBurnedOut,
-                                    const CBill& bill, const CAmount& nFee, uint64_t nNoteUnits);
+                                    const CBill& bill, const CAmount& nFee, uint64_t nNoteUnits, bool fIntoEscrow = false);
+    bool ClaimBillIntoHouseEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CHouse& house,
+                                  const CAmount& nFee);
     bool HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
 
     // Discount houses (Phase 3.1). v1 is the single-wallet handshake (this
@@ -1280,6 +1282,11 @@ public:
     bool ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);
     bool WinddownHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
     bool ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);
+    /** v0.2.28 CLOSE: anyone closes a failed house once its claim window has closed (FAILED_HOUSE_DESIGN.md E). Spends
+     *  every live escrow coin; pays the partners' residual shares and the rest to the mutual fund; the fee and change
+     *  come from this wallet's plain coins. */
+    bool CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amountFundOut, const uint32_t nHouseID,
+                    const CAmount& nFee);
     /** Publish a reserve attestation (Phase 3.4): proves the wallet's plain
      * confirmed coins as the house's liquid till (up to MAX_ATTEST_PROOFS,
      * largest first; fee funded from coins OUTSIDE the proof set). */

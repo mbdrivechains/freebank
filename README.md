@@ -131,8 +131,17 @@ v0.2.22 lets any number of houses net their notes in one settlement,
 v0.2.23 lets a node restart on its own after a power cut,
 v0.2.24 tightens disk safety and peer scoring,
 v0.2.25 makes a new node's first start faster,
-v0.2.26 stops a note holder burning their own notes by mistake, and
-v0.2.27 lets a borrower repay a house in its own notes:
+v0.2.26 stops a note holder burning their own notes by mistake,
+v0.2.27 lets a borrower repay a house in its own notes, and
+v0.2.28 settles a failed house end to end:
+
+- **What happens when a house fails** (v0.2.28). **A consensus change on beta that only adds:** no beta house has ever
+  been suspended or failed, so every block stays valid; upgrading is a binary swap with no `-reindex`, but a v0.2.27
+  node rejects the first block that uses the new operations. Once a house is suspended or insolvent, loan repayments
+  and defaulted bills' collateral go into its escrow (anyone can move the collateral); holders are paid after the loan
+  book is collected, or 6 months after the failure; a house may only buy bills due within 6 months; suspension is
+  capped at 12 months; and 2 years after a failure anyone can close the house (`closehouse`): partners get exactly
+  their residual, and the rest goes to a locked noteholders' mutual fund output. Details in the release notes.
 
 - **Repay in kind** (v0.2.27). **A consensus change on beta that only adds:** every block beta has today stays valid,
   so upgrading is a binary swap with no `-reindex`, but a v0.2.26 node rejects the first block that uses it. When a
@@ -379,7 +388,7 @@ v0.2.27 lets a borrower repay a house in its own notes:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-As of v0.2.27: 652 unit test cases and 73 integration gates, run on an eCash L1 (eCash's beta
+As of v0.2.28: 659 unit test cases and 74 integration gates, run on an eCash L1 (eCash's beta
 build on regtest with the L2L enforcer). All must pass to merge.
 
 ## Wallet (preview)

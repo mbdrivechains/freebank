@@ -50,6 +50,10 @@ static const uint8_t HOUSE_OP_REGISTER_MO   = 11; // REGISTER + house-type flags
 static const uint8_t HOUSE_OP_MEMBER_ADD    = 12; // add member keyids (M-of-N)
 static const uint8_t HOUSE_OP_MEMBER_REMOVE = 13; // schedule removals, MEMBER_REMOVE_DELAY blocks out (M-of-N)
 static const uint8_t HOUSE_OP_MEMBER_PURGE  = 14; // delete records whose removal is final (M-of-N)
+// v0.2.28 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md E, signed off 2026-10-16): once the claim window has closed
+// (2 years after insolvency), ANYONE closes a failed house: partners get exactly their residual, the rest of the
+// escrow goes to the mutual fund output, and every claim refuses from then on. No signature: every output is pinned.
+static const uint8_t HOUSE_OP_CLOSE         = 15;
 
 // House-type flags, fixed at registration (spec 4.0). REDEEM_ONLY only together with MEMBERS_ONLY.
 static const uint8_t HOUSE_FLAG_MEMBERS_ONLY = 1;
@@ -860,6 +864,21 @@ struct HouseRelease {
 /** Reclaim a tail-expired (or solo wound-down) pledge: spends the partner's
  * pledge UTXO(s). Signature binds hashOutputs (destination), Bills-RETIRE
  * pattern. Valid when partner status == tail AND height >= nTailUnlockHeight. */
+/** CLOSE (v0.2.28): the house id is the whole payload - the outputs are fixed by the rules, and the undo reverts the
+ * partner statuses (and a same-block materialization) exactly as the partners' settle's does. */
+struct HouseClose {
+    uint32_t nHouseID;
+
+    HouseClose() : nHouseID(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+    }
+};
+
 struct HouseReclaim {
     uint32_t nHouseID;
     uint32_t nPartnerIndex;
@@ -1038,6 +1057,16 @@ uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
 CScript HouseEscrowScript(const uint256& houseID);
 bool IsHouseEscrowScript(const CScript& script);
 
+/** v0.2.28: the noteholders' mutual fund output (CM-3 Rung 3, FAILED_HOUSE_DESIGN.md E): <"FreeBank mutual fund v1">
+ * OP_DROP OP_TRUE. Open at the script layer, LOCKED by consensus: every input spending it is refused until CM-3's
+ * fund (Phase B) defines a spender. A 23-byte push, so it can never pass for a 32-byte escrow script. */
+CScript MutualFundScript();
+bool IsMutualFundScript(const CScript& script);
+
+/** Every outpoint that could hold this house's escrow: the partner pledge lists, the waterfall's escrow change, and the
+ * locked till (DEFER) plus, since v0.2.28, repayments into escrow (ops 10/11). */
+std::vector<COutPoint> HouseEscrowOutpoints(const CHouse& house);
+
 /** True if strClassID is [a-z0-9]{1,MAX_HOUSE_CLASS_ID_BYTES}. */
 bool IsValidHouseClassID(const std::string& strClassID);
 
@@ -1063,11 +1092,11 @@ uint32_t HouseStressOrigin(const CHouse& house, int nHeight);
  *     past nLastAttestHeight  ->  Stressed from that deadline + 1;
  *   - window expiry:   Stressed (either origin) for HOUSE_STRESSED_WINDOW
  *     blocks  ->  Insolvent;
- *   - suspended (nDeferInvokedHeight != 0): Deferred, with NO end date
- *     (v0.2.18). The only way out to Insolvent is SILENCE: at
- *     HouseDeferSilenceInsolventHeight (missed MISS_N cadences, then
- *     Consensus::Params::nDeferSilenceWindow more blocks). Attesting before
- *     then moves nLastAttestHeight and keeps the house Deferred.
+ *   - suspended (nDeferInvokedHeight != 0): Deferred until
+ *     HouseDeferInsolventHeight, the earlier of SILENCE (missed MISS_N
+ *     cadences, then Consensus::Params::nDeferSilenceWindow more blocks;
+ *     attesting moves nLastAttestHeight) and, since v0.2.28, the CAP
+ *     nDeferInvokedHeight + nSuspensionCap (12 months; Michael 2026-10-16).
  * Stored 'i' (materialized by the first waterfall claim) and 'w' short-
  * circuit. Effective 'i' is absorbing without writes because every op that
  * could change the derivation inputs is rejected at effective 'i'. */
@@ -1080,11 +1109,29 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight);
  * same origin an open house's stress clock uses). 0 if not suspended. */
 uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house);
 
+/** v0.2.28: nDeferInvokedHeight + nSuspensionCap, saturated; 0 if not suspended. */
+uint32_t HouseDeferCapInsolventHeight(const CHouse& house);
+
+/** v0.2.28: the height a suspended house turns Insolvent = min(silence, cap); 0 if not suspended. */
+uint32_t HouseDeferInsolventHeight(const CHouse& house);
+
 /** E for the token holders' claim (v0.2.21): the height from which the chain counts the house insolvent, or 0 if it is
  * not insolvent at nHeight. Insolvency is absorbing - once insolvent, every op that could move these inputs (ATTEST,
  * TOPUP, REDEEM, DEFER) is refused - so E never moves. A materialized house (status stored INSOLVENT) is derived from
  * the same fields: materializing changes none of them. A house wound down is never insolvent. */
 uint32_t HouseInsolventSince(const CHouse& house, int nHeight);
+
+/** v0.2.28 (FAILED_HOUSE_DESIGN.md B, "collect, then pay"): at an insolvent house, payouts (note/deposit CLAIM, token
+ * COLLECT, the partners' settle, CLOSE) wait until the loan book is empty or nCollectWindow blocks past E. Monotonic:
+ * the book only falls once the house has left Open, and the height only rises. False if not insolvent at nHeight. */
+bool HouseCollectionDone(const CHouse& house, int nHeight);
+
+/** v0.2.28 (E): the first height at which anyone may CLOSE the house (E + nInsolventClaimWindow); 0 if not insolvent. */
+uint32_t HouseClaimWindowCloses(const CHouse& house, int nHeight);
+
+/** v0.2.28 (E): CLOSEd (or wound up by the partners' settle): stored Insolvent with every partner SETTLED. Every claim
+ * and settle refuses from then on. No new record field: the settled partners are the marker. */
+bool HouseClosed(const CHouse& house);
 
 /** The nStressSinceHeight value an accepted attestation of amountReserves at
  * nHeight leaves behind (T2 below-floor / T4 recovery-with-hysteresis /

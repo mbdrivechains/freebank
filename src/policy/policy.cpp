@@ -130,6 +130,17 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
                 o == 1 && IsBillEscrowScript(txout.scriptPubKey))
             continue;
 
+        // v0.2.28: ops 10/11 pay a house-held bill's money into the house's escrow at vout[0] (consensus pins it)
+        if (tx.nVersion == TRANSACTION_BILL_VERSION && o == 0 &&
+                (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) &&
+                IsHouseEscrowScript(txout.scriptPubKey))
+            continue;
+
+        // v0.2.28: CLOSE's mutual fund output (consensus pins its value and its place after the partner shares)
+        if (tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_CLOSE &&
+                IsMutualFundScript(txout.scriptPubKey))
+            continue;
+
         // House pledge escrow outputs (same script family) - REGISTER posts
         // one per partner at vout[0..N-1]; TOPUP / ADMIT post one at vout[0]
         if (tx.nVersion == TRANSACTION_HOUSE_VERSION &&

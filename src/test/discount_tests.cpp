@@ -6,6 +6,7 @@
 #include <house.h>
 #include <note.h>
 
+#include <chainparams.h>
 #include <coins.h>
 #include <txdb.h>
 #include <consensus/tx_verify.h>
@@ -714,20 +715,24 @@ BOOST_AUTO_TEST_CASE(hretire_happy_path_and_rejections)
            }, "bad-bill-hretire-book-underflow");
 }
 
-BOOST_AUTO_TEST_CASE(hretire_valid_at_every_house_status)
+BOOST_AUTO_TEST_CASE(hretire_valid_while_open_or_stressed)
 {
-    // The drawee must ALWAYS be able to discharge its debt - including into a
-    // house that is stressed, deferred or effectively insolvent. The
-    // destination is consensus-pinned, so there is nothing to steal.
-    for (int i = 0; i < 3; i++) {
+    // The drawee pays the custody key only while the house is Open or Stressed. v0.2.28 (FAILED_HOUSE_DESIGN.md A):
+    // once it is Deferred or Insolvent, op 10 takes over and the money goes into its escrow - so op 7 refuses there.
+    for (int i = 0; i < 4; i++) {
         Scene s = MakeHeldScene();
-        if (i == 0) s.house.status = HOUSE_STATUS_DEFERRED;
-        if (i == 1) s.house.nLastAttestHeight = 1;          // derived-Stressed
-        if (i == 2) s.house.status = HOUSE_STATUS_INSOLVENT;
+        if (i == 1) s.house.nLastAttestHeight = (uint32_t)H - 300;                   // derived-Stressed at H
+        if (i == 2) { s.house.nDeferInvokedHeight = (uint32_t)H - 100; s.house.nLastAttestHeight = (uint32_t)H - 5; }
+        if (i == 3) s.house.status = HOUSE_STATUS_INSOLVENT;
         const CMutableTransaction mtx = MakeHRetire(s);
         CValidationState state; CBill b; CHouse h; bool f = false;
-        BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
-        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
+        if (i < 2) {
+            BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
+            BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
+        } else {
+            BOOST_CHECK(!RunOp(s, mtx, state, b, h, f));
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-hretire-house-failed");
+        }
     }
 }
 
@@ -900,29 +905,24 @@ BOOST_AUTO_TEST_CASE(hretire_notes_rejections)
            }, "bad-bill-hretirenotes-book-underflow");
 }
 
-BOOST_AUTO_TEST_CASE(hretire_notes_valid_at_every_house_status)
+BOOST_AUTO_TEST_CASE(hretire_notes_valid_while_open_or_stressed)
 {
-    // Spec s0.4 (draft 2): no status gate, as op 7. At Insolvent the claim
-    // snapshot is nMintedUnits at the first claim, so a burn before it raises
-    // every other holder's share and a burn after it changes no entitlement.
+    // v0.2.27 had no status gate; v0.2.28 sends a Deferred/Insolvent house's money into escrow (op 10), so op 9 refuses
+    // there and stays valid while the house is Open or Stressed.
     for (int i = 0; i < 4; i++) {
         Scene s = MakeKindScene();
-        if (i == 0) s.house.status = HOUSE_STATUS_DEFERRED;
-        if (i == 1) s.house.nLastAttestHeight = 1;          // derived-Stressed
-        if (i == 2) s.house.status = HOUSE_STATUS_INSOLVENT;
-        if (i == 3) {                                       // materialized: snapshot taken
-            s.house.status = HOUSE_STATUS_INSOLVENT;
-            s.house.nInsolventUnits = s.house.nMintedUnits;
-            s.house.amountInsolventPot = 50000000;
-        }
+        if (i == 1) s.house.nLastAttestHeight = (uint32_t)H - 300;                   // derived-Stressed at H
+        if (i == 2) { s.house.nDeferInvokedHeight = (uint32_t)H - 100; s.house.nLastAttestHeight = (uint32_t)H - 5; }
+        if (i == 3) s.house.status = HOUSE_STATUS_INSOLVENT;
         const CMutableTransaction mtx = MakeHRetireNotes(s, (uint64_t)PRICE);
         CValidationState state; CBill b; CHouse h; bool f = false;
-        BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
-        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
-        BOOST_CHECK_EQUAL(h.nMintedUnits, OTHER_NOTES);
-        // After the snapshot the pro-rata denominator is untouched.
-        if (i == 3)
-            BOOST_CHECK_EQUAL(h.nInsolventUnits, (uint64_t)PRICE + OTHER_NOTES);
+        if (i < 2) {
+            BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
+            BOOST_CHECK_EQUAL(h.nMintedUnits, OTHER_NOTES);
+        } else {
+            BOOST_CHECK(!RunOp(s, mtx, state, b, h, f));
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-hretirenotes-house-failed");
+        }
     }
 }
 
@@ -1033,14 +1033,213 @@ BOOST_AUTO_TEST_CASE(hretire_notes_shape)
     BOOST_CHECK_EQUAL(shape(MakeHRetireNotes(s, (uint64_t)PRICE,
         [](BillHRetireNotes& h, CMutableTransaction&) { h.nOwnerHouseID = 0; })), "bad-bill-hretirenotes-fields");
     CMutableTransaction m = MakeHRetireNotes(s, (uint64_t)PRICE);
-    m.nBillOp = BILL_OP_HRETIRE_NOTES + 1;
+    m.nBillOp = BILL_OP_HCLAIM_ESCROW + 1;
     BOOST_CHECK_EQUAL(shape(m), "bad-bill-op");
+}
+
+// ===========================================================================
+// v0.2.28 ops 10/11 - a failed house's bill money goes into its escrow (FAILED_HOUSE_DESIGN.md A)
+// ===========================================================================
+
+static void MakeDeferred(Scene& s)
+{
+    s.house.nDeferInvokedHeight = (uint32_t)H - 100;
+    s.house.nLastAttestHeight = (uint32_t)H - 5;
+}
+
+/** A valid op 10 at the scene's (failed) house: nUnits of notes, the rest into the house escrow at vout[0]. */
+static CMutableTransaction MakeHRetireEscrow(const Scene& s, uint64_t nUnits,
+        const std::function<void(BillHRetireNotes&, CMutableTransaction&)>& pre =
+            std::function<void(BillHRetireNotes&, CMutableTransaction&)>(),
+        bool fSignAsOp9 = false)
+{
+    BillHRetireNotes h;
+    h.nBillID = BILL_ID;
+    h.nOwnerHouseID = HOUSE_ID;
+    h.amountFace = FACE;
+    h.nBillMaturityHeight = MATURITY;
+    h.nUnitsBurned = nUnits;
+    h.nPrevMintedUnits = s.house.nMintedUnits;
+    h.nPrevLoanBookFace = s.house.nLoanBookFace;
+    h.nPrevLoanWtMatHi = s.house.nLoanWtMatHi;
+    h.nPrevLoanWtMatLo = s.house.nLoanWtMatLo;
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_BILL_VERSION;
+    mtx.nBillOp = BILL_OP_HRETIRE_ESCROW;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0003"), 1)));   // the escrow coin
+    if (nUnits > 0)
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("0004"), 0)));   // the note coin
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0005"), 0)));   // plain funding
+    mtx.vout.push_back(CTxOut(FACE - (CAmount)nUnits, HouseEscrowScript(s.house.houseID)));
+    mtx.vout.push_back(CTxOut(ESCROW_BOND, GetScriptForDestination(s.acceptor.GetPubKey().GetID())));
+    if (pre)
+        pre(h, mtx);
+    const uint256 hp = BillHashPrevouts(CTransaction(mtx)), ho = BillHashOutputs(CTransaction(mtx));
+    BOOST_REQUIRE(s.acceptor.Sign(fSignAsOp9 ? BillHRetireNotesSigHash(h, s.bill.billID, hp, ho)
+                                             : BillHRetireEscrowSigHash(h, s.bill.billID, hp, ho), h.vchAcceptorSig));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << h;
+    mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+
+BOOST_AUTO_TEST_CASE(hretire_escrow_pays_the_failed_house_escrow)
+{
+    // Deferred and Insolvent: valid, with or without notes; the money joins the locked till.
+    for (int i = 0; i < 4; i++) {
+        Scene s = MakeKindScene();
+        if (i < 2) MakeDeferred(s); else s.house.status = HOUSE_STATUS_INSOLVENT;
+        const uint64_t nUnits = (i % 2 == 0) ? 0 : (uint64_t)PRICE;
+        const CMutableTransaction mtx = MakeHRetireEscrow(s, nUnits);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "");
+        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
+        BOOST_CHECK_EQUAL(b.nOwnerHouseID, 0);
+        BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
+        BOOST_CHECK_EQUAL(h.nMintedUnits, (uint64_t)PRICE + OTHER_NOTES - nUnits);
+        BOOST_CHECK_EQUAL(h.vOutReserveLock.size(), 1U);   // CHECK, not REQUIRE: the refusals below must still run
+        BOOST_CHECK(!h.vOutReserveLock.empty() && h.vOutReserveLock[0] == COutPoint(CTransaction(mtx).GetHash(), 0));
+    }
+    auto reject = [](const std::function<void(Scene&)>& scene, const std::function<void(BillHRetireNotes&,
+                     CMutableTransaction&)>& pre, const std::string& reason, bool fSignAsOp9) {
+        Scene s = MakeKindScene();
+        MakeDeferred(s);
+        if (scene) scene(s);
+        const CMutableTransaction mtx = MakeHRetireEscrow(s, (uint64_t)PRICE, pre, fSignAsOp9);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(!RunOp(s, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), reason);
+    };
+    const std::function<void(BillHRetireNotes&, CMutableTransaction&)> noPre;
+    // Only at a failed house: an Open house's drawee uses op 7 / op 9.
+    reject([](Scene& s) { s.house.nDeferInvokedHeight = 0; }, noPre, "bad-bill-hretireescrow-house-not-failed", false);
+    // The money must reach the house's escrow, in full - not the custody key, not short.
+    reject(nullptr, [](BillHRetireNotes&, CMutableTransaction& m) {
+               m.vout[0].scriptPubKey = BillScriptForPubKey(std::vector<unsigned char>(33, 0x02)); },
+           "bad-bill-hretireescrow-payment", false);
+    reject(nullptr, [](BillHRetireNotes&, CMutableTransaction& m) { m.vout[0].nValue -= 1; },
+           "bad-bill-hretireescrow-payment", false);
+    // A second escrow-shaped output would enter the UTXO set untagged.
+    reject(nullptr, [](BillHRetireNotes&, CMutableTransaction& m) {
+               m.vout.push_back(CTxOut(1000, m.vout[0].scriptPubKey)); },
+           "bad-bill-hretireescrow-stray-escrow", false);
+    // Its own digest: op 9's signature does not verify as op 10's.
+    reject(nullptr, noPre, "bad-bill-hretireescrow-sig", true);
+    reject(nullptr, [](BillHRetireNotes& h, CMutableTransaction&) { h.nPrevMintedUnits += 1; },
+           "bad-bill-hretireescrow-priors", false);
+    reject([](Scene& s) { s.bill.status = BILL_STATUS_RETIRED; }, noPre, "bad-bill-hretireescrow-inactive", false);
+}
+
+static CMutableTransaction MakeHClaimEscrow(const Scene& s,
+        const std::function<void(BillHClaimEscrow&, CMutableTransaction&)>& pre =
+            std::function<void(BillHClaimEscrow&, CMutableTransaction&)>())
+{
+    BillHClaimEscrow h;
+    h.nBillID = BILL_ID;
+    h.nOwnerHouseID = HOUSE_ID;
+    h.amountFace = FACE;
+    h.nBillMaturityHeight = MATURITY;
+    h.nPrevLoanBookFace = s.house.nLoanBookFace;
+    h.nPrevLoanWtMatHi = s.house.nLoanWtMatHi;
+    h.nPrevLoanWtMatLo = s.house.nLoanWtMatLo;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_BILL_VERSION;
+    mtx.nBillOp = BILL_OP_HCLAIM_ESCROW;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0003"), 1)));   // the bill escrow
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0005"), 0)));   // the submitter's fee coin
+    mtx.vout.push_back(CTxOut(ESCROW_BOND, HouseEscrowScript(s.house.houseID)));
+    if (pre)
+        pre(h, mtx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << h;
+    mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+
+BOOST_AUTO_TEST_CASE(hclaim_escrow_anyone_after_default)
+{
+    const int nLate = (int)MATURITY + (int)GRACE + 1;
+    {
+        Scene s = MakeHeldScene();
+        s.house.status = HOUSE_STATUS_INSOLVENT;
+        const CMutableTransaction mtx = MakeHClaimEscrow(s);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(RunOp(s, mtx, state, b, h, f, 100000, nLate));
+        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_DEFAULTED);
+        BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
+        BOOST_CHECK_EQUAL(h.vOutReserveLock.size(), 1U);
+    }
+    auto reject = [](const std::function<void(Scene&)>& scene,
+                     const std::function<void(BillHClaimEscrow&, CMutableTransaction&)>& pre,
+                     int nHeight, const std::string& reason) {
+        Scene s = MakeHeldScene();
+        s.house.status = HOUSE_STATUS_INSOLVENT;
+        if (scene) scene(s);
+        const CMutableTransaction mtx = MakeHClaimEscrow(s, pre);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(!RunOp(s, mtx, state, b, h, f, 100000, nHeight));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), reason);
+    };
+    const std::function<void(BillHClaimEscrow&, CMutableTransaction&)> noPre;
+    reject(nullptr, noPre, nLate - 1, "bad-bill-hclaimescrow-early");
+    reject([nLate](Scene& s) { s.house.status = HOUSE_STATUS_OPEN; s.house.nLastAttestHeight = (uint32_t)nLate - 5; },
+           noPre, nLate, "bad-bill-hclaimescrow-house-not-failed");
+    reject(nullptr, [](BillHClaimEscrow&, CMutableTransaction& m) { m.vout[0].nValue -= 1; }, nLate,
+           "bad-bill-hclaimescrow-payment");
+    // Op 8 refuses at the same failed house: its bond no longer goes where the quorum says.
+    {
+        Scene s = MakeHeldScene();
+        s.house.status = HOUSE_STATUS_INSOLVENT;
+        BillHClaim hc;
+        hc.nBillID = BILL_ID; hc.nOwnerHouseID = HOUSE_ID; hc.amountFace = FACE; hc.nBillMaturityHeight = MATURITY;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_BILL_VERSION;
+        mtx.nBillOp = BILL_OP_HCLAIM;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("0003"), 1)));
+        mtx.vout.push_back(CTxOut(ESCROW_BOND - 1000, BillScriptForPubKey(Pub(s.custody))));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << hc;
+        mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(!RunOp(s, mtx, state, b, h, f, 100000, nLate));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-hclaim-house-failed");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(discount_tenor_capped_at_the_collection_window)
+{
+    // v0.2.28 B(i): maturity + grace may lie at most nCollectWindow blocks ahead.
+    const uint32_t nWindow = Params().GetConsensus().nCollectWindow;
+    {
+        Scene s = MakeScene();
+        s.bill.nMaturityHeight = (uint32_t)H + nWindow - GRACE + 1;
+        BillDiscount d;
+        const CMutableTransaction mtx = MakeDiscount(s, d, [&s](BillDiscount& dd, CMutableTransaction&) {
+            dd.nBillMaturityHeight = s.bill.nMaturityHeight; });
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(!RunOp(s, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-discount-tenor");
+    }
+    {
+        Scene s = MakeScene();
+        s.bill.nMaturityHeight = (uint32_t)H + nWindow - GRACE;   // exactly at the window: allowed
+        BillDiscount d;
+        const CMutableTransaction mtx = MakeDiscount(s, d, [&s](BillDiscount& dd, CMutableTransaction&) {
+            dd.nBillMaturityHeight = s.bill.nMaturityHeight; });
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        RunOp(s, mtx, state, b, h, f);
+        BOOST_CHECK(state.GetRejectReason() != "bad-bill-discount-tenor");
+    }
 }
 
 BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
 {
     Scene s = MakeHeldScene();
     const int nLate = (int)MATURITY + (int)GRACE + 1;
+    // v0.2.28: op 8 runs only while the house is Open or Stressed, so keep it attesting up to the default.
+    s.house.nLastAttestHeight = (uint32_t)nLate - 10;
 
     auto build = [&s](const std::function<void(BillHClaim&, CMutableTransaction&)>& pre) {
         BillHClaim h;

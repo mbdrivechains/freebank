@@ -529,7 +529,7 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
  * snapshot must count actual lockable coins. */
 /** Every outpoint that could hold this house's escrow: the partner pledge
  * lists plus the escrow-change outpoints created by waterfall claims. */
-static std::vector<COutPoint> HouseEscrowOutpoints(const CHouse& house)
+std::vector<COutPoint> HouseEscrowOutpoints(const CHouse& house)
 {
     std::vector<COutPoint> vOut;
     for (const HousePartner& p : house.vPartner)
@@ -940,7 +940,8 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     // slot accounting and consensus agree exactly.
     if (mtx.nVersion == TRANSACTION_BILL_VERSION &&
             (mtx.nBillOp == BILL_OP_DISCOUNT || mtx.nBillOp == BILL_OP_HRETIRE ||
-             mtx.nBillOp == BILL_OP_HCLAIM || mtx.nBillOp == BILL_OP_HRETIRE_NOTES) &&
+             mtx.nBillOp == BILL_OP_HCLAIM || mtx.nBillOp == BILL_OP_HRETIRE_NOTES ||
+             mtx.nBillOp == BILL_OP_HRETIRE_ESCROW || mtx.nBillOp == BILL_OP_HCLAIM_ESCROW) &&
             mtx.vchBillPayload.size() >= 8) {
         memcpy(&nA, mtx.vchBillPayload.data() + 4, 4);
         return nA != 0;
@@ -3594,6 +3595,11 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-already-held");
         if ((uint32_t)nHeight >= bill.nMaturityHeight)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-matured");
+        // v0.2.28 (FAILED_HOUSE_DESIGN.md B(i), Michael 2026-10-16): a house buys no bill whose maturity PLUS grace
+        // lies further ahead than the collection window, so a failed house's book always runs off - repaid, or
+        // defaulted and its bond claimed - before its holders are paid.
+        if ((uint64_t)bill.nMaturityHeight + bill.nGraceBlocks > (uint64_t)nHeight + Params().GetConsensus().nCollectWindow)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-tenor");
         // The two bill facts every house delta is computed from, pinned
         // byte-exact. This is what makes the crash-replay arm and the
         // disconnect inverse derivable from the PAYLOAD ALONE - no DB read, no
@@ -3744,6 +3750,96 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         return true;
     }
 
+    if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+        // v0.2.28 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md A, signed off 2026-10-16): at a Deferred or Insolvent
+        // house a house-held bill's money goes into the house's ESCROW - joining the locked till in vOutReserveLock,
+        // so RELEASE frees it if the house recovers and the waterfall pot holds it if it fails. Op 10 is op 9 (notes
+        // optional) paid into escrow; op 11 is op 8 without the quorum, the destination being fixed.
+        const bool fRetire = (tx.nBillOp == BILL_OP_HRETIRE_ESCROW);
+        BillHRetireNotes hr;
+        BillHClaimEscrow hc;
+        if (fRetire ? !DecodeBillPayload(tx.vchBillPayload, hr) : !DecodeBillPayload(tx.vchBillPayload, hc))
+            return state.DoS(100, false, REJECT_INVALID,
+                fRetire ? "bad-bill-hretireescrow-payload" : "bad-bill-hclaimescrow-payload");
+        const uint32_t nBillID       = fRetire ? hr.nBillID : hc.nBillID;
+        const uint32_t nOwnerHouseID = fRetire ? hr.nOwnerHouseID : hc.nOwnerHouseID;
+        const CAmount  amountFace    = fRetire ? hr.amountFace : hc.amountFace;
+        const uint32_t nMaturity     = fRetire ? hr.nBillMaturityHeight : hc.nBillMaturityHeight;
+        const uint64_t nPrevFace     = fRetire ? hr.nPrevLoanBookFace : hc.nPrevLoanBookFace;
+        const uint64_t nPrevWtHi     = fRetire ? hr.nPrevLoanWtMatHi : hc.nPrevLoanWtMatHi;
+        const uint64_t nPrevWtLo     = fRetire ? hr.nPrevLoanWtMatLo : hc.nPrevLoanWtMatLo;
+        const std::string strOp      = fRetire ? "hretireescrow" : "hclaimescrow";
+        if (fRetire && hr.nUnitsBurned > (uint64_t)hr.amountFace)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-units");
+
+        CBill bill;
+        if (!fnGetBill(nBillID, bill))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
+        if (bill.status != BILL_STATUS_ACTIVE)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-inactive");
+        if (nOwnerHouseID != bill.nOwnerHouseID || amountFace != bill.amount || nMaturity != bill.nMaturityHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-bill-mismatch");
+
+        CHouse house;
+        if (!fnGetHouse(nOwnerHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-no-house");
+        const char chEff = HouseEffectiveStatus(house, nHeight);
+        if (chEff != HOUSE_STATUS_DEFERRED && chEff != HOUSE_STATUS_INSOLVENT)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-" + strOp + "-house-not-failed");   // flips with no tx
+        // A CLOSEd house has no escrow left to join: its book is settled for good.
+        if (HouseClosed(house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-house-closed");
+
+        // The money: vout[0] is the house's escrow, carrying at least what is owed in sECX.
+        CAmount amountOwed = 0;
+        if (fRetire) {
+            if (!BillVerifyStrict(bill.vchAcceptorPubKey,
+                    BillHRetireEscrowSigHash(hr, bill.billID, BillHashPrevouts(tx), BillHashOutputs(tx)),
+                    hr.vchAcceptorSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-sig");
+            amountOwed = hr.amountFace - (CAmount)hr.nUnitsBurned;
+        } else {
+            // Anyone, but only once the drawee has defaulted (op 8's maturity gate); the whole bond goes in.
+            if ((uint64_t)nHeight <= (uint64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-hclaimescrow-early");
+            amountOwed = bill.amountEscrow;
+        }
+        if (tx.vout.empty() || tx.vout[0].scriptPubKey != HouseEscrowScript(house.houseID) ||
+                tx.vout[0].nValue < amountOwed)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-payment");
+        // vout[0] is the only escrow-shaped output (any other would enter the UTXO set untagged).
+        for (size_t o = 1; o < tx.vout.size(); o++) {
+            if (IsHouseEscrowScript(tx.vout[o].scriptPubKey) || IsMutualFundScript(tx.vout[o].scriptPubKey))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-stray-escrow");
+        }
+
+        if (nPrevFace != house.nLoanBookFace || nPrevWtHi != house.nLoanWtMatHi || nPrevWtLo != house.nLoanWtMatLo ||
+                (fRetire && hr.nPrevMintedUnits != house.nMintedUnits))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-priors");
+        if (fRetire && hr.nUnitsBurned > house.nMintedUnits)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-units-exceed-minted");
+
+        // The book exit, exactly ops 7/8's.
+        const unsigned __int128 nWeight = (unsigned __int128)(uint64_t)amountFace * (unsigned __int128)nMaturity;
+        if (house.nLoanBookFace < (uint64_t)amountFace || house.LoanWtMaturity() < nWeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-" + strOp + "-book-underflow");
+        house.nLoanBookFace -= (uint64_t)amountFace;
+        house.SetLoanWtMaturity(house.LoanWtMaturity() - nWeight);
+        if (fRetire)
+            house.nMintedUnits -= hr.nUnitsBurned;
+        // The money joins the locked till: RELEASE frees it on recovery; the pot holds it at insolvency. Kept sorted,
+        // like DEFER and RELEASE keep it, and removed BY VALUE on undo (a RELEASE re-sorts the list).
+        house.vOutReserveLock.push_back(COutPoint(tx.GetHash(), 0));
+        std::sort(house.vOutReserveLock.begin(), house.vOutReserveLock.end());
+
+        billOut = bill;
+        billOut.status = fRetire ? BILL_STATUS_RETIRED : BILL_STATUS_DEFAULTED;
+        billOut.nOwnerHouseID = 0;
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
     if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
         // v0.2.27 repay in kind (gateway/docs/freebank/REPAY_IN_KIND_DESIGN.md
         // s2): op 7's checks, then the burn. Kept apart from the shared op 7/8
@@ -3772,7 +3868,14 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         CHouse house;
         if (!fnGetHouse(hn.nOwnerHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-no-house");
-        // NO status gate, deliberately, as op 7 (spec s0.4). At effective-
+        // v0.2.28 (FAILED_HOUSE_DESIGN.md A): once the house is Deferred or Insolvent the sECX part must go into its
+        // escrow - op 10, not this op.
+        {
+            const char chEff = HouseEffectiveStatus(house, nHeight);
+            if (chEff == HOUSE_STATUS_DEFERRED || chEff == HOUSE_STATUS_INSOLVENT)   // 10: status flips with no tx
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-hretirenotes-house-failed");
+        }
+        // (v0.2.27 had NO status gate here, as op 7.) At effective-
         // Insolvent the holders' claim is the escrow pot against the snapshot
         // nInsolventUnits = nMintedUnits taken by the FIRST claim
         // (MaterializeInsolvency): a burn before it shrinks the denominator, so
@@ -3858,9 +3961,15 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!fnGetHouse(nOwnerHouseID, house))
             return state.DoS(100, false, REJECT_INVALID,
                 fRetire ? "bad-bill-hretire-no-house" : "bad-bill-hclaim-no-house");
-        // NO status gate, deliberately: both are valid at every owner-house
-        // status including effective-Insolvent. The drawee must always be able
-        // to discharge its debt, and the destination is consensus-pinned.
+        // v0.2.28 (FAILED_HOUSE_DESIGN.md A): valid while the house is Open or Stressed only. Once it is Deferred or
+        // Insolvent its bills' money goes into its escrow, where the holders it stopped paying can reach it: op 10
+        // (the drawee retires) and op 11 (anyone claims the bond) take over. The drawee can still always discharge.
+        {
+            const char chEff = HouseEffectiveStatus(house, nHeight);
+            if (chEff == HOUSE_STATUS_DEFERRED || chEff == HOUSE_STATUS_INSOLVENT)
+                return state.DoS(10, false, REJECT_INVALID,   // 10: the status can flip with no transaction
+                    fRetire ? "bad-bill-hretire-house-failed" : "bad-bill-hclaim-house-failed");
+        }
 
         if (fRetire) {
             if (!BillVerifyStrict(bill.vchAcceptorPubKey,
@@ -4298,6 +4407,115 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         return true;
     }
 
+    if (tx.nHouseOp == HOUSE_OP_CLOSE) {
+        // v0.2.28 CLOSE (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md E, signed off 2026-10-16). The partners' settle
+        // with three differences: anyone may submit it (every output is pinned, so no signature is needed), it may run
+        // with claims still outstanding once the 2-year window has closed, and partners get EXACTLY their residual -
+        // no sweep. Everything else goes to the mutual fund output, and the house is closed for good.
+        HouseClose cl;
+        if (!DecodeHousePayload(tx.vchHousePayload, cl))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payload");
+        CHouse house;
+        if (!fnGetHouse(cl.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
+        if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-close-not-insolvent");
+        if (HouseClosed(house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-close-closed");
+        const uint32_t nCloses = HouseClaimWindowCloses(house, nHeight);
+        if (nCloses == 0 || nHeight < 0 || (uint32_t)nHeight < nCloses)
+            return state.DoS(10, false, REJECT_INVALID, "bad-house-close-window-open");
+        if (!HouseCollectionDone(house, nHeight))
+            return state.DoS(10, false, REJECT_INVALID, "bad-house-close-collecting");
+        // Every bill must have left the book first: once closed, ops 10/11 refuse, so a bill left in the book would be
+        // stuck for good. By now every bill is past maturity + grace (the discount tenor cap), so anyone can clear it
+        // with op 11.
+        if (house.nLoanBookFace != 0)
+            return state.DoS(10, false, REJECT_INVALID, "bad-house-close-book-open");
+        // No claim ever came: CLOSE is the first waterfall op and takes the snapshot itself.
+        if (house.status != HOUSE_STATUS_INSOLVENT)
+            MaterializeInsolvency(house, nHeight, fnGetProofCoin);
+
+        // The partners' residual, by today's arithmetic (escrow -> deposits -> notes loss order).
+        const CAmount amountSenior = (CAmount)house.nInsolventUnits + (CAmount)house.nInsolventDepositPrincipal;
+        const CAmount amountResidual =
+                house.amountInsolventPot > amountSenior ? house.amountInsolventPot - amountSenior : 0;
+
+        // Every still-live escrow coin must be spent by THIS tx - and no escrow coin the house does not list (its
+        // value would count toward nothing and leave as the closer's change).
+        std::set<COutPoint> setVin;
+        for (const CTxIn& in : tx.vin)
+            setVin.insert(in.prevout);
+        const std::vector<COutPoint> vListed = HouseEscrowOutpoints(house);
+        const std::set<COutPoint> setListed(vListed.begin(), vListed.end());
+        for (const CTxIn& in : tx.vin) {
+            Coin coin;
+            if (fnGetProofCoin(in.prevout, coin) && coin.fHouseEscrow && !setListed.count(in.prevout))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-close-unlisted-escrow");
+        }
+        CAmount amountLive = 0;
+        for (const COutPoint& out : vListed) {
+            Coin coin;
+            if (fnGetProofCoin(out, coin) && !coin.IsSpent() &&
+                    coin.fHouseEscrow && coin.nHouseID == house.nHouseID) {
+                if (!setVin.count(out))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-house-close-incomplete");
+                amountLive += coin.out.nValue;
+            }
+        }
+
+        // Shares by frozen pledge over every unsettled partner, floor only: no last-share sweep.
+        CAmount amountPledgeSum = 0;
+        for (const HousePartner& p : house.vPartner)
+            if (p.status != HOUSE_PARTNER_SETTLED)
+                amountPledgeSum += p.amountInsolventPledge;
+        std::vector<std::pair<size_t, CAmount>> vShare;
+        CAmount amountShareSum = 0;
+        if (amountResidual > 0) {
+            for (size_t j = 0; j < house.vPartner.size(); j++) {
+                if (house.vPartner[j].status == HOUSE_PARTNER_SETTLED)
+                    continue;
+                const CAmount s = HouseResidualShare(house.vPartner[j].amountInsolventPledge, amountResidual,
+                                                     amountPledgeSum);
+                if (s > 0) {
+                    vShare.push_back(std::make_pair(j, s));
+                    amountShareSum += s;
+                }
+            }
+        }
+        if (amountLive < amountShareSum)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-close-underfunded");
+        const CAmount amountFund = amountLive - amountShareSum;
+
+        // Pinned layout: vout[k] pays partner k's share exactly, then the fund output carries the rest exactly.
+        const size_t nPinned = vShare.size() + (amountFund > 0 ? 1 : 0);
+        if (tx.vout.size() < nPinned)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-close-vout");
+        for (size_t k = 0; k < vShare.size(); k++) {
+            const CScript expected = NoteScriptForPubKey(house.vPartner[vShare[k].first].vchPubKey);
+            if (tx.vout[k].scriptPubKey != expected || tx.vout[k].nValue != vShare[k].second)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payout");
+        }
+        if (amountFund > 0) {
+            const CTxOut& outFund = tx.vout[vShare.size()];
+            if (!IsMutualFundScript(outFund.scriptPubKey) || outFund.nValue != amountFund)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-close-fund");
+        }
+        // Past the pinned outputs only the closer's change: no escrow-shaped coin (it would enter the UTXO set
+        // untagged) and no second fund output.
+        for (size_t o = nPinned; o < tx.vout.size(); o++) {
+            if (IsHouseEscrowScript(tx.vout[o].scriptPubKey) || IsMutualFundScript(tx.vout[o].scriptPubKey))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-close-stray");
+        }
+
+        // Closed: every partner settles at once (the partners' settle's marker; its undo reverts them).
+        for (HousePartner& p : house.vPartner)
+            if (p.status != HOUSE_PARTNER_SETTLED)
+                p.status = HOUSE_PARTNER_SETTLED;
+        houseOut = house;
+        return true;
+    }
+
     if (tx.nHouseOp == HOUSE_OP_RECLAIM) {
         HouseReclaim rec;
         if (!DecodeHousePayload(tx.vchHousePayload, rec))
@@ -4335,6 +4553,12 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             // AND every deposit has been claimed.
             if (house.nMintedUnits != 0 || house.nDepositUnits != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-notes-outstanding");
+            // v0.2.28 (B): collect, then pay - the partners come last, after the book has run off too.
+            if (!HouseCollectionDone(house, nHeight))
+                return state.DoS(10, false, REJECT_INVALID, "bad-house-settle-collecting");
+            // As CLOSE: the book must be empty (anyone clears a defaulted bill with op 11), or a bill would be stuck.
+            if (house.nLoanBookFace != 0)
+                return state.DoS(10, false, REJECT_INVALID, "bad-house-settle-book-open");
             // A zero-liability house can reach (lazy) insolvency with no note
             // claim ever possible - the settle is then the FIRST waterfall op
             // and materializes the snapshot itself (deadlock escape).
@@ -5316,6 +5540,12 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // derived: window expiry is lazy - the claim itself materializes it).
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-not-insolvent");
+        // v0.2.28 (FAILED_HOUSE_DESIGN.md B, E): no claim once the house is closed; none until its book has run off
+        // (or the collection window has passed), so the snapshot carries every repayment.
+        if (HouseClosed(house))
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-claim-house-closed");
+        if (!HouseCollectionDone(house, nHeight))
+            return state.DoS(10, false, REJECT_INVALID, "bad-note-claim-collecting");
 
         // The holder authorizes burning U units AND (hashOutputs) the exact
         // payout + escrow change they computed.
@@ -5667,6 +5897,11 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-not-insolvent");
         if ((uint64_t)nHeight < (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
             return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-window-open");
+        // v0.2.28 (B, E): as the note claim.
+        if (HouseClosed(house))
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-house-closed");
+        if (!HouseCollectionDone(house, nHeight))
+            return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-collecting");
         if (col.vY.empty())
             return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-empty");
 
@@ -5971,6 +6206,11 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // materializes it).
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-not-insolvent");
+        // v0.2.28 (B, E): as the note claim.
+        if (HouseClosed(house))
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-claim-house-closed");
+        if (!HouseCollectionDone(house, nHeight))
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-claim-collecting");
 
         // The one burned receipt's principal (tx_verify enforced exactly one
         // receipt input, scripted to the declared holder).
@@ -7184,10 +7424,29 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 mapBillUndo[bill.nBillID] = bill;
             }
             else if (tx.nBillOp == BILL_OP_HRETIRE || tx.nBillOp == BILL_OP_HCLAIM ||
-                     tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+                     tx.nBillOp == BILL_OP_HRETIRE_NOTES || tx.nBillOp == BILL_OP_HRETIRE_ESCROW ||
+                     tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
                 uint32_t nBillID = 0;
                 uint32_t nOwnerHouseID = 0;
-                if (tx.nBillOp == BILL_OP_HRETIRE) {
+                if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+                    // v0.2.28: the bill half is op 7's / op 8's exactly.
+                    bool fOK;
+                    if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW) {
+                        BillHRetireNotes h;
+                        fOK = DecodeBillPayload(tx.vchBillPayload, h);
+                        nBillID = h.nBillID;
+                        nOwnerHouseID = h.nOwnerHouseID;
+                    } else {
+                        BillHClaimEscrow h;
+                        fOK = DecodeBillPayload(tx.vchBillPayload, h);
+                        nBillID = h.nBillID;
+                        nOwnerHouseID = h.nOwnerHouseID;
+                    }
+                    if (!fOK) {
+                        error("DisconnectBlock(): Failed to decode bill into-escrow undo!");
+                        return DISCONNECT_FAILED;
+                    }
+                } else if (tx.nBillOp == BILL_OP_HRETIRE) {
                     BillHRetire h;
                     if (!DecodeBillPayload(tx.vchBillPayload, h)) {
                         error("DisconnectBlock(): Failed to decode bill hretire undo!");
@@ -7247,12 +7506,35 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         // RECOURSE is absent on purpose: it mutates no house record at all.
         if (fHouseUndo && tx.nVersion == TRANSACTION_BILL_VERSION &&
                 (tx.nBillOp == BILL_OP_DISCOUNT || tx.nBillOp == BILL_OP_HRETIRE ||
-                 tx.nBillOp == BILL_OP_HCLAIM || tx.nBillOp == BILL_OP_HRETIRE_NOTES)) {
+                 tx.nBillOp == BILL_OP_HCLAIM || tx.nBillOp == BILL_OP_HRETIRE_NOTES ||
+                 tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW)) {
             uint32_t nHouseID = 0;
             bool fHaveMinted = false;
             uint64_t nPrevMinted = 0, nPrevFace = 0, nPrevWtHi = 0, nPrevWtLo = 0;
             bool fDecoded = false;
-            if (tx.nBillOp == BILL_OP_DISCOUNT) {
+            // v0.2.28 ops 10/11 also appended (txid, 0) to vOutReserveLock; popped below.
+            const bool fIntoEscrow = tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW;
+            if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW) {
+                BillHRetireNotes h;
+                if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                    nHouseID = h.nOwnerHouseID;
+                    fHaveMinted = true;
+                    nPrevMinted = h.nPrevMintedUnits;
+                    nPrevFace = h.nPrevLoanBookFace;
+                    nPrevWtHi = h.nPrevLoanWtMatHi;
+                    nPrevWtLo = h.nPrevLoanWtMatLo;
+                    fDecoded = true;
+                }
+            } else if (tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+                BillHClaimEscrow h;
+                if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                    nHouseID = h.nOwnerHouseID;
+                    nPrevFace = h.nPrevLoanBookFace;
+                    nPrevWtHi = h.nPrevLoanWtMatHi;
+                    nPrevWtLo = h.nPrevLoanWtMatLo;
+                    fDecoded = true;
+                }
+            } else if (tx.nBillOp == BILL_OP_DISCOUNT) {
                 BillDiscount d;
                 if (DecodeBillPayload(tx.vchBillPayload, d)) {
                     nHouseID = d.nHouseID;
@@ -7306,6 +7588,16 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
             // this record, so a direct write cannot lose a sibling's effect.
             if (fHaveMinted)
                 house.nMintedUnits = nPrevMinted;
+            // BY VALUE, as the DEFER undo does: a later RELEASE (or its undo) re-sorts the list, so the entry need not
+            // be last. Idempotent: a repeated disconnect finds it gone.
+            if (fIntoEscrow) {
+                const COutPoint outLock(tx.GetHash(), 0);
+                std::vector<COutPoint> vKeep;
+                for (const COutPoint& out : house.vOutReserveLock)
+                    if (!(out == outLock))
+                        vKeep.push_back(out);
+                house.vOutReserveLock = vKeep;
+            }
             house.nLoanBookFace = nPrevFace;
             house.nLoanWtMatHi = nPrevWtHi;
             house.nLoanWtMatLo = nPrevWtLo;
@@ -7460,6 +7752,35 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write house winddown undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nHouseOp == HOUSE_OP_CLOSE) {
+                // v0.2.28: CLOSE's effects are the partners' settle's - statuses to 'x', and a snapshot if no claim
+                // came first - so its inverse is the settle's: statuses back (tail/active from nTailUnlockHeight),
+                // and the snapshot reverted when its stamp is this block. The coins return via the generic undo.
+                HouseClose cl;
+                CHouse house;
+                if (!DecodeHousePayload(tx.vchHousePayload, cl) || !phousetree->GetHouse(cl.nHouseID, house) ||
+                        house.status != HOUSE_STATUS_INSOLVENT) {
+                    error("DisconnectBlock(): Failed to undo house close!");
+                    return DISCONNECT_FAILED;
+                }
+                for (HousePartner& partner : house.vPartner) {
+                    if (partner.status == HOUSE_PARTNER_SETTLED)
+                        partner.status = partner.nTailUnlockHeight != 0 ? HOUSE_PARTNER_TAIL : HOUSE_PARTNER_ACTIVE;
+                }
+                if (house.nInsolventHeight == (uint32_t)pindex->nHeight) {
+                    house.status = HOUSE_STATUS_OPEN;
+                    house.nInsolventHeight = 0;
+                    house.nInsolventUnits = 0;
+                    house.amountInsolventPot = 0;
+                    house.nInsolventDepositPrincipal = 0;
+                    for (HousePartner& p : house.vPartner)
+                        p.amountInsolventPledge = 0;
+                }
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write house close undo!");
                     return DISCONNECT_FAILED;
                 }
             }
@@ -9525,7 +9846,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             // record is the POST-state, so the delta gets applied twice.
             if (!fHouseDBReplay &&
                     (tx.nBillOp == BILL_OP_DISCOUNT || tx.nBillOp == BILL_OP_HRETIRE ||
-                     tx.nBillOp == BILL_OP_HCLAIM || tx.nBillOp == BILL_OP_HRETIRE_NOTES)) {
+                     tx.nBillOp == BILL_OP_HCLAIM || tx.nBillOp == BILL_OP_HRETIRE_NOTES ||
+                     tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW)) {
                 uint32_t nHouseID = 0;
                 bool fHaveMinted = false;
                 uint64_t nMinted = 0, nFace = 0;
@@ -9536,7 +9858,21 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 // at it too, or this is not the window we think it is.
                 bool fCheckMintedPrior = false;
                 uint64_t nPrevMintedPin = 0;
-                if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+                // v0.2.28 ops 10/11 also append (txid, 0) to vOutReserveLock.
+                const bool fIntoEscrow = tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW;
+                if (tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
+                    BillHClaimEscrow h;
+                    if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                        nHouseID = h.nOwnerHouseID;
+                        nFace = (uint64_t)h.amountFace;
+                        nBillMaturity = h.nBillMaturityHeight;
+                        nPrevFace = h.nPrevLoanBookFace;
+                        nPrevWtHi = h.nPrevLoanWtMatHi;
+                        nPrevWtLo = h.nPrevLoanWtMatLo;
+                        fDecoded = true;
+                    }
+                } else
+                if (tx.nBillOp == BILL_OP_HRETIRE_NOTES || tx.nBillOp == BILL_OP_HRETIRE_ESCROW) {
                     BillHRetireNotes h;
                     if (DecodeBillPayload(tx.vchBillPayload, h) && h.nUnitsBurned <= h.nPrevMintedUnits) {
                         nHouseID = h.nOwnerHouseID;
@@ -9625,6 +9961,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     }
                     if (fHaveMinted)
                         house.nMintedUnits = nMinted;
+                    if (fIntoEscrow) {
+                        house.vOutReserveLock.push_back(COutPoint(tx.GetHash(), 0));
+                        std::sort(house.vOutReserveLock.begin(), house.vOutReserveLock.end());
+                    }
 
                     for (const CHouse& h : vHouseNew)
                         if (h.nHouseID == house.nHouseID)

@@ -105,6 +105,14 @@ struct Params {
     uint32_t nDeferSilenceWindow;
     /** v0.2.21: the token holders' claim window at a failed house, in blocks from E (TOKEN_CLAIM_DESIGN.md). */
     uint32_t nTokenClaimWindow;
+    /** v0.2.28 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md, signed off 2026-10-16), all in blocks:
+     *  nSuspensionCap - a suspension ends in insolvency this long after DEFER (12 months);
+     *  nCollectWindow - payouts at an insolvent house wait until its loan book is empty or this long after E (6
+     *                   months), and DISCOUNT refuses a bill maturing further ahead than this;
+     *  nInsolventClaimWindow - claims close this long after E (2 years); then anyone may CLOSE the house. */
+    uint32_t nSuspensionCap;
+    uint32_t nCollectWindow;
+    uint32_t nInsolventClaimWindow;
     /** Gold oracle (Phase G-1, consensus-inert). Same never-a-CLI-knob rule.
      *  Quorum = DISTINCT registered submitters required in one block for a
      *  new fix; brake = max fall of the braked view, ppm per elapsed block,

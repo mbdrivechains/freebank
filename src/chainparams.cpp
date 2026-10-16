@@ -117,6 +117,10 @@ public:
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
         consensus.nDeferSilenceWindow = 4032;  // ~4 weeks after 2 missed cadences
         consensus.nTokenClaimWindow = 4032;    // the token claim window: ~4 weeks from insolvency
+        consensus.nSuspensionCap = 52560;          // v0.2.28: 12 months suspended, then insolvent
+        consensus.nCollectWindow = 26280;          // v0.2.28: collect for 6 months (or until the book is empty), then pay
+        consensus.nInsolventClaimWindow = 105120;  // v0.2.28: claims close 2 years after insolvency; CLOSE then
+        assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow);
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 347;  // ~5%/day / 144 blocks
         consensus.nOracleBrakeElapsedCap = 144;   // censor-charge bounded to one day's fall
@@ -342,6 +346,10 @@ public:
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
         consensus.nDeferSilenceWindow = 40;    // gate-testable silence clock (main: 4032)
         consensus.nTokenClaimWindow = 20;      // gate-testable claim window (main: 4032)
+        consensus.nSuspensionCap = 400;        // gate-testable (main: 52560); above the silence clock (2x144+1+40)
+        consensus.nCollectWindow = 600;        // gate-testable (main: 26280); above the discount gates' 400-500-block bills
+        consensus.nInsolventClaimWindow = 700; // gate-testable (main: 105120); after the collect window, as on main
+        assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow);
         consensus.nOracleQuorumMin = 3;
         consensus.nOracleBrakePpmPerBlock = 100000; // 10%/block: brake behavior testable in few blocks
         consensus.nOracleBrakeElapsedCap = 12;

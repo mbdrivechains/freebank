@@ -328,6 +328,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "reclaimpledge", 0, "id" },
     { "reclaimpledge", 1, "partner" },
     { "reclaimpledge", 2, "fee" },
+    { "closehouse", 0, "id" },
+    { "closehouse", 1, "fee" },
     { "gethouse", 0, "id" },
     { "bondoraclesubmitter", 0, "id" },
     { "bondoraclesubmitter", 1, "bond" },
