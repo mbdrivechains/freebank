@@ -188,6 +188,7 @@ std::string CreditOpName(int nVersion, uint8_t nOp)
         {{TRANSACTION_BILL_VERSION, BILL_OP_RECOURSE}, "recourse"},
         {{TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE}, "hretire"},
         {{TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM}, "hclaim"},
+        {{TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_NOTES}, "hretire_notes"},
         {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_REGISTER}, "register"},
         {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_TOPUP}, "topup"},
         {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_ADMIT}, "admit"},

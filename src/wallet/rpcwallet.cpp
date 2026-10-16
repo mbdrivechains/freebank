@@ -6972,21 +6972,33 @@ UniValue retirebill(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
             "retirebill\n"
             "\nArguments:\n"
-            "1. \"id\"   (numeric, required) the bill ID number\n"
-            "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "1. \"id\"     (numeric, required) the bill ID number\n"
+            "2. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "3. \"notes\"  (numeric, optional) default 0. A bill a discount house holds\n"
+            "             only: pay up to this many units of the house's OWN notes,\n"
+            "             burned at par (1 unit = 1 sat of face); the rest is paid in\n"
+            "             sECX. Whole plain (undemanded) note coins are burned, the\n"
+            "             largest that still fit, never more than face.\n"
             "\nRetire a bill: the drawee (acceptor) pays face to the current\n"
             "holder and reclaims the escrow bond.\n"
             "\nIf a discount house holds the bill this dispatches to the house-held\n"
             "form (op 8's twin, op 7) automatically - same authority, same money, and\n"
             "the face lands on the owning house's pinned custody key. The bill leaves\n"
-            "that house's loan book as it retires.\n"
+            "that house's loan book as it retires. With \"notes\" it is op 9 (v0.2.27):\n"
+            "the notes burned leave the house's notes outstanding too.\n"
             + HelpRequiringPassphrase(pwallet) +
+            "\nResult:\n"
+            "{\n"
+            "  \"txid\": \"hex\",          (string)\n"
+            "  \"notes_burned\": n       (numeric, only with \"notes\") units burned\n"
+            "}\n"
             "\nExamples:\n"
             + HelpExampleCli("retirebill", "1")
+            + HelpExampleCli("retirebill", "1 0.001 50000000")
             + HelpExampleRpc("retirebill", "1")
         );
 
@@ -6995,8 +7007,16 @@ UniValue retirebill(const JSONRPCRequest& request)
     const uint32_t nBillID = request.params[0].get_int();
 
     CAmount nFee = 100000;
-    if (request.params.size() >= 2)
+    if (request.params.size() >= 2 && !request.params[1].isNull())
         nFee = AmountFromValue(request.params[1]);
+
+    uint64_t nNoteUnits = 0;
+    if (request.params.size() >= 3 && !request.params[2].isNull()) {
+        const int64_t n = request.params[2].get_int64();
+        if (n < 0 || n > MAX_MONEY)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "notes must be 0..MAX_MONEY units");
+        nNoteUnits = (uint64_t)n;
+    }
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -7004,14 +7024,17 @@ UniValue retirebill(const JSONRPCRequest& request)
     LOCK2(cs_main, pwallet->cs_wallet);
 
     uint256 txid;
+    uint64_t nBurned = 0;
     std::string strFail = "";
-    if (!pwallet->RetireBill(strFail, txid, nBillID, nFee)) {
+    if (!pwallet->RetireBill(strFail, txid, nBillID, nFee, nNoteUnits, &nBurned)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
 
     UniValue response(UniValue::VOBJ);
     response.pushKV("txid", txid.ToString());
+    if (nNoteUnits > 0)
+        response.pushKV("notes_burned", (int64_t)nBurned);
     return response;
 }
 
@@ -7985,7 +8008,7 @@ static const CRPCCommand commands[] =
 
     { "bills",              "issuebill",                        &issuebill,                     {"body", "amount", "escrow", "maturityheight", "graceblocks", "fee"} },
     { "bills",              "endorsebill",                      &endorsebill,                   {"id", "topubkey", "fee"} },
-    { "bills",              "retirebill",                       &retirebill,                    {"id", "fee"} },
+    { "bills",              "retirebill",                       &retirebill,                    {"id", "fee", "notes"} },
     { "bills",              "claimbillescrow",                  &claimbillescrow,               {"id", "fee"} },
     { "bills",              "proposediscount",                  &proposediscount,               {"id", "houseid", "price", "expiryblocks"} },
     { "bills",              "signdiscount",                     &signdiscount,                  {"proposal", "fee"} },

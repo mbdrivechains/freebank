@@ -50,6 +50,11 @@ static const uint8_t BILL_OP_DISCOUNT = 5;
 static const uint8_t BILL_OP_RECOURSE = 6;
 static const uint8_t BILL_OP_HRETIRE  = 7;
 static const uint8_t BILL_OP_HCLAIM   = 8;
+// v0.2.27 repay in kind (gateway/docs/freebank/REPAY_IN_KIND_DESIGN.md, signed
+// off 2026-10-16): op 7's twin that pays some or all of the face in the owning
+// house's OWN notes, burned at par (1 unit = 1 sat). The notes a house minted to
+// buy the bill come home as the loan is repaid - the law of reflux.
+static const uint8_t BILL_OP_HRETIRE_NOTES = 9;
 
 // On-chain bill status (Issued / Endorsed collapse to active)
 static const char BILL_STATUS_ACTIVE    = 'a';
@@ -89,7 +94,7 @@ static const uint32_t BILL_ENDORSE_HEIGHT_SLACK = 64;
 // rho-at-mint reserve proofs. The house-payload cap precedent. PROVISIONAL (B-1)
 static const size_t MAX_BILL_DISCOUNT_PAYLOAD = 16384;
 
-// Ceiling for the ops 6-8 payloads (no proof sets, no approver-scale vectors
+// Ceiling for the ops 6-9 payloads (no proof sets, no approver-scale vectors
 // beyond one quorum). PROVISIONAL (B-1)
 static const size_t MAX_BILL_OP_PAYLOAD = 4096;
 
@@ -430,6 +435,47 @@ struct BillHRetire {
     }
 };
 
+/** HRETIRE_NOTES (op 9, v0.2.27): op 7 paid partly or wholly in the owning
+ * house's own notes. The note coins (plain: undemanded, no other tag, all of
+ * nOwnerHouseID) are inputs and are burned - a bill transaction makes no note
+ * outputs; the input layer pins their unit sum to nUnitsBurned. Valid at EVERY
+ * owner-house status, like op 7 (the spec's s0.4: at Insolvent the burn can only
+ * raise or leave unchanged what the other holders claim). nUnitsBurned plus the
+ * value paid to the custody key must reach face; nUnitsBurned may not exceed it.
+ * The acceptor signs its own digest (all value fields + hashPrevouts +
+ * hashOutputs), so an op 7 signature can never be replayed as op 9. */
+struct BillHRetireNotes {
+    uint32_t nBillID;                                     // LEADING
+    uint32_t nOwnerHouseID;                               // == bill.nOwnerHouseID (slot key, bytes 4..8)
+    CAmount amountFace;                                   // == bill.amount (book delta)
+    uint32_t nBillMaturityHeight;                         // == bill.nMaturityHeight
+    uint64_t nUnitsBurned;                                // 1..amountFace; == the note inputs' unit sum
+    uint64_t nPrevMintedUnits;                            // undo prior
+    uint64_t nPrevLoanBookFace;                           // undo priors
+    uint64_t nPrevLoanWtMatHi;
+    uint64_t nPrevLoanWtMatLo;
+    std::vector<unsigned char> vchAcceptorSig;            // over BillHRetireNotesSigHash
+
+    BillHRetireNotes() : nBillID(0), nOwnerHouseID(0), amountFace(0), nBillMaturityHeight(0), nUnitsBurned(0),
+                         nPrevMintedUnits(0), nPrevLoanBookFace(0), nPrevLoanWtMatHi(0), nPrevLoanWtMatLo(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nBillID);
+        READWRITE(nOwnerHouseID);
+        READWRITE(amountFace);
+        READWRITE(nBillMaturityHeight);
+        READWRITE(nUnitsBurned);
+        READWRITE(nPrevMintedUnits);
+        READWRITE(nPrevLoanBookFace);
+        READWRITE(nPrevLoanWtMatHi);
+        READWRITE(nPrevLoanWtMatLo);
+        READWRITE(vchAcceptorSig);
+    }
+};
+
 /** HCLAIM: the owning house takes the escrow on default. The house quorum
  * REPLACES the single holder signature - the custody key alone must never direct
  * the escrow payout, nor take a bill out of the book. */
@@ -534,6 +580,8 @@ uint256 BillDiscountSigHash(const BillDiscount& x, const uint256& billID,
                             const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
                             const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
+                                const uint256& hashPrevouts, const uint256& hashOutputs);
 
 /** The escrow output script: <bill_id> OP_DROP OP_TRUE - open at script
  * layer, locked by the consensus spend rules on fBillEscrow coins. */

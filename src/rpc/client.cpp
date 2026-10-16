@@ -172,6 +172,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "endorsebill", 2, "fee" },
     { "retirebill", 0, "id" },
     { "retirebill", 1, "fee" },
+    { "retirebill", 2, "notes" },
     { "claimbillescrow", 0, "id" },
     { "claimbillescrow", 1, "fee" },
     { "getbill", 0, "id" },

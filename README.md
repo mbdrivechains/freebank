@@ -130,8 +130,16 @@ v0.2.21 lets token holders claim at a failed house without its partners,
 v0.2.22 lets any number of houses net their notes in one settlement,
 v0.2.23 lets a node restart on its own after a power cut,
 v0.2.24 tightens disk safety and peer scoring,
-v0.2.25 makes a new node's first start faster, and
-v0.2.26 stops a note holder burning their own notes by mistake:
+v0.2.25 makes a new node's first start faster,
+v0.2.26 stops a note holder burning their own notes by mistake, and
+v0.2.27 lets a borrower repay a house in its own notes:
+
+- **Repay in kind** (v0.2.27). **A consensus change on beta that only adds:** every block beta has today stays valid,
+  so upgrading is a binary swap with no `-reindex`, but a v0.2.26 node rejects the first block that uses it. When a
+  discount house buys a bill it pays in newly minted notes of its own; the borrower can now repay that bill partly or
+  wholly in the same house's notes, which are burned at par (`retirebill <id> [fee] [notes]`). Notes come home as
+  loans are repaid, so borrowers become steady buyers of a house's notes. Signature checks are skipped up to beta
+  block 2000. Details in the release notes.
 
 - **`redeemnote` and `withdrawdeposit` need the house's keys** (v0.2.26). **No consensus change:** upgrade when it
   suits you, a binary swap with no `-reindex`. From a holder's wallet both burned the notes or receipt and paid the
@@ -371,7 +379,7 @@ v0.2.26 stops a note holder burning their own notes by mistake:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-As of v0.2.26: 647 unit test cases and 72 integration gates, run on an eCash L1 (eCash's beta
+As of v0.2.27: 652 unit test cases and 73 integration gates, run on an eCash L1 (eCash's beta
 build on regtest with the L2L enforcer). All must pass to merge.
 
 ## Wallet (preview)

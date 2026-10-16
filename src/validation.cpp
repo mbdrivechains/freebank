@@ -929,7 +929,8 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
         memcpy(&nA, mtx.vchHousePayload.data(), 4);
         return nA != 0;
     }
-    // B1: DISCOUNT / HRETIRE / HCLAIM mutate a CHouse, so they take its slot.
+    // B1: DISCOUNT / HRETIRE / HCLAIM (and v0.2.27's HRETIRE_NOTES) mutate a
+    // CHouse, so they take its slot.
     // Every one of them carries the house id in payload bytes 4..8 (the
     // leading-8 contract), which keeps this a PURE MEMCPY. Resolving ownership
     // from BillDB instead would put an unpriced point-read inside every
@@ -939,7 +940,8 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     // slot accounting and consensus agree exactly.
     if (mtx.nVersion == TRANSACTION_BILL_VERSION &&
             (mtx.nBillOp == BILL_OP_DISCOUNT || mtx.nBillOp == BILL_OP_HRETIRE ||
-             mtx.nBillOp == BILL_OP_HCLAIM) && mtx.vchBillPayload.size() >= 8) {
+             mtx.nBillOp == BILL_OP_HCLAIM || mtx.nBillOp == BILL_OP_HRETIRE_NOTES) &&
+            mtx.vchBillPayload.size() >= 8) {
         memcpy(&nA, mtx.vchBillPayload.data() + 4, 4);
         return nA != 0;
     }
@@ -3736,6 +3738,78 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         billOut.vchHolderPubKey = d.vchCustodyPubKey;
         billOut.outTitle = COutPoint(tx.GetHash(), 0);
         billOut.nOwnerHouseID = d.nHouseID;
+
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+        // v0.2.27 repay in kind (gateway/docs/freebank/REPAY_IN_KIND_DESIGN.md
+        // s2): op 7's checks, then the burn. Kept apart from the shared op 7/8
+        // block below so the shipped ops stay byte-identical. The input layer
+        // already pinned nUnitsBurned to the unit sum of plain, undemanded notes
+        // of nOwnerHouseID spent by this transaction.
+        BillHRetireNotes hn;
+        if (!DecodeBillPayload(tx.vchBillPayload, hn))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-payload");
+        // Shape caps this too; checked again because the subtraction below
+        // must never wrap.
+        if (hn.nUnitsBurned == 0 || hn.amountFace <= 0 || hn.nUnitsBurned > (uint64_t)hn.amountFace)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-units");
+
+        CBill bill;
+        if (!fnGetBill(hn.nBillID, bill))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
+        if (bill.status != BILL_STATUS_ACTIVE)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-inactive");
+        // The ownership pin, as op 7 (a reorg makes staleness a single-tx
+        // contextual failure the mempool sweep evicts).
+        if (hn.nOwnerHouseID != bill.nOwnerHouseID || hn.amountFace != bill.amount ||
+                hn.nBillMaturityHeight != bill.nMaturityHeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-bill-mismatch");
+
+        CHouse house;
+        if (!fnGetHouse(hn.nOwnerHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-no-house");
+        // NO status gate, deliberately, as op 7 (spec s0.4). At effective-
+        // Insolvent the holders' claim is the escrow pot against the snapshot
+        // nInsolventUnits = nMintedUnits taken by the FIRST claim
+        // (MaterializeInsolvency): a burn before it shrinks the denominator, so
+        // every other holder gets more; a burn after it changes no one's
+        // entitlement. An sECX repayment never reaches the pot either way.
+
+        if (!BillVerifyStrict(bill.vchAcceptorPubKey,
+                BillHRetireNotesSigHash(hn, bill.billID, BillHashPrevouts(tx), BillHashOutputs(tx)),
+                hn.vchAcceptorSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-sig");
+        // Notes burned at par (1 unit = 1 sat) plus value paid to the current
+        // holder - the custody key the discount pinned - must reach face.
+        const CAmount amountRest = hn.amountFace - (CAmount)hn.nUnitsBurned;
+        if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountRest)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-payment");
+
+        if (hn.nPrevLoanBookFace != house.nLoanBookFace || hn.nPrevLoanWtMatHi != house.nLoanWtMatHi ||
+                hn.nPrevLoanWtMatLo != house.nLoanWtMatLo || hn.nPrevMintedUnits != house.nMintedUnits)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-priors");
+        // Defensive: the coins-equal-counter invariant makes this unreachable
+        // (the settle precedent); it keeps the counter from ever wrapping.
+        if (hn.nUnitsBurned > house.nMintedUnits)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-units-exceed-minted");
+
+        // The book exit, exactly op 7's.
+        const unsigned __int128 nWeight =
+                (unsigned __int128)(uint64_t)hn.amountFace * (unsigned __int128)hn.nBillMaturityHeight;
+        if (house.nLoanBookFace < (uint64_t)hn.amountFace || house.LoanWtMaturity() < nWeight)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-book-underflow");
+        house.nLoanBookFace -= (uint64_t)hn.amountFace;
+        house.SetLoanWtMaturity(house.LoanWtMaturity() - nWeight);
+        // The reflux: the notes came home and are gone (REDEEM semantics).
+        house.nMintedUnits -= hn.nUnitsBurned;
+
+        billOut = bill;
+        billOut.status = BILL_STATUS_RETIRED;
+        billOut.nOwnerHouseID = 0;
 
         houseOut = house;
         fHouseChanged = true;
@@ -7109,13 +7183,24 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 bill.vchHolderPubKey = r.vchPrevHolderPubKey;
                 mapBillUndo[bill.nBillID] = bill;
             }
-            else if (tx.nBillOp == BILL_OP_HRETIRE || tx.nBillOp == BILL_OP_HCLAIM) {
+            else if (tx.nBillOp == BILL_OP_HRETIRE || tx.nBillOp == BILL_OP_HCLAIM ||
+                     tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
                 uint32_t nBillID = 0;
                 uint32_t nOwnerHouseID = 0;
                 if (tx.nBillOp == BILL_OP_HRETIRE) {
                     BillHRetire h;
                     if (!DecodeBillPayload(tx.vchBillPayload, h)) {
                         error("DisconnectBlock(): Failed to decode bill hretire undo!");
+                        return DISCONNECT_FAILED;
+                    }
+                    nBillID = h.nBillID;
+                    nOwnerHouseID = h.nOwnerHouseID;
+                } else if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+                    // v0.2.27: the bill half is op 7's exactly; the burned note
+                    // coins come back through the generic CTxUndo machinery.
+                    BillHRetireNotes h;
+                    if (!DecodeBillPayload(tx.vchBillPayload, h)) {
+                        error("DisconnectBlock(): Failed to decode bill hretire-notes undo!");
                         return DISCONNECT_FAILED;
                     }
                     nBillID = h.nBillID;
@@ -7162,7 +7247,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         // RECOURSE is absent on purpose: it mutates no house record at all.
         if (fHouseUndo && tx.nVersion == TRANSACTION_BILL_VERSION &&
                 (tx.nBillOp == BILL_OP_DISCOUNT || tx.nBillOp == BILL_OP_HRETIRE ||
-                 tx.nBillOp == BILL_OP_HCLAIM)) {
+                 tx.nBillOp == BILL_OP_HCLAIM || tx.nBillOp == BILL_OP_HRETIRE_NOTES)) {
             uint32_t nHouseID = 0;
             bool fHaveMinted = false;
             uint64_t nPrevMinted = 0, nPrevFace = 0, nPrevWtHi = 0, nPrevWtLo = 0;
@@ -7176,6 +7261,18 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     nPrevFace = d.nPrevLoanBookFace;
                     nPrevWtHi = d.nPrevLoanWtMatHi;
                     nPrevWtLo = d.nPrevLoanWtMatLo;
+                    fDecoded = true;
+                }
+            } else if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+                // v0.2.27: the burn reverts by value, like the discount's mint.
+                BillHRetireNotes h;
+                if (DecodeBillPayload(tx.vchBillPayload, h)) {
+                    nHouseID = h.nOwnerHouseID;
+                    fHaveMinted = true;
+                    nPrevMinted = h.nPrevMintedUnits;
+                    nPrevFace = h.nPrevLoanBookFace;
+                    nPrevWtHi = h.nPrevLoanWtMatHi;
+                    nPrevWtLo = h.nPrevLoanWtMatLo;
                     fDecoded = true;
                 }
             } else if (tx.nBillOp == BILL_OP_HRETIRE) {
@@ -9428,13 +9525,33 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             // record is the POST-state, so the delta gets applied twice.
             if (!fHouseDBReplay &&
                     (tx.nBillOp == BILL_OP_DISCOUNT || tx.nBillOp == BILL_OP_HRETIRE ||
-                     tx.nBillOp == BILL_OP_HCLAIM)) {
+                     tx.nBillOp == BILL_OP_HCLAIM || tx.nBillOp == BILL_OP_HRETIRE_NOTES)) {
                 uint32_t nHouseID = 0;
                 bool fHaveMinted = false;
                 uint64_t nMinted = 0, nFace = 0;
                 uint64_t nPrevFace = 0, nPrevWtHi = 0, nPrevWtLo = 0;
                 uint32_t nBillMaturity = 0;
                 bool fAdd = false, fDecoded = false;
+                // v0.2.27 op 9 also pins the note counter's prior: the DB must be
+                // at it too, or this is not the window we think it is.
+                bool fCheckMintedPrior = false;
+                uint64_t nPrevMintedPin = 0;
+                if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+                    BillHRetireNotes h;
+                    if (DecodeBillPayload(tx.vchBillPayload, h) && h.nUnitsBurned <= h.nPrevMintedUnits) {
+                        nHouseID = h.nOwnerHouseID;
+                        fHaveMinted = true;
+                        nMinted = h.nPrevMintedUnits - h.nUnitsBurned;
+                        fCheckMintedPrior = true;
+                        nPrevMintedPin = h.nPrevMintedUnits;
+                        nFace = (uint64_t)h.amountFace;
+                        nBillMaturity = h.nBillMaturityHeight;
+                        nPrevFace = h.nPrevLoanBookFace;
+                        nPrevWtHi = h.nPrevLoanWtMatHi;
+                        nPrevWtLo = h.nPrevLoanWtMatLo;
+                        fDecoded = true;
+                    }
+                } else
                 if (tx.nBillOp == BILL_OP_DISCOUNT) {
                     BillDiscount d;
                     if (DecodeBillPayload(tx.vchBillPayload, d)) {
@@ -9490,7 +9607,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     // are not in the window we think we are in. Fail closed
                     // rather than write a delta onto an unknown base.
                     if (house.nLoanBookFace != nPrevFace || house.nLoanWtMatHi != nPrevWtHi ||
-                            house.nLoanWtMatLo != nPrevWtLo)
+                            house.nLoanWtMatLo != nPrevWtLo ||
+                            (fCheckMintedPrior && house.nMintedUnits != nPrevMintedPin))
                         return error("ConnectBlock(): replay house priors mismatch for bill op %s",
                             tx.GetHash().ToString());
                     const unsigned __int128 nWeight =

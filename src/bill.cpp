@@ -124,6 +124,26 @@ uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
     return ss.GetHash();
 }
 
+uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
+                                const uint256& hashPrevouts, const uint256& hashOutputs)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankBill/hretire-notes");   // its own tag: an op 7 retire sig never verifies here
+    ss << x.nBillID;
+    ss << billID;
+    ss << x.nOwnerHouseID;
+    ss << x.amountFace;
+    ss << x.nBillMaturityHeight;
+    ss << x.nUnitsBurned;
+    ss << x.nPrevMintedUnits;
+    ss << x.nPrevLoanBookFace;
+    ss << x.nPrevLoanWtMatHi;
+    ss << x.nPrevLoanWtMatLo;
+    ss << hashPrevouts;           // R-i6: the acceptor authorizes exactly these notes and this escrow
+    ss << hashOutputs;            // pins any sECX part to the custody key
+    return ss.GetHash();
+}
+
 CScript BillEscrowScript(const uint256& billID)
 {
     return CScript() << std::vector<unsigned char>(billID.begin(), billID.end()) << OP_DROP << OP_TRUE;
@@ -163,6 +183,7 @@ template bool DecodeBillPayload<BillClaim>(const std::vector<unsigned char>&, Bi
 template bool DecodeBillPayload<BillDiscount>(const std::vector<unsigned char>&, BillDiscount&);
 template bool DecodeBillPayload<BillRecourse>(const std::vector<unsigned char>&, BillRecourse&);
 template bool DecodeBillPayload<BillHRetire>(const std::vector<unsigned char>&, BillHRetire&);
+template bool DecodeBillPayload<BillHRetireNotes>(const std::vector<unsigned char>&, BillHRetireNotes&);
 template bool DecodeBillPayload<BillHClaim>(const std::vector<unsigned char>&, BillHClaim&);
 
 void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin)
@@ -265,7 +286,7 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-bill-coinbase");
 
-    if (tx.nBillOp < BILL_OP_ISSUE || tx.nBillOp > BILL_OP_HCLAIM)
+    if (tx.nBillOp < BILL_OP_ISSUE || tx.nBillOp > BILL_OP_HRETIRE_NOTES)
         return state.DoS(100, false, REJECT_INVALID, "bad-bill-op");
 
     // Per-op payload ceilings. Ops 1-4 keep the shipped bound exactly (an ISSUE
@@ -464,6 +485,23 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-fields");
         if (!IsCanonicalBillSig(h.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-sig-encoding");
+    }
+    else
+    if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+        BillHRetireNotes h;
+        if (!DecodeBillPayload(tx.vchBillPayload, h))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-payload");
+
+        if (h.nBillID == 0 || h.nOwnerHouseID == 0 ||
+                h.amountFace <= 0 || h.amountFace > MAX_MONEY ||
+                h.nBillMaturityHeight == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-fields");
+        // At least one unit (zero is op 7), and never more than face: a mistake
+        // must not be able to burn notes for nothing.
+        if (h.nUnitsBurned == 0 || h.nUnitsBurned > (uint64_t)h.amountFace)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-units");
+        if (!IsCanonicalBillSig(h.vchAcceptorSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-sig-encoding");
     }
     else
     if (tx.nBillOp == BILL_OP_HCLAIM) {

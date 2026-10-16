@@ -8,6 +8,7 @@
 
 #include <coins.h>
 #include <txdb.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <key.h>
 #include <script/standard.h>
@@ -728,6 +729,312 @@ BOOST_AUTO_TEST_CASE(hretire_valid_at_every_house_status)
         BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
         BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
     }
+}
+
+// ===========================================================================
+// HRETIRE_NOTES (9, v0.2.27) - repay in kind (REPAY_IN_KIND_DESIGN.md s2-s3)
+// ===========================================================================
+
+// The house has other notes out besides the discount's, so a full repayment in
+// notes (FACE units) is within nMintedUnits.
+static const uint64_t OTHER_NOTES = 10000000;
+
+static Scene MakeKindScene()
+{
+    Scene s = MakeHeldScene();
+    s.house.nMintedUnits = (uint64_t)PRICE + OTHER_NOTES;
+    return s;
+}
+
+/** A valid op 9 burning nUnits; the sECX rest (if any) to the custody key.
+ * vin[0] = the escrow, vin[1] = one note coin of nUnits, vin[2] = plain funding.
+ * `pre` mutates before signing, as MakeHRetire's hook. */
+static CMutableTransaction MakeHRetireNotes(const Scene& s, uint64_t nUnits,
+        const std::function<void(BillHRetireNotes&, CMutableTransaction&)>& pre =
+            std::function<void(BillHRetireNotes&, CMutableTransaction&)>(),
+        bool fSignAsOp7 = false)
+{
+    BillHRetireNotes h;
+    h.nBillID = BILL_ID;
+    h.nOwnerHouseID = HOUSE_ID;
+    h.amountFace = FACE;
+    h.nBillMaturityHeight = MATURITY;
+    h.nUnitsBurned = nUnits;
+    h.nPrevMintedUnits = s.house.nMintedUnits;
+    h.nPrevLoanBookFace = s.house.nLoanBookFace;
+    h.nPrevLoanWtMatHi = s.house.nLoanWtMatHi;
+    h.nPrevLoanWtMatLo = s.house.nLoanWtMatLo;
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_BILL_VERSION;
+    mtx.nBillOp = BILL_OP_HRETIRE_NOTES;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0003"), 1)));   // the escrow coin
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0004"), 0)));   // the note coin
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("0005"), 0)));   // plain funding
+    if ((CAmount)nUnits < FACE)
+        mtx.vout.push_back(CTxOut(FACE - (CAmount)nUnits, BillScriptForPubKey(s.bill.vchHolderPubKey)));
+    mtx.vout.push_back(CTxOut(ESCROW_BOND, GetScriptForDestination(s.acceptor.GetPubKey().GetID())));
+
+    if (pre)
+        pre(h, mtx);
+
+    const uint256 sighash = fSignAsOp7
+        ? BillRetireSigHash(s.bill.billID, BillHashOutputs(CTransaction(mtx)))
+        : BillHRetireNotesSigHash(h, s.bill.billID, BillHashPrevouts(CTransaction(mtx)),
+                                  BillHashOutputs(CTransaction(mtx)));
+    BOOST_REQUIRE(s.acceptor.Sign(sighash, h.vchAcceptorSig));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << h;
+    mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+
+BOOST_AUTO_TEST_CASE(hretire_notes_part_and_whole)
+{
+    // Part: the discount's own notes (PRICE units) plus the rest in sECX.
+    {
+        const Scene s = MakeKindScene();
+        const CMutableTransaction mtx = MakeHRetireNotes(s, (uint64_t)PRICE);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "");
+        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
+        BOOST_CHECK_EQUAL(b.nOwnerHouseID, 0);
+        BOOST_CHECK(f);
+        // The book exits exactly as op 7...
+        BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
+        BOOST_CHECK(h.LoanWtMaturity() == 0);
+        // ...and, unlike op 7, the notes came home: the liability falls by the burn.
+        BOOST_CHECK_EQUAL(h.nMintedUnits, OTHER_NOTES);
+    }
+    // Whole: FACE units, no sECX output to the house at all.
+    {
+        const Scene s = MakeKindScene();
+        const CMutableTransaction mtx = MakeHRetireNotes(s, (uint64_t)FACE);
+        BOOST_CHECK_EQUAL(mtx.vout.size(), 1U);   // only the escrow back to the acceptor
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
+        BOOST_CHECK_EQUAL(h.nMintedUnits, (uint64_t)PRICE + OTHER_NOTES - (uint64_t)FACE);
+        BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
+    }
+}
+
+static void RejectKind(const std::function<void(Scene&)>& mutateScene, uint64_t nUnits,
+                       const std::function<void(BillHRetireNotes&, CMutableTransaction&)>& pre,
+                       const std::string& reason, bool fSignAsOp7 = false)
+{
+    Scene s = MakeKindScene();
+    if (mutateScene)
+        mutateScene(s);
+    const CMutableTransaction mtx = MakeHRetireNotes(s, nUnits, pre, fSignAsOp7);
+    CValidationState state; CBill b; CHouse h; bool f = false;
+    BOOST_CHECK(!RunOp(s, mtx, state, b, h, f));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), reason);
+}
+
+BOOST_AUTO_TEST_CASE(hretire_notes_rejections)
+{
+    const std::function<void(Scene&)> noScene;
+    const std::function<void(BillHRetireNotes&, CMutableTransaction&)> noPre;
+    const uint64_t U = (uint64_t)PRICE;
+
+    // Units: at least one, never more than face (also the shape gate's rule).
+    RejectKind(noScene, U, [](BillHRetireNotes& h, CMutableTransaction&) { h.nUnitsBurned = 0; },
+           "bad-bill-hretirenotes-units");
+    RejectKind(noScene, U, [](BillHRetireNotes& h, CMutableTransaction&) { h.nUnitsBurned = (uint64_t)FACE + 1; },
+           "bad-bill-hretirenotes-units");
+    // The ownership pin and the bill's own state, as op 7.
+    RejectKind([](Scene& s) { s.bill.nOwnerHouseID = 0; }, U, noPre, "bad-bill-hretirenotes-bill-mismatch");
+    RejectKind([](Scene& s) { s.bill.nOwnerHouseID = 9; }, U, noPre, "bad-bill-hretirenotes-bill-mismatch");
+    RejectKind(noScene, U, [](BillHRetireNotes& h, CMutableTransaction&) { h.amountFace = FACE - 1; },
+           "bad-bill-hretirenotes-bill-mismatch");
+    RejectKind(noScene, U, [](BillHRetireNotes& h, CMutableTransaction&) { h.nBillMaturityHeight = MATURITY + 1; },
+           "bad-bill-hretirenotes-bill-mismatch");
+    RejectKind([](Scene& s) { s.bill.status = BILL_STATUS_RETIRED; }, U, noPre, "bad-bill-hretirenotes-inactive");
+    // Notes plus sECX must reach face: one sat short is refused...
+    RejectKind(noScene, U, [](BillHRetireNotes&, CMutableTransaction& m) { m.vout[0].nValue -= 1; },
+           "bad-bill-hretirenotes-payment");
+    // ...and the sECX part must reach the custody key, not anyone else.
+    {
+        Scene sc = MakeKindScene();
+        const CMutableTransaction mtx = MakeHRetireNotes(sc, U,
+            [&sc](BillHRetireNotes&, CMutableTransaction& m) {
+                m.vout[0].scriptPubKey = BillScriptForPubKey(Pub(sc.stranger));
+            });
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(!RunOp(sc, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-hretirenotes-payment");
+    }
+    // The acceptor's own digest: an op 7 signature never verifies as op 9...
+    RejectKind(noScene, U, noPre, "bad-bill-hretirenotes-sig", true /* fSignAsOp7 */);
+    // ...and every term is bound: changing the units after signing breaks it.
+    {
+        const Scene s = MakeKindScene();
+        CMutableTransaction mtx = MakeHRetireNotes(s, U);
+        BillHRetireNotes h;
+        BOOST_REQUIRE(DecodeBillPayload(mtx.vchBillPayload, h));
+        h.nUnitsBurned = U - 1;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << h;
+        mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        CValidationState state; CBill b; CHouse ho; bool f = false;
+        BOOST_CHECK(!RunOp(s, mtx, state, b, ho, f));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-hretirenotes-sig");
+    }
+    // Priors: the loan book and the note counter, byte-exact.
+    RejectKind(noScene, U, [](BillHRetireNotes& h, CMutableTransaction&) { h.nPrevLoanBookFace = 1; },
+           "bad-bill-hretirenotes-priors");
+    RejectKind(noScene, U, [](BillHRetireNotes& h, CMutableTransaction&) { h.nPrevMintedUnits += 1; },
+           "bad-bill-hretirenotes-priors");
+    // The counter can never wrap, even where the input layer would have caught it.
+    RejectKind([](Scene& s) { s.house.nMintedUnits = 5; }, U, noPre, "bad-bill-hretirenotes-units-exceed-minted");
+    // The book invariant is enforced, as op 7.
+    RejectKind([](Scene& s) {
+               s.house.nLoanBookFace = 1000;
+               s.house.SetLoanWtMaturity(1000);
+           }, U, [](BillHRetireNotes& h, CMutableTransaction&) {
+               h.nPrevLoanBookFace = 1000;
+               h.nPrevLoanWtMatHi = 0;
+               h.nPrevLoanWtMatLo = 1000;
+           }, "bad-bill-hretirenotes-book-underflow");
+}
+
+BOOST_AUTO_TEST_CASE(hretire_notes_valid_at_every_house_status)
+{
+    // Spec s0.4 (draft 2): no status gate, as op 7. At Insolvent the claim
+    // snapshot is nMintedUnits at the first claim, so a burn before it raises
+    // every other holder's share and a burn after it changes no entitlement.
+    for (int i = 0; i < 4; i++) {
+        Scene s = MakeKindScene();
+        if (i == 0) s.house.status = HOUSE_STATUS_DEFERRED;
+        if (i == 1) s.house.nLastAttestHeight = 1;          // derived-Stressed
+        if (i == 2) s.house.status = HOUSE_STATUS_INSOLVENT;
+        if (i == 3) {                                       // materialized: snapshot taken
+            s.house.status = HOUSE_STATUS_INSOLVENT;
+            s.house.nInsolventUnits = s.house.nMintedUnits;
+            s.house.amountInsolventPot = 50000000;
+        }
+        const CMutableTransaction mtx = MakeHRetireNotes(s, (uint64_t)PRICE);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
+        BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
+        BOOST_CHECK_EQUAL(h.nMintedUnits, OTHER_NOTES);
+        // After the snapshot the pro-rata denominator is untouched.
+        if (i == 3)
+            BOOST_CHECK_EQUAL(h.nInsolventUnits, (uint64_t)PRICE + OTHER_NOTES);
+    }
+}
+
+// The input layer (consensus/tx_verify.cpp): op 9 is the fourth sanctioned
+// spender of note coins, and only of plain notes of its house, summing exactly.
+static void AddKindCoins(CCoinsViewCache& cache, const Scene& s, uint64_t nUnits)
+{
+    Coin escrow(CTxOut(ESCROW_BOND, BillEscrowScript(s.bill.billID)), H - 100, false, false, false, uint256());
+    escrow.SetBill(true /* fEscrow */, BILL_ID);
+    cache.AddCoin(COutPoint(uint256S("0003"), 1), std::move(escrow), false);
+    Coin note(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(Pub(s.acceptor))), H - 50, false, false, false, uint256());
+    note.SetNote(HOUSE_ID, nUnits);
+    cache.AddCoin(COutPoint(uint256S("0004"), 0), std::move(note), false);
+    Coin plain(CTxOut(FACE, GetScriptForDestination(s.acceptor.GetPubKey().GetID())), H - 50, false, false, false,
+               uint256());
+    cache.AddCoin(COutPoint(uint256S("0005"), 0), std::move(plain), false);
+}
+
+static std::string KindInputsReject(const CMutableTransaction& mtx, const CCoinsViewCache& cache)
+{
+    CValidationState state;
+    CAmount fee = 0;
+    if (Consensus::CheckTxInputs(CTransaction(mtx), state, cache, H, fee))
+        return "OK";
+    return state.GetRejectReason();
+}
+
+BOOST_AUTO_TEST_CASE(hretire_notes_input_layer)
+{
+    const Scene s = MakeKindScene();
+    const uint64_t U = (uint64_t)PRICE;
+    const CMutableTransaction good = MakeHRetireNotes(s, U);
+    {
+        CCoinsView base; CCoinsViewCache cache(&base);
+        AddKindCoins(cache, s, U);
+        BOOST_CHECK_EQUAL(KindInputsReject(good, cache), "OK");
+    }
+    auto withNote = [&](const std::function<void(Coin&)>& f) {
+        CCoinsView base; CCoinsViewCache cache(&base);
+        AddKindCoins(cache, s, U);
+        Coin coin = cache.AccessCoin(COutPoint(uint256S("0004"), 0));
+        f(coin);
+        cache.SpendCoin(COutPoint(uint256S("0004"), 0));
+        cache.AddCoin(COutPoint(uint256S("0004"), 0), std::move(coin), true);
+        return KindInputsReject(good, cache);
+    };
+    // Another house's notes do not pay this house's bill.
+    BOOST_CHECK_EQUAL(withNote([](Coin& c) { c.SetNote(HOUSE_ID + 1, (uint64_t)PRICE); }),
+                      "bad-bill-hretirenotes-issuer");
+    // Demanded (and so protested) notes are already in a demand.
+    BOOST_CHECK_EQUAL(withNote([](Coin& c) { c.nDemandHeight = 50; }), "bad-bill-hretirenotes-demanded");
+    // Pure notes only: never the pool's dual-tagged custody coin, never another tag.
+    BOOST_CHECK_EQUAL(withNote([](Coin& c) { c.fPoolEscrow = true; }), "bad-bill-hretirenotes-tagged-input");
+    BOOST_CHECK_EQUAL(withNote([](Coin& c) { c.fHouseEscrow = true; }), "bad-bill-hretirenotes-tagged-input");
+    // The burn the payload declares is exactly the notes spent.
+    BOOST_CHECK_EQUAL(withNote([](Coin& c) { c.nNoteUnits -= 1; }), "bad-bill-hretirenotes-burn-mismatch");
+    // A payload with no note input at all is not op 9 (zero units is op 7).
+    {
+        CCoinsView base; CCoinsViewCache cache(&base);
+        AddKindCoins(cache, s, U);
+        Coin plainNote = cache.AccessCoin(COutPoint(uint256S("0004"), 0));
+        plainNote.fNote = false; plainNote.nNoteUnits = 0; plainNote.nHouseID = 0;
+        cache.SpendCoin(COutPoint(uint256S("0004"), 0));
+        cache.AddCoin(COutPoint(uint256S("0004"), 0), std::move(plainNote), true);
+        BOOST_CHECK_EQUAL(KindInputsReject(good, cache), "bad-bill-hretirenotes-burn-mismatch");
+    }
+    // Without the escrow it is no retirement.
+    {
+        CMutableTransaction m = good;
+        m.vin.erase(m.vin.begin());
+        CCoinsView base; CCoinsViewCache cache(&base);
+        AddKindCoins(cache, s, U);
+        BOOST_CHECK_EQUAL(KindInputsReject(m, cache), "bad-bill-hretirenotes-inputs");
+    }
+    // Fail-closed: an undecodable payload admits no note input at all.
+    {
+        CMutableTransaction m = good;
+        m.vchBillPayload.resize(6);
+        CCoinsView base; CCoinsViewCache cache(&base);
+        AddKindCoins(cache, s, U);
+        BOOST_CHECK_EQUAL(KindInputsReject(m, cache), "bad-txns-spend-note-coin");
+    }
+    // And op 7 still may not spend notes at all.
+    {
+        CMutableTransaction m = good;
+        m.nBillOp = BILL_OP_HRETIRE;
+        CCoinsView base; CCoinsViewCache cache(&base);
+        AddKindCoins(cache, s, U);
+        BOOST_CHECK_EQUAL(KindInputsReject(m, cache), "bad-txns-spend-note-coin");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(hretire_notes_shape)
+{
+    const Scene s = MakeKindScene();
+    auto shape = [](const CMutableTransaction& m) {
+        CValidationState state;
+        if (CheckBillTransactionShape(CTransaction(m), state))
+            return std::string("OK");
+        return state.GetRejectReason();
+    };
+    BOOST_CHECK_EQUAL(shape(MakeHRetireNotes(s, (uint64_t)PRICE)), "OK");
+    BOOST_CHECK_EQUAL(shape(MakeHRetireNotes(s, (uint64_t)PRICE,
+        [](BillHRetireNotes& h, CMutableTransaction&) { h.nUnitsBurned = 0; })), "bad-bill-hretirenotes-units");
+    BOOST_CHECK_EQUAL(shape(MakeHRetireNotes(s, (uint64_t)PRICE,
+        [](BillHRetireNotes& h, CMutableTransaction&) { h.nUnitsBurned = (uint64_t)FACE + 1; })),
+        "bad-bill-hretirenotes-units");
+    BOOST_CHECK_EQUAL(shape(MakeHRetireNotes(s, (uint64_t)PRICE,
+        [](BillHRetireNotes& h, CMutableTransaction&) { h.nOwnerHouseID = 0; })), "bad-bill-hretirenotes-fields");
+    CMutableTransaction m = MakeHRetireNotes(s, (uint64_t)PRICE);
+    m.nBillOp = BILL_OP_HRETIRE_NOTES + 1;
+    BOOST_CHECK_EQUAL(shape(m), "bad-bill-op");
 }
 
 BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)

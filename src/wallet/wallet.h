@@ -1062,7 +1062,10 @@ public:
      * consensus reject string. The AUTHORITY differs, though: op 3 and op 7 are
      * both the acceptor's, but op 4 is the holder's while op 8 is the owning
      * HOUSE's quorum - so a house-held claim runs from the house's wallet. */
-    bool RetireBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
+    /** v0.2.27: nNoteUnits > 0 on a house-held bill pays up to that many units of the owning house's own notes
+     *  (op 9, burned at par) and the rest in sECX; *pnUnitsBurned gets the units actually burned (whole coins). */
+    bool RetireBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee,
+                    uint64_t nNoteUnits = 0, uint64_t* pnUnitsBurned = nullptr);
     bool ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
 
     /** Discount ceremony (Phase 3.9, B1 T-d7). Three messages, because a discount
@@ -1095,6 +1098,8 @@ public:
      * dispatch here - but members rather than file statics because they need
      * the private SelectCoins. */
     bool HouseHeldRetireBill(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
+    bool HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut, uint64_t& nUnitsBurnedOut,
+                                    const CBill& bill, const CAmount& nFee, uint64_t nNoteUnits);
     bool HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
 
     // Discount houses (Phase 3.1). v1 is the single-wallet handshake (this

@@ -152,12 +152,13 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
 
         // By default assume that the signatures in ancestors of this block are valid.
-        // v0.2.26: beta block 1950: every signature to it checked by the seed
-        // (v0.2.24 to 1091, then v0.2.25 above its own 992) and by this
-        // release's -assumevalid=0 rehearsal; same hash on the seed and the
-        // explorer on 2026-10-13. v0.2.25: block 992 (a939cbd9...). v0.2.24 and
-        // before: the genesis block, nothing skipped. Set again at each release.
-        consensus.defaultAssumeValid = uint256S("0xa34134c10326fa624822c1b3c0947e277292aae90933d038b4d163ae1b831191");
+        // v0.2.27: beta block 2000: every signature to it checked by the seed
+        // (v0.2.26 above its own 1950) and by this release's -assumevalid=0
+        // rehearsal; same hash on the seed and the explorer on 2026-10-16.
+        // v0.2.26: block 1950 (a34134c1...). v0.2.25: block 992 (a939cbd9...).
+        // v0.2.24 and before: the genesis block, nothing skipped. Set again at
+        // each release.
+        consensus.defaultAssumeValid = uint256S("0x75ea13a1f0a1d7b5a33c498991e7f67655ea5ce004c07ac4feacda36baa231f6");
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.

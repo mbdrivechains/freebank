@@ -417,6 +417,17 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         }
     }
 
+    // Repay in kind (v0.2.27, bill op 9, REPAY_IN_KIND_DESIGN.md s2): a decoded op 9 is the fourth sanctioned spender
+    // of fNote coins. Same fail-closed rule as the settles: if the payload does not decode, the note guard below
+    // rejects every note input.
+    BillHRetireNotes hretireNotes;
+    bool fHaveHRetireNotes = false;
+    if (tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp == BILL_OP_HRETIRE_NOTES &&
+            DecodeBillPayload(tx.vchBillPayload, hretireNotes))
+        fHaveHRetireNotes = true;
+    unsigned int nHRetireNoteIn = 0;
+    uint64_t nHRetireUnitsIn = 0;
+
     // For an oracle BOND (v17, Phase G-1), any spent bond escrow coin must
     // carry THIS submitter's bond script - the registered pubkey is in the
     // script, so re-bond/top-up consolidation is key-pinned by script
@@ -532,6 +543,24 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                         coin.fOracleBond)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
             }
+        }
+
+        // Repay in kind (op 9): every note input is a PLAIN note of the payload's house - no other tag bit (the pool's
+        // dual-tagged custody coin above all: burning it would strand the pool), undemanded (so it sits on its
+        // holder's P2PKH and that holder's scriptSig authorizes the spend; demanded and protested coins are already
+        // in a demand), and its units are burned: a bill transaction makes no note outputs.
+        if (fHaveHRetireNotes && coin.fNote) {
+            if (coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow || coin.fBill || coin.fBillEscrow ||
+                    coin.fDeposit || coin.IsAssetColoured() || coin.fOracleBond)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-tagged-input");
+            if (coin.nHouseID != hretireNotes.nOwnerHouseID)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-issuer");
+            if (coin.nDemandHeight != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-demanded");
+            if (coin.nNoteUnits > (uint64_t)MAX_MONEY || nHRetireUnitsIn > (uint64_t)MAX_MONEY - coin.nNoteUnits)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-units-overflow");
+            nHRetireUnitsIn += coin.nNoteUnits;
+            nHRetireNoteIn++;
         }
 
         vSpentCoins.push_back(&coin);
@@ -668,7 +697,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // rejected. All note inputs must share one house; note txs cannot
         // spend asset/bill coins, and only CLAIM may spend house escrow
         // (checked above).
-        if (coin.fNote && !coin.fPoolEscrow && !fHaveSettle && !fHaveSettleNet) {
+        if (coin.fNote && !coin.fPoolEscrow && !fHaveSettle && !fHaveSettleNet && !fHaveHRetireNotes) {
             // (fHaveSettle: a decoded v16 EXCHANGE is the third sanctioned
             // spender class of fNote coins; its bundles are fully validated by
             // the positional block above - issuer, tag purity, presenter
@@ -843,6 +872,18 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nBillIDPayload = h.nBillID;
             if (nBillTitleIn != 0 || nBillEscrowIn != 1)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-inputs");
+        }
+        else if (tx.nBillOp == BILL_OP_HRETIRE_NOTES) {
+            // fHaveHRetireNotes is the same decode; failing it means no note input was admitted above.
+            if (!fHaveHRetireNotes)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-payload");
+            nBillIDPayload = hretireNotes.nBillID;
+            if (nBillTitleIn != 0 || nBillEscrowIn != 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-inputs");
+            // The burn the payload declares is exactly the notes spent: the contextual check and the house's
+            // nMintedUnits move by nUnitsBurned, so this pin is what ties the counter to real coins.
+            if (nHRetireNoteIn == 0 || nHRetireUnitsIn != hretireNotes.nUnitsBurned)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-burn-mismatch");
         }
         else if (tx.nBillOp == BILL_OP_HCLAIM) {
             BillHClaim h;
