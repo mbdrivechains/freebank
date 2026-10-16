@@ -129,6 +129,7 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
         uint32_t nDepOrigination = 0;
         bool fDepEscrowChange = false;
         uint32_t nDepEscrowHouse = 0;
+        uint32_t nDepDemandTag = 0;   // v0.2.29: DEMAND / PROTEST re-issue the receipt with a demand tag
         if (fDepositTx) {
             if (tx.nDepositOp == DEPOSIT_OP_ORIGINATE) {
                 DepositOriginate o;
@@ -151,6 +152,28 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
                 if (DecodeDepositPayload(tx.vchDepositPayload, c) && c.fEscrowChange) {
                     fDepEscrowChange = true;
                     nDepEscrowHouse = c.nHouseID;
+                }
+            } else if (tx.nDepositOp == DEPOSIT_OP_DEMAND) {
+                // v0.2.29: vout[0] is the receipt, now in custody, stamped with this height and the pre-auth bit.
+                DepositDemand d;
+                if (DecodeDepositPayload(tx.vchDepositPayload, d)) {
+                    nDepHouse = d.nHouseID;
+                    vDepPrincipal.push_back(d.nPrincipal);
+                    vDepRate.push_back(d.nRateBps);
+                    vDepMaturity.push_back(d.nMaturityHeight);
+                    nDepOrigination = d.nOriginationHeight;
+                    nDepDemandTag = NoteDemandTag((uint32_t)nHeight, NOTE_DEMAND_MODE_PREAUTH);
+                }
+            } else if (tx.nDepositOp == DEPOSIT_OP_PROTEST) {
+                // v0.2.29: the same receipt re-issued with the protested bit on its (payload-pinned) demand tag.
+                DepositProtest pr;
+                if (DecodeDepositPayload(tx.vchDepositPayload, pr)) {
+                    nDepHouse = pr.nHouseID;
+                    vDepPrincipal.push_back(pr.nPrincipal);
+                    vDepRate.push_back(pr.nRateBps);
+                    vDepMaturity.push_back(pr.nMaturityHeight);
+                    nDepOrigination = pr.nOriginationHeight;
+                    nDepDemandTag = pr.nDemandTag | NOTE_DEMAND_PROTESTED_BIT;
                 }
             }
         }
@@ -189,8 +212,10 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
 
             ApplyNoteCoinTags(tx, i, coin, true /* fConnected */, (uint32_t)nHeight);
 
-            if (fDepositTx && nDepHouse != 0 && i < vDepPrincipal.size())
+            if (fDepositTx && nDepHouse != 0 && i < vDepPrincipal.size()) {
                 coin.SetDeposit(nDepHouse, vDepPrincipal[i], vDepRate[i], vDepMaturity[i], nDepOrigination);
+                coin.nDemandHeight = nDepDemandTag;   // 0 except a v0.2.29 DEMAND / PROTEST re-issue
+            }
 
             if (fDepositTx && fDepEscrowChange && i == 1)
                 coin.SetHouseEscrow(nDepEscrowHouse);

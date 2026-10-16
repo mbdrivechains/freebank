@@ -5872,6 +5872,7 @@ struct WalletDepositCoin {
     uint32_t originationHeight;
     std::vector<unsigned char> vchHolderPubKey;
     CScript script;
+    uint32_t nDemandTag = 0;   // v0.2.29: nonzero = demanded (in B3 custody; leaves only by PROTEST/DISCHARGE/CLAIM)
 };
 
 // Collect this wallet's unspent deposit receipt coins of nHouseID. Reads the
@@ -5899,19 +5900,30 @@ static void CollectWalletDepositCoins(CWallet* pwallet, uint32_t nHouseID,
         for (size_t i = 0; i < pcoin->tx->vout.size(); i++) {
             if (pwallet->IsSpent(wtxid, i))
                 continue;
-            if (pwallet->IsMine(pcoin->tx->vout[i]) == ISMINE_NO)
+            const CScript& scriptOut = pcoin->tx->vout[i].scriptPubKey;
+            // v0.2.29: a DEMANDED receipt sits on the B3 custody script (not IsMine); this wallet committed the
+            // demand or protest itself, so ownership there is key POSSESSION (the note collector's rule).
+            const bool fCustody = IsNotePreAuthScript(scriptOut);
+            if (!fCustody && pwallet->IsMine(pcoin->tx->vout[i]) == ISMINE_NO)
                 continue;
             Coin coinUtxo;
             if (!pcoinsTip->GetCoin(COutPoint(wtxid, i), coinUtxo) || coinUtxo.IsSpent())
                 continue;
             if (!coinUtxo.fDeposit || coinUtxo.nHouseID != nHouseID)
                 continue;
-            CTxDestination dest;
-            if (!ExtractDestination(pcoin->tx->vout[i].scriptPubKey, dest))
-                continue;
-            const CKeyID* keyid = boost::get<CKeyID>(&dest);
-            if (!keyid)
-                continue;
+            CKeyID keyidHolder;
+            if (fCustody) {
+                keyidHolder = CKeyID(uint160(std::vector<unsigned char>(scriptOut.begin() + 1, scriptOut.begin() + 21)));
+            } else {
+                CTxDestination dest;
+                if (!ExtractDestination(scriptOut, dest))
+                    continue;
+                const CKeyID* pkeyid = boost::get<CKeyID>(&dest);
+                if (!pkeyid)
+                    continue;
+                keyidHolder = *pkeyid;
+            }
+            const CKeyID* keyid = &keyidHolder;
             CPubKey pub;
             if (!pwallet->GetPubKey(*keyid, pub))
                 continue;
@@ -5924,6 +5936,7 @@ static void CollectWalletDepositCoins(CWallet* pwallet, uint32_t nHouseID,
             dc.originationHeight = coinUtxo.nDepositOriginationHeight;
             dc.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
             dc.script = pcoin->tx->vout[i].scriptPubKey;
+            dc.nDemandTag = coinUtxo.nDemandHeight;
             vOut.push_back(dc);
         }
     }
@@ -6046,12 +6059,15 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
 // Pick this wallet's first held receipt of (house, principal). fMaturedOnly
 // filters to receipts at/after maturity (WITHDRAW). Returns false if none.
 static bool SelectDepositReceipt(CWallet* pwallet, uint32_t nHouseID, uint64_t nPrincipal,
-                                 bool fMaturedOnly, int nHeight, WalletDepositCoin& out)
+                                 bool fMaturedOnly, int nHeight, WalletDepositCoin& out, bool fAllowDemanded = false)
 {
     std::vector<WalletDepositCoin> vDep;
     CollectWalletDepositCoins(pwallet, nHouseID, vDep);
     for (const WalletDepositCoin& dc : vDep) {
         if (dc.principal != nPrincipal)
+            continue;
+        // v0.2.29: a demanded receipt is only ever claimed (TRANSFER / WITHDRAW / DEMAND would be refused).
+        if (dc.nDemandTag != 0 && !fAllowDemanded)
             continue;
         if (fMaturedOnly && (nHeight < 0 || (uint32_t)nHeight < dc.maturityHeight))
             continue;
@@ -6279,6 +6295,265 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     return true;
 }
 
+// v0.2.29 (FAILED_HOUSE_DESIGN.md D): a saver forces payment at maturity. Shared: fund nFee from plain coins and
+// sign those inputs; vin[0] is the receipt (signed here only when it is still on its P2PKH, i.e. for DEMAND).
+bool CWallet::FundSignCommitDepositOp(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx,
+                                      const CAmount& amountReceiptIn, const CAmount& amountOutPinned, const CAmount& nFee,
+                                      bool fSignReceipt, const CScript& scriptReceipt)
+{
+    CWallet* pwallet = this;
+    const CAmount nTarget = amountOutPinned + nFee;
+    const CAmount nRaise = nTarget > amountReceiptIn ? nTarget - amountReceiptIn : 0;
+    std::vector<COutput> vCoins;
+    pwallet->AvailableCoins(vCoins, true);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (nRaise > 0 && !pwallet->SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) {
+        strFail = "Could not fund the transaction + fee!"; return false;
+    }
+    CReserveKey reserveKey(pwallet);
+    const CAmount nChange = amountReceiptIn + nAmountRet - nTarget;
+    if (nChange > 0) {
+        CPubKey pubChange;
+        if (!reserveKey.GetReservedKey(pubChange, true)) { strFail = "Keypool ran out!"; return false; }
+        CTxOut out(nChange, GetScriptForDestination(pubChange.GetID()));
+        if (!IsDust(out, ::dustRelayFee)) mtx.vout.push_back(out);
+    }
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    const CTransaction txToSign(mtx);
+    if (fSignReceipt) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(pwallet, &txToSign, 0, amountReceiptIn, SIGHASH_ALL),
+                scriptReceipt, sigdata)) { strFail = "Signing the receipt input failed!"; return false; }
+        UpdateTransaction(mtx, 0, sigdata);
+    }
+    unsigned int nIn = 1;
+    for (const auto& coin : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(pwallet, &txToSign, nIn, coin.txout.nValue, SIGHASH_ALL),
+                coin.txout.scriptPubKey, sigdata)) { strFail = "Signing the funding inputs failed!"; return false; }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(pwallet);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!pwallet->CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+// The transaction that created a custody receipt (a DEMAND or a PROTEST), from this wallet or the chain.
+static bool GetDepositCustodyTx(CWallet* pwallet, const uint256& txid, CTransactionRef& txOut)
+{
+    std::map<uint256, CWalletTx>::const_iterator it = pwallet->mapWallet.find(txid);
+    if (it != pwallet->mapWallet.end()) { txOut = it->second.tx; return true; }
+    uint256 hashBlock;
+    return GetTransaction(txid, txOut, Params().GetConsensus(), hashBlock, true);
+}
+
+bool CWallet::DemandDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal,
+                            const CScript& scriptPayoutIn, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+        strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
+    }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    const int nNext = chainActive.Height() + 1;
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    const char chEff = HouseEffectiveStatus(house, nNext);
+    if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
+        strFail = "A demand is made while the house is open or stressed (suspended: savers wait; insolvent: claimdeposit)!";
+        return false;
+    }
+    WalletDepositCoin dc;
+    if (!SelectDepositReceipt(this, nHouseID, nPrincipal, true, nNext, dc)) {
+        strFail = "No matured receipt of that house and principal is held by this wallet!"; return false;
+    }
+    CKey keyHolder;
+    if (!GetKey(CPubKey(dc.vchHolderPubKey).GetID(), keyHolder)) { strFail = "Holder key missing!"; return false; }
+    const CScript scriptPayout = scriptPayoutIn.empty() ? DepositScriptForPubKey(dc.vchHolderPubKey) : scriptPayoutIn;
+
+    DepositDemand d;
+    d.nHouseID = nHouseID;
+    d.nPrincipal = dc.principal;
+    d.nRateBps = dc.rateBps;
+    d.nMaturityHeight = dc.maturityHeight;
+    d.nOriginationHeight = dc.originationHeight;
+    d.vchHolderPubKey = dc.vchHolderPubKey;
+    d.vchPayoutScript = std::vector<unsigned char>(scriptPayout.begin(), scriptPayout.end());
+    if (!keyHolder.Sign(DepositPreAuthSigHash(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight,
+            d.nOriginationHeight, d.vchPayoutScript), d.vchPreAuthSig)) { strFail = "Failed to sign the pre-authorization!"; return false; }
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
+    mtx.nDepositOp = DEPOSIT_OP_DEMAND;
+    mtx.vin.push_back(CTxIn(dc.outpoint, CScript()));
+    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, NotePreAuthScript(dc.vchHolderPubKey)));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << d;
+    mtx.vchDepositPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return FundSignCommitDepositOp(strFail, txidOut, mtx, DEPOSIT_DUST_VALUE, DEPOSIT_DUST_VALUE, nFee, true, dc.script);
+}
+
+bool CWallet::ProtestDeposit(std::string& strFail, uint256& txidOut, const uint256& txidCustody, const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    const COutPoint out(txidCustody, 0);
+    Coin coin;
+    if (!pcoinsTip->GetCoin(out, coin) || coin.IsSpent() || !coin.fDeposit || !NoteDemandIsPreAuth(coin.nDemandHeight)) {
+        strFail = "That transaction's vout 0 is not a live demanded receipt (confirmed)!"; return false;
+    }
+    if (NoteDemandIsProtested(coin.nDemandHeight)) { strFail = "This demand has already been protested!"; return false; }
+    CTransactionRef txDemand;
+    DepositDemand d;
+    if (!GetDepositCustodyTx(this, txidCustody, txDemand) || txDemand->nDepositOp != DEPOSIT_OP_DEMAND ||
+            !DecodeDepositPayload(txDemand->vchDepositPayload, d)) { strFail = "Could not read the demand!"; return false; }
+    CKey keyHolder;
+    if (!GetKey(CPubKey(d.vchHolderPubKey).GetID(), keyHolder)) { strFail = "This wallet is not the receipt's holder!"; return false; }
+    if (HouseFailFastEnabled() && HouseStateChangePending(coin.nHouseID)) {
+        strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
+    }
+    CHouse house;
+    if (!phousetree->GetHouse(coin.nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    const int nNext = chainActive.Height() + 1;
+    const uint32_t nOpens = std::max(NoteDemandHeightOf(coin.nDemandHeight), house.nDeferEndedHeight) +
+                            Params().GetConsensus().nDemandWindow;
+    if ((uint32_t)nNext < nOpens) { strFail = strprintf("The house has until block %u to pay - protest from then on!", nOpens); return false; }
+
+    DepositProtest pr;
+    pr.nHouseID = coin.nHouseID;
+    pr.nPrincipal = coin.nDepositPrincipal;
+    pr.nRateBps = coin.nDepositRateBps;
+    pr.nMaturityHeight = coin.nDepositMaturityHeight;
+    pr.nOriginationHeight = coin.nDepositOriginationHeight;
+    pr.nDemandTag = coin.nDemandHeight;
+    pr.vchHolderPubKey = d.vchHolderPubKey;
+    pr.nPrevProtestOpen = house.nProtestOpen;
+    pr.nPrevProtestHeight = house.nProtestHeight;
+    pr.nPrevProtestDemandHeight = house.nProtestDemandHeight;
+    pr.vchPayoutScript = d.vchPayoutScript;
+    pr.vchPreAuthSig = d.vchPreAuthSig;
+
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
+    mtx.nDepositOp = DEPOSIT_OP_PROTEST;
+    mtx.vin.push_back(CTxIn(out, CScript()));   // custody: <keyid> OP_DROP OP_TRUE, no scriptSig
+    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, NotePreAuthScript(d.vchHolderPubKey)));
+    // The holder signs the exact output set, so fund first (change included), then sign the payload.
+    std::vector<COutput> vCoins;
+    AvailableCoins(vCoins, true);
+    std::set<CInputCoin> setCoins;
+    CAmount nAmountRet = 0;
+    if (!SelectCoins(vCoins, nFee, setCoins, nAmountRet)) { strFail = "Could not fund the fee!"; return false; }
+    CReserveKey reserveKey(this);
+    if (nAmountRet - nFee > 0) {
+        CPubKey pubChange;
+        if (!reserveKey.GetReservedKey(pubChange, true)) { strFail = "Keypool ran out!"; return false; }
+        CTxOut outChange(nAmountRet - nFee, GetScriptForDestination(pubChange.GetID()));
+        if (!IsDust(outChange, ::dustRelayFee)) mtx.vout.push_back(outChange);
+    }
+    for (const auto& c : setCoins)
+        mtx.vin.push_back(CTxIn(c.outpoint.hash, c.outpoint.n, CScript()));
+    if (!keyHolder.Sign(DepositProtestSigHash(pr.nHouseID, pr.nPrincipal, pr.nOriginationHeight, pr.nDemandTag,
+            BillHashOutputs(CTransaction(mtx))), pr.vchHolderSig)) { strFail = "Failed to sign the protest!"; return false; }
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << pr;
+    mtx.vchDepositPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    const CTransaction txToSign(mtx);
+    unsigned int nIn = 1;
+    for (const auto& c : setCoins) {
+        SignatureData sigdata;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, nIn, c.txout.nValue, SIGHASH_ALL),
+                c.txout.scriptPubKey, sigdata)) { strFail = "Signing the funding inputs failed!"; return false; }
+        UpdateTransaction(mtx, nIn, sigdata);
+        nIn++;
+    }
+    CWalletTx walletTx;
+    walletTx.fTimeReceivedIsTxTime = true;
+    walletTx.fFromMe = true;
+    walletTx.BindWallet(this);
+    walletTx.SetTx(MakeTransactionRef(std::move(mtx)));
+    CValidationState state;
+    if (!CommitTransaction(walletTx, reserveKey, g_connman.get(), state)) {
+        strFail = "Failed to commit the protest! Reject reason: " + FormatStateMessage(state); return false;
+    }
+    txidOut = walletTx.tx->GetHash();
+    return true;
+}
+
+bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& amountPaidOut, const uint256& txidCustody,
+                               const CAmount& nFee)
+{
+    strFail = "Unknown error!";
+    amountPaidOut = 0;
+    if (!HasWallets()) { strFail = "No active wallet!"; return false; }
+    BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, cs_wallet);
+    const COutPoint out(txidCustody, 0);
+    Coin coin;
+    if (!pcoinsTip->GetCoin(out, coin) || coin.IsSpent() || !coin.fDeposit || !NoteDemandIsPreAuth(coin.nDemandHeight)) {
+        strFail = "That transaction's vout 0 is not a live demanded receipt (confirmed)!"; return false;
+    }
+    CTransactionRef txC;
+    if (!GetDepositCustodyTx(this, txidCustody, txC)) { strFail = "Could not read the demand or protest transaction!"; return false; }
+    std::vector<unsigned char> vchKey, vchPayout, vchPreAuth;
+    if (txC->nDepositOp == DEPOSIT_OP_DEMAND) {
+        DepositDemand d;
+        if (!DecodeDepositPayload(txC->vchDepositPayload, d)) { strFail = "Undecodable demand!"; return false; }
+        vchKey = d.vchHolderPubKey; vchPayout = d.vchPayoutScript; vchPreAuth = d.vchPreAuthSig;
+    } else if (txC->nDepositOp == DEPOSIT_OP_PROTEST) {
+        DepositProtest pr;
+        if (!DecodeDepositPayload(txC->vchDepositPayload, pr)) { strFail = "Undecodable protest!"; return false; }
+        vchKey = pr.vchHolderPubKey; vchPayout = pr.vchPayoutScript; vchPreAuth = pr.vchPreAuthSig;
+    } else { strFail = "That transaction is not a deposit demand or protest!"; return false; }
+    if (HouseFailFastEnabled() && HouseStateChangePending(coin.nHouseID)) {
+        strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
+    }
+    CHouse house;
+    if (!phousetree->GetHouse(coin.nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    const int nNext = chainActive.Height() + 1;
+    const char chEff = HouseEffectiveStatus(house, nNext);
+    if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED) {
+        strFail = "A demanded deposit is paid while the house is open or stressed (suspended: it waits; insolvent: claimdeposit)!";
+        return false;
+    }
+    // WITHDRAW's floor, paid at a height a margin ahead (a later confirmation still clears it - the per-block clock).
+    static const uint32_t DISCHARGE_CONFIRM_MARGIN = 12;
+    const uint32_t nPayHeight = (uint32_t)nNext + DISCHARGE_CONFIRM_MARGIN;
+    const uint32_t nBlocks = nPayHeight > coin.nDepositOriginationHeight ? nPayHeight - coin.nDepositOriginationHeight : 0;
+    amountPaidOut = (CAmount)coin.nDepositPrincipal + DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps);
+
+    DepositDischarge dc;
+    dc.nHouseID = coin.nHouseID;
+    dc.vchHolderPubKey = vchKey;
+    dc.vchPayoutScript = vchPayout;
+    dc.vchPreAuthSig = vchPreAuth;
+    dc.nPrevProtestOpen = house.nProtestOpen;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
+    mtx.nDepositOp = DEPOSIT_OP_DISCHARGE;
+    mtx.vin.push_back(CTxIn(out, CScript()));   // custody: no scriptSig
+    mtx.vout.push_back(CTxOut(amountPaidOut, CScript(vchPayout.begin(), vchPayout.end())));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << dc;
+    mtx.vchDepositPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return FundSignCommitDepositOp(strFail, txidOut, mtx, coin.out.nValue, amountPaidOut, nFee, false, CScript());
+}
+
 bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee)
 {
     strFail = "Unknown error!";
@@ -6310,7 +6585,7 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     }
 
     WalletDepositCoin dc;
-    if (!SelectDepositReceipt(this, nHouseID, nPrincipal, false, nNextHeight, dc)) {
+    if (!SelectDepositReceipt(this, nHouseID, nPrincipal, false, nNextHeight, dc, true /* v0.2.29: demanded too */)) {
         strFail = "No receipt of that house and principal is held by this wallet!"; return false;
     }
     CKey keyHolder;
@@ -6411,11 +6686,14 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     const CTransaction txToSign = mtx;
-    SignatureData sigReceipt;
-    if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, 0, DEPOSIT_DUST_VALUE, SIGHASH_ALL), dc.script, sigReceipt)) {
-        strFail = "Signing the claimed receipt failed!"; return false;
+    // A demanded receipt (v0.2.29) sits on the custody script: no scriptSig - the payload signature is its authority.
+    if (dc.nDemandTag == 0) {
+        SignatureData sigReceipt;
+        if (!ProduceSignature(TransactionSignatureCreator(this, &txToSign, 0, DEPOSIT_DUST_VALUE, SIGHASH_ALL), dc.script, sigReceipt)) {
+            strFail = "Signing the claimed receipt failed!"; return false;
+        }
+        UpdateTransaction(mtx, 0, sigReceipt);
     }
-    UpdateTransaction(mtx, 0, sigReceipt);
     int nIn = 1 + (int)vEscrowSpend.size();
     for (const auto& coin : setCoins) {
         SignatureData sigdata;
@@ -6608,7 +6886,8 @@ static bool HouseStateChangePending(uint32_t nHouseID)
             memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); fMatch = true;
         } else if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
                 (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
-                 mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+                 mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
+             mtx.nDepositOp == DEPOSIT_OP_DISCHARGE) && mtx.vchDepositPayload.size() >= 4) {
             memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4); fMatch = true;
         } else if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.nPoolOp == POOL_OP_RETIRE &&
                 mtx.vchPoolPayload.size() >= 4) {

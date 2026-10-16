@@ -335,6 +335,11 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     // receipt (ORIGINATE spends no receipts).
     CScript expectedDepositScript;
     bool fHaveExpectedDeposit = false;
+    // v0.2.29: a DEMANDED receipt sits on the B3 custody script of the same holder key (tag-aware pin, as for notes).
+    std::vector<unsigned char> vchDepositHolderKey;
+    bool fDepositDemandOp = false, fDepositProtestOp = false;
+    DepositDemand depositDemand;
+    DepositProtest depositProtest;
     if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION) {
         if (tx.nDepositOp == DEPOSIT_OP_TRANSFER) {
             DepositTransfer x;
@@ -344,7 +349,16 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (DecodeDepositPayload(tx.vchDepositPayload, w)) { expectedDepositScript = DepositScriptForPubKey(w.vchHolderPubKey); fHaveExpectedDeposit = true; }
         } else if (tx.nDepositOp == DEPOSIT_OP_CLAIM) {
             DepositClaim c;
-            if (DecodeDepositPayload(tx.vchDepositPayload, c)) { expectedDepositScript = DepositScriptForPubKey(c.vchHolderPubKey); fHaveExpectedDeposit = true; }
+            if (DecodeDepositPayload(tx.vchDepositPayload, c)) { expectedDepositScript = DepositScriptForPubKey(c.vchHolderPubKey); vchDepositHolderKey = c.vchHolderPubKey; fHaveExpectedDeposit = true; }
+        } else if (tx.nDepositOp == DEPOSIT_OP_DEMAND) {
+            DepositDemand d;
+            if (DecodeDepositPayload(tx.vchDepositPayload, d)) { expectedDepositScript = DepositScriptForPubKey(d.vchHolderPubKey); vchDepositHolderKey = d.vchHolderPubKey; fHaveExpectedDeposit = true; fDepositDemandOp = true; depositDemand = d; }
+        } else if (tx.nDepositOp == DEPOSIT_OP_PROTEST) {
+            DepositProtest pr;
+            if (DecodeDepositPayload(tx.vchDepositPayload, pr)) { expectedDepositScript = DepositScriptForPubKey(pr.vchHolderPubKey); vchDepositHolderKey = pr.vchHolderPubKey; fHaveExpectedDeposit = true; fDepositProtestOp = true; depositProtest = pr; }
+        } else if (tx.nDepositOp == DEPOSIT_OP_DISCHARGE) {
+            DepositDischarge dc;
+            if (DecodeDepositPayload(tx.vchDepositPayload, dc)) { expectedDepositScript = DepositScriptForPubKey(dc.vchHolderPubKey); vchDepositHolderKey = dc.vchHolderPubKey; fHaveExpectedDeposit = true; }
         }
     }
 
@@ -796,12 +810,35 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         if (coin.fDeposit) {
             if (tx.nVersion != TRANSACTION_DEPOSIT_VERSION ||
                     (tx.nDepositOp != DEPOSIT_OP_TRANSFER && tx.nDepositOp != DEPOSIT_OP_WITHDRAW &&
-                     tx.nDepositOp != DEPOSIT_OP_CLAIM))
+                     tx.nDepositOp != DEPOSIT_OP_CLAIM && tx.nDepositOp != DEPOSIT_OP_DEMAND &&
+                     tx.nDepositOp != DEPOSIT_OP_PROTEST && tx.nDepositOp != DEPOSIT_OP_DISCHARGE))
                 return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-deposit-coin");
             if (nDepositHouseIn != 0 && coin.nHouseID != nDepositHouseIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-inputs-mixed-house");
-            if (fHaveExpectedDeposit && coin.out.scriptPubKey != expectedDepositScript)
+            // v0.2.29: which receipts each op may take. A demanded receipt (on custody) leaves only by PROTEST,
+            // DISCHARGE or an insolvency CLAIM; a plain one never by those first two; DEMAND takes a plain one.
+            const bool fDemanded = coin.nDemandHeight != 0;
+            if (fDemanded && (tx.nDepositOp == DEPOSIT_OP_TRANSFER || tx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
+                              tx.nDepositOp == DEPOSIT_OP_DEMAND))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demanded");
+            if (!fDemanded && (tx.nDepositOp == DEPOSIT_OP_PROTEST || tx.nDepositOp == DEPOSIT_OP_DISCHARGE))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-not-demanded");
+            // Tag-aware holder pin: a demanded receipt on the custody script of the SAME key, any other on its P2PKH.
+            if (fHaveExpectedDeposit && coin.out.scriptPubKey !=
+                    (fDemanded ? NotePreAuthScript(vchDepositHolderKey) : expectedDepositScript))
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-input-not-holder");
+            // The payload's terms (and, for PROTEST, the spent tag) are what AddCoins re-tags from: pinned here.
+            if (fDepositDemandOp && (coin.nHouseID != depositDemand.nHouseID ||
+                    coin.nDepositPrincipal != depositDemand.nPrincipal || coin.nDepositRateBps != depositDemand.nRateBps ||
+                    coin.nDepositMaturityHeight != depositDemand.nMaturityHeight ||
+                    coin.nDepositOriginationHeight != depositDemand.nOriginationHeight))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-terms-mismatch");
+            if (fDepositProtestOp && (coin.nHouseID != depositProtest.nHouseID ||
+                    coin.nDepositPrincipal != depositProtest.nPrincipal || coin.nDepositRateBps != depositProtest.nRateBps ||
+                    coin.nDepositMaturityHeight != depositProtest.nMaturityHeight ||
+                    coin.nDepositOriginationHeight != depositProtest.nOriginationHeight ||
+                    coin.nDemandHeight != depositProtest.nDemandTag))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-terms-mismatch");
             nDepositHouseIn = coin.nHouseID;
             nDepositIn++;
         }
@@ -1228,6 +1265,25 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nDepositIn != 1)
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-withdraw-inputs");
             if (w.nHouseID != nDepositHouseIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-input-house-mismatch");
+            if (nHouseEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-op-spends-escrow");
+        }
+        else if (tx.nDepositOp == DEPOSIT_OP_DEMAND || tx.nDepositOp == DEPOSIT_OP_PROTEST ||
+                 tx.nDepositOp == DEPOSIT_OP_DISCHARGE) {
+            // v0.2.29: exactly one receipt (the pins above applied to it), never escrow; the payload's house is its.
+            uint32_t nPayloadHouse = 0;
+            if (tx.nDepositOp == DEPOSIT_OP_DEMAND && fDepositDemandOp) nPayloadHouse = depositDemand.nHouseID;
+            else if (tx.nDepositOp == DEPOSIT_OP_PROTEST && fDepositProtestOp) nPayloadHouse = depositProtest.nHouseID;
+            else {
+                DepositDischarge dc;
+                if (DecodeDepositPayload(tx.vchDepositPayload, dc)) nPayloadHouse = dc.nHouseID;
+            }
+            if (nPayloadHouse == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-payload");
+            if (nDepositIn != 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-inputs");
+            if (nPayloadHouse != nDepositHouseIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-input-house-mismatch");
             if (nHouseEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-op-spends-escrow");

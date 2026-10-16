@@ -11,6 +11,7 @@
 #include <pool.h>
 #include <settle.h>
 #include <note.h>
+#include <deposit.h>
 #include <token.h>
 #include <cashu.h>
 #include <bmmcache.h>
@@ -5408,6 +5409,160 @@ UniValue transferdeposit(const JSONRPCRequest& request)
     return response;
 }
 
+UniValue demanddeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
+        throw std::runtime_error(
+            "demanddeposit id principal ( \"address\" fee )\n"
+            "\nDemand payment of a MATURED deposit receipt this wallet holds (v0.2.29): the receipt moves into custody\n"
+            "with a pre-authorized payout, so the house can pay it alone (dischargedeposit). Unpaid for a week\n"
+            "(nDemandWindow blocks), you may protest it (protestdeposit), which puts the house under stress.\n"
+            "While the house is open or stressed only.\n"
+            "\nArguments:\n"
+            "1. id         (numeric, required) the house\n"
+            "2. principal  (numeric, required) the receipt's principal, in sats\n"
+            "3. address    (string, optional) where the house must pay; default: the receipt's own key\n"
+            "4. fee        (numeric, optional) default 0.001\n"
+            "\nResult: { \"txid\": \"hex\" }   (keep it: protestdeposit / dischargedeposit take it)\n"
+            + HelpExampleCli("demanddeposit", "1 1000000"));
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const int64_t nPrincipal = request.params[1].get_int64();
+    if (nPrincipal <= 0 || nPrincipal > MAX_MONEY)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid principal");
+    CScript scriptPayout;
+    if (request.params.size() >= 3 && !request.params[2].isNull() && !request.params[2].get_str().empty()) {
+        const CTxDestination dest = DecodeDestination(request.params[2].get_str());
+        if (!IsValidDestination(dest))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+        scriptPayout = GetScriptForDestination(dest);
+    }
+    CAmount nFee = 100000;
+    if (request.params.size() >= 4 && !request.params[3].isNull())
+        nFee = AmountFromValue(request.params[3]);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->DemandDeposit(strFail, txid, nHouseID, (uint64_t)nPrincipal, scriptPayout, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("txid", txid.ToString());
+    return r;
+}
+
+UniValue protestdeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "protestdeposit \"txid\" ( fee )\n"
+            "\nProtest an unpaid deposit demand (v0.2.29), from nDemandWindow blocks after it: the house becomes\n"
+            "stressed, and insolvent after the stress window unless it pays or suspends.\n"
+            "\nArguments:\n"
+            "1. txid  (string, required) the demanddeposit transaction\n"
+            "2. fee   (numeric, optional) default 0.001\n"
+            "\nResult: { \"txid\": \"hex\" }\n"
+            + HelpExampleCli("protestdeposit", "\"txid\""));
+    ObserveSafeMode();
+    const uint256 txidCustody = ParseHashV(request.params[0], "txid");
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2 && !request.params[1].isNull())
+        nFee = AmountFromValue(request.params[1]);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->ProtestDeposit(strFail, txid, txidCustody, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("txid", txid.ToString());
+    return r;
+}
+
+UniValue dischargedeposit(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "dischargedeposit \"txid\" ( fee )\n"
+            "\nPay a demanded deposit receipt to its pre-authorized payout (v0.2.29): principal plus interest at its own\n"
+            "rate, funded from this wallet - the house's, normally. Paying a protested one lifts its protest.\n"
+            "While the house is open or stressed only.\n"
+            "\nArguments:\n"
+            "1. txid  (string, required) the transaction whose vout 0 is the demanded receipt (its demanddeposit, or\n"
+            "         its protestdeposit once protested)\n"
+            "2. fee   (numeric, optional) default 0.001\n"
+            "\nResult: { \"txid\": \"hex\", \"paid\": x.xxx }\n"
+            + HelpExampleCli("dischargedeposit", "\"txid\""));
+    ObserveSafeMode();
+    const uint256 txidCustody = ParseHashV(request.params[0], "txid");
+    CAmount nFee = 100000;
+    if (request.params.size() >= 2 && !request.params[1].isNull())
+        nFee = AmountFromValue(request.params[1]);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    CAmount amountPaid = 0;
+    std::string strFail;
+    if (!pwallet->DischargeDeposit(strFail, txid, amountPaid, txidCustody, nFee))
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("txid", txid.ToString());
+    r.pushKV("paid", ValueFromAmount(amountPaid));
+    return r;
+}
+
+UniValue listdepositdemands(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "listdepositdemands id\n"
+            "\nThe deposit receipts savers have DEMANDED payment of at house `id` (v0.2.29), read from the UTXO set - so\n"
+            "a house learns of every demand without being told. Pay each with dischargedeposit <txid> before\n"
+            "protest_opens_at, or the saver may protest and the house becomes stressed.\n"
+            "\nResult: [ { \"txid\", \"principal\", \"rate_bps\", \"maturity\", \"demand_height\", \"protested\",\n"
+            "            \"protest_opens_at\", \"due_now\" }, ... ]\n"
+            + HelpExampleCli("listdepositdemands", "1"));
+    const uint32_t nHouseID = request.params[0].get_int();
+    FlushStateToDisk();
+    LOCK(cs_main);
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown house");
+    const uint32_t nNext = (uint32_t)chainActive.Height() + 1;
+    UniValue arr(UniValue::VARR);
+    std::unique_ptr<CCoinsViewCursor> pcursor(pcoinsdbview->Cursor());
+    while (pcursor && pcursor->Valid()) {
+        COutPoint key;
+        Coin coin;
+        if (pcursor->GetKey(key) && pcursor->GetValue(coin) && !coin.IsSpent() && coin.fDeposit &&
+                coin.nHouseID == nHouseID && NoteDemandIsPreAuth(coin.nDemandHeight) && !mempool.isSpent(key)) {
+            const uint32_t nDemandH = NoteDemandHeightOf(coin.nDemandHeight);
+            const uint32_t nBlocks = nNext > coin.nDepositOriginationHeight ? nNext - coin.nDepositOriginationHeight : 0;
+            UniValue o(UniValue::VOBJ);
+            o.pushKV("txid", key.hash.GetHex());
+            o.pushKV("vout", (int)key.n);
+            o.pushKV("principal", (uint64_t)coin.nDepositPrincipal);
+            o.pushKV("rate_bps", (uint64_t)coin.nDepositRateBps);
+            o.pushKV("maturity", (uint64_t)coin.nDepositMaturityHeight);
+            o.pushKV("demand_height", (uint64_t)nDemandH);
+            o.pushKV("protested", NoteDemandIsProtested(coin.nDemandHeight));
+            o.pushKV("protest_opens_at", (uint64_t)(std::max(nDemandH, house.nDeferEndedHeight) +
+                                                    Params().GetConsensus().nDemandWindow));
+            o.pushKV("due_now", ValueFromAmount((CAmount)coin.nDepositPrincipal +
+                     DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps)));
+            arr.push_back(o);
+        }
+        pcursor->Next();
+    }
+    return arr;
+}
+
 UniValue withdrawdeposit(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -7037,6 +7192,9 @@ UniValue retirebill(const JSONRPCRequest& request)
             "the face lands on the owning house's pinned custody key. The bill leaves\n"
             "that house's loan book as it retires. With \"notes\" it is op 9 (v0.2.27):\n"
             "the notes burned leave the house's notes outstanding too.\n"
+            "\nOnce that house is suspended or insolvent (v0.2.28) it is op 10 instead:\n"
+            "the face goes into the HOUSE'S ESCROW, where its noteholders and savers\n"
+            "can reach it, never to the custody key (\"notes\" still burns its notes).\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nResult:\n"
             "{\n"
@@ -7104,6 +7262,8 @@ UniValue claimbillescrow(const JSONRPCRequest& request)
             "form (op 8), whose authority is the owning house's M-of-N QUORUM rather\n"
             "than the single custody key - so run it from the HOUSE's wallet, and the\n"
             "proceeds go to that house's custody key.\n"
+            "\nOnce that house is suspended or insolvent (v0.2.28) it is op 11 instead:\n"
+            "ANYONE may run it, and the bond goes into the house's escrow.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("claimbillescrow", "1")
@@ -8086,6 +8246,10 @@ static const CRPCCommand commands[] =
     { "deposits",           "originatedeposit",                 &originatedeposit,              {"id", "principal", "ratebps", "maturity", "fee", "address"} },
     { "deposits",           "transferdeposit",                  &transferdeposit,               {"id", "principal", "fee", "address"} },
     { "deposits",           "withdrawdeposit",                  &withdrawdeposit,               {"id", "principal", "fee"} },
+    { "deposits",           "demanddeposit",                    &demanddeposit,                 {"id", "principal", "address", "fee"} },
+    { "deposits",           "protestdeposit",                   &protestdeposit,                {"txid", "fee"} },
+    { "deposits",           "dischargedeposit",                 &dischargedeposit,              {"txid", "fee"} },
+    { "deposits",           "listdepositdemands",               &listdepositdemands,            {"id"} },
     { "deposits",           "claimdeposit",                     &claimdeposit,                  {"id", "principal", "fee"} },
 
     { "pools",              "createpool",                       &createpool,                    {"id", "noteunits", "btxsats", "feebps", "fee"} },

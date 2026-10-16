@@ -962,7 +962,8 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     }
     if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
             (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
-             mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+             mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
+             mtx.nDepositOp == DEPOSIT_OP_DISCHARGE) && mtx.vchDepositPayload.size() >= 4) {
         memcpy(&nA, mtx.vchDepositPayload.data(), 4);
         return nA != 0;
     }
@@ -2049,10 +2050,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     if (nTheirs == nHouseIDNewLE)
                         return state.DoS(0, false, REJECT_DUPLICATE, "house-op-in-mempool");
                 }
-                // Or a pending deposit ORIGINATE/WITHDRAW/CLAIM for the same house.
+                // Or a pending deposit ORIGINATE/WITHDRAW/CLAIM/PROTEST/DISCHARGE for the same house - or a v0.2.29 deposit DEMAND,
+                // which is house-state-neutral but status-dependent (the note DEMAND rule).
                 else if (!fIncomingRegister && mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
                         (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
-                         mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+                         mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
+             mtx.nDepositOp == DEPOSIT_OP_DISCHARGE ||
+                         mtx.nDepositOp == DEPOSIT_OP_DEMAND) && mtx.vchDepositPayload.size() >= 4) {
                     uint32_t nTheirs = 0;
                     memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4); // nHouseID leads every deposit payload
                     if (nTheirs == nHouseIDNewLE)
@@ -2176,7 +2180,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     // changes house state (the D accounting) - one op per block.
                     else if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
                             (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
-                             mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+                             mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
+             mtx.nDepositOp == DEPOSIT_OP_DISCHARGE) && mtx.vchDepositPayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4);
                         if (nTheirs == nHouseTouched)
@@ -2230,6 +2235,18 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             if (!CheckDepositOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, houseResult, fHouseChanged))
                 return error("%s: CheckDepositOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
+            // v0.2.29: an incoming deposit DEMAND is house-state-neutral but STATUS-dependent - a pooled op on its
+            // house that could change the status (a DEFER, a protest) must not share its template. One waits a block.
+            if (!fHouseChanged && tx.nDepositOp == DEPOSIT_OP_DEMAND && tx.vchDepositPayload.size() >= 4) {
+                uint32_t nHouseDemanded = 0;
+                memcpy(&nHouseDemanded, tx.vchDepositPayload.data(), 4);
+                for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                    std::vector<uint32_t> vTheirs;
+                    if (GetHouseSlotSet(mi->GetTx(), vTheirs) &&
+                            std::find(vTheirs.begin(), vTheirs.end(), nHouseDemanded) != vTheirs.end())
+                        return state.DoS(0, false, REJECT_DUPLICATE, "deposit-demand-house-op-in-mempool");
+                }
+            }
             if (fHouseChanged) {
                 const uint32_t nHouseTouched = houseResult.nHouseID;
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
@@ -2238,7 +2255,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     bool fTheirsHouseChanging = false;
                     if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
                             (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
-                             mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+                             mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
+             mtx.nDepositOp == DEPOSIT_OP_DISCHARGE) && mtx.vchDepositPayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4);
                         fTheirsHouseChanging = true;
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
@@ -2320,7 +2338,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         fTheirsHouseChanging = true;
                     } else if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
                             (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
-                             mtx.nDepositOp == DEPOSIT_OP_CLAIM) && mtx.vchDepositPayload.size() >= 4) {
+                             mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
+             mtx.nDepositOp == DEPOSIT_OP_DISCHARGE) && mtx.vchDepositPayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4);
                         fTheirsHouseChanging = true;
                     }
@@ -6010,6 +6029,14 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
  * carries the house with its updated deposit accounting and fHouseChanged is true
  * (the caller stages it under the one-house-state-change-per-house-per-block
  * rule); TRANSFER changes no house state (fHouseChanged=false). */
+/** v0.2.29: the consensus-locked script families - never a payout destination (each is open at the script layer and
+ * protected only by its coin tag, so a payment to one would be an untagged, anyone-can-spend coin). */
+static bool IsLockedScriptFamily(const CScript& script)
+{
+    return IsHouseEscrowScript(script) || IsBillEscrowScript(script) || IsMutualFundScript(script) ||
+           IsNotePreAuthScript(script) || IsPoolEscrowScript(script) || IsOracleBondScript(script);
+}
+
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                            const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                            const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
@@ -6189,6 +6216,138 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         house.nDepositUnits -= receipt.nDepositPrincipal;
         house.SetDepositWtMaturity(house.DepositWtMaturity() -
             (unsigned __int128)receipt.nDepositPrincipal * (unsigned __int128)receipt.nDepositMaturityHeight);
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    // v0.2.29 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md D, signed off 2026-10-16): a saver can force payment at
+    // maturity - the notes' B3 demand/protest, for deposits. tx_verify already pinned the one receipt input (plain for
+    // DEMAND, demanded for PROTEST / DISCHARGE) to the payload's holder key and, for DEMAND / PROTEST, its terms.
+    if (tx.nDepositOp == DEPOSIT_OP_DEMAND) {
+        DepositDemand d;
+        if (!DecodeDepositPayload(tx.vchDepositPayload, d))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payload");
+        CHouse house;
+        if (!fnGetHouse(d.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-unknown-house");
+        // While the house is Open or Stressed - where it could pay. Suspended, its savers queue behind its noteholders;
+        // insolvent, they claim.
+        const char chEff = HouseEffectiveStatus(house, nHeight);
+        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-house-status");
+        if (nHeight < 0 || (uint32_t)nHeight < d.nMaturityHeight)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-early");
+        // The payout must be a real destination, never one of the consensus-locked script families.
+        if (IsLockedScriptFamily(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payout-script");
+        // Into custody, same holder: the house can pay it alone from now on.
+        if (tx.vout[0].scriptPubKey != NotePreAuthScript(d.vchHolderPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-custody-script");
+        if (!CPubKey(d.vchHolderPubKey).VerifyStrict(
+                DepositPreAuthSigHash(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight, d.nOriginationHeight,
+                                      d.vchPayoutScript), d.vchPreAuthSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-preauth-sig");
+        // No house state: the demand lives on the coin, and takes no house slot (a willing house can clear any
+        // number of demands). It is status-dependent, so the mempool keeps it apart from a pooled op on its house
+        // that could change the status (the note DEMAND rule, in AcceptToMemoryPool).
+        return true;
+    }
+
+    if (tx.nDepositOp == DEPOSIT_OP_PROTEST) {
+        DepositProtest pr;
+        if (!DecodeDepositPayload(tx.vchDepositPayload, pr))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-payload");
+        CHouse house;
+        if (!fnGetHouse(pr.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-unknown-house");
+        // As a note protest: at Open or Stressed (while suspended, the clause governs).
+        const char chEff = HouseEffectiveStatus(house, nHeight);
+        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-house-status");
+        // A week after the demand - restarted by a recovery from suspension, so a window that ran while the house was
+        // suspended (and could not pay) never counts.
+        const uint32_t nDemandH = NoteDemandHeightOf(pr.nDemandTag);
+        // A confirmed demand always carries its height (the mempool view's tag does not): never protest without one.
+        if (nDemandH == 0)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-no-demand-height");
+        const uint32_t nWindowStart = std::max(nDemandH, house.nDeferEndedHeight);
+        if ((int64_t)nHeight < (int64_t)nWindowStart + (int64_t)Params().GetConsensus().nDemandWindow)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-early");
+        if (pr.nPrevProtestOpen != house.nProtestOpen || pr.nPrevProtestHeight != house.nProtestHeight ||
+                pr.nPrevProtestDemandHeight != house.nProtestDemandHeight)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-prior");   // stale state, not malice
+        if (!CPubKey(pr.vchHolderPubKey).VerifyStrict(
+                DepositProtestSigHash(pr.nHouseID, pr.nPrincipal, pr.nOriginationHeight, pr.nDemandTag, hashOutputs),
+                pr.vchHolderSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-sig");
+        if (IsLockedScriptFamily(CScript(pr.vchPayoutScript.begin(), pr.vchPayoutScript.end())))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-payout-script");
+        // The standing authorization, re-stated: whoever later pays reads it from this transaction.
+        if (!CPubKey(pr.vchHolderPubKey).VerifyStrict(
+                DepositPreAuthSigHash(pr.nHouseID, pr.nPrincipal, pr.nRateBps, pr.nMaturityHeight, pr.nOriginationHeight,
+                                      pr.vchPayoutScript), pr.vchPreAuthSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-preauth-sig");
+        if (tx.vout[0].scriptPubKey != NotePreAuthScript(pr.vchHolderPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-custody-script");
+        // Effects: exactly a note protest's (one marked coin) - the house is Stressed from here (HouseStressOrigin).
+        const bool fFreshEpisode = house.nProtestOpen == 0;
+        house.nProtestOpen += 1;
+        if (fFreshEpisode || (uint32_t)nHeight < house.nProtestHeight)
+            house.nProtestHeight = (uint32_t)nHeight;
+        if (fFreshEpisode || nDemandH < house.nProtestDemandHeight)
+            house.nProtestDemandHeight = nDemandH;
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
+    if (tx.nDepositOp == DEPOSIT_OP_DISCHARGE) {
+        DepositDischarge dc;
+        if (!DecodeDepositPayload(tx.vchDepositPayload, dc))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-payload");
+        CHouse house;
+        if (!fnGetHouse(dc.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-unknown-house");
+        // Open or Stressed only: while suspended, deposits stay junior to the noteholders the house has stopped paying.
+        const char chEff = HouseEffectiveStatus(house, nHeight);
+        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-discharge-house-status");
+        Coin receipt;
+        bool fFound = false;
+        for (const CTxIn& in : tx.vin) {
+            Coin c;
+            if (fnGetCoin(in.prevout, c) && c.fDeposit) { receipt = c; fFound = true; break; }
+        }
+        if (!fFound || !NoteDemandIsPreAuth(receipt.nDemandHeight))
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-discharge-no-receipt");   // e.g. unconfirmed, reorged
+        if (IsLockedScriptFamily(CScript(dc.vchPayoutScript.begin(), dc.vchPayoutScript.end())))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-payout-script");
+        // The holder's standing authorization, made at DEMAND, re-verified against the receipt's own terms.
+        if (!CPubKey(dc.vchHolderPubKey).VerifyStrict(
+                DepositPreAuthSigHash(dc.nHouseID, receipt.nDepositPrincipal, receipt.nDepositRateBps,
+                                      receipt.nDepositMaturityHeight, receipt.nDepositOriginationHeight,
+                                      dc.vchPayoutScript), dc.vchPreAuthSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-preauth-sig");
+        // WITHDRAW's floor: principal + interest at the receipt's own rate on one continuous clock from origination.
+        const uint32_t nBlocks = (uint32_t)nHeight > receipt.nDepositOriginationHeight
+                               ? (uint32_t)nHeight - receipt.nDepositOriginationHeight : 0;
+        const CAmount amountDue = (CAmount)receipt.nDepositPrincipal +
+                DepositMaturityInterest(receipt.nDepositPrincipal, nBlocks, receipt.nDepositRateBps);
+        const CScript scriptPayout(dc.vchPayoutScript.begin(), dc.vchPayoutScript.end());
+        if (tx.vout.empty() || tx.vout[0].scriptPubKey != scriptPayout || tx.vout[0].nValue < amountDue)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-discharge-underpaid");   // the floor rises each block
+        if (dc.nPrevProtestOpen != house.nProtestOpen)
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-discharge-prior");   // stale state, not malice
+        if (house.nDepositUnits < receipt.nDepositPrincipal)
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-accounting");
+        house.nDepositUnits -= receipt.nDepositPrincipal;
+        house.SetDepositWtMaturity(house.DepositWtMaturity() -
+            (unsigned __int128)receipt.nDepositPrincipal * (unsigned __int128)receipt.nDepositMaturityHeight);
+        // A protested receipt paid: one fewer open protest (the exact inverse of its PROTEST).
+        // (Clamped, as the note REDEEM clamps: the counts are exact, so 0 here is unreachable - and must never brick.)
+        if (NoteDemandIsProtested(receipt.nDemandHeight) && house.nProtestOpen > 0)
+            house.nProtestOpen -= 1;
         houseOut = house;
         fHouseChanged = true;
         return true;
@@ -8011,6 +8170,50 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.SetDepositWtMaturity(house.DepositWtMaturity() + (unsigned __int128)p * (unsigned __int128)m);
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write deposit withdraw undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            // v0.2.29 PROTEST: the protest counter and heights back to the payload's priors (the note protest's undo).
+            else if (tx.nDepositOp == DEPOSIT_OP_PROTEST) {
+                DepositProtest pr;
+                CHouse house;
+                if (!DecodeDepositPayload(tx.vchDepositPayload, pr) || !phousetree->GetHouse(pr.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo deposit protest!");
+                    return DISCONNECT_FAILED;
+                }
+                house.nProtestOpen = pr.nPrevProtestOpen;
+                house.nProtestHeight = pr.nPrevProtestHeight;
+                house.nProtestDemandHeight = pr.nPrevProtestDemandHeight;
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write deposit protest undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            // v0.2.29 DISCHARGE: WITHDRAW's inverse (D back from the burned receipt's undo Coin) plus the protest
+            // count back to its prior.
+            else if (tx.nDepositOp == DEPOSIT_OP_DISCHARGE) {
+                DepositDischarge dc;
+                CHouse house;
+                if (!DecodeDepositPayload(tx.vchDepositPayload, dc) || !phousetree->GetHouse(dc.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo deposit discharge!");
+                    return DISCONNECT_FAILED;
+                }
+                uint64_t p = 0; uint32_t m = 0; bool fFound = false;
+                if (i > 0) {
+                    const CTxUndo& txundoDep = blockUndo.vtxundo[i - 1];
+                    for (const Coin& c : txundoDep.vprevout) {
+                        if (c.fDeposit) { p = c.nDepositPrincipal; m = c.nDepositMaturityHeight; fFound = true; break; }
+                    }
+                }
+                if (!fFound || p == 0 || house.nDepositUnits > (uint64_t)MAX_MONEY - p) {
+                    error("DisconnectBlock(): deposit discharge undo receipt missing!");
+                    return DISCONNECT_FAILED;
+                }
+                house.nDepositUnits += p;
+                house.SetDepositWtMaturity(house.DepositWtMaturity() + (unsigned __int128)p * (unsigned __int128)m);
+                house.nProtestOpen = dc.nPrevProtestOpen;
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write deposit discharge undo!");
                     return DISCONNECT_FAILED;
                 }
             }

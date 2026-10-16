@@ -10,6 +10,7 @@
 #include <bill.h>
 #include <house.h>
 #include <note.h>
+#include <deposit.h>
 
 #include <consensus/validation.h>
 #include <validation.h>
@@ -130,6 +131,12 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
                 o == 1 && IsBillEscrowScript(txout.scriptPubKey))
             continue;
 
+        // v0.2.29: a deposit DEMAND / PROTEST re-issues the receipt onto the B3 custody script at vout[0]
+        if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION && o == 0 &&
+                (tx.nDepositOp == DEPOSIT_OP_DEMAND || tx.nDepositOp == DEPOSIT_OP_PROTEST) &&
+                IsNotePreAuthScript(txout.scriptPubKey))
+            continue;
+
         // v0.2.28: ops 10/11 pay a house-held bill's money into the house's escrow at vout[0] (consensus pins it)
         if (tx.nVersion == TRANSACTION_BILL_VERSION && o == 0 &&
                 (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) &&
@@ -200,6 +207,10 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 
         // House pledge prevouts likewise (RECLAIM spends them)
         if (tx.nVersion == TRANSACTION_HOUSE_VERSION && coin.fHouseEscrow)
+            continue;
+
+        // v0.2.29: a demanded deposit receipt in B3 custody (PROTEST / DISCHARGE / CLAIM spend it, scriptSig empty)
+        if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION && coin.fDeposit && coin.nDemandHeight != 0)
             continue;
 
         // B3 consensus-custody prevouts (pre-auth demanded notes): spent by

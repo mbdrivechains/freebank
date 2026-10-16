@@ -46,6 +46,13 @@ static const uint8_t DEPOSIT_OP_ORIGINATE = 1;   // house issues receipt(s) (bat
 static const uint8_t DEPOSIT_OP_TRANSFER  = 2;   // holder reassigns a whole receipt
 static const uint8_t DEPOSIT_OP_WITHDRAW  = 3;   // holder takes principal + accrued at maturity (Open)
 static const uint8_t DEPOSIT_OP_CLAIM     = 4;   // holder takes the subordinated pro-rata at Insolvent
+// v0.2.29 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md D, signed off 2026-10-16): a saver can force payment at
+// maturity, mirroring the notes' B3 demand/protest. The receipt moves onto the B3 custody script (NotePreAuthScript of
+// the holder key) with the pre-auth bit in nDemandHeight, so the house can pay it ALONE to the payout script the holder
+// pre-authorized; unpaid a week later, the holder protests and the house is Stressed.
+static const uint8_t DEPOSIT_OP_DEMAND    = 5;   // holder: matured receipt into custody + pre-authorized payout (Open/Stressed)
+static const uint8_t DEPOSIT_OP_PROTEST   = 6;   // holder: unpaid nDemandWindow after the demand -> the house is Stressed
+static const uint8_t DEPOSIT_OP_DISCHARGE = 7;   // anyone: pays a demanded receipt to its payout script (Open/Stressed)
 
 // Dust base-value each receipt UTXO carries (it holds the claim, not value).
 static const CAmount DEPOSIT_DUST_VALUE = 1000;
@@ -179,6 +186,100 @@ struct DepositClaim {
 // Pure helpers (deposit.cpp)
 //
 
+/** DEMAND (v0.2.29): the receipt's terms ride in the payload (AddCoins tags the re-issued vout[0] from it alone;
+ * tx_verify pins them to the spent receipt). vout[0] = the receipt on NotePreAuthScript(holder), dust value. The
+ * pre-auth signature covers (house, terms, payout script) only - no transaction - so the house can reuse it to pay. */
+struct DepositDemand {
+    uint32_t nHouseID;                                    // LEADING
+    uint64_t nPrincipal;
+    uint32_t nRateBps;
+    uint32_t nMaturityHeight;
+    uint32_t nOriginationHeight;
+    std::vector<unsigned char> vchHolderPubKey;           // the receipt's P2PKH key; its keyid goes into the custody script
+    std::vector<unsigned char> vchPayoutScript;           // where the house must pay
+    std::vector<unsigned char> vchPreAuthSig;             // over DepositPreAuthSigHash
+
+    DepositDemand() : nHouseID(0), nPrincipal(0), nRateBps(0), nMaturityHeight(0), nOriginationHeight(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nPrincipal);
+        READWRITE(nRateBps);
+        READWRITE(nMaturityHeight);
+        READWRITE(nOriginationHeight);
+        READWRITE(vchHolderPubKey);
+        READWRITE(vchPayoutScript);
+        READWRITE(vchPreAuthSig);
+    }
+};
+
+/** PROTEST (v0.2.29): re-issues the demanded receipt (terms + the spent tag, pinned by tx_verify) with the protested
+ * bit; the house's protest count and heights move exactly as a note protest moves them (priors for the undo). */
+struct DepositProtest {
+    uint32_t nHouseID;                                    // LEADING (house slot)
+    uint64_t nPrincipal;
+    uint32_t nRateBps;
+    uint32_t nMaturityHeight;
+    uint32_t nOriginationHeight;
+    uint32_t nDemandTag;                                  // the spent receipt's tag (height + pre-auth bit)
+    std::vector<unsigned char> vchHolderPubKey;
+    uint32_t nPrevProtestOpen;
+    uint32_t nPrevProtestHeight;
+    uint32_t nPrevProtestDemandHeight;
+    std::vector<unsigned char> vchPayoutScript;           // the DEMAND's, re-stated (re-verified) so the receipt's
+    std::vector<unsigned char> vchPreAuthSig;             //   creating tx always carries what a DISCHARGE needs
+    std::vector<unsigned char> vchHolderSig;              // over DepositProtestSigHash
+
+    DepositProtest() : nHouseID(0), nPrincipal(0), nRateBps(0), nMaturityHeight(0), nOriginationHeight(0),
+                       nDemandTag(0), nPrevProtestOpen(0), nPrevProtestHeight(0), nPrevProtestDemandHeight(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nPrincipal);
+        READWRITE(nRateBps);
+        READWRITE(nMaturityHeight);
+        READWRITE(nOriginationHeight);
+        READWRITE(nDemandTag);
+        READWRITE(vchHolderPubKey);
+        READWRITE(nPrevProtestOpen);
+        READWRITE(nPrevProtestHeight);
+        READWRITE(nPrevProtestDemandHeight);
+        READWRITE(vchPayoutScript);
+        READWRITE(vchPreAuthSig);
+        READWRITE(vchHolderSig);
+    }
+};
+
+/** DISCHARGE (v0.2.29): anyone pays a demanded receipt to its pre-authorized payout script (vout[0]) at no less than
+ * principal + interest at its own rate from origination; the holder's pre-auth signature is re-verified. A protested
+ * receipt takes one off the house's protest count (prior for the undo). */
+struct DepositDischarge {
+    uint32_t nHouseID;                                    // LEADING (house slot)
+    std::vector<unsigned char> vchHolderPubKey;
+    std::vector<unsigned char> vchPayoutScript;
+    std::vector<unsigned char> vchPreAuthSig;
+    uint32_t nPrevProtestOpen;
+
+    DepositDischarge() : nHouseID(0), nPrevProtestOpen(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(vchHolderPubKey);
+        READWRITE(vchPayoutScript);
+        READWRITE(vchPreAuthSig);
+        READWRITE(nPrevProtestOpen);
+    }
+};
+
 /** Receipt UTXO lock: standard P2PKH to the holder. Deposit-ness is carried by
  * the coin tag (fDeposit + terms), never the script - so a transfer is an
  * ordinary key-spend and the tag propagates via the v14 op (notes/bills pattern). */
@@ -197,6 +298,12 @@ uint256 DepositTransferSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t 
 uint256 DepositWithdrawSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nMaturityHeight,
                                uint32_t nOriginationHeight, const uint256& hashOutputs);
 uint256 DepositClaimSigHash(uint32_t nHouseID, uint64_t nPrincipal, const uint256& hashOutputs);
+/** v0.2.29: the holder's standing authorization - (house, terms, payout script), no transaction, so a DISCHARGE built
+ * by anyone re-verifies it. */
+uint256 DepositPreAuthSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight,
+                              uint32_t nOriginationHeight, const std::vector<unsigned char>& vchPayoutScript);
+uint256 DepositProtestSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nOriginationHeight, uint32_t nDemandTag,
+                              const uint256& hashOutputs);
 
 /** Accrued interest on a matured receipt: principal held nBlocks at rateBps per
  * year, pro-rated by block (simple, not compounding). 128-bit intermediate

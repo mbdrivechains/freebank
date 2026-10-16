@@ -132,8 +132,17 @@ v0.2.23 lets a node restart on its own after a power cut,
 v0.2.24 tightens disk safety and peer scoring,
 v0.2.25 makes a new node's first start faster,
 v0.2.26 stops a note holder burning their own notes by mistake,
-v0.2.27 lets a borrower repay a house in its own notes, and
-v0.2.28 settles a failed house end to end:
+v0.2.27 lets a borrower repay a house in its own notes,
+v0.2.28 settles a failed house end to end, and
+v0.2.29 lets a saver force payment of a matured deposit:
+
+- **Deposit demand** (v0.2.29). **A consensus change on beta that only adds:** every block beta has today stays valid,
+  so upgrading is a binary swap with no `-reindex`, but a v0.2.28 node rejects the first block that uses it. A saver
+  holding a matured deposit can demand payment (`demanddeposit`): the receipt moves into custody with a
+  pre-authorized payout, so the house can pay it alone (`dischargedeposit`, at least principal plus interest; anyone
+  may pay it). Unpaid about a week after the demand, the saver can protest (`protestdeposit`): the house is then
+  Stressed, and fails unless it pays or suspends. A house lists the demands on it with `listdepositdemands`. Details
+  in the release notes.
 
 - **What happens when a house fails** (v0.2.28). **A consensus change on beta that only adds:** no beta house has ever
   been suspended or failed, so every block stays valid; upgrading is a binary swap with no `-reindex`, but a v0.2.27
@@ -388,7 +397,7 @@ v0.2.28 settles a failed house end to end:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-As of v0.2.28: 659 unit test cases and 74 integration gates, run on an eCash L1 (eCash's beta
+As of v0.2.29: 667 unit test cases and 75 integration gates, run on an eCash L1 (eCash's beta
 build on regtest with the L2L enforcer). All must pass to merge.
 
 ## Wallet (preview)

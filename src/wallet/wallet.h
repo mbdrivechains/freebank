@@ -1098,6 +1098,9 @@ public:
      * dispatch here - but members rather than file statics because they need
      * the private SelectCoins. */
     bool HouseHeldRetireBill(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
+    bool FundSignCommitDepositOp(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx,
+                                 const CAmount& amountReceiptIn, const CAmount& amountOutPinned, const CAmount& nFee,
+                                 bool fSignReceipt, const CScript& scriptReceipt);
     bool HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut, uint64_t& nUnitsBurnedOut,
                                     const CBill& bill, const CAmount& nFee, uint64_t nNoteUnits, bool fIntoEscrow = false);
     bool ClaimBillIntoHouseEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CHouse& house,
@@ -1214,6 +1217,14 @@ public:
     /** At/after maturity and while the house is Open, burn a matured receipt
      * (house, nPrincipal) for principal + accrued interest (consensus floor). */
     bool WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
+    /** v0.2.29 (FAILED_HOUSE_DESIGN.md D): a saver forces payment at maturity. DEMAND moves a matured receipt into
+     *  custody with a pre-authorized payout (default: the holder's own key); PROTEST, from the holder after the window;
+     *  DISCHARGE, from anyone (the house, normally) - txidCustody is the tx whose vout 0 is the custody receipt. */
+    bool DemandDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal,
+                       const CScript& scriptPayout, const CAmount& nFee);
+    bool ProtestDeposit(std::string& strFail, uint256& txidOut, const uint256& txidCustody, const CAmount& nFee);
+    bool DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& amountPaidOut, const uint256& txidCustody,
+                          const CAmount& nFee);
     /** At insolvency, burn a receipt (house, nPrincipal) for the subordinated
      * pro-rata from the escrow pot (junior to notes). */
     bool ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);

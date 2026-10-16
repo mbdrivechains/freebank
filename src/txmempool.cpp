@@ -993,6 +993,21 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
                     DepositClaim c;
                     if (DecodeDepositPayload(ptx->vchDepositPayload, c) && c.fEscrowChange)
                         coin.SetHouseEscrow(0);
+                } else if (ptx->nDepositOp == DEPOSIT_OP_DEMAND && outpoint.n == 0) {
+                    // v0.2.29: the demand height (the connect height) is not known here: the pre-auth bit alone. Nothing
+                    // chains off it in the mempool - a PROTEST needs the height, and the deposit checks read confirmed
+                    // coins only, so a DISCHARGE waits for the DEMAND to confirm.
+                    DepositDemand d;
+                    if (DecodeDepositPayload(ptx->vchDepositPayload, d)) {
+                        coin.SetDeposit(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight, d.nOriginationHeight);
+                        coin.nDemandHeight = NOTE_DEMAND_PREAUTH_BIT;
+                    }
+                } else if (ptx->nDepositOp == DEPOSIT_OP_PROTEST && outpoint.n == 0) {
+                    DepositProtest pr;
+                    if (DecodeDepositPayload(ptx->vchDepositPayload, pr)) {
+                        coin.SetDeposit(pr.nHouseID, pr.nPrincipal, pr.nRateBps, pr.nMaturityHeight, pr.nOriginationHeight);
+                        coin.nDemandHeight = pr.nDemandTag | NOTE_DEMAND_PROTESTED_BIT;
+                    }
                 }
             }
 

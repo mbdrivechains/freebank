@@ -836,7 +836,9 @@ bool IsClockTx(const CTransaction& tx)
                tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_CLAIM ||
                tx.nNoteOp == NOTE_OP_TOKEN_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT;   // v0.2.21: token holders' turn
     if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION)
-        return tx.nDepositOp == DEPOSIT_OP_WITHDRAW || tx.nDepositOp == DEPOSIT_OP_CLAIM;
+        return tx.nDepositOp == DEPOSIT_OP_WITHDRAW || tx.nDepositOp == DEPOSIT_OP_CLAIM ||
+               tx.nDepositOp == DEPOSIT_OP_DEMAND || tx.nDepositOp == DEPOSIT_OP_PROTEST ||   // v0.2.29
+               tx.nDepositOp == DEPOSIT_OP_DISCHARGE;
     if (tx.nVersion == TRANSACTION_HOUSE_VERSION)
         return tx.nHouseOp == HOUSE_OP_ATTEST;
     return false;

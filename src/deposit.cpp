@@ -5,6 +5,7 @@
 #include <deposit.h>
 
 #include <house.h>   // BLOCKS_PER_YEAR (accrued interest denominator)
+#include <note.h>    // v0.2.29: the B3 custody script and demand tag bits, shared with deposits
 
 #include <consensus/validation.h>
 #include <hash.h>
@@ -86,6 +87,26 @@ uint256 DepositClaimSigHash(uint32_t nHouseID, uint64_t nPrincipal, const uint25
     return ss.GetHash();
 }
 
+uint256 DepositPreAuthSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight,
+                              uint32_t nOriginationHeight, const std::vector<unsigned char>& vchPayoutScript)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankDeposit/preauth");
+    ss << nHouseID << nPrincipal << nRateBps << nMaturityHeight << nOriginationHeight;
+    ss << vchPayoutScript;
+    return ss.GetHash();
+}
+
+uint256 DepositProtestSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nOriginationHeight, uint32_t nDemandTag,
+                              const uint256& hashOutputs)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankDeposit/protest");
+    ss << nHouseID << nPrincipal << nOriginationHeight << nDemandTag;
+    ss << hashOutputs;
+    return ss.GetHash();
+}
+
 CAmount DepositMaturityInterest(uint64_t nPrincipal, uint32_t nBlocks, uint32_t nRateBps)
 {
     if (nPrincipal == 0 || nBlocks == 0 || nRateBps == 0)
@@ -150,6 +171,9 @@ template bool DecodeDepositPayload<DepositOriginate>(const std::vector<unsigned 
 template bool DecodeDepositPayload<DepositTransfer>(const std::vector<unsigned char>&, DepositTransfer&);
 template bool DecodeDepositPayload<DepositWithdraw>(const std::vector<unsigned char>&, DepositWithdraw&);
 template bool DecodeDepositPayload<DepositClaim>(const std::vector<unsigned char>&, DepositClaim&);
+template bool DecodeDepositPayload<DepositDemand>(const std::vector<unsigned char>&, DepositDemand&);
+template bool DecodeDepositPayload<DepositProtest>(const std::vector<unsigned char>&, DepositProtest&);
+template bool DecodeDepositPayload<DepositDischarge>(const std::vector<unsigned char>&, DepositDischarge&);
 
 static bool IsValidDepositPubKey(const std::vector<unsigned char>& vch)
 {
@@ -179,7 +203,7 @@ bool CheckDepositTransactionShape(const CTransaction& tx, CValidationState& stat
 {
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-deposit-coinbase");
-    if (tx.nDepositOp < DEPOSIT_OP_ORIGINATE || tx.nDepositOp > DEPOSIT_OP_CLAIM)
+    if (tx.nDepositOp < DEPOSIT_OP_ORIGINATE || tx.nDepositOp > DEPOSIT_OP_DISCHARGE)
         return state.DoS(100, false, REJECT_INVALID, "bad-deposit-op");
 
     // Up to 100 receipts x (u64 + 2x u32) + M approver sigs; bounded above worst.
@@ -237,6 +261,44 @@ bool CheckDepositTransactionShape(const CTransaction& tx, CValidationState& stat
         if (!IsValidDepositPubKey(wd.vchHolderPubKey) ||
                 wd.vchHolderSig.empty() || wd.vchHolderSig.size() > 80)
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-withdraw-sig-shape");
+    }
+    else if (tx.nDepositOp == DEPOSIT_OP_DEMAND || tx.nDepositOp == DEPOSIT_OP_PROTEST) {
+        // v0.2.29: one receipt re-issued at vout[0], dust-valued and custody-SHAPED (the exact keyid is contextual).
+        std::vector<unsigned char> vchKey;
+        bool fSigOK = false;
+        if (tx.nDepositOp == DEPOSIT_OP_DEMAND) {
+            DepositDemand d;
+            if (!DecodeDepositPayload(tx.vchDepositPayload, d))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payload");
+            if (d.nPrincipal == 0 || d.nPrincipal > (uint64_t)MAX_MONEY || d.vchPayoutScript.empty() ||
+                    d.vchPayoutScript.size() > 128)
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-fields");
+            vchKey = d.vchHolderPubKey;
+            fSigOK = !d.vchPreAuthSig.empty() && d.vchPreAuthSig.size() <= 80;
+        } else {
+            DepositProtest pr;
+            if (!DecodeDepositPayload(tx.vchDepositPayload, pr))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-payload");
+            if (pr.nPrincipal == 0 || pr.nPrincipal > (uint64_t)MAX_MONEY || !NoteDemandIsPreAuth(pr.nDemandTag) ||
+                    NoteDemandIsProtested(pr.nDemandTag))
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-fields");
+            vchKey = pr.vchHolderPubKey;
+            fSigOK = !pr.vchHolderSig.empty() && pr.vchHolderSig.size() <= 80;
+        }
+        if (!IsValidDepositPubKey(vchKey) || !fSigOK)
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-sig-shape");
+        if (tx.vout.empty() || tx.vout[0].nValue != DEPOSIT_DUST_VALUE || !IsNotePreAuthScript(tx.vout[0].scriptPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-vout");
+    }
+    else if (tx.nDepositOp == DEPOSIT_OP_DISCHARGE) {
+        DepositDischarge dc;
+        if (!DecodeDepositPayload(tx.vchDepositPayload, dc))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-payload");
+        if (!IsValidDepositPubKey(dc.vchHolderPubKey) || dc.vchPayoutScript.empty() || dc.vchPayoutScript.size() > 128 ||
+                dc.vchPreAuthSig.empty() || dc.vchPreAuthSig.size() > 80)
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-fields");
+        if (tx.vout.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-vout");
     }
     else { // DEPOSIT_OP_CLAIM
         DepositClaim clm;
