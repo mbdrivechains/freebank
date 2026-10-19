@@ -447,6 +447,7 @@ EOF
                                  -- env HOST="$host" \
                                         DISTNAME="$DISTNAME" \
                                         JOBS="$JOBS" \
+                                        ${EASYNET:+EASYNET=1} \
                                         SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:?unable to determine value}" \
                                         ${V:+V=1} \
                                         ${SOURCES_PATH:+SOURCES_PATH="$SOURCES_PATH"} \

@@ -74,10 +74,12 @@ if [ -n "${FORCE_VERSION:-}" ] && [ "$FORCE_VERSION" != "$CONFIGURE_VERSION" ]; 
     echo "ERR: FORCE_VERSION=$FORCE_VERSION but configure.ac says $CONFIGURE_VERSION"; exit 1
 fi
 VERSION="$CONFIGURE_VERSION"
-DISTNAME="${DISTNAME:-freebank-${VERSION}}"
+# EASYNET=1: the easynet build (configure --with-easynet), asset freebank-easynet-<version>-<host>.tar.gz, built in its
+# own guix-build-easynet-<version> so it never mixes with the beta build of the same version.
+DISTNAME="${DISTNAME:-freebank${EASYNET:+-easynet}-${VERSION}}"
 
 version_base_prefix="${PWD}/guix-build-"
-VERSION_BASE="${version_base_prefix}${VERSION}"  # TOP
+VERSION_BASE="${version_base_prefix}${EASYNET:+easynet-}${VERSION}"  # TOP
 
 DISTSRC_BASE="${DISTSRC_BASE:-${VERSION_BASE}}"
 

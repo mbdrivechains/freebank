@@ -6,6 +6,7 @@
 # configure.ac; FORCE_VERSION, if set, must match it.
 #   contrib/guix/docker/run.sh                    # HOSTS=x86_64-linux-gnu JOBS=2 by default
 #   JOBS=8 contrib/guix/docker/run.sh
+#   EASYNET=1 contrib/guix/docker/run.sh          # the easynet build: freebank-easynet-<version>-<host>.tar.gz
 set -euo pipefail
 TOP=$(git rev-parse --show-toplevel)
 cd "$TOP"
@@ -19,6 +20,7 @@ exec docker run --rm --init --privileged \
     -v "$STORE_VOL-gnu:/gnu" -v "$STORE_VOL-var:/var/guix" -v freebank-guix-cache:/cache \
     -v "$TOP:$TOP" -v "$GITDIR:$GITDIR" -w "$TOP" \
     -e HOSTS="${HOSTS:-x86_64-linux-gnu}" -e JOBS="${JOBS:-2}" ${FORCE_VERSION:+-e FORCE_VERSION="$FORCE_VERSION"} \
+    ${EASYNET:+-e EASYNET=1} \
     ${GUIX_URL:+-e GUIX_URL="$GUIX_URL"} ${SUBSTITUTE_URLS:+-e SUBSTITUTE_URLS="$SUBSTITUTE_URLS"} ${V:+-e V=1} \
     ${ADDITIONAL_GUIX_COMMON_FLAGS:+-e ADDITIONAL_GUIX_COMMON_FLAGS="$ADDITIONAL_GUIX_COMMON_FLAGS"} \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \

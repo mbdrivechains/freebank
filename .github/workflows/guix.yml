@@ -3,7 +3,8 @@ name: guix-linux
 # Reproducible Linux x86_64 build with Guix (contrib/guix), run in the same Docker image as on a developer box
 # (contrib/guix/docker). Anyone can compare this run's SHA256SUMS with their own build of the same commit.
 # The version (and so the asset name freebank-<version>-x86_64-linux-gnu.tar.gz) comes from configure.ac; on a tag
-# push the tag must match it.
+# push the tag's vX.Y.Z must match it. The easynet job builds the same commit with EASYNET=1 (configure --with-easynet):
+# freebank-easynet-<version>-x86_64-linux-gnu.tar.gz.
 on:
   workflow_dispatch:
   push:
@@ -15,6 +16,10 @@ permissions:
 
 jobs:
   guix:
+    strategy:
+      fail-fast: false
+      matrix:
+        net: [beta, easynet]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -36,14 +41,15 @@ jobs:
           # Guix's main repository (same history as savannah, which is flaky from hosted runners).
           GUIX_URL: https://codeberg.org/guix/guix.git
         run: |
-          VER="${TAG#v}"
+          VER=$(sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<< "$TAG")
+          if [ "${{ matrix.net }}" = easynet ]; then export EASYNET=1; fi
           JOBS=$(nproc) FORCE_VERSION="$VER" contrib/guix/docker/run.sh
       - name: SHA256SUMS
         run: |
           cd guix-build-*/output && find . -name '*.tar.gz' -exec sha256sum {} + | sort -k2 | tee ../../SHA256SUMS.guix
       - uses: actions/upload-artifact@v4
         with:
-          name: freebank-guix
+          name: ${{ matrix.net == 'easynet' && 'freebank-guix-easynet' || 'freebank-guix' }}
           path: |
             guix-build-*/output/*/*.tar.gz
             SHA256SUMS.guix
@@ -57,7 +63,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: freebank-guix
+          pattern: freebank-guix*
+          merge-multiple: true
       - uses: actions/attest-build-provenance@v1
         with:
           subject-path: guix-build-*/output/*/*.tar.gz

@@ -9,17 +9,23 @@ jobs:
     # One job per Mac CPU: a separate tarball for each, not a universal binary, because BitWindow
     # picks its download by CPU name. macos-15-intel is GitHub's Intel image. macos-14 is retired on 2026-11-02
     # (brownouts from 10-05), so Apple Silicon builds on macos-15 too: both tarballs need macOS 15 or later.
+    # Each CPU also gets an easynet build (configure --with-easynet): freebank-easynet-<version>-<arch>-apple-darwin,
+    # which BitWindow's freebank-<digits>- pattern never picks.
     strategy:
       fail-fast: false
       matrix:
+        net: [beta, easynet]
+        arch: [arm64, x86_64]
         include:
-          - runner: macos-15
-            arch: arm64
+          - arch: arm64
+            runner: macos-15
             dbbuild: arm-apple-darwin
-          - runner: macos-15-intel
-            arch: x86_64
+          - arch: x86_64
+            runner: macos-15-intel
             dbbuild: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
+    env:
+      PKG: ${{ matrix.net == 'easynet' && 'freebank-easynet' || 'freebank' }}
     permissions:
       contents: read
       id-token: write      # signed build provenance (attestation) for tagged releases
@@ -72,7 +78,10 @@ jobs:
           ./configure --without-gui --with-incompatible-bdb --disable-bench \
             --with-boost="$STATICROOT" \
             CPPFLAGS="-I$PWD/db4/include -I${BREW_PREFIX}/include" \
-            LDFLAGS="-L${STATICROOT}/lib"
+            LDFLAGS="-L${STATICROOT}/lib" ${{ matrix.net == 'easynet' && '--with-easynet' || '' }}
+          if [ "${{ matrix.net }}" = easynet ]; then
+            grep -q '^#define FREEBANK_EASYNET_BUILD 1' src/config/bitcoin-config.h || { echo "FREEBANK_EASYNET_BUILD not defined"; exit 1; }
+          fi
 
       - name: Dump config.log on configure failure
         if: failure()
@@ -87,6 +96,8 @@ jobs:
           ./src/freebank-cli --version | head -1
 
       - name: Unit test suite
+        # The beta job runs them; the easynet build is the same code with other chain parameters.
+        if: matrix.net == 'beta'
         run: make check
 
       - name: Dump test log on failure
@@ -101,14 +112,15 @@ jobs:
           # Capture all four, then strip a trailing .0 so plain releases keep
           # their three-component name.
           VER=$(./src/freebank-cli --version | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/; s/\.0$//')
-          mkdir -p dist/freebank/bin
-          cp src/freebankd src/freebank-cli src/freebank-tx dist/freebank/bin/
-          strip -S dist/freebank/bin/*
-          cp COPYING README.md dist/freebank/
+          mkdir -p "dist/$PKG/bin"
+          cp src/freebankd src/freebank-cli src/freebank-tx "dist/$PKG/bin/"
+          strip -S "dist/$PKG/bin/"*
+          cp COPYING README.md "dist/$PKG/"
+          [ "$PKG" = freebank ] || bash contrib/easynet-readme.sh "$VER" > "dist/$PKG/EASYNET.md"
           gtar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
-            --mtime='2026-07-20 10:00' -cf "freebank-${VER}-${{ matrix.arch }}-apple-darwin.tar" freebank
-          gzip -n "freebank-${VER}-${{ matrix.arch }}-apple-darwin.tar"
-          shasum -a 256 freebank-${VER}-${{ matrix.arch }}-apple-darwin.tar.gz
+            --mtime='2026-07-20 10:00' -cf "${PKG}-${VER}-${{ matrix.arch }}-apple-darwin.tar" "$PKG"
+          gzip -n "${PKG}-${VER}-${{ matrix.arch }}-apple-darwin.tar"
+          shasum -a 256 "${PKG}-${VER}-${{ matrix.arch }}-apple-darwin.tar.gz"
 
       - name: Portability gate (no external dylib references)
         # Runs against the PACKAGED tarball, not the build tree. Only
@@ -116,12 +128,12 @@ jobs:
         # else (brew, /usr/local) means the artifact only runs on the builder.
         run: |
           mkdir -p /tmp/porttest
-          tar -xzf freebank-*-${{ matrix.arch }}-apple-darwin.tar.gz -C /tmp/porttest
+          tar -xzf "${PKG}"-*-${{ matrix.arch }}-apple-darwin.tar.gz -C /tmp/porttest
           FAIL=0
           for b in freebankd freebank-cli freebank-tx; do
             echo "== $b"
-            otool -L "/tmp/porttest/freebank/bin/$b"
-            BAD=$(otool -L "/tmp/porttest/freebank/bin/$b" | tail -n +2 | grep -vE '^\s+(/usr/lib/|/System/Library/)' || true)
+            otool -L "/tmp/porttest/$PKG/bin/$b"
+            BAD=$(otool -L "/tmp/porttest/$PKG/bin/$b" | tail -n +2 | grep -vE '^\s+(/usr/lib/|/System/Library/)' || true)
             if [ -n "$BAD" ]; then echo "NON-PORTABLE references in $b:"; echo "$BAD"; FAIL=1; fi
           done
           exit $FAIL
@@ -136,8 +148,13 @@ jobs:
           HB=$( [ -d /opt/homebrew ] && echo /opt/homebrew || echo /usr/local/Cellar )
           sudo mv "$HB" "$HB.hidden"
           trap 'sudo mv "$HB.hidden" "$HB"' EXIT
-          B=/tmp/porttest/freebank/bin
+          B=/tmp/porttest/$PKG/bin
           "$B/freebankd" --version | head -2
+          if [ "$PKG" = freebank-easynet ]; then
+            "$B/freebankd" -help | grep -A1 '^  -port=' | grep -q 28455 || { echo "freebankd help does not show easynet's P2P 28455"; exit 1; }
+            "$B/freebank-cli" -help | grep -A1 '^  -rpcport=' | grep -q 28454 || { echo "freebank-cli help does not show easynet's RPC 28454"; exit 1; }
+            echo "easynet ports: P2P 28455, RPC 28454"
+          fi
           "$B/freebank-cli" --version | head -1
           "$B/freebank-tx" --help | head -1
           mkdir -p /tmp/fbsmoke2
@@ -156,10 +173,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: freebank-*-${{ matrix.arch }}-apple-darwin.tar.gz
+          subject-path: ${{ env.PKG }}-*-${{ matrix.arch }}-apple-darwin.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: freebank-${{ matrix.arch }}-apple-darwin
-          path: freebank-*-${{ matrix.arch }}-apple-darwin.tar.gz
+          name: ${{ env.PKG }}-${{ matrix.arch }}-apple-darwin
+          path: ${{ env.PKG }}-*-${{ matrix.arch }}-apple-darwin.tar.gz

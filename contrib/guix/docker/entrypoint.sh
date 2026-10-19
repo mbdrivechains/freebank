@@ -40,7 +40,7 @@ echo "building $HEAD_COMMIT in $WORK"
 mkdir -p /cache/sources /cache/built /cache/xdg
 cd "$WORK"
 rc=0
-env HOSTS="${HOSTS:-x86_64-linux-gnu}" JOBS="${JOBS:-2}" ${FORCE_VERSION:+FORCE_VERSION="$FORCE_VERSION"} \
+env HOSTS="${HOSTS:-x86_64-linux-gnu}" JOBS="${JOBS:-2}" ${FORCE_VERSION:+FORCE_VERSION="$FORCE_VERSION"} ${EASYNET:+EASYNET=1} \
     SOURCES_PATH=/cache/sources BASE_CACHE=/cache/built XDG_CACHE_HOME=/cache/xdg \
     ./contrib/guix/guix-build || rc=$?
 # Hand the outputs back to the invoking user, even after a failure (partial outputs help).

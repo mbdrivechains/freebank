@@ -216,6 +216,12 @@ mkdir -p "$OUTDIR"
 
 # CONFIGFLAGS
 CONFIGFLAGS="--enable-reduce-exports --disable-bench --disable-tests --without-gui --with-incompatible-bdb --without-libs"
+# EASYNET=1: the same source built for easynet (its one public network), packaged as freebank-easynet/
+PKG=freebank
+if [ -n "${EASYNET:-}" ]; then
+    CONFIGFLAGS+=" --with-easynet"
+    PKG=freebank-easynet
+fi
 
 # CFLAGS
 HOST_CFLAGS="-O2 -g"
@@ -251,6 +257,10 @@ mkdir -p "$DISTSRC"
                     ${HOST_CXXFLAGS:+CXXFLAGS="${HOST_CXXFLAGS}"} \
                     ${HOST_LDFLAGS:+LDFLAGS="${HOST_LDFLAGS}"}
 
+    if [ -n "${EASYNET:-}" ]; then
+        grep -q '^#define FREEBANK_EASYNET_BUILD 1' src/config/bitcoin-config.h || { echo "ERR: FREEBANK_EASYNET_BUILD not defined"; exit 1; }
+    fi
+
     sed -i.old 's/-lstdc++ //g' config.status libtool
     # FreeBank: univalue and secp256k1 are sub-configures with their own libtool (Core v26 has neither); without this,
     # libunivalue.la records the Guix libstdc++.la and every link gets libstdc++.so despite -static-libstdc++.
@@ -269,16 +279,20 @@ mkdir -p "$DISTSRC"
 
     # The release layout BitWindow downloads (docs-local/release-linux.sh): freebank/bin/{freebankd,freebank-cli,
     # freebank-tx} stripped, COPYING, README.md; asset freebank-<version>-x86_64-linux-gnu.tar.gz.
-    STAGE="${PWD}/installed/freebank"
+    # The easynet build: freebank-easynet/ with the same files plus EASYNET.md; asset freebank-easynet-<version>-<host>.
+    STAGE="${PWD}/installed/${PKG}"
     mkdir -p "${STAGE}/bin"
     for b in $BINS; do
         "${HOST}-strip" --strip-all -o "${STAGE}/bin/$(basename "$b")" "$b"
     done
     cp COPYING README.md "${STAGE}/"
+    if [ -n "${EASYNET:-}" ]; then
+        bash contrib/easynet-readme.sh "${DISTNAME##*-}" > "${STAGE}/EASYNET.md"
+    fi
     (
         cd installed
-        find freebank -print0 | xargs -0r touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
-        find freebank -print0 \
+        find "${PKG}" -print0 | xargs -0r touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
+        find "${PKG}" -print0 \
             | sort --zero-terminated \
             | tar --create --no-recursion --mode='u+rw,go+r-w,a+X' --null --files-from=- \
             | gzip -9n > "${OUTDIR}/${DISTNAME}-${HOST}.tar.gz" \
