@@ -15563,8 +15563,8 @@ void HandleQueuedMainchainReorgs()
  *  network's fork height if that is lower. Nothing FreeBank anchors or credits
  *  can be below a network's fork block, so a pin set higher (any block works
  *  as an identity pin) does not move the floor above it. 0: none, the list
- *  goes down to genesis (mainnet until its build sets the fork height). On
- *  regtest the pin is the floor (the gates choose it). */
+ *  goes down to genesis. On regtest the pin is the floor (the gates choose
+ *  it). */
 static int MainCacheStopHeight(int nPinHeight)
 {
     if (nPinHeight <= 0)
@@ -15572,6 +15572,8 @@ static int MainCacheStopHeight(int nPinHeight)
     const std::string strNetwork = Params().NetworkIDString();
     if (strNetwork == CBaseChainParams::REGTEST)
         return nPinHeight;
+    if (strNetwork == CBaseChainParams::MAIN)
+        return std::min(nPinHeight, 973728);   // eCash mainnet's fork block
     if (strNetwork == CBaseChainParams::BETA)
         return std::min(nPinHeight, 967680);   // eCash betanet's fork block
     return 0;

@@ -19,6 +19,12 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > each operator is responsible for any licence its jurisdiction requires. FreeBank is not
 > offered where using it would be unlawful.
 
+> **Which release runs which network.** v1.0.0 and later run **FreeBank mainnet**, slot 130 on
+> eCash mainnet (eCash leaves Bitcoin at block 973,728). v1.0.0 ships it **dormant**: the node runs
+> and follows eCash, but no FreeBank block after genesis is valid until a later release switches the
+> chain on; deposits made meanwhile are credited, in order, then. The v0.2.x releases run the
+> **eCash beta** network; v0.2.29 is beta's current release.
+
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
 > gotchas, parameters, glossary) written so you can hand it to an AI assistant and be walked
@@ -460,7 +466,14 @@ REST interface. The sidechain advances by blind-merged-mining against the mainch
 
 Two things worth knowing before you start:
 
-- **The live network is the eCash beta.** FreeBank runs as sidechain slot 130 on the eCash
+- **Mainnet (v1.0.0 and later).** The L1 is eCash's mainnet release
+  (<https://releases.ecash.com/L1-ecash-bitcoin/mainnet/>, tag `ecash-v1.0.0-core31.1`; source
+  [ecash-com/bitcoin](https://github.com/ecash-com/bitcoin), branch `master`). Once eCash's fork
+  block exists, pin it: `-mainchainblockpin=973728:<hash of eCash block 973,728>`. The enforcer
+  needs eCash mainnet's settings; L2L had not published a mainnet preset as of 2026-10-22. FreeBank
+  mainnet keeps its data in `mainnet` inside the data directory and uses the same ports (8455,
+  RPC 8454) and seeds as beta, so stop a beta node before starting it.
+- **Beta (v0.2.x).** FreeBank runs as sidechain slot 130 on the eCash
   beta network, with a public seed at `seed.ecxfreebank.com` (port 8455). The beta L1 comes
   from eCash's own releases (<https://releases.ecash.com/L1-ecash-bitcoin/betanet/>; source
   [ecash-com/bitcoin](https://github.com/ecash-com/bitcoin/tree/betanet), branch `betanet`) and

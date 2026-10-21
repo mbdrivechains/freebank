@@ -57,9 +57,9 @@ void SelectBaseParams(const std::string& chain)
 
 std::string ChainNameFromCommandLine()
 {
-    // One public network per build (Michael, 2026-10-04): this build runs beta,
-    // with no flag, as every release before it. FreeBank mainnet is in the code
-    // (dormant) but no flag selects it: the mainnet release runs it the same way.
+    // One public network per build (Michael, 2026-10-04): the mainnet release
+    // (v1.0.0 on) runs FreeBank mainnet with no flag, as the beta releases run
+    // beta. No flag selects beta in a mainnet build.
     bool fRegTest = gArgs.GetBoolArg("-regtest", false);
 
     if (fRegTest)
@@ -70,12 +70,12 @@ std::string ChainNameFromCommandLine()
 
 const std::string& PublicNetworkOfThisBuild()
 {
-    // An easynet build (configure --with-easynet) is the same source as the beta
+    // An easynet build (configure --with-easynet) is the same source as the
     // release it is cut from, with easynet as its one public network: that is how
     // easynet tracks each FreeBank release (Michael, 2026-10-12).
 #ifdef FREEBANK_EASYNET_BUILD
     return CBaseChainParams::EASYNET;
 #else
-    return CBaseChainParams::BETA;
+    return CBaseChainParams::MAIN;
 #endif
 }

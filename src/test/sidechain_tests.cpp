@@ -1675,13 +1675,14 @@ BOOST_AUTO_TEST_CASE(networks_beta_and_dormant_mainnet)
     BOOST_CHECK_EQUAL(baseMain->RPCPort(), 8454);
     BOOST_CHECK_EQUAL(baseBeta->RPCPort(), 8454);
 
-    // One public network per build: no flag runs beta; -beta and -mainnet are
-    // not network flags (an unknown argument changes nothing); -regtest is.
-    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::BETA);
+    // One public network per build: no flag runs mainnet (v1.0.0 on); -beta and
+    // -mainnet are not network flags (an unknown argument changes nothing);
+    // -regtest is.
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::MAIN);
     gArgs.ForceSetArg("-mainnet", "1");
-    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::BETA);
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::MAIN);
     gArgs.ForceSetArg("-beta", "1");
-    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::BETA);
+    BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::MAIN);
     gArgs.ForceSetArg("-regtest", "1");
     BOOST_CHECK_EQUAL(ChainNameFromCommandLine(), CBaseChainParams::REGTEST);
     gArgs.ForceSetArg("-regtest", "0");
