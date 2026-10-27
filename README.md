@@ -467,20 +467,24 @@ REST interface. The sidechain advances by blind-merged-mining against the mainch
 Two things worth knowing before you start:
 
 - **Mainnet (v1.0.0 and later).** The L1 is eCash's mainnet release
-  (<https://releases.ecash.com/L1-ecash-bitcoin/mainnet/>, tag `ecash-v1.0.0-core31.1`; source
-  [ecash-com/bitcoin](https://github.com/ecash-com/bitcoin), branch `master`). Once eCash's fork
-  block exists, pin it: `-mainchainblockpin=973728:<hash of eCash block 973,728>`. The enforcer
-  needs eCash mainnet's settings; L2L had not published a mainnet preset as of 2026-10-22. FreeBank
+  (<https://releases.ecash.com/L1-ecash-bitcoin/mainnet/>, tag `ecash-v1.1.0-core31.1` or later; source
+  [ecash-com/bitcoin](https://github.com/ecash-com/bitcoin), branch `master`). Don't use
+  `ecash-v1.0.0-core31.1`: it lacks the difficulty adjustment that starts at block 974,016 and
+  leaves eCash's chain there. Once eCash's fork block exists, pin it:
+  `-mainchainblockpin=973728:<hash of eCash block 973,728>`. The enforcer needs eCash mainnet's
+  settings and eCash replay protection (L2L's `master` from 2026-10-27, PR #666); L2L had not
+  tagged an enforcer release as of 2026-10-28. FreeBank
   mainnet keeps its data in `mainnet` inside the data directory and uses the same ports (8455,
   RPC 8454) and seeds as beta, so stop a beta node before starting it.
-- **Beta (v0.2.x).** FreeBank runs as sidechain slot 130 on the eCash
-  beta network, with a public seed at `seed.ecxfreebank.com` (port 8455). The beta L1 comes
+- **Beta (v0.2.x), history.** Our beta seed and enforcer stopped on 2026-10-26, so FreeBank on beta
+  makes no new blocks. It ran as sidechain slot 130 on the eCash beta network, with a public seed
+  at `seed.ecxfreebank.com` (port 8455). The beta L1 comes
   from eCash's own releases (<https://releases.ecash.com/L1-ecash-bitcoin/betanet/>; source
   [ecash-com/bitcoin](https://github.com/ecash-com/bitcoin/tree/betanet), branch `betanet`) and
   the enforcer runs with `--network-preset=betanet`. Pin the
   fork block with `-mainchainblockpin=967680:00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
   The signet walkthrough below still describes the stack's shape.
-- **Next to BitWindow.** A BitWindow set to the eCash network already runs the beta L1 (with
+- **Next to BitWindow (beta, until 2026-10-26).** A BitWindow set to the eCash network ran the beta L1 (with
   the REST and txindex FreeBank needs) and the enforcer.
   Once both are fully synced, run the release binary beside them. It finds the seed by itself:
 
