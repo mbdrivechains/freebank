@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <queue>
+#include <set>
 #include <utility>
 
 #ifdef ENABLE_WALLET
@@ -433,50 +434,50 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
         }
     }
 
-    // Get list of deposits from the mainchain
+    // Get list of deposits from the mainchain: every change to the treasury the
+    // L1 has, oldest first, each with what it credits (v1.0.1,
+    // DEPOSITS_664_SPEC: what a deposit added to the treasury, as the enforcer
+    // measured it; 0 for a withdrawal return).
+    std::vector<SidechainDeposit> vDeposit = client.UpdateDeposits(uint256(), 0);
 
-    std::vector<SidechainDeposit> vDeposit;
-
-    SidechainDeposit lastDeposit;
-    uint256 hashLastDeposit;
-    uint32_t nBurnIndex = 0;
-    bool fHaveDeposits = psidechaintree->GetLastDeposit(lastDeposit);
-    if (fHaveDeposits) {
-        hashLastDeposit = lastDeposit.dtx.GetHash();
-        nBurnIndex = lastDeposit.nBurnIndex;
-    }
-    vDeposit = client.UpdateDeposits(hashLastDeposit, nBurnIndex);
-
-    // Find new deposits
-    std::vector<SidechainDeposit> vDepositNew;
-    for (const SidechainDeposit& d: vDeposit) {
-        // We look up the deposit using the hash of the deposit without the
-        // payout amount set because we do not know the payout amount yet.
-        if (!psidechaintree->HaveDepositNonAmount(d.GetID())) {
-            vDepositNew.push_back(d);
-        }
-    }
-
-    // v0.2.17 A9: a problem with the new deposits leaves them out of this
-    // block; it no longer stops block making (each of these returned no
-    // template, so one bad deposit halted the chain).
-    bool fSkipDeposits = false;
-
-    // Check deposit burn index
-    for (const SidechainDeposit& d : vDepositNew) {
-        if (d.nBurnIndex >= d.dtx.vout.size()) {
-            LogPrintf("%s: Error: new deposit has invalid burn index:\n%s\n", __func__, d.ToString());
-            fSkipDeposits = true;
-            break;
-        }
-    }
-
-    // Sort the deposits into CTIP UTXO spend order
+    // The new ones: an L1 treasury outpoint not recorded yet (R3). Since L2L
+    // #664 the treasury is a set of outputs merged at the end of each L1 block,
+    // so records no longer chain (R2): each stands alone, and one with a
+    // problem is left out without holding back the rest (v0.2.17 A9's aim).
+    // Each is asked what the validator asks (CheckDepositWithL1, for an L1
+    // block at or before the one this block will be BMM'd in): one it would
+    // refuse, or that the L1 cannot answer for yet, waits outside this block.
+    // Before, such a record went into every template and the node refused
+    // each of its own blocks (review 2026-10-30).
+    const uint256 hashMainForDeposits = hashMainTip.IsNull() ? bmmCache.GetLastMainBlockHash() : hashMainTip;
     std::vector<SidechainDeposit> vDepositSorted;
-    if (!fSkipDeposits && !SortDeposits(vDepositNew, vDepositSorted)) {
-        LogPrintf("%s: Error: Failed to sort deposits!\n", __func__);
-        fSkipDeposits = true;
+    std::set<COutPoint> setNewDepositOutpoints;
+    for (const SidechainDeposit& d : vDeposit) {
+        if (d.nBurnIndex >= d.dtx.vout.size()) {
+            LogPrintf("%s: Error: new deposit has invalid burn index, left out:\n%s\n", __func__, d.ToString());
+            continue;
+        }
+        const COutPoint outpoint(d.dtx.GetHash(), d.nBurnIndex);
+        if (!setNewDepositOutpoints.insert(outpoint).second || psidechaintree->HaveDepositOutpoint(outpoint))
+            continue;
+        CAmount nCredit = 0;
+        std::string strWhy;
+        const L1Answer answer = CheckDepositWithL1(d, hashMainForDeposits, nCredit, strWhy);
+        if (answer != L1Answer::YES || nCredit != d.amtUserPayout) {
+            LogPrintf("%s: deposit %s:%u left out of this block: %s\n", __func__, outpoint.hash.ToString(), outpoint.n,
+                      answer != L1Answer::YES ? strWhy : strprintf("it credits %s, the L1 says %s",
+                                                                   FormatMoney(d.amtUserPayout), FormatMoney(nCredit)));
+            continue;
+        }
+        vDepositSorted.push_back(d);
     }
+
+    // The sidechain's first deposit: logged per template that carries it (a
+    // rebuild before it connects logs again), never on a build without new
+    // deposits (v0.2.15 logged it on every one; v0.2.16 (e))
+    uint256 hashLastDepositID;
+    if (!vDepositSorted.empty() && !psidechaintree->GetLastDepositID(hashLastDepositID))
+        LogPrintf("%s: first deposit for this sidechain: %s (mainchain txid)\n", __func__, vDepositSorted.front().dtx.GetHash().ToString());
 
     // Create deposit payout output(s)
     //
@@ -488,98 +489,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
     // outputs for one deposit. When adding / removing deposits of the coinbase
     // transaction we have to add or remove all of the outputs for a deposit.
     std::vector<std::vector<CTxOut>> vOutPackages;
-
-    //
-    // Create the deposit payout outputs for deposits.
-    //
-    // - First deposit in the list should have spent the sidechain CTIP that
-    // the sidechain already knows about (in db) if one exists.
-    //
-    // - Set the payout amount by subtracting the previous CTIP from the next.
-    //
-    // - Create and return a vector of vectors where each sub vector is the list
-    // of outputs required to payout a deposit correctly. We keep the outputs
-    // for each deposit contained in their own vector instead of combining them
-    // all because we must include all of the outputs for a deposit payout to
-    // be valid and if we run out of space we need to know which outputs to
-    // remove without invalidating a deposit.
-
-    // Look up CTIP spent by first new deposit and calculate payout
-    if (vDepositSorted.size()) {
-        const SidechainDeposit& first = vDepositSorted.front();
-        if (fHaveDeposits) {
-            bool fFound = false;
-            for (const CTxIn& in : first.dtx.vin) {
-                if (in.prevout.hash == lastDeposit.dtx.GetHash()
-                        && lastDeposit.dtx.vout.size() > in.prevout.n
-                        && lastDeposit.nBurnIndex == in.prevout.n) {
-                    // Calculate payout amount
-                    CAmount ctipAmount = lastDeposit.dtx.vout[lastDeposit.nBurnIndex].nValue;
-                    if (first.amtUserPayout > ctipAmount)
-                        vDepositSorted.front().amtUserPayout -= ctipAmount;
-                    else
-                        vDepositSorted.front().amtUserPayout = CAmount(0);
-
-                    fFound = true;
-                    break;
-                }
-            }
-            if (!fFound) {
-                LogPrintf("%s: Error: No CTIP found for first deposit in sorted list: %s (mainchain txid)\n", __func__, first.dtx.GetHash().ToString());
-                fSkipDeposits = true;
-            }
-        } else {
-            // This is the very first deposit for this sidechain so we don't
-            // need to look up the CTIP that it spent. Logged per template that
-            // carries it (a rebuild before it connects logs again), never on a
-            // build without new deposits (v0.2.15 logged it on every one).
-            LogPrintf("%s: first deposit for this sidechain: %s (mainchain txid)\n", __func__, first.dtx.GetHash().ToString());
-        }
-    }
-
-    // Now that we have the value for the known CTIP that was spent for the
-    // first deposit in the sorted list and have calculated the payout amount
-    // for that deposit we can calculate the payout amount for the rest of the
-    // deposits in the list.
-    //
-    // Calculate payout for remaining deposits
-    if (!fSkipDeposits && vDepositSorted.size() > 1) {
-        std::vector<SidechainDeposit>::iterator it = vDepositSorted.begin() + 1;
-        for (; it != vDepositSorted.end(); it++) {
-            // Points to the previous deposit in the sorted list
-            std::vector<SidechainDeposit>::iterator itPrev = it - 1;
-
-            // Find the output (ctip) this deposit spend and subract it from
-            // the user payout amount. Note that we've already sorted by CTIP so
-            // they all should exist but we are going to double check anyways.
-            bool fFound = false;
-            for (const CTxIn& in : it->dtx.vin) {
-                if (in.prevout.hash == itPrev->dtx.GetHash()
-                        && itPrev->dtx.vout.size() > in.prevout.n
-                        && itPrev->nBurnIndex == in.prevout.n) {
-                    // Calculate payout amount
-                    CAmount ctipAmount = itPrev->dtx.vout[itPrev->nBurnIndex].nValue;
-
-                    if (it->amtUserPayout > ctipAmount)
-                        it->amtUserPayout -= ctipAmount;
-                    else
-                        it->amtUserPayout = CAmount(0);
-
-                    fFound = true;
-                    break;
-                }
-            }
-            if (!fFound) {
-                LogPrintf("%s: Error: Failed to calculate payout amount - no CTIP found for deposit: %s (mainchain txid)\n", __func__, it->dtx.GetHash().ToString());
-                fSkipDeposits = true;
-                break;
-            }
-        }
-    }
-    if (fSkipDeposits) {
-        LogPrintf("%s: building this block without new deposits\n", __func__);
-        vDepositSorted.clear();
-    }
 
     // Create the deposit outputs.
     // We will loop through the sorted list of new deposits, double check a few

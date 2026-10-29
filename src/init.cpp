@@ -1821,6 +1821,11 @@ bool AppInitMain()
                 pblocktree.reset();
                 pblocktree.reset(new CBlockTreeDB(nBlockTreeDBCache, false, fReset));
                 psidechaintree.reset(new CSidechainTreeDB(nSidechainTreeDBCache, false, fReset));
+                // v1.0.1: the deposit outpoint index (DEPOSITS_664_SPEC R3), rebuilt from the deposit rows every start
+                if (!psidechaintree->BuildDepositOutpointIndex()) {
+                    strLoadError = _("Error building the deposit outpoint index");
+                    break;
+                }
                 passettree.reset(new BitAssetDB(nBitAssetDBCache, false, fReset));
                 pbilltree.reset(new BillDB(nBillDBCache, false, fReset));
                 phousetree.reset(new HouseDB(nBillDBCache, false, fReset));

@@ -49,6 +49,9 @@ int nDiskFormatVersion = FREEBANK_DISK_FORMAT_VERSION;
 
 static const char DB_LAST_SIDECHAIN_DEPOSIT = 'x';
 static const char DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE = 'w';
+// v1.0.1 (DEPOSITS_664_SPEC R3): L1 treasury outpoint -> deposit record ID,
+// rebuilt from the rows at every startup (BuildDepositOutpointIndex)
+static const char DB_SIDECHAIN_DEPOSIT_OUTPOINT = 'o';
 
 // v0.2.18: asset records keyed by genesis txid ('A' / 'I' were the counter-era keys).
 static const char DB_ASSET_GENESIS = 'G';
@@ -413,6 +416,8 @@ bool CSidechainTreeDB::WriteSidechainIndex(const std::vector<std::pair<uint256, 
 
             // Update DB_LAST_SIDECHAIN_DEPOSIT
             batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, hashNonAmount);
+
+            batch.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OUTPOINT, COutPoint(ptr->dtx.GetHash(), ptr->nBurnIndex)), hashNonAmount);
         }
     }
 
@@ -468,6 +473,7 @@ bool CSidechainTreeDB::WriteBlockEffects(const std::vector<SidechainWithdrawal>&
             batch.Write(key, *ptr);
             batch.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, ptr->GetID()), *ptr);
             batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, ptr->GetID());
+            batch.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OUTPOINT, COutPoint(ptr->dtx.GetHash(), ptr->nBurnIndex)), ptr->GetID());
         }
     }
 
@@ -513,9 +519,18 @@ bool CSidechainTreeDB::WriteBlockUndo(const BlockUndo& undo)
     // D-3: the block's deposits, as WriteDepositDisconnect (never the row the
     // restored baseline points at)
     if (undo.fDepositUndo) {
-        for (const uint256& id : undo.vDepositErase)
-            if (id != undo.hashPrevLastDeposit)
+        if (undo.vDepositOutpointErase.size() != undo.vDepositErase.size()) {
+            LogPrintf("%s: deposit undo has %u rows but %u outpoints\n", __func__,
+                      undo.vDepositErase.size(), undo.vDepositOutpointErase.size());
+            return false;
+        }
+        for (size_t i = 0; i < undo.vDepositErase.size(); i++) {
+            const uint256& id = undo.vDepositErase[i];
+            if (id != undo.hashPrevLastDeposit) {
                 batch.Erase(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, id));
+                batch.Erase(std::make_pair(DB_SIDECHAIN_DEPOSIT_OUTPOINT, undo.vDepositOutpointErase[i]));
+            }
+        }
         if (undo.hashPrevLastDeposit.IsNull())
             batch.Erase(DB_LAST_SIDECHAIN_DEPOSIT);
         else
@@ -735,6 +750,48 @@ bool CSidechainTreeDB::HaveDepositNonAmount(const uint256& hashNonAmount)
         return true;
 
     return false;
+}
+
+bool CSidechainTreeDB::HaveDepositOutpoint(const COutPoint& outpoint)
+{
+    return Exists(std::make_pair(DB_SIDECHAIN_DEPOSIT_OUTPOINT, outpoint));
+}
+
+bool CSidechainTreeDB::BuildDepositOutpointIndex()
+{
+    // Rebuilt from the rows every time, not once: an older build run on this
+    // DB in between writes and erases rows without index entries, and a stale
+    // or missing entry would refuse a valid block or let a deposit be credited
+    // twice. One pass over the deposit rows.
+    CDBBatch batch(*this);
+    size_t nErased = 0, nRows = 0;
+    {
+        std::unique_ptr<CDBIterator> pcursor(NewIterator());
+        pcursor->Seek(std::make_pair(DB_SIDECHAIN_DEPOSIT_OUTPOINT, COutPoint(uint256(), 0)));
+        for (; pcursor->Valid(); pcursor->Next()) {
+            std::pair<char, COutPoint> key;
+            if (!pcursor->GetKey(key) || key.first != DB_SIDECHAIN_DEPOSIT_OUTPOINT)
+                break;
+            batch.Erase(key);
+            nErased++;
+        }
+    }
+    // Every row stored under its own ID (the only key deposits are written
+    // under), from the first possible 'D' key to the last
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, uint256()));
+    for (; pcursor->Valid(); pcursor->Next()) {
+        std::pair<char, uint256> key;
+        if (!pcursor->GetKey(key) || key.first != DB_SIDECHAIN_DEPOSIT_OP)
+            break;
+        SidechainDeposit deposit;
+        if (!pcursor->GetSidechainValue(deposit) || key.second != deposit.GetID())
+            continue;
+        batch.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OUTPOINT, COutPoint(deposit.dtx.GetHash(), deposit.nBurnIndex)), key.second);
+        nRows++;
+    }
+    LogPrintf("%s: indexed the L1 outpoints of %u deposit records (%u entries before)\n", __func__, nRows, nErased);
+    return WriteBatch(batch, true);
 }
 
 bool CSidechainTreeDB::GetLastDeposit(SidechainDeposit& deposit, bool* pfPointerSet)

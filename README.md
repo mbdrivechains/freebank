@@ -22,8 +22,9 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > **Which release runs which network.** v1.0.0 and later run **FreeBank mainnet**, slot 130 on
 > eCash mainnet (eCash leaves Bitcoin at block 973,728). v1.0.0 ships it **dormant**: the node runs
 > and follows eCash, but no FreeBank block after genesis is valid until a later release switches the
-> chain on; deposits made meanwhile are credited, in order, then. The v0.2.x releases run the
-> **eCash beta** network; v0.2.29 is beta's current release.
+> chain on; deposits made meanwhile are credited, in order, then. v1.0.1 changes how deposits are
+> credited (below); while mainnet is dormant, v1.0.1 runs it exactly as v1.0.0 does, and the
+> mainnet M1 names v1.0.0. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
 
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
@@ -139,8 +140,19 @@ v0.2.24 tightens disk safety and peer scoring,
 v0.2.25 makes a new node's first start faster,
 v0.2.26 stops a note holder burning their own notes by mistake,
 v0.2.27 lets a borrower repay a house in its own notes,
-v0.2.28 settles a failed house end to end, and
-v0.2.29 lets a saver force payment of a matured deposit:
+v0.2.28 settles a failed house end to end,
+v0.2.29 lets a saver force payment of a matured deposit, and
+v1.0.1 credits deposits the way LayerTwo-Labs' current enforcer makes them:
+
+- **Deposits under the current enforcer** (v1.0.1). **A consensus change that only adds:** every earlier block stays
+  valid, so upgrading is a binary swap on the same data directory with no `-reindex`, but an earlier release rejects
+  the first block that credits a deposit the new way. From its v1.0.0 (PR #664), the
+  enforcer gives each deposit its own treasury output and merges them in a later block, so a deposit no longer spends
+  the one before it. Earlier FreeBank releases require that, so under this enforcer they credit only the first deposit
+  ever. FreeBank now
+  credits each deposit what the enforcer says it added to the treasury (more than zero, at most the treasury output),
+  credits each eCash output once, and records a withdrawal's change to the treasury only when the enforcer reports
+  that withdrawal paid. Deposits an earlier release left uncredited are credited in the next block.
 
 - **Deposit demand** (v0.2.29). **A consensus change on beta that only adds:** every block beta has today stays valid,
   so upgrading is a binary swap with no `-reindex`, but a v0.2.28 node rejects the first block that uses it. A saver
@@ -403,8 +415,9 @@ v0.2.29 lets a saver force payment of a matured deposit:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-As of v0.2.29: 667 unit test cases and 75 integration gates, run on an eCash L1 (eCash's beta
-build on regtest with the L2L enforcer). All must pass to merge.
+As of v1.0.1: 669 unit test cases. The deposit and peg-out gates run on regtest with eCash v1.2.0 and the enforcer
+from PR #664; the other gates (75 in all as of v0.2.29) ran on eCash's beta build on regtest with the L2L enforcer.
+All must pass to merge.
 
 ## Wallet (preview)
 

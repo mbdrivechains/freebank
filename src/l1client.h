@@ -400,9 +400,10 @@ unsigned char TreasuryScriptOpcode(const CScript& script, unsigned int nSidechai
 inline bool IsTreasuryScript(const CScript& script, unsigned int nSidechain)
 { return TreasuryScriptOpcode(script, nSidechain) != 0; }
 
-/** The enforcer's m6id of an L1 M6 that spends a treasury UTXO worth
- *  nPrevTreasury (port of bip300301_enforcer OpDrivechain::compute_m6id):
- *  exactly one input; vout[0] a treasury script for nSidechain; fee =
+/** The enforcer's m6id of an L1 M6 that spends treasury UTXOs worth
+ *  nPrevTreasury in all (port of bip300301_enforcer OpDrivechain::compute_m6id):
+ *  at least one input (since L2L #664 an M6 can spend the merged treasury output
+ *  and unmerged deposits together); vout[0] a treasury script for nSidechain; fee =
  *  nPrevTreasury - vout[0] - sum(payouts) >= 0; blind = clear vin and replace
  *  vout[0] with OP_RETURN PUSH8(fee big-endian); m6id = its txid. False if the
  *  tx is not M6-shaped or an amount is out of range. Pure. */

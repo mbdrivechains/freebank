@@ -191,6 +191,7 @@ public:
         uint256 hashPrevLastBundle;
         bool fDepositUndo = false;
         std::vector<uint256> vDepositErase;
+        std::vector<COutPoint> vDepositOutpointErase; //!< the L1 outpoint of each vDepositErase row, same order
         uint256 hashPrevLastDeposit;
         std::vector<uint256> vWithdrawalErase;
         uint256 hashBest;
@@ -205,6 +206,14 @@ public:
     bool GetDeposit(const uint256 & /* Deposit ID */, SidechainDeposit &deposit);
     bool HaveDeposits();
     bool HaveDepositNonAmount(const uint256& hashNonAmount);
+    /** v1.0.1 (DEPOSITS_664_SPEC R3): is this L1 treasury output already
+     *  recorded? Each one is credited once; the record ID is no substitute,
+     *  since it also hashes fields the L1 does not fix (nTx). */
+    bool HaveDepositOutpoint(const COutPoint& outpoint);
+    /** Rebuild the outpoint index from the deposit rows (at startup: a DB
+     *  from before v1.0.1 has rows but no index, and one an older build ran on
+     *  since may have stale entries). False on a write failure. */
+    bool BuildDepositOutpointIndex();
     /** The deposit-CTIP baseline. pfPointerSet (optional) distinguishes the two
      *  ways this returns false: no pointer at all (no deposits yet - false) from
      *  a pointer whose ROW is missing (true = a DANGLING baseline, i.e. a

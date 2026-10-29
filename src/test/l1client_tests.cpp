@@ -599,10 +599,13 @@ BOOST_AUTO_TEST_CASE(l1client_m6id_roundtrip)
         BOOST_CHECK(!ComputeM6id(m6, m6.vout[0].nValue, 130, m6id));
         BOOST_CHECK(!ComputeM6id(m6, nTreasury - nFee - 1, 130, m6id));
         BOOST_CHECK(!ComputeM6id(m6, nTreasury, 129, m6id));
-        // Input count must be exactly one
+        // At least one input (v1.0.1: since L2L #664 an M6 can spend the merged
+        // treasury output and unmerged deposits together); the inputs are
+        // blinded, so a second one leaves the m6id as it was
         CMutableTransaction two(m6);
         two.vin.push_back(CTxIn(COutPoint(uint256S("bb"), 1)));
-        BOOST_CHECK(!ComputeM6id(two, nTreasury, 130, m6id));
+        BOOST_REQUIRE(ComputeM6id(two, nTreasury, 130, m6id));
+        BOOST_CHECK(m6id == m6idChassis);
         CMutableTransaction none(m6);
         none.vin.clear();
         BOOST_CHECK(!ComputeM6id(none, nTreasury, 130, m6id));

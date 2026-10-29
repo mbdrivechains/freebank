@@ -287,14 +287,19 @@ public:
  * its own identity: magic, genesis, ports and data directory ("easynet"), so it
  * never mixes with beta or mainnet and can run beside a beta node. Fixed seed
  * 163.47.9.132:28455, no DNS seed. An easynet build (configure --with-easynet) runs
- * it with no flag. When easynet's L1 resets, the magic's last byte follows it.
+ * it with no flag. When easynet's L1 resets and FreeBank-easynet starts a new chain, the magic's last byte
+ * follows it (not on reset 4: see below).
  */
 class CEasynetParams : public CBetaParams {
 public:
     CEasynetParams() {
         strNetworkID = "easynet";
 
-        // Its own network; the last byte follows easynet's L1 magic (ea5e4e03, reset 2026-10-13)
+        // Its own network; the last byte followed easynet's L1 magic (ea5e4e03, reset 2026-10-13). Kept at 03 on
+        // reset 4 (ea5e4e04, 2026-10-29): FreeBank-easynet must carry its reset-4 chain on in place (a chain started
+        // fresh on an L1 whose treasury already paid out would credit every deposit again, DEPOSITS_664_SPEC), and
+        // -reindex finds blocks by this magic, so a bump would hide every block written before it. The L1 pin keeps
+        // reset-3 and reset-4 nodes apart.
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;

@@ -185,11 +185,11 @@ private:
      * fetch them from the mainchain node's REST interface. */
     bool RestGet(const std::string& strPath, std::string& strBody);
     bool RestGetBlockTxids(const uint256& hashBlock, std::vector<uint256>& vTxid);
-    /* v0.2.17: tx txid of L1 block hashBlock, and its index there, read from
-     * the block itself (/rest/block/<hash>.hex). No -txindex needed: on a node
+    /* v0.2.17: L1 block hashBlock, raw (/rest/block/<hash>.hex), to read a
+     * tx and its index from (FindL1TxInBlock). No -txindex needed: on a node
      * started from an assumeutxo snapshot the tx index covers only the
      * background chainstate, and /rest/tx answers 404 for weeks. */
-    L1TxFetch RestGetTxFromBlock(const uint256& hashBlock, const uint256& txid, CMutableTransaction& tx, int& nTx);
+    bool RestGetBlock(const uint256& hashBlock, std::vector<unsigned char>& vchBlock);
 
     /* Fetch all withdrawal-bundle events for THIS_SIDECHAIN via GetTwoWayPegData. */
     bool FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents);
@@ -680,7 +680,7 @@ unsigned char TreasuryScriptOpcode(const CScript& script, unsigned int nSidechai
 
 bool ComputeM6id(const CMutableTransaction& mtx, CAmount nPrevTreasury, unsigned int nSidechain, uint256& m6id)
 {
-    if (mtx.vin.size() != 1 || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, nSidechain))
+    if (mtx.vin.empty() || mtx.vout.empty() || !IsTreasuryScript(mtx.vout[0].scriptPubKey, nSidechain))
         return false;
     if (!MoneyRange(nPrevTreasury))
         return false;
@@ -1612,17 +1612,18 @@ EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale)
     return r;
 }
 
-L1TxFetch EnforcerL1Client::RestGetTxFromBlock(const uint256& hashBlock, const uint256& txid, CMutableTransaction& tx, int& nTx)
+bool EnforcerL1Client::RestGetBlock(const uint256& hashBlock, std::vector<unsigned char>& vchBlock)
 {
-    nTx = -1;
+    vchBlock.clear();
     std::string body;
     if (!RestGet("/rest/block/" + hashBlock.ToString() + ".hex", body))
-        return L1TxFetch::FAILED;
+        return false;
     while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
         body.pop_back();
     if (body.empty() || !IsHex(body))
-        return L1TxFetch::FAILED;
-    return FindL1TxInBlock(ParseHex(body), txid, tx, nTx);
+        return false;
+    vchBlock = ParseHex(body);
+    return true;
 }
 
 bool EnforcerL1Client::RestGetBlockTxids(const uint256& hashBlock, std::vector<uint256>& vTxid)
@@ -1651,9 +1652,12 @@ bool EnforcerL1Client::RestGetBlockTxids(const uint256& hashBlock, std::vector<u
 
 // One enforcer Deposit event, flattened. output.address is a Hex of the ASCII
 // bytes of the sidechain address string (== the jsonrpc strdest, verified
-// live), so we decode it back to the string. value_sats is deliberately NOT
-// kept: it is the deposit INCREMENT, whereas the chassis needs the cumulative
-// CTIP value (read from the raw tx's burn output) and computes the delta itself.
+// live), so we decode it back to the string. value_sats is what the deposit
+// added to the treasury, and since v1.0.1 (DEPOSITS_664_SPEC R1) it is what the
+// record credits: after L2L #664 the treasury outputs a deposit spends can be
+// merges, which no record holds, so the delta cannot be computed here.
+// hashLastDeposit / nLastBurnIndex are not used: records no longer form a
+// chain (R2), so "everything after the last record" is not "everything new".
 std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex)
 {
     std::vector<SidechainDeposit> incoming;
@@ -1664,8 +1668,8 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     }
 
     // The treasury's changes over the whole L1 history (a full rescan each
-    // call; the caller dedups with HaveDepositNonAmount). A start block is a
-    // follow-up: the caller passes the last record's txid, not its L1 block.
+    // call; the ones already recorded are dropped below by their outpoint,
+    // before their L1 block is read). A start block is a follow-up.
     L1BlockHeader tip;
     if (!GetChainTip(tip))
         return incoming;
@@ -1677,7 +1681,9 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     }
 
     // v0.2.17 A9 + D7: every change to the treasury in running-number order,
-    // deposits and bundle payouts together (they share the counter). A payout's
+    // deposits and bundle payouts together (they share the counter; since
+    // #664 the deposits of one L1 block share a number, so the sort is stable:
+    // deposits before payouts, each in the enforcer's order). A payout's
     // M6 is the tx the enforcer sends with its "paid" event; freebankd searched
     // the L1 block for it (BuildM6Candidates). A6: a deposit with an empty
     // address is kept (the parser used to drop it, leaving a gap in the
@@ -1701,7 +1707,7 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         }
         vChange.push_back({ev.nSequence, nullptr, &ev});
     }
-    std::sort(vChange.begin(), vChange.end(), [](const Change& a, const Change& b) { return a.nSequence < b.nSequence; });
+    std::stable_sort(vChange.begin(), vChange.end(), [](const Change& a, const Change& b) { return a.nSequence < b.nSequence; });
 
     // Each change as a record (without its tx yet): the outpoint from the
     // event, a payout's txid from the M6 the event carries
@@ -1732,24 +1738,23 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         vRecord.push_back(deposit);
     }
 
-    // Skip everything up to and including the caller's last record
-    size_t nStart = 0;
-    if (!hashLastDeposit.IsNull()) {
-        for (size_t i = 0; i < vRecord.size(); i++) {
-            if (vTxid[i] == hashLastDeposit && vRecord[i].nBurnIndex == nLastBurnIndex) {
-                nStart = i + 1;
-                break;
-            }
-        }
-    }
-
-    // The new ones, each tx read from its own L1 block (which also shows it is
-    // there). All or nothing: one failure gives no new deposits this time, and
-    // the builder builds without them.
-    for (size_t i = nStart; i < vRecord.size(); i++) {
+    // The new ones (outpoint not recorded yet, R3), each tx read from its own
+    // L1 block (which also shows it is there). All or nothing: one failure
+    // gives no new deposits this time, and the builder builds without them.
+    // The last block read is kept: the changes come in L1 order, and since
+    // #664 one L1 block often holds several deposits (one block, not all of
+    // them: a mainnet backlog's blocks would not fit in memory).
+    uint256 hashBlockHeld;
+    std::vector<unsigned char> vchBlockHeld;
+    for (size_t i = 0; i < vRecord.size(); i++) {
         SidechainDeposit& deposit = vRecord[i];
+        if (psidechaintree && psidechaintree->HaveDepositOutpoint(COutPoint(vTxid[i], deposit.nBurnIndex)))
+            continue;
         int nTx = -1;
-        if (RestGetTxFromBlock(deposit.hashMainchainBlock, vTxid[i], deposit.dtx, nTx) != L1TxFetch::OK) {
+        if (hashBlockHeld != deposit.hashMainchainBlock)
+            hashBlockHeld = RestGetBlock(deposit.hashMainchainBlock, vchBlockHeld) ? deposit.hashMainchainBlock : uint256();
+        if (hashBlockHeld != deposit.hashMainchainBlock ||
+                FindL1TxInBlock(vchBlockHeld, vTxid[i], deposit.dtx, nTx) != L1TxFetch::OK) {
             LogPrintf("ERROR Enforcer client: treasury change %s (number %u): could not read it from its L1 block %s (batch failed closed)\n",
                       vTxid[i].ToString(), vChange[i].nSequence, deposit.hashMainchainBlock.ToString());
             return std::vector<SidechainDeposit>();
@@ -1765,9 +1770,9 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
                       vTxid[i].ToString(), deposit.nBurnIndex);
             return std::vector<SidechainDeposit>();
         }
-        // The treasury's value after this change; the builder subtracts the
-        // one before (a payout's "D" record is clamped to 0 there)
-        deposit.amtUserPayout = deposit.dtx.vout[deposit.nBurnIndex].nValue;
+        // What it credits (R1, R4): the enforcer's increment for a deposit,
+        // nothing for a withdrawal return
+        deposit.amtUserPayout = vChange[i].pDeposit ? vChange[i].pDeposit->nValue : CAmount(0);
         incoming.push_back(deposit);
     }
     return incoming;
@@ -2747,9 +2752,10 @@ std::vector<SidechainDeposit> JsonRpcL1Client::UpdateDeposits(const uint256& has
             continue;
         }
 
-        // Get the user payout amount from the deposit output. At this point the
-        // amount is the total CTIP, and the real payout will be calculated
-        // later.
+        // Get the user payout amount from the deposit output: the total CTIP.
+        // Since v1.0.1 the builder no longer subtracts the previous one (records
+        // carry what they credit, DEPOSITS_664_SPEC R1); this transport's
+        // deposits are parked anyway (it cannot answer the L1 check, v0.2.17).
         deposit.amtUserPayout = deposit.dtx.vout[deposit.nBurnIndex].nValue;
 
         // Add this deposit to the list

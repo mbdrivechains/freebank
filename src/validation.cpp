@@ -7398,6 +7398,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     // atomic batch after the loop (fSideDB only - real disconnects, never the
     // VerifyDB throwaway pass).
     std::vector<uint256> vDepositUndo;
+    std::vector<COutPoint> vDepositOutpointUndo; // v1.0.1: their outpoint index rows, same order
 
     // B6: the bundle this block created and its withdrawals, reverted in one
     // batch after the walk below (fSideDB only).
@@ -8921,6 +8922,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     // D-3: collect for the post-loop baseline revert + row erase
                     const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
                     vDepositUndo.push_back(deposit->GetID());
+                    vDepositOutpointUndo.push_back(COutPoint(deposit->dtx.GetHash(), deposit->nBurnIndex));
                 }
                 else
                 if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
@@ -9001,6 +9003,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         }
         sidechainUndo.fDepositUndo = fDepositUndo && !vDepositUndo.empty();
         sidechainUndo.vDepositErase = vDepositUndo;
+        sidechainUndo.vDepositOutpointErase = vDepositOutpointUndo;
         sidechainUndo.hashPrevLastDeposit = pindex->pprev->hashLastDeposit;
         sidechainUndo.vWithdrawalErase = vWithdrawalUndo;
         sidechainUndo.hashBest = pindex->pprev->GetBlockHash();
@@ -9272,23 +9275,26 @@ static int64_t nBlocksTotal = 0;
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
-/** v0.2.17 A1 + A4: is deposit record d what the L1 recorded? Asked of the
- *  enforcer's peg events of exactly the deposit's own L1 block (it lists only
- *  deposits it checked by the eCash drivechain rules). A deposit: an event
- *  with the same outpoint, the same address, and an amount equal to what the
- *  record's treasury output adds to the previous one (amountPrev); the first
- *  record ever must be the treasury's first change (running number 0). The
- *  treasury outputs form one chain and each record must spend the previous
- *  one's (ConnectBlock), so none can be skipped or repeated. A withdrawal
- *  return: the L1 paid a bundle in that block with this very tx. And the L1
- *  block must be on the L1's main chain, at or below the block's own (A4).
- *  YES / NO; UNKNOWN when the L1 cannot answer. Before, VerifyDeposit only
- *  checked the tx was in the named L1 block: an unrelated tx there was
- *  credited as a deposit (money from nothing), and nothing compared the
- *  address (a deposit redirected). */
-static L1Answer CheckDepositWithL1(const SidechainDeposit& d, CAmount amountPrev, bool fFirst,
-                                   const uint256& hashBlockMain, std::string& strWhy)
+/** v0.2.17 A1 + A4, v1.0.1 (DEPOSITS_664_SPEC): is deposit record d what the
+ *  L1 recorded, and what does it credit (nCredit)? Asked of the enforcer's peg
+ *  events of exactly the deposit's own L1 block (it lists only deposits it
+ *  checked by the eCash drivechain rules). A deposit: an event with the same
+ *  outpoint and the same address; it credits the event's amount, what the
+ *  deposit added to the treasury (R1). Since L2L #664 the treasury is a set of
+ *  outputs merged at the end of each L1 block (the merge has no event), so the
+ *  amount cannot be read from the record's tx alone: the enforcer's word,
+ *  bounded by the record's treasury output. Records no longer chain (R2), each
+ *  outpoint is credited once (R3, ConnectBlock). A withdrawal return: the L1
+ *  paid a bundle in that block with this very tx (R4); it credits nothing.
+ *  And the L1 block must be on the L1's main chain, at or below the block's
+ *  own (A4). YES / NO; UNKNOWN when the L1 cannot answer. Before v0.2.17,
+ *  VerifyDeposit only checked the tx was in the named L1 block: an unrelated
+ *  tx there was credited as a deposit (money from nothing), and nothing
+ *  compared the address (a deposit redirected). */
+L1Answer CheckDepositWithL1(const SidechainDeposit& d, const uint256& hashBlockMain, CAmount& nCredit,
+                            std::string& strWhy)
 {
+    nCredit = 0;
     // Our list's positions (GetMainchainBlockHeight is off by one, the same for both)
     const int nOwn = bmmCache.GetMainchainBlockHeight(hashBlockMain);
     if (nOwn < 0) {
@@ -9335,51 +9341,50 @@ static L1Answer CheckDepositWithL1(const SidechainDeposit& d, CAmount amountPrev
             strWhy = "its address is not the one the depositor wrote";
             return L1Answer::NO;
         }
-        if (ev.nValue != nTreasury - amountPrev) {
-            strWhy = strprintf("the L1 recorded %s deposited, the record's treasury output adds %s", FormatMoney(ev.nValue),
-                               FormatMoney(nTreasury - amountPrev));
+        if (ev.nValue <= 0 || ev.nValue > nTreasury) {
+            strWhy = strprintf("the L1 recorded %s deposited, outside (0, %s], its treasury output", FormatMoney(ev.nValue),
+                               FormatMoney(nTreasury));
             return L1Answer::NO;
         }
-        if (fFirst && ev.nSequence != 0) {
-            strWhy = strprintf("the first deposit recorded is the treasury's change number %u, not its first", ev.nSequence);
-            return L1Answer::NO;
-        }
+        nCredit = ev.nValue;
         return L1Answer::YES;
     }
 
     // Else a withdrawal return: the L1 paid a bundle in that block with this
-    // very tx, whose treasury change is its output 0 (into_m6)
+    // very tx, whose treasury change is its output 0 (into_m6). Matched by the
+    // M6 the "paid" event carries (D7): its m6id would need the value of every
+    // treasury output the M6 spends, merges included, which no record holds.
     if (d.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST) {
-        uint256 m6id;
-        if (d.nBurnIndex != 0 || !ComputeM6id(d.dtx, amountPrev, THIS_SIDECHAIN, m6id)) {
-            strWhy = "a withdrawal return that is not a bundle payout with its treasury change at output 0";
+        if (d.nBurnIndex != 0) {
+            strWhy = "a withdrawal return whose treasury change is not output 0";
             return L1Answer::NO;
         }
+        std::string strCantTell;
         for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
-            if (ev.status != 'S' || ev.m6id != m6id)
+            if (ev.status != 'S')
                 continue;
-            // The very M6 the L1 carries, not a copy with other inputs (the
-            // m6id ignores them): the event sends the M6 itself (D7)
             if (ev.vchTx.empty()) {
-                strWhy = strprintf("the L1's \"paid\" event for %s carries no transaction", m6id.ToString());
-                return L1Answer::UNKNOWN;
+                strCantTell = strprintf("the L1's \"paid\" event for %s carries no transaction", ev.m6id.ToString());
+                continue;
             }
             L1MutableTransaction mtxPaid;
             try {
                 CDataStream ss(ev.vchTx, SER_NETWORK, PROTOCOL_VERSION);
                 ss >> mtxPaid;
             } catch (const std::exception&) {
-                strWhy = strprintf("the L1's \"paid\" event for %s carries a transaction that does not decode", m6id.ToString());
-                return L1Answer::UNKNOWN;
+                strCantTell = strprintf("the L1's \"paid\" event for %s carries a transaction that does not decode", ev.m6id.ToString());
+                continue;
             }
-            if (mtxPaid.GetHash() != d.dtx.GetHash()) {
-                strWhy = strprintf("the return's tx %s is not the M6 %s the L1 paid", d.dtx.GetHash().ToString(),
-                                   mtxPaid.GetHash().ToString());
-                return L1Answer::NO;
-            }
-            return L1Answer::YES;
+            if (mtxPaid.GetHash() == d.dtx.GetHash())
+                return L1Answer::YES;
         }
-        strWhy = strprintf("the L1 paid no bundle %s in block %s", m6id.ToString(), d.hashMainchainBlock.ToString());
+        // A paid bundle we could not read may be this one
+        if (!strCantTell.empty()) {
+            strWhy = strCantTell;
+            return L1Answer::UNKNOWN;
+        }
+        strWhy = strprintf("the L1 paid no bundle with tx %s in block %s", d.dtx.GetHash().ToString(),
+                           d.hashMainchainBlock.ToString());
         return L1Answer::NO;
     }
 
@@ -9850,82 +9855,40 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             }
         }
 
-        // Verify new deposit payouts
+        // Verify new deposit payouts (v1.0.1, DEPOSITS_664_SPEC). Each record
+        // stands alone: no chain of treasury outputs (R2), so no baseline.
         //
-        // - Find the previous deposit CTIP (input for first new deposit)
+        // - Each L1 treasury outpoint is recorded once (R3)
         //
-        // - Re-calculate the deposit payouts ourselves
-        //
-        // - Loop through all of the rest of the deposits, recalculating
-        // and verifying their deposit payout amounts
+        // - The record is what the L1 recorded and credits what the enforcer
+        // says it added to the treasury; a withdrawal return credits nothing
+        // (R1, R4, CheckDepositWithL1)
         //
         // - Check for a coinbase payout output matching each deposit
         //
         if (fCheckBMM && vDeposit.size() && !fSidechainDBReplay) {
-            SidechainDeposit prev;
-            bool fPointerSet = false;
-            bool fHaveDeposits = psidechaintree->GetLastDeposit(prev, &fPointerSet);
-
-            // Fail CLOSED on a dangling baseline (pointer set, row missing).
-            // The branch below treats !fHaveDeposits as "no deposits yet" and
-            // so skips the CTIP-input check with amountPrev = 0, which would
-            // size this payout at the whole cumulative CTIP. A dangling
-            // pointer means a corrupt deposit DB, never a valid chain state:
-            // halt and demand a rebuild instead of minting from the damage.
-            if (!fHaveDeposits && fPointerSet) {
-                return state.Error(strprintf("%s: deposit CTIP baseline is dangling (pointer set, "
-                                             "row missing) - deposit DB is corrupt; restart with "
-                                             "-reindex", __func__));
-            }
-
-            CAmount amountPrev = CAmount(0);
-            if (fHaveDeposits) {
-                // First deposit should be spending current CTIP, find the
-                // current CTIP in the deposit's inputs
-                bool fFound = false;
-                for (const CTxIn& in : vDeposit.front().dtx.vin) {
-                    if (in.prevout.hash == prev.dtx.GetHash() &&
-                            prev.dtx.vout.size() > in.prevout.n &&
-                            prev.nBurnIndex == in.prevout.n) {
-                        fFound = true;
-                        break;
-                    }
-                }
-                if (!fFound) {
-                    return state.DoS(90, error("%s: invalid sidechain deposit input:\n%s", __func__, vDeposit.front().ToString()), REJECT_INVALID, "invalid-deposit-input");
-                }
-                // Copy the burn amount from CTIP
-                amountPrev = prev.dtx.vout[prev.nBurnIndex].nValue;
-            }
-
             // Coinbase outputs already spoken for by an earlier deposit in
             // THIS block go in setClaimedPayouts (above). Without it, two
             // identical deposits are both satisfied by one output and the
             // miner keeps the difference (D-1).
+            std::set<COutPoint> setDepositOutpoints;
 
             // Check deposit payout amounts & find coinbase output
-            for (size_t nDeposit = 0; nDeposit < vDeposit.size(); nDeposit++) {
-                const SidechainDeposit& d = vDeposit[nDeposit];
-
-                // v0.2.17 A1: each record after the first spends the previous
-                // one's treasury output (the first is checked against the DB's
-                // last record above). Only the first was: a block could repeat
-                // a deposit and a payout and credit the deposit again each time.
-                if (nDeposit > 0) {
-                    const COutPoint prevTreasury(vDeposit[nDeposit - 1].dtx.GetHash(), vDeposit[nDeposit - 1].nBurnIndex);
-                    bool fSpends = false;
-                    for (const CTxIn& in : d.dtx.vin)
-                        fSpends |= in.prevout == prevTreasury;
-                    if (!fSpends)
-                        return state.DoS(90, error("%s: sidechain deposit does not spend the previous record's treasury output:\n%s",
-                                                   __func__, d.ToString()),
-                                         REJECT_INVALID, "invalid-deposit-input");
-                }
+            for (const SidechainDeposit& d : vDeposit) {
+                // R3: once per L1 outpoint, against the DB (the chain up to
+                // pprev) and this block. It replaces v0.2.17 A1's chain, which
+                // stopped a block repeating a deposit and a payout to credit
+                // the deposit again each time.
+                const COutPoint outpoint(d.dtx.GetHash(), d.nBurnIndex);
+                if (!setDepositOutpoints.insert(outpoint).second || psidechaintree->HaveDepositOutpoint(outpoint))
+                    return state.DoS(90, error("%s: sidechain deposit %s:%u is already recorded:\n%s", __func__,
+                                               outpoint.hash.ToString(), outpoint.n, d.ToString()),
+                                     REJECT_INVALID, "bad-deposit-duplicate");
 
                 // v0.2.17 A1 + A4: the record is what the L1 recorded
                 std::string strWhy;
-                const L1Answer answer = CheckDepositWithL1(d, amountPrev, !fHaveDeposits && nDeposit == 0,
-                                                           block.hashMainchainBlock, strWhy);
+                CAmount nCredit = 0;
+                const L1Answer answer = CheckDepositWithL1(d, block.hashMainchainBlock, nCredit, strWhy);
                 if (answer == L1Answer::UNKNOWN)
                     return state.Error(strprintf("%s: deposit %s: %s", __func__, d.dtx.GetHash().ToString(), strWhy));
                 if (answer == L1Answer::NO)
@@ -9933,15 +9896,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                                               d.dtx.GetHash().ToString(), strWhy),
                                      REJECT_INVALID, "bad-deposit-l1");
 
-                CAmount burn = d.dtx.vout[d.nBurnIndex].nValue;
-                CAmount payout = burn - amountPrev;
-
-                amountPrev = burn;
-
-                if (d.amtUserPayout == 0 && d.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST)
-                    continue;
-
-                if (d.amtUserPayout != payout) {
+                if (d.amtUserPayout != nCredit) {
                     return state.DoS(90, error("%s: invalid sidechain deposit amount:\n%s", __func__, d.ToString()), REJECT_INVALID, "invalid-deposit-amount");
                 }
 
@@ -9949,8 +9904,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 // is owed nothing (dust at or below the fee, or an undecodable
                 // depositor-supplied destination) is recorded but not paid, and
                 // demanding an output for it made the node reject its own
-                // blocks forever - deposits are strictly ordered, so the queue
-                // could never move past one.
+                // blocks forever (when deposits were strictly ordered, the
+                // queue could never move past one).
                 CTxOut required;
                 if (!GetDepositPayoutOutput(d, required))
                     continue;

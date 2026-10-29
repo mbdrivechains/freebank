@@ -1748,11 +1748,12 @@ BOOST_AUTO_TEST_CASE(d4_no_bid_while_l1_view_behind)
 
 // ---------------------------------------------------------------------------
 // v0.2.17 A1 + A4: a deposit record must be on the enforcer's list of its L1
-// block: the same outpoint, address and amount; the first ever is the
-// treasury's first change; its L1 block on the L1's main chain at or below the
-// block's own. Before, only "the tx is in that L1 block" was checked (a cache
-// of txids): any tx there could be credited (money from nothing), to any
-// address (a deposit redirected), and nothing tied the first to the treasury.
+// block: the same outpoint and address; it credits the listed amount (v1.0.1
+// R1), no more than its treasury output; its L1 block on the L1's main chain at
+// or below the block's own. Before, only "the tx is in that L1 block" was
+// checked (a cache of txids): any tx there could be credited (money from
+// nothing), to any address (a deposit redirected). Since v1.0.1 (R5) the first
+// record need not be the treasury's first change.
 // ---------------------------------------------------------------------------
 PEGBIND_BOTH_LAYOUTS(a1_deposit_must_be_on_the_l1_list)
 {
@@ -1787,15 +1788,21 @@ PEGBIND_BOTH_LAYOUTS(a1_deposit_must_be_on_the_l1_list)
         chain.Reject(Try(dRedirect, true), "bad-deposit-l1", "an enforcer redirects a deposit");
     }
 
-    // The L1 recorded 4 COIN deposited, the record's treasury output adds 5
+    // The L1 recorded 4 COIN deposited, the record credits 5
     chain.oracle.mapWindowEvents.clear();
     L1ListsDeposit(chain.oracle, dFake, 4 * COIN, 0);
-    chain.Reject(Try(dFake, true), "bad-deposit-l1", "wrong amount");
+    chain.Reject(Try(dFake, true), "invalid-deposit-amount", "wrong amount");
 
-    // The first record must be the treasury's first change
+    // R1's bound: an enforcer that lists 6 COIN added by a 5 COIN treasury output
     chain.oracle.mapWindowEvents.clear();
-    L1ListsDeposit(chain.oracle, dFake, 5 * COIN, 3);
-    chain.Reject(Try(dFake, true), "bad-deposit-l1", "first record is not the treasury's first");
+    L1ListsDeposit(chain.oracle, dFake, 6 * COIN, 0);
+    const SidechainDeposit dOver = MakeDepositRecord(dtx, nBurn, alice.strAddress, 6 * COIN, hashL1a);
+    chain.Reject(Try(dOver, true), "bad-deposit-l1", "more than its treasury output");
+    // ... and one that lists nothing added
+    chain.oracle.mapWindowEvents.clear();
+    L1ListsDeposit(chain.oracle, dFake, 0, 0);
+    const SidechainDeposit dZero = MakeDepositRecord(dtx, nBurn, alice.strAddress, 0, hashL1a);
+    chain.Reject(Try(dZero, true), "bad-deposit-l1", "nothing added to the treasury");
 
     // A4: its L1 block is not on the L1's main chain (ours)
     const SidechainDeposit dStale = MakeDepositRecord(dtx, nBurn, alice.strAddress, 5 * COIN, hashStale);
@@ -1809,7 +1816,8 @@ PEGBIND_BOTH_LAYOUTS(a1_deposit_must_be_on_the_l1_list)
     BOOST_CHECK(!chain.Process(pblock).empty());
     BOOST_CHECK(TipForTest() == pindexTip);
     BOOST_CHECK(!BlockFailedForTest(pblock->GetHash()));
-    L1ListsDeposit(chain.oracle, dFake, 5 * COIN, 0);
+    // The treasury's change number 3 (its first changes recorded later, R5)
+    L1ListsDeposit(chain.oracle, dFake, 5 * COIN, 3);
     chain.Connect(pblock, "the real first deposit, once the L1 answers");
     BOOST_CHECK_EQUAL(psidechaintree->GetDeposits(THIS_SIDECHAIN).size(), 1U);
 }
@@ -1899,16 +1907,22 @@ PEGBIND_BOTH_LAYOUTS(a3_a8_coinbase_payouts)
 
 // ---------------------------------------------------------------------------
 // v0.2.17 A9: a problem with the new deposits leaves them out of the block; it
-// no longer stops block making. Here the L1 client reports a deposit that does
-// not spend the treasury output FreeBank recorded last (no CTIP found): the
-// builder returned no template at all.
+// no longer stops block making. v1.0.1 (R2): a deposit that does not spend the
+// treasury output FreeBank recorded last is no problem any more (since L2L #664
+// that is how the enforcer's wallet deposits); it goes in, credited what the L1
+// client reports. One with a broken treasury output index, and one the L1 check
+// refuses (not on the enforcer's list), are left out alone, without holding back
+// the good one (the first used to take every new deposit out; the second went
+// into every template and the node refused its own blocks). The block the
+// builder makes connects.
 // ---------------------------------------------------------------------------
 PEGBIND_BOTH_LAYOUTS(a9_builder_builds_without_a_bad_deposit)
 {
     PegChain chain(layout, scriptCoinbase);
     const TestKey alice, bob;
     const uint256 hashL1a = ArithToUint256(arith_uint256(0xa1)), hashE1 = ArithToUint256(arith_uint256(0xe1));
-    MainCacheScope cache({ArithToUint256(arith_uint256(0xa0)), hashL1a, hashE1});
+    const uint256 hashE2 = ArithToUint256(arith_uint256(0xe2));
+    MainCacheScope cache({ArithToUint256(arith_uint256(0xa0)), hashL1a, hashE1, hashE2});
     uint32_t nBurn1 = 0;
     const CMutableTransaction dtx1 = MakeDepositTx(layout, {COutPoint(ArithToUint256(arith_uint256(0xd1)), 0)},
                                                    5 * COIN, alice.strAddress, nBurn1);
@@ -1916,22 +1930,53 @@ PEGBIND_BOTH_LAYOUTS(a9_builder_builds_without_a_bad_deposit)
     L1ListsDeposit(chain.oracle, d1, 5 * COIN, 0);
     chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, d1); }), hashE1), "first deposit");
 
-    // A new deposit that spends something else than d1's treasury output
+    // A new deposit that spends something else than d1's treasury output (a
+    // #664 deposit: its own treasury output, 2 COIN)
     uint32_t nBurn2 = 0;
     const CMutableTransaction dtx2 = MakeDepositTx(layout, {COutPoint(ArithToUint256(arith_uint256(0xd2)), 0)},
-                                                   7 * COIN, bob.strAddress, nBurn2);
-    SidechainDeposit d2 = MakeDepositRecord(dtx2, nBurn2, bob.strAddress, 7 * COIN, hashL1a);
+                                                   2 * COIN, bob.strAddress, nBurn2);
+    const SidechainDeposit d2 = MakeDepositRecord(dtx2, nBurn2, bob.strAddress, 2 * COIN, hashL1a);
+    // ... and one whose treasury output index is out of range
+    uint32_t nBurn3 = 0;
+    const CMutableTransaction dtx3 = MakeDepositTx(layout, {COutPoint(ArithToUint256(arith_uint256(0xd3)), 0)},
+                                                   3 * COIN, bob.strAddress, nBurn3);
+    SidechainDeposit dBad = MakeDepositRecord(dtx3, nBurn3, bob.strAddress, 3 * COIN, hashL1a);
+    dBad.nBurnIndex = 9;
+    // ... and one the enforcer does not list (the L1 check says no)
+    uint32_t nBurn4 = 0;
+    const CMutableTransaction dtx4 = MakeDepositTx(layout, {COutPoint(ArithToUint256(arith_uint256(0xd4)), 0)},
+                                                   4 * COIN, bob.strAddress, nBurn4);
+    const SidechainDeposit dNo = MakeDepositRecord(dtx4, nBurn4, bob.strAddress, 4 * COIN, hashL1a);
+    L1ListsDeposit(chain.oracle, d2, 2 * COIN, 1);
     FakeL1Client l1;
-    l1.vDepositsToReport = {d2};
+    l1.vDepositsToReport = {dBad, dNo, d2, d1};
     CBlock block;
     std::string strError;
     const bool fBuilt = BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
         std::vector<CMutableTransaction>(), uint256(), scriptCoinbase);
     BOOST_REQUIRE_MESSAGE(fBuilt, LayoutName(layout) << ": no block template: " << strError);
+    std::vector<uint256> vIn;
     for (const CTxOut& out : block.vtx[0]->vout) {
         std::vector<unsigned char> vch;
-        BOOST_CHECK_MESSAGE(!out.scriptPubKey.IsSidechainObj(vch), LayoutName(layout) << ": the bad deposit went in");
+        if (!out.scriptPubKey.IsSidechainObj(vch))
+            continue;
+        std::unique_ptr<SidechainObj> obj(ParseSidechainObj(vch));
+        BOOST_REQUIRE(obj && obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP);
+        const SidechainDeposit& d = *static_cast<const SidechainDeposit*>(obj.get());
+        BOOST_CHECK_EQUAL(d.amtUserPayout, 2 * COIN);
+        vIn.push_back(d.GetID());
     }
+    // d2 alone: not the bad ones, and not d1 again (its outpoint is recorded)
+    BOOST_CHECK_MESSAGE(vIn.size() == 1 && vIn[0] == d2.GetID(), LayoutName(layout) << ": " << vIn.size() << " records went in");
+
+    // ... and the builder's block connects
+    {
+        LOCK(cs_main);
+        block.nTime = chainActive.Tip()->GetMedianTimePast() + 1;
+    }
+    chain.Connect(OnL1(std::make_shared<const CBlock>(block), hashE2), "the builder's block");
+    BOOST_CHECK(psidechaintree->HaveDepositOutpoint(COutPoint(d2.dtx.GetHash(), d2.nBurnIndex)));
+    BOOST_CHECK(!psidechaintree->HaveDepositOutpoint(COutPoint(dNo.dtx.GetHash(), dNo.nBurnIndex)));
 }
 
 
@@ -1989,18 +2034,20 @@ PEGBIND_BOTH_LAYOUTS(crash_replay_keeps_sidechain_effects)
 
 
 // ---------------------------------------------------------------------------
-// v0.2.17, from the deposit review: every record in a block spends the
-// previous record's treasury output (only the first was checked); a deposit is
-// what the enforcer lists as one, whatever its address says; a withdrawal
-// return's treasury change is its output 0.
+// v0.2.17, from the deposit review: a record can't be credited twice (v0.2.17:
+// every record spent the previous one's treasury output; v1.0.1 R3: each L1
+// outpoint once, in a block and across blocks, whatever else the record says);
+// a deposit is what the enforcer lists as one, whatever its address says; a
+// withdrawal return's treasury change is its output 0.
 // ---------------------------------------------------------------------------
-PEGBIND_BOTH_LAYOUTS(a1_every_record_chains_and_d_is_a_deposit)
+PEGBIND_BOTH_LAYOUTS(a1_every_record_once_and_d_is_a_deposit)
 {
     PegChain chain(layout, scriptCoinbase);
     const TestKey alice, bob;
     const uint256 hashL1a = ArithToUint256(arith_uint256(0xa1)), hashL1b = ArithToUint256(arith_uint256(0xa2));
     const uint256 hashE1 = ArithToUint256(arith_uint256(0xe1)), hashE2 = ArithToUint256(arith_uint256(0xe2));
-    MainCacheScope cache({ArithToUint256(arith_uint256(0xa0)), hashL1a, hashL1b, hashE1, hashE2});
+    const uint256 hashE3 = ArithToUint256(arith_uint256(0xe3));
+    MainCacheScope cache({ArithToUint256(arith_uint256(0xa0)), hashL1a, hashL1b, hashE1, hashE2, hashE3});
     uint32_t nBurn1 = 0;
     const CMutableTransaction dtx1 = MakeDepositTx(layout, {COutPoint(ArithToUint256(arith_uint256(0xd1)), 0)},
                                                    5 * COIN, alice.strAddress, nBurn1);
@@ -2016,24 +2063,36 @@ PEGBIND_BOTH_LAYOUTS(a1_every_record_chains_and_d_is_a_deposit)
     const SidechainDeposit dD = MakeDepositRecord(dtx2, nBurn2, SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST, 2 * COIN, hashL1b);
     L1ListsDeposit(chain.oracle, dD, 2 * COIN, 1);
 
-    // The same record twice in one block: the second does not spend the first's treasury output
+    // The same record twice in one block
     SidechainDeposit dAgain = dD;
     dAgain.amtUserPayout = 0;
     chain.Reject(OnL1(chain.Block({}, [&](CMutableTransaction& cb) {
         AddDepositToCoinbase(cb, dD);
         AddDepositToCoinbase(cb, dAgain);
-    }), hashE2), "invalid-deposit-input", "a record repeated in one block");
+    }), hashE2), "bad-deposit-duplicate", "a record repeated in one block");
 
     chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, dD); }, true), hashE2),
                   "a deposit to the address D");
     BOOST_CHECK_EQUAL(psidechaintree->GetDeposits(THIS_SIDECHAIN).size(), 2U);
+
+    // Once recorded, again in a later block: the same record, and one that
+    // differs only where the L1 fixes nothing (nTx, so another record ID)
+    chain.Reject(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, dD); }, true), hashE3),
+                 "bad-deposit-duplicate", "a recorded deposit again");
+    SidechainDeposit dOtherTx = dD;
+    dOtherTx.nTx = 7;
+    BOOST_REQUIRE(dOtherTx.GetID() != dD.GetID());
+    chain.Reject(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, dOtherTx); }, true), hashE3),
+                 "bad-deposit-duplicate", "a recorded deposit under another nTx");
 }
 
 // Withdrawal returns (the CUSF layout: an M6 has its treasury change at
 // output 0). The treasury X (5 COIN) is paid down by bundle payout P (1 COIN
 // out), then refilled by deposit D (1 COIN in). A block [P, D, P, D] credited D
-// twice (P's m6id recomputes the same once D restores the treasury): each
-// record now spends the previous one's treasury output.
+// twice (P's m6id recomputes the same once D restores the treasury): v0.2.17
+// made each record spend the previous one's treasury output; since v1.0.1 each
+// L1 outpoint is recorded once (R3), and a return is matched by the M6 the
+// "paid" event carries, not by an m6id recomputed from a previous value (R4).
 BOOST_AUTO_TEST_CASE(a1_withdrawal_return_and_its_cycle)
 {
     const Layout layout = Layout::CUSF;
@@ -2094,7 +2153,7 @@ BOOST_AUTO_TEST_CASE(a1_withdrawal_return_and_its_cycle)
         AddDepositToCoinbase(cb, d3);
         AddDepositToCoinbase(cb, ret);
         AddDepositToCoinbase(cb, d3);
-    }), hashE2), "invalid-deposit-input", "a payout and a deposit repeated");
+    }), hashE2), "bad-deposit-duplicate", "a payout and a deposit repeated");
 
     // A copy of P with another input sequence: the same m6id, another txid
     SidechainDeposit retCopy = ret;
@@ -2163,6 +2222,165 @@ PEGBIND_BOTH_LAYOUTS(crash_replay_of_a_deposit_block)
     L1ListsDeposit(chain.oracle, d2, 2 * COIN, 1);
     chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, d2); }), hashE2), "the next deposit");
     BOOST_CHECK_EQUAL(psidechaintree->GetDeposits(THIS_SIDECHAIN).size(), 2U);
+}
+
+
+// ---------------------------------------------------------------------------
+// v1.0.1 (DEPOSITS_664_SPEC): the treasury after L2L #664. A deposit through
+// the enforcer's wallet is its own treasury output, and the last tx of its L1
+// block merges every treasury output into one (no event, so no record). Here:
+// d1 (5) in L1 block a; d2 (1) and d3 (2) in block b, each spending only
+// wallet coins, then the merge M (8); in block c d5 (an older wallet's shape)
+// spends M and adds 0.5, d4 is its own output (0.5), d6 spends d4's output
+// still unmerged and adds 0.25, and payout P takes 1 out of d5's and d6's
+// outputs together (9.25). FreeBank never sees M: each record credits what the
+// L1 says it added (R1), none
+// chains (R2), each outpoint once (R3), a return matches its M6 (R4), records
+// go in any order (R5), and a disconnect gives the outpoint back.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(v101_aggregated_deposits)
+{
+    const Layout layout = Layout::CUSF;
+    PegChain chain(layout, GetCoinbaseScript());
+    const auto H = [](uint64_t n) { return ArithToUint256(arith_uint256(n)); };
+    const TestKey alice, bob, carol;
+    const uint256 hashL1a = H(0xa1), hashL1b = H(0xa2), hashL1c = H(0xa3);
+    const uint256 hashE1 = H(0xe1), hashE2 = H(0xe2), hashE3 = H(0xe3), hashE4 = H(0xe4);
+    MainCacheScope cache({H(0xa0), hashL1a, hashL1b, hashL1c, hashE1, hashE2, hashE3, hashE4});
+    const auto Recorded = [](const SidechainDeposit& d) {
+        return psidechaintree->HaveDepositOutpoint(COutPoint(d.dtx.GetHash(), d.nBurnIndex));
+    };
+
+    uint32_t nBurn1 = 0, nBurn2 = 0, nBurn3 = 0, nBurn4 = 0, nBurn5 = 0, nBurn6 = 0;
+    const CMutableTransaction dtx1 = MakeDepositTx(layout, {COutPoint(H(0xd1), 0)}, 5 * COIN, alice.strAddress, nBurn1);
+    const SidechainDeposit d1 = MakeDepositRecord(dtx1, nBurn1, alice.strAddress, 5 * COIN, hashL1a);
+    L1ListsDeposit(chain.oracle, d1, 5 * COIN, 0);
+    chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, d1); }), hashE1),
+                  "d1, the first deposit");
+
+    // Block b: two deposits that spend no treasury output, sharing a running number
+    const CMutableTransaction dtx2 = MakeDepositTx(layout, {COutPoint(H(0xd2), 0)}, COIN, bob.strAddress, nBurn2);
+    const CMutableTransaction dtx3 = MakeDepositTx(layout, {COutPoint(H(0xd3), 0)}, 2 * COIN, carol.strAddress, nBurn3);
+    const SidechainDeposit d2 = MakeDepositRecord(dtx2, nBurn2, bob.strAddress, COIN, hashL1b);
+    const SidechainDeposit d3 = MakeDepositRecord(dtx3, nBurn3, carol.strAddress, 2 * COIN, hashL1b, 2);
+    L1ListsDeposit(chain.oracle, d2, COIN, 1);
+    L1ListsDeposit(chain.oracle, d3, 2 * COIN, 1);
+    chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) {
+        AddDepositToCoinbase(cb, d2);
+        AddDepositToCoinbase(cb, d3);
+    }), hashE2), "d2 and d3, two deposits of one L1 block");
+    BOOST_CHECK(Recorded(d1) && Recorded(d2) && Recorded(d3));
+
+    // Block c: d5 spends the merge M (8 COIN, unknown to FreeBank) and adds 0.5
+    const COutPoint outMerged(H(0x3e), 0);
+    const CMutableTransaction dtx5 = MakeDepositTx(layout, {outMerged, COutPoint(H(0xd5), 0)}, 8 * COIN + COIN / 2,
+                                                   alice.strAddress, nBurn5);
+    const SidechainDeposit d5 = MakeDepositRecord(dtx5, nBurn5, alice.strAddress, COIN / 2, hashL1c);
+    L1ListsDeposit(chain.oracle, d5, COIN / 2, 2);
+    // d4: its own output; d6 spends it (unmerged) and a wallet coin, adding 0.25
+    const CMutableTransaction dtx4 = MakeDepositTx(layout, {COutPoint(H(0xd4), 0)}, COIN / 2, bob.strAddress, nBurn4);
+    const SidechainDeposit d4 = MakeDepositRecord(dtx4, nBurn4, bob.strAddress, COIN / 2, hashL1c, 2);
+    L1ListsDeposit(chain.oracle, d4, COIN / 2, 2);
+    const CMutableTransaction dtx6 = MakeDepositTx(layout,
+        {COutPoint(CTransaction(dtx4).GetHash(), nBurn4), COutPoint(H(0xd6), 0)}, 3 * COIN / 4, carol.strAddress, nBurn6);
+    const SidechainDeposit d6 = MakeDepositRecord(dtx6, nBurn6, carol.strAddress, COIN / 4, hashL1c, 3);
+    L1ListsDeposit(chain.oracle, d6, COIN / 4, 2);
+    // P: 1 COIN out of d5's 8.5 and d6's 0.75 together
+    const CAmount nFee = 1000;
+    const CAmount nTreasuryIn = 8 * COIN + COIN / 2 + 3 * COIN / 4;
+    CMutableTransaction m6;
+    m6.nVersion = 2;
+    m6.vin.push_back(CTxIn(COutPoint(CTransaction(dtx5).GetHash(), nBurn5)));
+    m6.vin.push_back(CTxIn(COutPoint(CTransaction(dtx6).GetHash(), nBurn6)));
+    m6.vout.push_back(CTxOut(nTreasuryIn - COIN - nFee, TreasuryScript(layout)));
+    m6.vout.push_back(CTxOut(COIN, CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x42) << OP_EQUALVERIFY << OP_CHECKSIG));
+    uint256 m6id;
+    BOOST_REQUIRE(ComputeM6id(m6, nTreasuryIn, THIS_SIDECHAIN, m6id));
+    SidechainDeposit ret;
+    ret.nSidechain = THIS_SIDECHAIN;
+    ret.strDest = SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST;
+    ret.dtx = m6;
+    ret.nBurnIndex = 0;
+    ret.amtUserPayout = 0;
+    ret.hashMainchainBlock = hashL1c;
+    {
+        auto& entry = chain.oracle.mapWindowEvents[std::make_pair(hashL1c, hashL1c)];
+        L1WithdrawalEvent ev;
+        ev.m6id = m6id;
+        ev.status = 'S';
+        ev.hashMainBlock = hashL1c;
+        ev.fHaveSequence = true;
+        ev.nSequence = 3;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << L1MutableTransaction(m6);
+        ev.vchTx.assign(ss.begin(), ss.end());
+        entry.second.vWithdrawal.push_back(ev);
+    }
+
+    // d5 credited its treasury output (8.5), not what it added (0.5)
+    SidechainDeposit d5Whole = d5;
+    d5Whole.amtUserPayout = 8 * COIN + COIN / 2;
+    chain.Reject(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, d5Whole); }, true), hashE3),
+                 "invalid-deposit-amount", "a deposit credited the treasury, not what it added");
+    // A return that credits something
+    SidechainDeposit retPaid = ret;
+    retPaid.amtUserPayout = COIN;
+    chain.Reject(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, retPaid); }, true), hashE3),
+                 "invalid-deposit-amount", "a withdrawal return that credits");
+
+    // Any order (R5): the payout first, then the deposits it spends
+    chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, ret); }, true), hashE3),
+                  "P before d5, d4, d6");
+    const CBlockIndex* const pindexP = TipForTest();
+    const auto Block456 = [&]() {
+        return OnL1(chain.Block({}, [&](CMutableTransaction& cb) {
+            AddDepositToCoinbase(cb, d5);
+            AddDepositToCoinbase(cb, d4);
+            AddDepositToCoinbase(cb, d6);
+        }, true), hashE4);
+    };
+    chain.Connect(Block456(), "d5, d4 and d6 after P");
+    BOOST_CHECK_EQUAL(psidechaintree->GetDeposits(THIS_SIDECHAIN).size(), 7U);
+
+    // A disconnect gives the three outpoints back; they go in again on the new branch
+    InvalidateForTest(TipForTest());
+    BOOST_CHECK(TipForTest() == pindexP);
+    BOOST_CHECK(!Recorded(d5) && !Recorded(d4) && !Recorded(d6));
+    BOOST_CHECK(Recorded(ret));
+    chain.Connect(Block456(), "d5, d4 and d6 again, on the new branch");
+    BOOST_CHECK(Recorded(d5) && Recorded(d4) && Recorded(d6));
+}
+
+// v1.0.1: the outpoint index is rebuilt from the deposit rows at every
+// startup: a DB written before it (rows, no index), and one an older build ran
+// on since (a row written without its entry, a row erased leaving its entry)
+BOOST_AUTO_TEST_CASE(v101_outpoint_index_rebuilt_from_the_rows)
+{
+    CSidechainTreeDB db(1 << 20, true /* fMemory */, true /* fWipe */);
+    uint32_t nBurn = 0;
+    const TestKey alice;
+    const auto Row = [&](uint64_t nCoin, CAmount amt) {
+        const CMutableTransaction dtx = MakeDepositTx(Layout::CUSF, {COutPoint(ArithToUint256(arith_uint256(nCoin)), 0)},
+                                                      amt, alice.strAddress, nBurn);
+        return MakeDepositRecord(dtx, nBurn, alice.strAddress, amt, ArithToUint256(arith_uint256(0xa1)));
+    };
+    const auto Out = [](const SidechainDeposit& d) { return COutPoint(d.dtx.GetHash(), d.nBurnIndex); };
+    // As a v1.0.0 node wrote it: the row under its ID, and the pointer
+    const SidechainDeposit d1 = Row(0xd1, 5 * COIN);
+    BOOST_REQUIRE(db.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, d1.GetID()), d1));
+    BOOST_REQUIRE(db.Write('x', d1.GetID()));
+    BOOST_CHECK(!db.HaveDepositOutpoint(Out(d1)));
+    BOOST_REQUIRE(db.BuildDepositOutpointIndex());
+    BOOST_CHECK(db.HaveDepositOutpoint(Out(d1)));
+    BOOST_CHECK(!db.HaveDepositOutpoint(COutPoint(d1.dtx.GetHash(), d1.nBurnIndex + 1)));
+    // An older build in between: it writes d2's row without an entry and
+    // erases d1's row, leaving d1's entry. The next start puts both right.
+    const SidechainDeposit d2 = Row(0xd2, COIN);
+    BOOST_REQUIRE(db.Write(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, d2.GetID()), d2));
+    BOOST_REQUIRE(db.Erase(std::make_pair(DB_SIDECHAIN_DEPOSIT_OP, d1.GetID())));
+    BOOST_REQUIRE(db.BuildDepositOutpointIndex());
+    BOOST_CHECK(db.HaveDepositOutpoint(Out(d2)));
+    BOOST_CHECK(!db.HaveDepositOutpoint(Out(d1)));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

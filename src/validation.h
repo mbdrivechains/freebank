@@ -469,6 +469,11 @@ enum class L1Answer;
  *  (see validation.cpp). Used by ConnectBlock and the block builder. */
 L1Answer GetBundleOutcomeOnL1(const SidechainWithdrawalBundle& bundle, const CBlockIndex* pindexPrev,
                               const uint256& hashMainBlock, char& cOutcome);
+/** v0.2.17 A1 + A4, v1.0.1 R1/R4: is deposit record d what the L1 recorded, and
+ *  what does it credit (see validation.cpp)? For a block whose own L1 block is
+ *  hashBlockMain. Used by ConnectBlock and the block builder. */
+L1Answer CheckDepositWithL1(const SidechainDeposit& d, const uint256& hashBlockMain, CAmount& nCredit,
+                            std::string& strWhy);
 
 /** Context-independent validity checks */
 bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckMerkleRoot = true, bool fCheckBMM = true);
