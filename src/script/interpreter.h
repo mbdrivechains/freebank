@@ -111,6 +111,11 @@ enum
     // Public keys in segregated witness scripts must be compressed
     //
     SCRIPT_VERIFY_WITNESS_PUBKEYTYPE = (1U << 15),
+
+    // Credit transactions (v11-17): both input digests also bind the op and the payload minus its signature fields
+    // (v1.0.2, NEXT 40, creditbind.h). Mandatory from consensus.nCreditBindingHeight (genesis on mainnet).
+    //
+    SCRIPT_VERIFY_CREDIT_BINDING = (1U << 16),
 };
 
 bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, unsigned int flags, ScriptError* serror);
@@ -119,6 +124,9 @@ struct PrecomputedTransactionData
 {
     uint256 hashPrevouts, hashSequence, hashOutputs;
     bool ready = false;
+    // CreditBindingHash, for a credit transaction whatever its witness (the legacy digest uses it too).
+    uint256 hashCreditBinding;
+    bool fCreditBindingReady = false;
 
     explicit PrecomputedTransactionData(const CTransaction& tx);
 };
@@ -129,7 +137,9 @@ enum SigVersion
     SIGVERSION_WITNESS_V0 = 1,
 };
 
-uint256 SignatureHash(const CScript &scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache = nullptr);
+/** fCreditBinding: bind a credit transaction's op and payload (SCRIPT_VERIFY_CREDIT_BINDING). Signers always do;
+ * only a block below the binding height verifies without it. */
+uint256 SignatureHash(const CScript &scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache = nullptr, bool fCreditBinding = true);
 
 class BaseSignatureChecker
 {
@@ -159,13 +169,14 @@ private:
     unsigned int nIn;
     const CAmount amount;
     const PrecomputedTransactionData* txdata;
+    const bool fCreditBinding;
 
 protected:
     virtual bool VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const;
 
 public:
-    TransactionSignatureChecker(const CTransaction* txToIn, unsigned int nInIn, const CAmount& amountIn) : txTo(txToIn), nIn(nInIn), amount(amountIn), txdata(nullptr) {}
-    TransactionSignatureChecker(const CTransaction* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn) : txTo(txToIn), nIn(nInIn), amount(amountIn), txdata(&txdataIn) {}
+    TransactionSignatureChecker(const CTransaction* txToIn, unsigned int nInIn, const CAmount& amountIn) : txTo(txToIn), nIn(nInIn), amount(amountIn), txdata(nullptr), fCreditBinding(true) {}
+    TransactionSignatureChecker(const CTransaction* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn, bool fCreditBindingIn = true) : txTo(txToIn), nIn(nInIn), amount(amountIn), txdata(&txdataIn), fCreditBinding(fCreditBindingIn) {}
     bool CheckSig(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;

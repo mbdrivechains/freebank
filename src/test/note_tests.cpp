@@ -1319,10 +1319,10 @@ BOOST_AUTO_TEST_CASE(token_lock_inputs)
 }
 
 // v0.2.21 one-step lock: the customer signs its inputs before the house adds its partners' signatures to the payload.
-// That works only because an input's signature hash leaves out nNoteOp and the note payload (the payload carries its
-// own signatures over hashPrevouts + hashOutputs). Pin it: if the payload ever enters the input sighash, the
-// customer's input signatures break when the house approves, and this test says why.
-BOOST_AUTO_TEST_CASE(note_payload_outside_input_sighash)
+// Since v1.0.2 an input's signature hash binds nNoteOp and the payload minus its signature fields (creditbind.h), so
+// the approvals can land later. Pin both halves: the approvals leave the input sighash alone (or the customer's
+// signatures break when the house approves), and the rest of the lock moves it (or a relay could rewrite it).
+BOOST_AUTO_TEST_CASE(note_lock_approvals_outside_input_sighash)
 {
     CKey key;
     key.MakeNewKey(true);
@@ -1355,6 +1355,19 @@ BOOST_AUTO_TEST_CASE(note_payload_outside_input_sighash)
     BOOST_CHECK(SignatureHash(script, CTransaction(mtx), 1, SIGHASH_ALL, 50000, SIGVERSION_BASE) == h1);
     // ... while the txid does (the payload is part of the transaction).
     BOOST_CHECK(CTransaction(mtx).GetHash() != txidBefore);
+    // The lock itself and the op are bound.
+    {
+        CMutableTransaction m2 = mtx;
+        NoteLock moved = lock;
+        moved.nUnits += 1;
+        CDataStream ss3(SER_NETWORK, PROTOCOL_VERSION);
+        ss3 << moved;
+        m2.vchNotePayload.assign(ss3.begin(), ss3.end());
+        BOOST_CHECK(SignatureHash(script, CTransaction(m2), 0, SIGHASH_ALL, NOTE_DUST_VALUE, SIGVERSION_BASE) != h0);
+        m2 = mtx;
+        m2.nNoteOp = NOTE_OP_UNLOCK;
+        BOOST_CHECK(SignatureHash(script, CTransaction(m2), 0, SIGHASH_ALL, NOTE_DUST_VALUE, SIGVERSION_BASE) != h0);
+    }
 
     // The payload's own digest is what binds the lock: it changes with the outputs.
     const uint256 d0 = NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));

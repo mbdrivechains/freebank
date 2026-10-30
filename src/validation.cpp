@@ -13,6 +13,7 @@
 #include <chainparams.h>
 #include <checkpoints.h>
 #include <checkqueue.h>
+#include <creditbind.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
@@ -1488,6 +1489,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
     if (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS))
         return state.DoS(0, false, REJECT_NONSTANDARD, "non-final");
 
+    // Credit binding (v1.0.2, NEXT 40): signers always sign the bound digest, which a block below the binding height
+    // rejects, and an unbound signature is not standard. So below it (easynet only) no credit transaction can be
+    // mined: say so instead of failing its scripts.
+    if (IsCreditBindingVersion(tx.nVersion) && !chainparams.GetConsensus().CreditBindingActive(chainActive.Height() + 1))
+        return state.DoS(0, false, REJECT_NONSTANDARD, "credit-binding-not-active", false,
+                         strprintf("credit transactions are accepted from block %d", chainparams.GetConsensus().nCreditBindingHeight));
+
     // is it already in the memory pool?
     if (pool.exists(hash)) {
         return state.Invalid(false, REJECT_DUPLICATE, "txn-already-in-mempool");
@@ -2851,6 +2859,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // invalid blocks (using TestBlockValidity), however allowing such
         // transactions into the mempool can be exploited as a DoS attack.
         unsigned int currentBlockScriptVerifyFlags = GetBlockScriptFlags(chainActive.Tip(), Params().GetConsensus());
+        // The credit binding is a flag day, not a soft fork: a bound signature fails without it. The gate above
+        // admits credit transactions only once the NEXT block binds, so check against that.
+        if (Params().GetConsensus().CreditBindingActive(chainActive.Height() + 1))
+            currentBlockScriptVerifyFlags |= SCRIPT_VERIFY_CREDIT_BINDING;
         if (!CheckInputsFromMempoolAndCache(tx, state, view, pool, currentBlockScriptVerifyFlags, true, txdata))
         {
             // If we're using promiscuousmempoolflags, we may hit this normally
@@ -7087,7 +7099,7 @@ bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int n
 bool CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
-    return VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata), &error);
+    return VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata, (nFlags & SCRIPT_VERIFY_CREDIT_BINDING) != 0), &error);
 }
 
 int GetSpendHeight(const CCoinsViewCache& inputs)
@@ -7180,9 +7192,18 @@ bool CheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsVi
                         // arguments; if so, don't trigger DoS protection to
                         // avoid splitting the network between upgraded and
                         // non-upgraded nodes.
+                        //
+                        // The credit binding (v1.0.2) is not a soft fork: a bound signature fails without it. So the
+                        // re-run keeps it, and a credit transaction an older node signed unbound is policy too.
+                        const unsigned int flagsMandatory = flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS;
                         CScriptCheck check2(coin.out, tx, i,
-                                flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata);
-                        if (check2())
+                                flagsMandatory | (flags & SCRIPT_VERIFY_CREDIT_BINDING), cacheSigStore, &txdata);
+                        bool fPolicyOnly = check2();
+                        if (!fPolicyOnly && (flags & SCRIPT_VERIFY_CREDIT_BINDING) && IsCreditBindingVersion(tx.nVersion)) {
+                            CScriptCheck check3(coin.out, tx, i, flagsMandatory, cacheSigStore, &txdata);
+                            fPolicyOnly = check3();
+                        }
+                        if (fPolicyOnly)
                             return state.Invalid(false, REJECT_NONSTANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
                     }
                     // Failures of other flags indicate a transaction that is
@@ -9256,6 +9277,11 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
     if (IsWitnessEnabled(pindex->pprev, consensusparams)) {
         flags |= SCRIPT_VERIFY_WITNESS;
         flags |= SCRIPT_VERIFY_NULLDUMMY;
+    }
+
+    // v1.0.2 (NEXT 40): credit transactions' input digests bind their op and payload.
+    if (consensusparams.CreditBindingActive(pindex->nHeight)) {
+        flags |= SCRIPT_VERIFY_CREDIT_BINDING;
     }
 
     return flags;

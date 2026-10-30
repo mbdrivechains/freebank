@@ -63,6 +63,7 @@ BITCOIN_TESTS =\
   test/fb_property_tests.cpp \
   test/house_tests.cpp \
   test/note_tests.cpp \
+  test/creditbind_tests.cpp \
   test/cashu_tests.cpp \
   test/token_tests.cpp \
   test/deposit_tests.cpp \

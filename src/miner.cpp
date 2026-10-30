@@ -15,6 +15,7 @@
 #include <coins.h>
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
+#include <creditbind.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <deposit.h>
@@ -614,6 +615,7 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 // - premature witness (in case segwit transactions are added to mempool before
 //   segwit activation)
 // - the withdrawal poison-row guard (from nWithdrawalGuardHeight)
+// - credit transactions below nCreditBindingHeight
 bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package)
 {
     // Withdrawal poison-row guard (v0.2.13): from nWithdrawalGuardHeight a block
@@ -629,10 +631,17 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
     // took. Testing the whole package also drops every descendant, because a
     // descendant's package always carries its unconfirmed withdrawal ancestor.
     const bool fWithdrawalGuard = WithdrawalGuardActive(nHeight, chainparams.GetConsensus().nWithdrawalGuardHeight);
+    // Credit binding (v1.0.2): every credit transaction in the pool is signed over the bound digest, which a block
+    // below the binding height rejects. ATMP admits none before that height, but a reorg back across it can leave
+    // one pooled; included, it would fail TestBlockValidity and CreateNewBlock would drop it from the pool. Skipped,
+    // it waits for the binding height.
+    const bool fCreditBinding = chainparams.GetConsensus().CreditBindingActive(nHeight);
     for (const CTxMemPool::txiter it : package) {
         if (!IsFinalTx(it->GetTx(), nHeight, nLockTimeCutoff))
             return false;
         if (!fIncludeWitness && it->GetTx().HasWitness())
+            return false;
+        if (!fCreditBinding && IsCreditBindingVersion(it->GetTx().nVersion))
             return false;
         std::string strUnpayable;
         if (fWithdrawalGuard && TxHasUnpayableWithdrawal(it->GetTx(), strUnpayable)) {

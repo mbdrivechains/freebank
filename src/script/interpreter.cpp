@@ -5,6 +5,7 @@
 
 #include <script/interpreter.h>
 
+#include <creditbind.h>
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
@@ -1056,13 +1057,15 @@ private:
     const bool fAnyoneCanPay;  //!< whether the hashtype has the SIGHASH_ANYONECANPAY flag set
     const bool fHashSingle;    //!< whether the hashtype is SIGHASH_SINGLE
     const bool fHashNone;      //!< whether the hashtype is SIGHASH_NONE
+    const uint256* pCreditBinding; //!< CreditBindingHash to append, or null (not a bound credit transaction)
 
 public:
-    CTransactionSignatureSerializer(const CTransaction &txToIn, const CScript &scriptCodeIn, unsigned int nInIn, int nHashTypeIn) :
+    CTransactionSignatureSerializer(const CTransaction &txToIn, const CScript &scriptCodeIn, unsigned int nInIn, int nHashTypeIn, const uint256* pCreditBindingIn) :
         txTo(txToIn), scriptCode(scriptCodeIn), nIn(nInIn),
         fAnyoneCanPay(!!(nHashTypeIn & SIGHASH_ANYONECANPAY)),
         fHashSingle((nHashTypeIn & 0x1f) == SIGHASH_SINGLE),
-        fHashNone((nHashTypeIn & 0x1f) == SIGHASH_NONE) {}
+        fHashNone((nHashTypeIn & 0x1f) == SIGHASH_NONE),
+        pCreditBinding(pCreditBindingIn) {}
 
     /** Serialize the passed scriptCode, skipping OP_CODESEPARATORs */
     template<typename S>
@@ -1145,6 +1148,10 @@ public:
             ::Serialize(s, txTo.payload);
             ::Serialize(s, txTo.nDecimals);
         }
+        // Credit transactions (v1.0.2, NEXT 40): the op and the payload minus its signature fields
+        // (creditbind.h), whatever the hash type, so a relay can't rewrite what the transaction does.
+        if (pCreditBinding)
+            ::Serialize(s, *pCreditBinding);
     }
 };
 
@@ -1183,11 +1190,22 @@ PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo)
         hashOutputs = GetOutputsHash(txTo);
         ready = true;
     }
+    if (IsCreditBindingVersion(txTo.nVersion)) {
+        hashCreditBinding = CreditBindingHash(txTo);
+        fCreditBindingReady = true;
+    }
 }
 
-uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache)
+uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache, bool fCreditBinding)
 {
     assert(nIn < txTo.vin.size());
+
+    uint256 hashCreditBinding;
+    const uint256* pCreditBinding = nullptr;
+    if (fCreditBinding && IsCreditBindingVersion(txTo.nVersion)) {
+        hashCreditBinding = (cache && cache->fCreditBindingReady) ? cache->hashCreditBinding : CreditBindingHash(txTo);
+        pCreditBinding = &hashCreditBinding;
+    }
 
     if (sigversion == SIGVERSION_WITNESS_V0) {
         uint256 hashPrevouts;
@@ -1237,6 +1255,9 @@ uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsig
             ss << txTo.payload;
             ss << txTo.nDecimals;
         }
+        // Credit op + payload binding (v1.0.2; see the legacy serializer above), whatever the hash type.
+        if (pCreditBinding)
+            ss << *pCreditBinding;
         // Sighash type
         ss << nHashType;
 
@@ -1254,7 +1275,7 @@ uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsig
     }
 
     // Wrapper to serialize only the necessary parts of the transaction being signed
-    CTransactionSignatureSerializer txTmp(txTo, scriptCode, nIn, nHashType);
+    CTransactionSignatureSerializer txTmp(txTo, scriptCode, nIn, nHashType, pCreditBinding);
 
     // Serialize and hash
     CHashWriter ss(SER_GETHASH, 0);
@@ -1280,7 +1301,7 @@ bool TransactionSignatureChecker::CheckSig(const std::vector<unsigned char>& vch
     int nHashType = vchSig.back();
     vchSig.pop_back();
 
-    uint256 sighash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, sigversion, this->txdata);
+    uint256 sighash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, sigversion, this->txdata, fCreditBinding);
 
     if (!VerifySignature(vchSig, pubkey, sighash))
         return false;

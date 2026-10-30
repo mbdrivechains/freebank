@@ -18,4 +18,9 @@ Not for beta or mainnet.
 - Upgrading from an earlier FreeBank easynet build: swap the binaries and keep the data directory (no \`-reindex\`).
   Deposits the earlier build left uncredited are credited in the next block. Don't start a fresh FreeBank chain on
   an L1 whose treasury has already paid a withdrawal: it would credit every deposit again.
+- From FreeBank block 600 (v1.0.2 and later), a credit transaction's input signatures also cover its operation and
+  payload. Upgrade every node and wallet before 600. Until then an upgraded node and wallet take no credit
+  transaction (\`credit-binding-not-active\`). A node still on an earlier build at 600 rejects the first such block:
+  after upgrading, \`reconsiderblock\` it or restart with \`-reindex\`. A credit transaction an earlier wallet signed
+  and that is still pending at 600 can never confirm: \`abandontransaction\` it.
 EOF

@@ -23,8 +23,8 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > eCash mainnet (eCash leaves Bitcoin at block 973,728). v1.0.0 ships it **dormant**: the node runs
 > and follows eCash, but no FreeBank block after genesis is valid until a later release switches the
 > chain on; deposits made meanwhile are credited, in order, then. v1.0.1 changes how deposits are
-> credited (below); while mainnet is dormant, v1.0.1 runs it exactly as v1.0.0 does, and the
-> mainnet M1 names v1.0.0. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
+> credited and v1.0.2 what a credit transaction's signatures cover (below); while mainnet is dormant,
+> both run it exactly as v1.0.0 does, and the mainnet M1 names v1.0.0. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
 
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
@@ -141,8 +141,17 @@ v0.2.25 makes a new node's first start faster,
 v0.2.26 stops a note holder burning their own notes by mistake,
 v0.2.27 lets a borrower repay a house in its own notes,
 v0.2.28 settles a failed house end to end,
-v0.2.29 lets a saver force payment of a matured deposit, and
-v1.0.1 credits deposits the way LayerTwo-Labs' current enforcer makes them:
+v0.2.29 lets a saver force payment of a matured deposit,
+v1.0.1 credits deposits the way LayerTwo-Labs' current enforcer makes them, and
+v1.0.2 makes a credit transaction's input signatures cover what it does:
+
+- **Signatures cover what a credit transaction does** (v1.0.2). **A consensus change.** Each input signature of a
+  credit transaction (bills, houses, notes, deposits, pools, settlement, the oracle) now also covers the transaction's
+  operation and its payload. Left out are only the payload's own signatures (with which approver made each) and a
+  discount's endorsement height, because some ceremonies add them after the inputs are signed; every one of them is
+  checked against its own digest. Mainnet and regtest bind from genesis. Easynet binds from FreeBank block 600:
+  upgrade before it (an upgraded node and wallet take no credit transaction until then, and an earlier release
+  rejects the first block after it that carries one). Every other transaction signs as before.
 
 - **Deposits under the current enforcer** (v1.0.1). **A consensus change that only adds:** every earlier block stays
   valid, so upgrading is a binary swap on the same data directory with no `-reindex`, but an earlier release rejects
@@ -415,9 +424,8 @@ v1.0.1 credits deposits the way LayerTwo-Labs' current enforcer makes them:
   state-changing op for the same house is already pooled, instead of building a
   transaction the validator will reject.
 
-As of v1.0.1: 669 unit test cases. The deposit and peg-out gates run on regtest with eCash v1.2.0 and the enforcer
-from PR #664; the other gates (75 in all as of v0.2.29) ran on eCash's beta build on regtest with the L2L enforcer.
-All must pass to merge.
+As of v1.0.2: 681 unit test cases, and all 76 integration gates run on regtest with eCash v1.2.0 and the enforcer
+from PR #664. All must pass to merge.
 
 ## Wallet (preview)
 

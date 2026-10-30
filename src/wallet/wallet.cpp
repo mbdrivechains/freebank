@@ -25,6 +25,7 @@
 #include <wallet/coincontrol.h>
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
+#include <creditbind.h>
 #include <fs.h>
 #include <wallet/init.h>
 #include <key.h>
@@ -7896,7 +7897,8 @@ bool CWallet::SignSettle(std::string& strFail, std::string& strHexTxOut,
 
     // Payload signatures: OUR quorum + OUR presenter over the shared digest
     // (the skeleton is final; the initiator's signatures land later - the
-    // digest excludes sig fields and P2PKH sighash excludes the trailer).
+    // digest excludes sig fields, and so does the input sighash's payload
+    // binding, creditbind.h).
     const CTransaction ctxDigest(mtx);
     const uint256 sighash = SettleExchangeSigHash(x, SettleHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
     {
@@ -8574,7 +8576,8 @@ bool CWallet::SignNetting(std::string& strFail, std::string& strRoundOut, uint25
         mtx.vchSettlePayload.assign(ss.begin(), ss.end());
     }
 
-    // Our inputs (the legacy sighash leaves out the payload trailer, so the order of signing doesn't matter).
+    // Our inputs (the input sighash binds the payload minus its signature fields, creditbind.h, so the other houses'
+    // signatures can land in any order).
     const CTransaction txToSign(mtx);
     for (size_t i = 0; i < mtx.vin.size(); i++) {
         if (vInputHouse[i] != nOwnHouseID)
@@ -9040,9 +9043,10 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
     ssPayload << d;
     mtx.vchBillPayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
-    // scriptSig-sign OUR funding inputs only. The legacy sighash covers neither
-    // the v11 trailer nor another input's scriptSig, so round 3 may patch the
-    // payload and sign vin[0] without invalidating any of these.
+    // scriptSig-sign OUR funding inputs only. The input sighash binds the payload
+    // minus its signature fields and the link's height (creditbind.h), and never
+    // another input's scriptSig, so round 3 may fill those and sign vin[0]
+    // without invalidating any of these.
     const CTransaction txToSign(mtx);
     unsigned int nIn = 1;
     for (const auto& coin : setCoins) {
@@ -9194,8 +9198,8 @@ bool CWallet::CompleteDiscount(std::string& strFail, uint256& txidOut, const std
     mtx.vchBillPayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     // Finally the title input. The house's funding scriptSigs are untouched:
-    // SIGHASH_ALL blanks every other input's scriptSig, and the legacy sighash
-    // does not reach the v11 trailer we just rewrote.
+    // SIGHASH_ALL blanks every other input's scriptSig, and the payload binding
+    // leaves out exactly the fields we just filled (creditbind.h).
     {
         const CTransaction txToSign(mtx);
         SignatureData sigdata;
@@ -11822,6 +11826,16 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey, CCon
 {
     {
         LOCK2(cs_main, cs_wallet);
+        // Credit binding (v1.0.2): below the binding height (easynet only) the mempool refuses every credit
+        // transaction. Kept anyway, it would sit in the wallet with its inputs spent and go out once the height
+        // passes, days after the operator gave up on it: refuse it before it is stored.
+        if (IsCreditBindingVersion(wtxNew.tx->nVersion) &&
+                !Params().GetConsensus().CreditBindingActive(chainActive.Height() + 1)) {
+            state.DoS(0, false, REJECT_NONSTANDARD, "credit-binding-not-active", false,
+                      strprintf("credit transactions are accepted from block %d", Params().GetConsensus().nCreditBindingHeight));
+            LogPrintf("CommitTransaction(): refused %s, %s\n", wtxNew.GetHash().ToString(), FormatStateMessage(state));
+            return false;
+        }
         LogPrintf("CommitTransaction:\n%s", wtxNew.tx->ToString());
         {
             // Take key pair from key pool so it won't be used again

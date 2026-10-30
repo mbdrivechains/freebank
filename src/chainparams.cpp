@@ -141,6 +141,10 @@ public:
         // would show up only as a fork on a fresh v0.2.13 sync.
         // Mainnet has the rule from its first block, so it never needs a flag day.
         consensus.nWithdrawalGuardHeight = 0;
+        // Credit binding from genesis. Mainnet inherits it: no credit transaction can exist on its dormant chain.
+        // Beta is dead (D-2026-10-26-3): its old credit history does not verify on this release, and nothing needs it
+        // to. Easynet sets its own.
+        consensus.nCreditBindingHeight = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 1199145601; // January 1, 2008
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = 1230767999; // December 31, 2008
@@ -311,6 +315,11 @@ public:
                                      1791800000, 1, 0);
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256S("0xbd474c68aeeeb97dcc82df8d54d5f7461ce1e7ad6b8c372df190343573e6daf9"));
+        // Its chain already holds unbound credit transactions (houses from block 231), so it binds from here: 286
+        // blocks past height 314 on 2026-10-31, ~52 h at ~11 min a block; set again at the release build to about a
+        // day after it. Every easynet node and wallet upgrades before it; until then an upgraded node takes no credit
+        // transaction.
+        consensus.nCreditBindingHeight = 600;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
 
         vSeeds.clear();
@@ -362,6 +371,7 @@ public:
         consensus.nOracleOpWindow = 3;            // mechanical floor 2 + 1 margin; small enough
                                                   // that the gate proves expiry in 3 blocks
         consensus.nWithdrawalGuardHeight = 0;     // poison-row guard active from genesis on regtest
+        consensus.nCreditBindingHeight = 0;       // credit binding from genesis on regtest
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;

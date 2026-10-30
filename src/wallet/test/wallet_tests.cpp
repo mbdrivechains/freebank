@@ -12,6 +12,7 @@
 #include <base58.h>
 #include <chainparams.h>
 #include <consensus/validation.h>
+#include <house.h>
 #include <rpc/server.h>
 #include <test/test_bitcoin.h>
 #include <validation.h>
@@ -909,6 +910,34 @@ BOOST_AUTO_TEST_CASE(wallet_encryption_warning)
     BOOST_CHECK(pwalletMain->EncryptWallet(SecureString("test passphrase")));
     BOOST_CHECK(pwalletMain->IsCrypted());
     BOOST_CHECK(pwalletMain->GetEncryptionWarning().empty());
+}
+
+// v1.0.2 credit binding: below the binding height (easynet only) the mempool refuses every credit transaction, so the
+// wallet must refuse it too. Stored, it would keep its inputs spent and go out once the height passed.
+BOOST_AUTO_TEST_CASE(commit_refuses_credit_below_binding_height)
+{
+    struct Scope {
+        Consensus::Params& consensus = const_cast<Consensus::Params&>(Params().GetConsensus());
+        const int nSaved = consensus.nCreditBindingHeight;
+        ~Scope() { consensus.nCreditBindingHeight = nSaved; }
+    } scope;
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_HOUSE_VERSION;
+    m.nHouseOp = HOUSE_OP_CLOSE;
+    m.vchHousePayload = {0x07, 0x00, 0x00, 0x00};
+    m.vin.push_back(CTxIn(COutPoint(uint256S("0d"), 0)));
+    m.vout.push_back(CTxOut(100000, CScript() << OP_TRUE));
+    CWalletTx wtx(pwalletMain.get(), MakeTransactionRef(m));
+    CReserveKey reservekey(pwalletMain.get());
+    {
+        LOCK(cs_main);
+        scope.consensus.nCreditBindingHeight = chainActive.Height() + 2;
+    }
+    CValidationState state;
+    BOOST_CHECK(!pwalletMain->CommitTransaction(wtx, reservekey, nullptr, state));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "credit-binding-not-active");
+    LOCK(pwalletMain->cs_wallet);
+    BOOST_CHECK_EQUAL(pwalletMain->mapWallet.count(wtx.GetHash()), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

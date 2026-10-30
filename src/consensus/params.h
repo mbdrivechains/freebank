@@ -143,6 +143,13 @@ struct Params {
      *  never-a-CLI-knob rule as nSettleCadence; unit tests move it through a
      *  const_cast on Params().GetConsensus(). */
     int nWithdrawalGuardHeight;
+    /** v1.0.2 (NEXT 40, docs-local/CREDIT_SIGHASH_SPEC.md): from this height both input digests of a credit
+     *  transaction (v11-17) bind its op and payload minus the payload's signature fields
+     *  (SCRIPT_VERIFY_CREDIT_BINDING). Genesis on mainnet, beta and regtest; easynet already holds unbound credit
+     *  transactions, so it binds from a height set at its release. Below it, a node takes no credit transaction into
+     *  its mempool or its templates (signers always sign the bound form). Never a CLI knob. */
+    int nCreditBindingHeight;
+    bool CreditBindingActive(int nHeight) const { return nHeight >= nCreditBindingHeight; }
     /** v0.2.19 (genesis M1, Michael 2026-10-04, option A): while set, no block
      *  after genesis is valid and none is produced. Mainnet ships dormant so its
      *  M1 can name a real release; a later release clears it ("switches it on"),
