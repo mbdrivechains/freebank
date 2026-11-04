@@ -12,11 +12,14 @@ others bid. Anyone may bid, and the highest bid wins. For that period:
   reporter sends two reports for one block, the producer keeps the latest valid one it received, by a fixed rule, and
   the log records the replacement.
 - He, any entity he controls, and anyone acting for him hold no gram notes, gold or dollar tokens, pool shares or stake
-  in any house; post no issuer bond and put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any
-  issuer or house; buy nothing to support a price and rescue no house.
+  in any house.
 
 The no-forfeit rule for price reporters ends at a height that a later release sets once a second, unconnected bidder
 is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
+
+These limits do not end with that period: he, any entity he controls, and anyone acting for him post no issuer bond and
+put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any issuer or house; and buy nothing to
+support a price and rescue no house.
 
 The producer is a block producer only. It runs no house, no money changer and no custody. FreeBank has no protocol
 fee: no part of any transaction is set aside for a developer or a foundation. A block's coinbase pays whoever produced it the
