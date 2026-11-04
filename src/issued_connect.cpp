@@ -1164,6 +1164,28 @@ bool GoldParEligible(const CHouse& house, int nHeight)
     return (unsigned __int128)gold.nTillMg * 10000 >= (unsigned __int128)house.nMintedUnits * gp.nTillMinBps;
 }
 
+uint32_t GoldTillRatioBps(const CHouse& house, int nHeight)
+{
+    if (house.nMintedUnits == 0)
+        return 10000;
+    CGoldCount gold;
+    HouseGoldForChecks(house, nHeight, gold);
+    const unsigned __int128 bps = (unsigned __int128)gold.nTillMg * 10000 / (unsigned __int128)house.nMintedUnits;
+    return bps > 10000 ? 10000 : (uint32_t)bps;
+}
+
+uint32_t GoldBrassageBps(const CHouse& house, int nHeight)
+{
+    if (house.nMintedUnits == 0)
+        return 0;
+    // D-2026-11-05-1 (Michael, option A): an Open house always redeems at par. Under the gram rules a thin till only
+    // stops issuing, so without this a paying house would charge its holders for keeping a thin till.
+    if (HouseEffectiveStatus(house, nHeight) == HOUSE_STATUS_OPEN)
+        return 0;
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
+    return BrassageBpsAt(GoldTillRatioBps(house, nHeight), gp.nTillMinBps);
+}
+
 uint64_t g_nPayoutPriceTestOverride = 0;
 
 bool PayoutPriceForChecks(int nPriceHeight, uint64_t& nSatsPerGram)

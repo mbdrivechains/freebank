@@ -1732,7 +1732,9 @@ static UniValue BillToJSON(const CBill& bill, bool fIncludeBody)
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("id", (uint64_t)bill.nBillID);
     obj.pushKV("bill_id", bill.billID.ToString());
-    obj.pushKV("amount", ValueFromAmount(bill.amount));
+    // v1.1.1: the face is mg of gold (gram notes), a whole number like every other gram amount; v1.1.0 printed it as
+    // an 8-decimal "amount" (x1e-8). The escrow is sECX.
+    obj.pushKV("face_mg", (uint64_t)bill.amount);
     obj.pushKV("escrow", ValueFromAmount(bill.amountEscrow));
     obj.pushKV("status", std::string(1, bill.status));
     obj.pushKV("issued_height", (uint64_t)bill.nIssuedHeight);
@@ -1772,7 +1774,8 @@ UniValue listbills(const JSONRPCRequest& request)
         throw std::runtime_error(
             "listbills\n"
             "List all bills of exchange tracked by the node\n"
-            "\nResult (array of bill objects)\n"
+            "\nResult (array of bill objects): \"face_mg\" is the face in mg of gold (a whole number), \"escrow\"\n"
+            "the drawer's bond in sECX.\n"
             "\nExamples:\n"
             + HelpExampleCli("listbills", "")
             + HelpExampleRpc("listbills", "")
@@ -1800,7 +1803,7 @@ UniValue listloanbook(const JSONRPCRequest& request)
             "{\n"
             "  \"house_id\": n,             (numeric) 0 when unfiltered\n"
             "  \"count\": n,                (numeric) bills held\n"
-            "  \"face_total\": n,           (numeric) summed face, sats\n"
+            "  \"face_total\": n,           (numeric) summed face, mg of gold\n"
             "  \"recorded_face\": n,        (numeric) the house's own nLoanBookFace\n"
             "  \"face_matches\": true|false,(boolean) the two agree - the state invariant\n"
             "  \"wtd_avg_maturity\": n,     (numeric) sum(face*maturity)/sum(face), as a height\n"
@@ -1865,7 +1868,8 @@ UniValue getbill(const JSONRPCRequest& request)
             "getbill\n"
             "\nArguments:\n"
             "1. id            (numeric, required) the bill ID number\n"
-            "\nGet one bill of exchange (full record incl. encrypted body)\n"
+            "\nGet one bill of exchange (full record incl. encrypted body). \"face_mg\" is the face in mg of gold\n"
+            "(a whole number), \"escrow\" the drawer's bond in sECX.\n"
             "\nExamples:\n"
             + HelpExampleCli("getbill", "1")
             + HelpExampleRpc("getbill", "1")
@@ -1960,8 +1964,11 @@ static UniValue HouseToJSON(const CHouse& house)
     // The attested ratio and the redemption spread it implies (3.5). Published
     // so a holder can see the cost of the exit BEFORE they take it - the whole
     // deterrent depends on the fee being known ex ante.
-    obj.pushKV("attestedratiobps", (uint64_t)HouseAttestedRatioBps(house));
-    obj.pushKV("brassagebps", (uint64_t)HouseBrassageBps(house));
+    // v1.1.0: "attestedratiobps" dropped (attested ECX sats over notes in mg: no meaning under gram notes, and no
+    // longer read by any rule).
+    // v1.1.0: the spread a redemption owes now reads the counted gold till against the 2% till floor
+    obj.pushKV("tillratiobps", (uint64_t)GoldTillRatioBps(house, chainActive.Height() + 1));
+    obj.pushKV("brassagebps", (uint64_t)GoldBrassageBps(house, chainActive.Height() + 1));
 
     static const auto StatusName = [](char s) -> std::string {
         if (s == HOUSE_STATUS_OPEN) return "open";
@@ -2379,9 +2386,10 @@ UniValue listoraclesubmitters(const JSONRPCRequest& request)
             "\nHONEST LIMIT: a gap in these heights does NOT prove a submitter was\n"
             "absent. Consensus cannot distinguish \"did not submit\" from \"the block\n"
             "producer did not include it\" - the sequencer authors these records.\n"
-            "Do not read this as a reliability score, and note that nothing here\n"
-            "may be used to slash: no penalty exists in this phase, and these\n"
-            "counters accrued under rules that did not bind.\n"
+            "Do not read this as a reliability score: nothing here is used to\n"
+            "forfeit a bond. While there is one block producer no reporter bond\n"
+            "is forfeited at all (D-2026-11-04-1); a later release sets the height\n"
+            "from which forfeits apply.\n"
             "\nExamples:\n"
             + HelpExampleCli("listoraclesubmitters", "")
             + HelpExampleRpc("listoraclesubmitters", "")

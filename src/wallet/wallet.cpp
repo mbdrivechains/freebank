@@ -5461,7 +5461,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
 
     // Brassage incidence (Delta-2): the RUNNER bears the spread - it comes out
     // of the payout, and the house's out-of-pocket stays U + interest.
-    const uint32_t nBps = HouseBrassageBps(house);
+    const uint32_t nBps = GoldBrassageBps(house, chainActive.Height() + 1);   // v1.1.0: the gold till's spread
     const CAmount amountSpreadMg = HouseBrassageAmount(U, nBps);
     const CAmount amountPayoutMg = (CAmount)U + amountInterest - amountSpreadMg;
     // Gram-notes release: what's owed is mg, paid in sECX at the tip's payout price.
@@ -5796,7 +5796,7 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     // same floor as a B3 discharge), so this overpays the floor by the spread;
     // whether the wallet should deduct it is a separate (open) monetary
     // choice - it would also change ordinary undemanded redemptions.
-    const uint32_t nBps = HouseBrassageBps(houseB);
+    const uint32_t nBps = GoldBrassageBps(houseB, chainActive.Height() + 1);   // v1.1.0: the gold till's spread
     const CAmount amountSpreadMg = HouseBrassageAmount(U, nBps);
     const CAmount amountSpread = amountSpreadMg > 0 ? WalletMgToSats((uint64_t)amountSpreadMg, nPrice) : 0;
 

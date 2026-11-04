@@ -185,6 +185,9 @@ extern std::vector<unsigned char> ParseHexV(const UniValue& v, std::string strNa
 extern std::vector<unsigned char> ParseHexO(const UniValue& o, std::string strKey);
 
 extern CAmount AmountFromValue(const UniValue& value);
+/** v1.1.1: a gram amount (mg of gold) given to an RPC: a whole number from 1 to MAX_MONEY, as a JSON number or a
+ *  string of digits. strName names the argument in the error. */
+extern CAmount MgFromValue(const UniValue& value, const std::string& strName);
 extern std::string HelpExampleCli(const std::string& methodname, const std::string& args);
 extern std::string HelpExampleRpc(const std::string& methodname, const std::string& args);
 

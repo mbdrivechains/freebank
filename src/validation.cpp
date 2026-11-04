@@ -5529,8 +5529,21 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // runner bears the spread - sheet delta-2: a floor of U + interest
         // with no spread deduction would make demand-then-redeem the
         // universal brassage bypass below rho).
-        const uint32_t nBrassageBps = HouseBrassageBps(house);
-        const CAmount amountBrassageSpread = HouseBrassageAmount(nNoteUnitsIn, nBrassageBps);
+        // v1.1.0 (D-2026-11-05-1): no spread at an Open house; otherwise the curve on the counted gold till against the
+        // 2% till floor (not the last attested ECX ratio, which compared sats with mg and charged the full 4% at a gold
+        // house that never attests). The spread is paid in sECX at the bound price into the escrow pot. A redemption
+        // that binds no price (gold in kind) can't pay it that way, and redemption never stops, so it owes no sECX
+        // spread - instead the gold it draws from the house's vaults is capped at what the holder is owed less the spread
+        // (below, after the interest): the spread stays in the house for the holders who stay, and the house can't waive
+        // it for whomever it pays in kind (design, 11-05).
+        const uint32_t nSpreadBpsOwed = GoldBrassageBps(house, nHeight);
+        const uint32_t nBrassageBps = nRedeemPrice ? nSpreadBpsOwed : 0;
+        const CAmount amountBrassageSpread = HouseBrassageAmount(nNoteUnitsIn, nBrassageBps);   // the sECX output
+        // What the runner bears, either way (Delta-2): the demanded-note floor deducts it whether it is paid in sECX
+        // (price bound) or kept in kind (none bound; review 11-05: deducting only the sECX form made a no-price in-kind
+        // discharge impossible from the vaults alone, the cap below being U + I - spread).
+        const CAmount amountSpreadBorne = HouseBrassageAmount(nNoteUnitsIn, nSpreadBpsOwed);
+        CAmount amountInterestOwed = 0;   // the demanded notes' interest, set below (the in-kind cap needs it)
 
         // DEFERRAL INTEREST (3.5 D6; v0.2.18 rate schedule, 10%/yr from block
         // 0). Redeeming notes that were DEMANDED pays principal + interest at
@@ -5582,6 +5595,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 // promptly after reopening owes nothing for the time since.
                 const CAmount amountInterest = NoteDemandInterest(house, nDemandTag, nNoteUnitsIn,
                                                                   (uint32_t)nHeight, Params().GetConsensus());
+                amountInterestOwed = amountInterest;
                 // THE FLOOR, the same in both modes (operator Q7, 2026-10-02:
                 // "make the two redeem paths consistent on who bears the
                 // spread"): U + interest - spread to the holder's side, the
@@ -5593,7 +5607,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 // it only differed below rho, where a demanded note was not
                 // redeemable before v0.2.18 (Deferred) except after a fresh
                 // post-recovery stress.
-                const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest - amountBrassageSpread;
+                const CAmount amountDue = (CAmount)nNoteUnitsIn + amountInterest - amountSpreadBorne;
                 if (redeem.fPreAuthDischarge) {
                     // The discharge pays the PRE-AUTHORISED script, not the
                     // holder-key script - that is the standing instruction the
@@ -5644,8 +5658,23 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             }
         }
 
-        // DYNAMIC BRASSAGE (3.5 D1/D10). A redemption while the house's attested
-        // ratio is below rho pays a spread INTO THE ESCROW POT - so the holder
+        // v1.1.0 (D-2026-11-05-1, design 11-05): with no price bound, the spread is kept in kind. The gold this
+        // redemption draws from the house's vaults may not exceed the notes burned plus their interest, less the spread,
+        // mg for mg. (With a price bound, the spread is the sECX output checked below.)
+        if (!nRedeemPrice && nSpreadBpsOwed > 0 && !tx.vVaultMove.empty()) {
+            unsigned __int128 nDrawMg = 0;
+            for (const CVaultMove& m : tx.vVaultMove)
+                nDrawMg += (unsigned __int128)((uint64_t)0 - (uint64_t)m.nDelta);   // all draws (checked above: nDelta < 0)
+            const unsigned __int128 nCapMg = (unsigned __int128)nNoteUnitsIn + (uint64_t)amountInterestOwed -
+                                             std::min<unsigned __int128>((uint64_t)amountSpreadBorne,
+                                                                         (unsigned __int128)nNoteUnitsIn + (uint64_t)amountInterestOwed);
+            if (nDrawMg > nCapMg)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-brassage-inkind");
+        }
+
+        // DYNAMIC BRASSAGE (3.5 D1/D10; v1.1.0 D-2026-11-05-1). A redemption from a
+        // house that is not Open (Stressed, Deferred) while its counted gold till
+        // is below the 2% floor pays a spread INTO THE ESCROW POT - so the holder
         // who runs compensates the holders who stay, instead of stranding them.
         // Par redemption on a fractional reserve always lowers the ratio, which
         // is what makes the exit a race; this prices it.
@@ -5653,10 +5682,10 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // DR-2: demanded notes are NOT exempt. The old exemption keyed on the
         // permanent nDemandHeight coin tag, making a once-demanded note
         // brassage-free forever. v0.2.18 (operator Q7: brassage unchanged): a
-        // queued note paid WHILE SUSPENDED owes whatever spread the last
-        // attested ratio implies, like any other exit (usually the full ramp:
-        // most suspended houses attested below rho); the interest floor above
-        // already deducts it (runner bears).
+        // queued note paid WHILE SUSPENDED owes whatever spread the house's
+        // gold till implies (v1.1.0: was the last attested ratio), like any
+        // other exit; the interest floor above already deducts it (runner
+        // bears).
         {
             const CAmount amountSpread = amountBrassageSpread;   // hoisted above (the interest floor needs it first)
 

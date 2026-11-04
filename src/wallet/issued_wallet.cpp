@@ -925,7 +925,8 @@ UniValue TokenToUniv(const CIssuedToken& t)
 {
     UniValue o(UniValue::VOBJ);
     o.pushKV("token_id", t.tokenID.GetHex());
-    o.pushKV("kind", t.nKind == ISSUED_KIND_GOLD_MG ? "gold_mg" : t.nKind == ISSUED_KIND_USD_CENTS ? "usd_cents" : "unknown");
+    o.pushKV("kind", t.nKind == ISSUED_KIND_GOLD_MG ? "gold_mg" : t.nKind == ISSUED_KIND_USD_CENTS ? "usd_cents" :
+                     t.nKind == ISSUED_KIND_POOL_LP ? "pool_lp" : "unknown");   // v1.1.1: pool_lp (was "unknown")
     o.pushKV("ticker", t.strTicker);
     o.pushKV("issuer_key", HexStr(t.vchIssuerKey));
     o.pushKV("freeze_key", HexStr(t.vchFreezeKey));
@@ -1619,18 +1620,24 @@ const CRPCCommand issuedCommands[] = {
     { "token",            "freezeissued",           &freezeissued,           {"token_id", "coins", "fee"} },
     { "token",            "unfreezeissued",         &unfreezeissued,         {"token_id", "coins", "fee"} },
     { "token",            "listissued",             &listissued,             {"token_id"} },
-    { "token",            "getissuedtoken",         &getissuedtoken,         {"token_id"} },
     { "token",            "submitoracleobs",        &submitoracleobs,        {"id", "observations", "fee"} },
     { "token",            "issuerbond",             &issuerbond,             {"token_id", "amount", "fee"} },
     { "token",            "pledgegold",             &pledgegold,             {"houseid", "partner_index", "token_id", "units", "fee"} },
     { "token",            "movetill",               &movetill,               {"houseid", "token_id", "units", "fee"} },
     { "token",            "cleardustslot",          &cleardustslot,          {"houseid", "partner_index", "token_clear", "token_add", "units_add", "fee"} },
-    { "token",            "gethousegold",           &gethousegold,           {"houseid"} },
     { "token",            "proveequity",            &proveequity,            {"houseid", "fee"} },
     { "token",            "createtokenpool",        &createtokenpool,        {"token_id", "units", "sats", "fee_bps", "fee"} },
     { "token",            "addtokenliquidity",      &addtokenliquidity,      {"token_id", "units", "fee", "max_sats"} },
     { "token",            "removetokenliquidity",   &removetokenliquidity,   {"token_id", "lp_units", "fee"} },
     { "token",            "swaptoken",              &swaptoken,              {"token_id", "direction", "amount_in", "fee", "min_out"} },
+};
+
+// v1.1.1: the read-only ones never touch a wallet, so they are registered with the node's commands, also under
+// -disablewallet (a seed or an explorer's node runs without one; v1.1.0 answered them "Method not found" there).
+const CRPCCommand issuedNodeCommands[] = {
+    //  category              name                      actor (function)         argNames
+    { "token",            "getissuedtoken",         &getissuedtoken,         {"token_id"} },
+    { "token",            "gethousegold",           &gethousegold,           {"houseid"} },
     { "token",            "gettokenpool",           &gettokenpool,           {"token_id"} },
     { "token",            "listtokenpools",         &listtokenpools,         {} },
 };
@@ -1640,5 +1647,11 @@ const CRPCCommand issuedCommands[] = {
 void RegisterIssuedRPCCommands(CRPCTable& t)
 {
     for (const CRPCCommand& c : issuedCommands)
+        t.appendCommand(c.name, &c);
+}
+
+void RegisterIssuedNodeRPCCommands(CRPCTable& t)
+{
+    for (const CRPCCommand& c : issuedNodeCommands)
         t.appendCommand(c.name, &c);
 }

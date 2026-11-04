@@ -18,6 +18,7 @@
 #include <note.h>
 
 #include <house.h>
+#include <issued.h>
 
 #include <chainparams.h>
 #include <coins.h>
@@ -477,7 +478,7 @@ BOOST_AUTO_TEST_CASE(discharge_brassage_incidence)
     house.status = HOUSE_STATUS_STRESSED;                 // what a below-floor attest produces
     house.nStressSinceHeight = (uint32_t)H - 1;
     BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_STRESSED);
-    const CAmount amountSpread = HouseBrassageAmount(U, HouseBrassageBps(house));
+    const CAmount amountSpread = HouseBrassageAmount(U, GoldBrassageBps(house, H));
     BOOST_REQUIRE(amountSpread > 0);
     const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), NotePreAuthScript(vchKey));
 
@@ -883,7 +884,7 @@ BOOST_AUTO_TEST_CASE(suspended_redeem_demanded_only_at_floor)
     // Fully reserved suspended house -> no spread; the floor is U + interest.
     CHouse house = MakeSuspendedHouse(1, H, 2 * U, (CAmount)(2 * U), S);
     BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
-    BOOST_REQUIRE_EQUAL(HouseBrassageBps(house), 0u);
+    BOOST_REQUIRE_EQUAL(GoldBrassageBps(house, H), 0u);
 
     // Rate check: 10%/yr on 1e6 units for exactly half a year = 50,000 sats.
     const CAmount I = Interest(U, (uint32_t)H - D);
@@ -951,7 +952,7 @@ BOOST_AUTO_TEST_CASE(suspended_redeem_runner_bears_brassage)
 
     CHouse house = MakeSuspendedHouse(1, H, 2 * U, (CAmount)(U / 10), S);   // 500 bps < rho
     BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
-    const CAmount amountSpread = HouseBrassageAmount(U, HouseBrassageBps(house));
+    const CAmount amountSpread = HouseBrassageAmount(U, GoldBrassageBps(house, H));
     BOOST_REQUIRE(amountSpread > 0);
     const CAmount I = Interest(U, (uint32_t)H - D);
     BOOST_REQUIRE(I > 0);

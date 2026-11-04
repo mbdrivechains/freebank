@@ -116,6 +116,19 @@ CAmount AmountFromValue(const UniValue& value)
     return amount;
 }
 
+CAmount MgFromValue(const UniValue& value, const std::string& strName)
+{
+    if (!value.isNum() && !value.isStr())
+        throw JSONRPCError(RPC_TYPE_ERROR, strName + " is not a number or string");
+    const std::string str = value.getValStr();
+    int64_t n = 0;
+    if (str.empty() || str.find_first_not_of("0123456789") != std::string::npos || !ParseInt64(str, &n))
+        throw JSONRPCError(RPC_TYPE_ERROR, strName + " must be a whole number of mg (got '" + str + "')");
+    if (n <= 0 || !MoneyRange(n))
+        throw JSONRPCError(RPC_TYPE_ERROR, strName + " out of range (1 to " + std::to_string(MAX_MONEY) + " mg)");
+    return n;
+}
+
 uint256 ParseHashV(const UniValue& v, std::string strName)
 {
     std::string strHex;

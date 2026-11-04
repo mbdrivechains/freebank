@@ -586,6 +586,15 @@ private:
 /** Par-eligible for settlement (gram-notes release): effectively Open, and its counted gold till at least nTillMinBps of
  *  its notes (replaces HouseParEligible's attested ratio and recency, which the exact gold till makes moot). */
 bool GoldParEligible(const CHouse& house, int nHeight);
+/** v1.1.0 (D-2026-11-05-1): the redemption spread, basis points. Zero at an Open house (par while it pays) and at a house
+ *  with no notes. Otherwise (Stressed, Deferred) the brassage curve (BrassageBpsAt) on the counted gold till / notes
+ *  (both mg) against the till floor (nTillMinBps, 2%): par at or above the floor, rising to the full 4% at a quarter of
+ *  it. Counted against the scope's view, as every issuing check. A REDEEM that binds a price pays it in sECX into the
+ *  escrow pot; one that binds none keeps it in kind (validation.cpp: the gold it draws from the vaults is capped at the
+ *  notes plus interest less the spread), so redemption never stops and the runner bears it either way. */
+uint32_t GoldBrassageBps(const CHouse& house, int nHeight);
+/** The counted gold till / notes ratio, basis points, capped at 10000 (10000 with no notes). */
+uint32_t GoldTillRatioBps(const CHouse& house, int nHeight);
 
 /** D-2026-11-04-1 (3c): the interest a house's demanded notes (plain and pre-auth) have accrued by nHeight, in mg,
  *  against the scope's view. HouseEquityMg counts it as a liability. */

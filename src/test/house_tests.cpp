@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <house.h>
+#include <issued.h>
 
 #include <bill.h>            // MAX_BILL_TENOR_BLOCKS, LOAN_BOOK_MAX_FACE (B1)
 #include <chainparams.h>     // SelectParams / CreateChainParams (v0.2.18 silence clock)
@@ -687,6 +688,49 @@ BOOST_AUTO_TEST_CASE(house_attest_floor_logic)
     hEmpty.nMintedUnits = 0;
     hEmpty.nStressSinceHeight = 1050;
     BOOST_CHECK_EQUAL(HouseAttestNewStressOrigin(hEmpty, 0, 1100), 0);
+}
+
+BOOST_AUTO_TEST_CASE(gold_brassage_schedule)
+{
+    // v1.1.0 (D-2026-11-05-1): an Open house redeems at par whatever its till (option A). A house that is not Open
+    // (here Stressed) owes the spread on the counted gold till / notes against the 2% till floor - par at or above it,
+    // the full 4% at a quarter of it, the same quadratic curve between. Nothing about the attested ECX reserves enters.
+    uint64_t nTill = 0;
+    g_fnGoldForChecksTestOverride = [&nTill](const CHouse&, int, CGoldCount& count) { count.nTillMg = nTill; };
+    const int H = 100;
+    CHouse house;
+    house.nMintedUnits = 1000000000;           // 1 tonne of notes, in mg
+    house.amountLastAttestReserves = 0;        // never attested: no longer the full spread
+    CHouse hEmpty;
+    BOOST_CHECK_EQUAL(GoldBrassageBps(hEmpty, H), 0u);
+    // Open: par at any till, even none.
+    house.status = HOUSE_STATUS_OPEN;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+    nTill = 0;
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), 0u);
+    nTill = 10000000;                          // 1%: below the floor, still par while Open
+    BOOST_CHECK_EQUAL(GoldTillRatioBps(house, H), 100u);
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), 0u);
+    // Stressed: the curve.
+    house.status = HOUSE_STATUS_STRESSED;
+    house.nStressSinceHeight = (uint32_t)H - 1;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_STRESSED);
+    nTill = 20000000;                          // 2% = the floor: par
+    BOOST_CHECK_EQUAL(GoldTillRatioBps(house, H), 200u);
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), 0u);
+    nTill = 900000000;                         // 90%: par
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), 0u);
+    nTill = 12500000;                          // 1.25%, the midpoint of [0.5%, 2%]: a quarter of the full spread
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), HOUSE_BRASSAGE_MAX_BPS / 4);
+    nTill = 5000000;                           // 0.5% = theta: the full spread
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), HOUSE_BRASSAGE_MAX_BPS);
+    nTill = 0;
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), HOUSE_BRASSAGE_MAX_BPS);
+    house.amountLastAttestReserves = 500000000;   // a big ECX attestation changes nothing
+    BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), HOUSE_BRASSAGE_MAX_BPS);
+    nTill = 19900000;                          // a whisker under the floor: almost nothing
+    BOOST_CHECK(GoldBrassageBps(house, H) < 5);
+    g_fnGoldForChecksTestOverride = nullptr;
 }
 
 BOOST_AUTO_TEST_CASE(house_brassage_schedule)

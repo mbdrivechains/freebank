@@ -192,8 +192,11 @@ bool WalletParameterInteraction()
     return true;
 }
 
+void RegisterIssuedNodeRPCCommands(CRPCTable& t);   // wallet/issued_wallet.cpp: read-only, no wallet needed (v1.1.1)
+
 void RegisterWalletRPC(CRPCTable &t)
 {
+    RegisterIssuedNodeRPCCommands(t);
     if (gArgs.GetBoolArg("-disablewallet", DEFAULT_DISABLE_WALLET)) {
         return;
     }

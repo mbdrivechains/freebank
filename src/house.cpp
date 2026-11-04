@@ -508,25 +508,28 @@ uint32_t HouseAttestedRatioBps(const CHouse& house)
     return bps > 10000 ? 10000 : (uint32_t)bps;
 }
 
-uint32_t HouseBrassageBps(const CHouse& house)
+uint32_t BrassageBpsAt(uint32_t nRatio, uint32_t nRho)
 {
-    const uint32_t nRho = HOUSE_RESERVE_FLOOR_PCT * 100;   // rho in bps
-    const uint32_t nRatio = HouseAttestedRatioBps(house);
-
-    // At or above the floor: exact PAR. An Open house is always here (a
-    // below-floor attestation is what makes a house Stressed), so the spread
-    // only ever bites on a publicly impaired house.
+    const uint32_t nTheta = nRho / 4;
+    // At or above the floor: exact PAR.
     if (nRatio >= nRho)
         return 0;
     // At or below theta: the full spread.
-    if (nRatio <= HOUSE_THETA_BPS)
+    if (nRatio <= nTheta)
         return HOUSE_BRASSAGE_MAX_BPS;
 
     // Between: quadratic in proximity (the sim's prox^2 - zero first derivative
     // at rho, so the fee opens gently instead of with a cliff at the floor).
     const uint64_t nNum = nRho - nRatio;                   // 0 .. (rho - theta)
-    const uint64_t nDen = nRho - HOUSE_THETA_BPS;          // rho - theta (750)
+    const uint64_t nDen = nRho - nTheta;                   // rho - theta
     return (uint32_t)(((uint64_t)HOUSE_BRASSAGE_MAX_BPS * nNum * nNum) / (nDen * nDen));
+}
+
+uint32_t HouseBrassageBps(const CHouse& house)
+{
+    // The pre-gram curve on the attested ECX ratio against rho = 10% (theta = rho/4 = HOUSE_THETA_BPS). Consensus no
+    // longer reads it from v1.1.0 (GoldBrassageBps); kept for the unit tests of the curve.
+    return BrassageBpsAt(HouseAttestedRatioBps(house), HOUSE_RESERVE_FLOOR_PCT * 100);
 }
 
 CAmount HouseBrassageAmount(uint64_t nUnits, uint32_t nBps)

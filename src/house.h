@@ -1223,10 +1223,13 @@ uint64_t HouseMintCapUnits(const CHouse& house);
  * its last report implied: the incentive points at attesting. */
 uint32_t HouseAttestedRatioBps(const CHouse& house);
 
-/** The dynamic-brassage spread, basis points, from the attested ratio (D1/D8).
- * Zero at or above rho (PAR while Open); ramps quadratically - the sim's
- * prox^2, so it opens gently rather than with a cliff at the floor - to
- * HOUSE_BRASSAGE_MAX_BPS at or below theta. */
+/** The dynamic-brassage curve (D1/D8), basis points: zero at or above the floor nRho (PAR); ramps quadratically - the
+ * sim's prox^2, so it opens gently rather than with a cliff at the floor - to HOUSE_BRASSAGE_MAX_BPS at or below
+ * theta = nRho / 4. Ratios and nRho in basis points. */
+uint32_t BrassageBpsAt(uint32_t nRatio, uint32_t nRho);
+
+/** The PRE-GRAM spread: the curve on the attested ECX ratio against rho = 10%. Not read by consensus from v1.1.0; the
+ * spread a redemption owes is GoldBrassageBps (issued.h): the counted gold till against the 2% till floor. */
 uint32_t HouseBrassageBps(const CHouse& house);
 
 /** The spread owed on redeeming nUnits at nBps. Floor division; 128-bit. */

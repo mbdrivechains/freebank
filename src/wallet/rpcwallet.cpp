@@ -37,6 +37,8 @@
 #include <util.h>
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
+#include <units.h>     // v1.1.1: signdiscount's loss figures at the payout price
+#include <issued.h>
 #include <wallet/coincontrol.h>
 #include <wallet/feebumper.h>
 #include <wallet/rpcwallet.h>
@@ -4035,8 +4037,9 @@ UniValue issuebill(const JSONRPCRequest& request)
             "issuebill\n"
             "\nArguments:\n"
             "1. \"body\"            (string, required) hex of the encrypted bill body\n"
-            "2. \"amount\"          (numeric or string, required) face amount\n"
-            "3. \"escrow\"          (numeric or string, required) escrow bond amount\n"
+            "2. \"face_mg\"         (numeric, required) the face in mg of gold, a whole number (v1.1.1; v1.1.0 read\n"
+            "                     an 8-decimal amount here, x1e8)\n"
+            "3. \"escrow\"          (numeric or string, required) escrow bond in sECX\n"
             "4. \"maturityheight\"  (numeric, required) sidechain height the bill matures at\n"
             "5. \"graceblocks\"     (numeric, optional) grace period, default 1008\n"
             "6. \"fee\"             (numeric or string, optional) default 0.001\n"
@@ -4044,8 +4047,8 @@ UniValue issuebill(const JSONRPCRequest& request)
             "this wallet plays drawer, acceptor and initial holder with fresh keys.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
-            + HelpExampleCli("issuebill", "\"deadbeef\" 10 7.5 500")
-            + HelpExampleRpc("issuebill", "\"deadbeef\" 10 7.5 500")
+            + HelpExampleCli("issuebill", "\"deadbeef\" 10000000 7.5 500")
+            + HelpExampleRpc("issuebill", "\"deadbeef\" 10000000 7.5 500")
         );
 
     ObserveSafeMode();
@@ -4055,7 +4058,7 @@ UniValue issuebill(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_MISC_ERROR, "Invalid body (need hex)");
     std::vector<unsigned char> vchBody = ParseHex(strBody);
 
-    CAmount nAmount = AmountFromValue(request.params[1]);
+    const CAmount nAmount = MgFromValue(request.params[1], "face_mg");
     CAmount nEscrow = AmountFromValue(request.params[2]);
     int nMaturityHeight = request.params[3].get_int();
     if (nMaturityHeight <= 0)
@@ -5530,7 +5533,7 @@ UniValue listdepositdemands(const JSONRPCRequest& request)
             "a house learns of every demand without being told. Pay each with dischargedeposit <txid> before\n"
             "protest_opens_at, or the saver may protest and the house becomes stressed.\n"
             "\nResult: [ { \"txid\", \"principal\", \"rate_bps\", \"maturity\", \"demand_height\", \"protested\",\n"
-            "            \"protest_opens_at\", \"due_now\" }, ... ]\n"
+            "            \"protest_opens_at\", \"due_now_mg\" }, ... ]: principal and due_now_mg in mg of gold\n"
             + HelpExampleCli("listdepositdemands", "1"));
     const uint32_t nHouseID = request.params[0].get_int();
     FlushStateToDisk();
@@ -5558,8 +5561,8 @@ UniValue listdepositdemands(const JSONRPCRequest& request)
             o.pushKV("protested", NoteDemandIsProtested(coin.nDemandHeight));
             o.pushKV("protest_opens_at", (uint64_t)(std::max(nDemandH, house.nDeferEndedHeight) +
                                                     Params().GetConsensus().nDemandWindow));
-            o.pushKV("due_now", ValueFromAmount((CAmount)coin.nDepositPrincipal +
-                     DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps)));
+            o.pushKV("due_now_mg", (uint64_t)coin.nDepositPrincipal +   // v1.1.1: whole mg (v1.1.0: "due_now", x1e-8)
+                     (uint64_t)DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps));
             arr.push_back(o);
         }
         pcursor->Next();
@@ -6865,9 +6868,10 @@ UniValue bondoraclesubmitter(const JSONRPCRequest& request)
             "Re-bonding an existing ID CONSOLIDATES its current bond coin into\n"
             "the new one (only a same-key bond may spend it) and cancels any\n"
             "pending unbond request.\n"
-            "\nNOTE: the oracle is consensus-INERT in this phase. The fix it\n"
-            "maintains is recorded and served over RPC, but nothing in the\n"
-            "credit rules reads it, and no bond is ever slashed.\n"
+            "\nThe price feed is live from v1.1.0: its fixes set the payout price and\n"
+            "token backing (getgoldfix). While there is one block producer no bond\n"
+            "is forfeited (D-2026-11-04-1); a later release sets the height from\n"
+            "which forfeits apply.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("bondoraclesubmitter", "")
@@ -7315,7 +7319,8 @@ UniValue proposediscount(const JSONRPCRequest& request)
             "\nArguments:\n"
             "1. \"id\"           (numeric, required) the bill to sell\n"
             "2. \"houseid\"      (numeric, required) the house asked to buy it\n"
-            "3. \"price\"        (numeric or string, required) note-units offered; 0 < price <= face\n"
+            "3. \"price_mg\"     (numeric, required) the notes offered, in mg of gold (a whole number); 0 < price <=\n"
+            "                  face (v1.1.1; v1.1.0 read an 8-decimal amount here, x1e8)\n"
             "4. \"expiryblocks\" (numeric, optional, default 252) blocks from now the offer stays live\n"
             "\nRound 1, from the SELLER's wallet: offer this wallet's bill to a discount\n"
             "house. Returns an unsigned proposal blob to hand to the house, which runs\n"
@@ -7327,14 +7332,14 @@ UniValue proposediscount(const JSONRPCRequest& request)
             "  \"proposal\": \"hex\"    (string) hand this to the buying house\n"
             "}\n"
             "\nExamples:\n"
-            + HelpExampleCli("proposediscount", "1 3 0.95")
-            + HelpExampleRpc("proposediscount", "1, 3, 0.95")
+            + HelpExampleCli("proposediscount", "1 3 9500000")
+            + HelpExampleRpc("proposediscount", "1, 3, 9500000")
         );
 
     ObserveSafeMode();
     const uint32_t nBillID = request.params[0].get_int();
     const uint32_t nHouseID = request.params[1].get_int();
-    const CAmount amountPrice = AmountFromValue(request.params[2]);
+    const CAmount amountPrice = MgFromValue(request.params[2], "price_mg");
     uint32_t nExpiryBlocks = 0;
     if (request.params.size() >= 4) nExpiryBlocks = request.params[3].get_int();
 
@@ -7374,11 +7379,12 @@ UniValue signdiscount(const JSONRPCRequest& request)
             "\nResult:\n"
             "{\n"
             "  \"hex\": \"...\",          (string) hand this back to the seller\n"
-            "  \"face\": x.xxx,          (numeric) what the drawee owes at maturity\n"
-            "  \"price\": x.xxx,         (numeric) what the house pays now (new notes to the seller)\n"
-            "  \"bond\": x.xxx,          (numeric) the seller's bond in escrow\n"
-            "  \"max_deficiency\": x.xxx, (numeric) face not covered by the bond\n"
-            "  \"max_loss\": x.xxx       (numeric) price minus bond: the most the house loses if the drawee pays\n"
+            "  \"face_mg\": n,           (numeric) what the drawee owes at maturity, mg of gold\n"
+            "  \"price_mg\": n,          (numeric) what the house pays now (new notes to the seller), mg of gold\n"
+            "  \"bond\": x.xxx,          (numeric) the seller's bond in escrow, sECX\n"
+            "  \"payout_price\": n,      (numeric) sats per gram the two figures below use (null: no price yet)\n"
+            "  \"max_deficiency\": x.xxx, (numeric) face not covered by the bond, sECX at that price\n"
+            "  \"max_loss\": x.xxx       (numeric) price minus bond, sECX at that price: the most the house loses if the drawee pays\n"
             "                            nothing. Recourse to the seller is CAPPED at the bond, not added to it\n"
             "}\n"
             "\nExamples:\n"
@@ -7417,11 +7423,30 @@ UniValue signdiscount(const JSONRPCRequest& request)
         if (!pbilltree->GetBill(prop.nBillID, bill))
             return response;
     }
-    response.pushKV("face", ValueFromAmount(bill.amount));
-    response.pushKV("price", ValueFromAmount(prop.amountPrice));
+    // v1.1.1: the face and price are mg of gold, the bond sECX; the two loss figures compare them at the payout price
+    // (v1.1.0 subtracted sECX from mg).
+    response.pushKV("face_mg", (uint64_t)bill.amount);
+    response.pushKV("price_mg", (uint64_t)prop.amountPrice);
     response.pushKV("bond", ValueFromAmount(bill.amountEscrow));
-    response.pushKV("max_deficiency", ValueFromAmount(std::max<CAmount>(0, bill.amount - bill.amountEscrow)));
-    response.pushKV("max_loss", ValueFromAmount(std::max<CAmount>(0, prop.amountPrice - bill.amountEscrow)));
+    uint64_t nPrice = 0;
+    bool fPrice;
+    {
+        LOCK(cs_main);
+        CUnitsView units(punitsdb.get());
+        fPrice = PayoutPrice(units, chainActive.Height(), Params().GetConsensus().GramAt(chainActive.Height()), nPrice);
+    }
+    if (fPrice) {
+        auto toSats = [nPrice](uint64_t nMg) {
+            return (CAmount)std::min<unsigned __int128>(((unsigned __int128)nMg * nPrice + 999) / 1000, (unsigned __int128)MAX_MONEY);
+        };
+        response.pushKV("payout_price", nPrice);
+        response.pushKV("max_deficiency", ValueFromAmount(std::max<CAmount>(0, toSats((uint64_t)bill.amount) - bill.amountEscrow)));
+        response.pushKV("max_loss", ValueFromAmount(std::max<CAmount>(0, toSats((uint64_t)prop.amountPrice) - bill.amountEscrow)));
+    } else {
+        response.pushKV("payout_price", NullUniValue);
+        response.pushKV("max_deficiency", NullUniValue);
+        response.pushKV("max_loss", NullUniValue);
+    }
     return response;
 }
 
@@ -7552,7 +7577,8 @@ UniValue listmybills(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size())
         throw std::runtime_error(
             "listmybills\n"
-            "\nList bills this wallet participates in, with our role(s)\n"
+            "\nList bills this wallet participates in, with our role(s). \"face_mg\" is the face in mg of gold (a\n"
+            "whole number), \"escrow\" the drawer's bond in sECX.\n"
             "\nExamples:\n"
             + HelpExampleCli("listmybills", "")
             + HelpExampleRpc("listmybills", "")
@@ -7577,7 +7603,7 @@ UniValue listmybills(const JSONRPCRequest& request)
         UniValue obj(UniValue::VOBJ);
         obj.pushKV("id", (uint64_t)bill.nBillID);
         obj.pushKV("bill_id", bill.billID.ToString());
-        obj.pushKV("amount", ValueFromAmount(bill.amount));
+        obj.pushKV("face_mg", (uint64_t)bill.amount);   // v1.1.1: whole mg (v1.1.0: "amount", x1e-8)
         obj.pushKV("escrow", ValueFromAmount(bill.amountEscrow));
         obj.pushKV("status", std::string(1, bill.status));
         obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
@@ -8214,11 +8240,11 @@ static const CRPCCommand commands[] =
     { "BitAssets",          "transferasset",                    &transferasset,                 {"asset_id", "address", "units", "fee"} },
     { "BitAssets",          "transferassetcontrol",             &transferassetcontrol,          {"asset_id", "address", "fee"} },
 
-    { "bills",              "issuebill",                        &issuebill,                     {"body", "amount", "escrow", "maturityheight", "graceblocks", "fee"} },
+    { "bills",              "issuebill",                        &issuebill,                     {"body", "face_mg", "escrow", "maturityheight", "graceblocks", "fee"} },
     { "bills",              "endorsebill",                      &endorsebill,                   {"id", "topubkey", "fee"} },
     { "bills",              "retirebill",                       &retirebill,                    {"id", "fee", "notes"} },
     { "bills",              "claimbillescrow",                  &claimbillescrow,               {"id", "fee"} },
-    { "bills",              "proposediscount",                  &proposediscount,               {"id", "houseid", "price", "expiryblocks"} },
+    { "bills",              "proposediscount",                  &proposediscount,               {"id", "houseid", "price_mg", "expiryblocks"} },
     { "bills",              "signdiscount",                     &signdiscount,                  {"proposal", "fee"} },
     { "bills",              "completediscount",                 &completediscount,              {"hex"} },
     { "bills",              "recoursebill",                     &recoursebill,                  {"id", "fee"} },

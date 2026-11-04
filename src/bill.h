@@ -155,7 +155,7 @@ struct CBill {
     uint32_t nBillID;                             // dense id (BitAsset nID pattern); coin tags carry this
     uint256 billID;                               // sha256(encrypted_body) - canonical identity
     std::vector<unsigned char> vchEncryptedBody;  // opaque to consensus
-    CAmount amount;                               // face, base-coin sats (D2)
+    CAmount amount;                               // face, mg of gold (gram notes, v1.1.0; was base-coin sats, D2)
     CAmount amountEscrow;                         // bond actually posted (issue vout[1] value)
     uint32_t nIssuedHeight;
     uint32_t nMaturityHeight;
