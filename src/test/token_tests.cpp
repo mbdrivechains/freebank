@@ -144,6 +144,9 @@ struct FailedHouse {
         house.status = HOUSE_STATUS_OPEN;
         house.nRegisteredHeight = 100;
         house.nLastAttestHeight = 200;
+        // Gram-notes release: the old missed-cadence origin (deadline + 1), stored, since that origin no longer
+        // derives (stress starts only on unpaid demand); every height below is unchanged.
+        house.nStressSinceHeight = 200 + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;
         house.amountLastAttestReserves = 100 * COIN;
         house.nMintedUnits = 1000000;
         house.nTokenUnits = 300000;
@@ -465,6 +468,7 @@ BOOST_AUTO_TEST_CASE(token_collect_pays_a_notes_share)
     f.house.nInsolventHeight = f.E;
     f.house.nInsolventUnits = 1000000;
     f.house.amountInsolventPot = 10 * COIN;
+    f.house.nInsolventSatsPerGram = 1000;   // gram-notes release: the snapshot's price (1 mg = 1 sat)
     f.house.nTokenUnits = 299000;
     f.house.nTokenClaimed = 327680;
     f.house.nTokenClaims = 3;

@@ -646,11 +646,9 @@ BOOST_AUTO_TEST_CASE(note_redeem_rejected_while_deferred)
 
 BOOST_AUTO_TEST_CASE(note_mint_rho_liveness_gate)
 {
-    // R-i7 (DR-1): the reserve cap is the reserves PROVEN LIVE in the mint, not a
-    // stored snapshot. An Open, well-capitalised house with an EMPTY reserve
-    // proof proves zero reserves -> cap 0 -> any mint is under-reserved. This is
-    // the mint-side of the DR-1 fix: a house cannot mint against reserves it did
-    // not prove it currently holds.
+    // Gram-notes release: the till cap is the house's counted gold till (the test fixture emulates it from the
+    // attested figure), exact on-chain, so the R-i7 liveness proof and its as-of vectors are gone. What stays: a
+    // well-capitalised house with too little till can't mint.
     CHouse house;
     house.nHouseID = 5;
     house.houseID = uint256S("f00d");
@@ -674,26 +672,13 @@ BOOST_AUTO_TEST_CASE(note_mint_rho_liveness_gate)
     auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
     auto fnBlock = [](uint32_t, uint256& h) { h = uint256S("beef"); return true; };
 
-    // Fresh as-of, empty proof -> proven reserves 0 -> under-reserved (not stale).
+    // A till of 1 sat-equivalent (emulated 0 mg) can't back even 100 units.
+    house.amountLastAttestReserves = 1;
     {
         CMutableTransaction mtx = MakeMintTx(5, 100, /*nAsOfHeight=*/999);
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, 1000, 0, fnGetHouse, fnNoCoin, fnNoCoin, fnBlock, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-note-mint-under-reserved");
-    }
-    // A future as-of height is refused before the proof is even examined.
-    {
-        CMutableTransaction mtx = MakeMintTx(5, 100, /*nAsOfHeight=*/1000);
-        CValidationState state; CHouse houseOut; bool fChanged = false;
-        BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, 1000, 0, fnGetHouse, fnNoCoin, fnNoCoin, fnBlock, houseOut, fChanged));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-note-mint-reserve-future");
-    }
-    // A stale as-of height (older than the staleness window) is refused too.
-    {
-        CMutableTransaction mtx = MakeMintTx(5, 100, /*nAsOfHeight=*/100);
-        CValidationState state; CHouse houseOut; bool fChanged = false;
-        BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, 1000, 0, fnGetHouse, fnNoCoin, fnNoCoin, fnBlock, houseOut, fChanged));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-note-mint-reserve-stale");
     }
 }
 

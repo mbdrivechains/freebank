@@ -141,7 +141,8 @@ BOOST_AUTO_TEST_CASE(members_chouse_v10_and_v9)
     std::vector<unsigned char> v(ss.begin(), ss.end());
     BOOST_REQUIRE_EQUAL(v[0], HOUSE_SER_VERSION);
     v[0] = 9;
-    v.resize(v.size() - (1 + sizeof(uint64_t) + 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t)));   // + the v12 claim totals
+    v.resize(v.size() - (1 + sizeof(uint64_t) + 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t)   // + the v12 claim totals
+                         + 2 * sizeof(uint64_t) + sizeof(uint32_t)));                           // + the v13 fields
     CDataStream ss9(v, SER_DISK, CLIENT_VERSION);
     CHouse old;
     ss9 >> old;
@@ -226,9 +227,9 @@ BOOST_AUTO_TEST_CASE(members_op_shape)
         op.nHouseID = 0;
         BOOST_CHECK_EQUAL(ShapeReject(MemberTx(nOp, op)), "bad-house-member-house");
     }
-    // Op codes past the last house op are refused (v0.2.28: CLOSE, 15, is the last)
+    // Op codes past the last house op are refused (gram-notes release: EQUITY, 17, is the last)
     CMutableTransaction mtx = MemberTx(HOUSE_OP_MEMBER_PURGE, ValidMemberOp(1));
-    mtx.nHouseOp = HOUSE_OP_CLOSE + 1;
+    mtx.nHouseOp = HOUSE_OP_EQUITY + 1;
     BOOST_CHECK_EQUAL(ShapeReject(mtx), "bad-house-op");
 }
 

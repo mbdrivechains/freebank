@@ -439,10 +439,10 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
         if (!CheckBillApproverShape(d.vApproverIndex, d.vApproverSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-approver-shape");
 
-        // Every discount MINTS, so the rho-at-mint reserve proof set (R-i7) is
-        // unconditionally required - an empty set is invalid outright, and is
-        // caught here rather than costing a DB read to discover.
-        if (d.vReserveProofs.empty() || d.vReserveProofs.size() > MAX_ATTEST_PROOFS)
+        // Gram-notes release: the rho-at-mint ECX reserve proof set (R-i7) no longer counts - a discount's cap is the
+        // counted gold till's (GOLD_USD_SCOPE.md call 1, decision 15) - so the set may be empty; any proof present
+        // must still be well formed.
+        if (d.vReserveProofs.size() > MAX_ATTEST_PROOFS)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-proofs-shape");
         std::set<COutPoint> setProof;
         for (const AttestProof& p : d.vReserveProofs) {

@@ -42,12 +42,15 @@
 #include <wallet/fees.h>
 
 #include <algorithm>
+#include <deque>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <utility>
 
 #ifdef ENABLE_WALLET
 #include <wallet/wallet.h>
+#include <univalue.h>
 #endif
 
 //////////////////////////////////////////////////////////////////////////////
@@ -238,8 +241,24 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         CValidationState state;
         std::unique_ptr<CBlockTemplate> t = CreateNewBlockOnce(scriptPubKeyIn, hashPrevBlock, nFeesOut, hashMainTip,
                                                                fCheckBMM, fNoMempoolTxs, fInvalid, state);
-        if (!fInvalid)
+        if (!fInvalid) {
+            // The inclusion log (7j): what this template carries, and what it leaves in the pool.
+            if (t) {
+                std::vector<uint256> vIn;
+                std::set<uint256> setIn;
+                for (size_t i = 1; i < t->block.vtx.size(); i++) {
+                    vIn.push_back(t->block.vtx[i]->GetHash());
+                    setIn.insert(vIn.back());
+                }
+                std::vector<std::pair<uint256, std::string>> vOut;
+                for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++)
+                    if (!setIn.count(mi->GetTx().GetHash()))
+                        vOut.push_back(std::make_pair(mi->GetTx().GetHash(), fNoMempoolTxs ? "template-from-no-pool-txs" : "not-selected"));
+                CBlockIndex* pindexPrevLog = hashPrevBlock.IsNull() ? chainActive.Tip() : mapBlockIndex[hashPrevBlock];
+                InclusionLogTemplate(pindexPrevLog ? pindexPrevLog->nHeight + 1 : 0, vIn, vOut);
+            }
             return t;
+        }
         if (fNoMempoolTxs)
             throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, FormatStateMessage(state)));
 
@@ -255,6 +274,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         }
         LogPrintf("%s: template failed: dropping tx %s (%s) and its descendants from the mempool\n", __func__,
                   ptxBad->GetHash().ToString(), FormatStateMessage(stateTx));
+        InclusionLogDrop(ptxBad->GetHash(), FormatStateMessage(stateTx));
         mempool.removeRecursive(*ptxBad, MemPoolRemovalReason::UNKNOWN);
     }
 }
@@ -1147,3 +1167,91 @@ bool BlockAssembler::GenerateBMMBlock(CBlock& block, std::string& strError, CAmo
     return true;
 }
 
+// ---- the inclusion log (7j) ------------------------------------------------------------------------------------
+
+namespace {
+std::mutex g_inclusionMutex;
+std::deque<UniValue> g_inclusionRecent;
+uint256 g_inclusionLastTemplate;
+static const size_t INCLUSION_LOG_KEEP = 1000;
+
+void InclusionLogWrite(UniValue entry)
+{
+    entry.pushKV("time", GetTime());
+    const std::string strLine = entry.write() + "\n";
+    std::lock_guard<std::mutex> lock(g_inclusionMutex);
+    g_inclusionRecent.push_back(entry);
+    while (g_inclusionRecent.size() > INCLUSION_LOG_KEEP)
+        g_inclusionRecent.pop_front();
+    FILE* file = fsbridge::fopen(GetDataDir() / "inclusion.log", "a");
+    if (file) {
+        fwrite(strLine.data(), 1, strLine.size(), file);
+        fclose(file);
+    }
+}
+} // namespace
+
+void InclusionLogTemplate(int nHeight, const std::vector<uint256>& vIncluded,
+                          const std::vector<std::pair<uint256, std::string>>& vLeftOut)
+{
+    // Logged when the template's height or transaction sets change, not on every BMM refresh.
+    CHashWriter hw(SER_GETHASH, 0);
+    hw << nHeight;
+    for (const uint256& h : vIncluded)
+        hw << h;
+    for (const std::pair<uint256, std::string>& p : vLeftOut)
+        hw << p.first;
+    const uint256 hSet = hw.GetHash();
+    {
+        std::lock_guard<std::mutex> lock(g_inclusionMutex);
+        if (hSet == g_inclusionLastTemplate)
+            return;
+        g_inclusionLastTemplate = hSet;
+    }
+    UniValue e(UniValue::VOBJ);
+    e.pushKV("kind", "template");
+    e.pushKV("height", nHeight);
+    UniValue in(UniValue::VARR);
+    for (const uint256& h : vIncluded)
+        in.push_back(h.GetHex());
+    e.pushKV("included", in);
+    UniValue out(UniValue::VARR);
+    for (const std::pair<uint256, std::string>& p : vLeftOut) {
+        UniValue o(UniValue::VOBJ);
+        o.pushKV("txid", p.first.GetHex());
+        o.pushKV("reason", p.second);
+        out.push_back(o);
+    }
+    e.pushKV("left_out", out);
+    InclusionLogWrite(e);
+}
+
+void InclusionLogDisplace(uint32_t nSubmitter, const uint256& txidOld, const uint256& txidNew)
+{
+    UniValue e(UniValue::VOBJ);
+    e.pushKV("kind", "oracle-displace");
+    e.pushKV("submitter", (uint64_t)nSubmitter);
+    e.pushKV("displaced", txidOld.GetHex());
+    e.pushKV("by", txidNew.GetHex());
+    e.pushKV("rule", "the latest valid submission received wins");
+    InclusionLogWrite(e);
+}
+
+void InclusionLogDrop(const uint256& txid, const std::string& strReason)
+{
+    UniValue e(UniValue::VOBJ);
+    e.pushKV("kind", "template-drop");
+    e.pushKV("txid", txid.GetHex());
+    e.pushKV("reason", strReason);
+    InclusionLogWrite(e);
+}
+
+UniValue InclusionLogRecent(size_t nMax)
+{
+    std::lock_guard<std::mutex> lock(g_inclusionMutex);
+    UniValue arr(UniValue::VARR);
+    const size_t nFrom = g_inclusionRecent.size() > nMax ? g_inclusionRecent.size() - nMax : 0;
+    for (size_t i = nFrom; i < g_inclusionRecent.size(); i++)
+        arr.push_back(g_inclusionRecent[i]);
+    return arr;
+}

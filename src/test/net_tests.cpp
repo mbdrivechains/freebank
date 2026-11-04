@@ -257,4 +257,20 @@ BOOST_AUTO_TEST_CASE(bmm_behind_judgement)
     BOOST_CHECK(JudgeBMMBehind(true, none, false) == BMMBehind::NO);
 }
 
+BOOST_AUTO_TEST_CASE(invalid_header_backoff_schedule)
+{
+    // Gram-notes release: a peer dropped for a block we hold as invalid is not redialled for 60 s, doubling per
+    // repeat to an hour; a quiet spell (twice the back-off) starts again at 60 s.
+    std::pair<int64_t, int64_t> e{0, 0};
+    e = CConnman::NextInvalidHeaderBackoff(e, 1000);
+    BOOST_CHECK_EQUAL(e.first, 1060); BOOST_CHECK_EQUAL(e.second, 60);
+    e = CConnman::NextInvalidHeaderBackoff(e, 1061);
+    BOOST_CHECK_EQUAL(e.first, 1181); BOOST_CHECK_EQUAL(e.second, 120);
+    for (int i = 0; i < 10; i++)
+        e = CConnman::NextInvalidHeaderBackoff(e, e.first + 1);
+    BOOST_CHECK_EQUAL(e.second, 3600);
+    e = CConnman::NextInvalidHeaderBackoff(e, e.first + 2 * e.second + 1);
+    BOOST_CHECK_EQUAL(e.second, 60);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -54,6 +54,18 @@ static const uint8_t HOUSE_OP_MEMBER_PURGE  = 14; // delete records whose remova
 // (2 years after insolvency), ANYONE closes a failed house: partners get exactly their residual, the rest of the
 // escrow goes to the mutual fund output, and every claim refuses from then on. No signature: every output is pinned.
 static const uint8_t HOUSE_OP_CLOSE         = 15;
+// Gram-notes release (GOLD_USD_SCOPE.md step 5, decisions log 15): move gold into or out of the house's till vault (the
+// units DB), approved by the house's M-of-N. A house op, so the one-op-per-house-per-block rule keeps it and a DEFER
+// apart.
+static const uint8_t HOUSE_OP_TILL          = 16;
+// Gram-notes release (R3-1): anyone proves a house's equity negative, which opens claims (Insolvent from that block).
+static const uint8_t HOUSE_OP_EQUITY        = 17;
+static const size_t MAX_EQUITY_OVERDUE_BILLS = 1000;
+// A partner's gold pledge has a minimum (decisions log 16; provisional until the Monte Carlo sets figures).
+static const uint64_t HOUSE_MIN_GOLD_PLEDGE_MG = 10000;
+// D-2026-11-04-1 (3a): a token the house holds at most this much of in all its vaults is a dust slot: a partner may
+// take their whole entry of it out in a TOPUP that puts at least as many mg of the house's other tokens in.
+static const uint64_t HOUSE_DUST_SLOT_MG = 1000;
 
 // House-type flags, fixed at registration (spec 4.0). REDEEM_ONLY only together with MEMBERS_ONLY.
 static const uint8_t HOUSE_FLAG_MEMBERS_ONLY = 1;
@@ -226,7 +238,7 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // (NOTE_OP_LOCK was reserved inert).
 // v12 (token holders' claim at a failed house, gateway docs/freebank/TOKEN_CLAIM_DESIGN.md draft 3): the claim
 // totals. A v11 record reads as 0: no claim op existed.
-static const uint8_t HOUSE_SER_VERSION = 12;
+static const uint8_t HOUSE_SER_VERSION = 13;
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -411,6 +423,13 @@ struct CHouse {
     uint64_t nTokenPaid;           // units paid out by collects
     uint64_t nTokenWriteOff;       // units written off when the last claim was collected (or none was made)
     uint32_t nTokenWriteOffHeight; // 0 = not written off
+    // v13 (gram-notes release, R2-int-10): the insolvency snapshot's price (sats per gram) and gold (the vaults' units,
+    // mg), which rank the tranches in value: notes take gold first, then sECX at this price up to par; deposits the
+    // rest up to par; partners what is left. Written with nInsolventHeight (a snapshot always has a price).
+    uint64_t nInsolventSatsPerGram;
+    uint64_t nInsolventGoldMg;
+    // v13: the height an EQUITY op proved equity negative (0 = never). Insolvent from then on.
+    uint32_t nEquityNegativeHeight;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -423,7 +442,8 @@ struct CHouse {
                nLoanBookFace(0), nLoanWtMatHi(0), nLoanWtMatLo(0),
                nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0), nTokenUnits(0),
                nTokenClaimed(0), nTokenClaims(0), nTokenCollected(0), nTokenBase(0), nTokenBaseHeight(0),
-               nTokenPaid(0), nTokenWriteOff(0), nTokenWriteOffHeight(0) {}
+               nTokenPaid(0), nTokenWriteOff(0), nTokenWriteOffHeight(0), nInsolventSatsPerGram(0),
+               nInsolventGoldMg(0), nEquityNegativeHeight(0) {}
 
     bool IsMembersOnly() const { return (nFlags & HOUSE_FLAG_MEMBERS_ONLY) != 0; }
     bool IsRedeemOnly() const { return (nFlags & HOUSE_FLAG_REDEEM_ONLY) != 0; }
@@ -564,6 +584,12 @@ struct CHouse {
             READWRITE(nTokenPaid);
             READWRITE(nTokenWriteOff);
             READWRITE(nTokenWriteOffHeight);
+        }
+        // v13: the snapshot's price and gold. A v12 record predates the gram-notes release: 0.
+        if (nSerVersion >= 13) {
+            READWRITE(nInsolventSatsPerGram);
+            READWRITE(nInsolventGoldMg);
+            READWRITE(nEquityNegativeHeight);
         }
     }
 
@@ -844,6 +870,23 @@ struct HouseRenew {
  * only reserve-lock coins, M-of-N approved with the destination bound. While the
  * house is Stressed, Deferred or Insolvent the till stays where the holders can
  * reach it. */
+struct HouseTill {
+    uint32_t nHouseID;
+    std::vector<uint32_t> vApproverIndex;
+    std::vector<std::vector<unsigned char>> vApproverSig;
+
+    HouseTill() : nHouseID(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
+    }
+};
+
 struct HouseRelease {
     uint32_t nHouseID;
     std::vector<uint32_t> vApproverIndex;
@@ -866,6 +909,25 @@ struct HouseRelease {
  * pattern. Valid when partner status == tail AND height >= nTailUnlockHeight. */
 /** CLOSE (v0.2.28): the house id is the whole payload - the outputs are fixed by the rules, and the undo reverts the
  * partner statuses (and a same-block materialization) exactly as the partners' settle's does. */
+/** HOUSE_OP_EQUITY payload: the house, the price height (at most nPriceBackBlocks back), and the bills in its book that
+ *  are unpaid nBillOverdueBlocks past maturity (they count zero). No signature: anyone may prove it. */
+struct HouseEquity {
+    uint32_t nHouseID;
+    uint32_t nPriceHeight;
+    std::vector<uint32_t> vOverdueBillID;
+
+    HouseEquity() : nHouseID(0), nPriceHeight(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nPriceHeight);
+        READWRITE(vOverdueBillID);
+    }
+};
+
 struct HouseClose {
     uint32_t nHouseID;
 
@@ -1035,6 +1097,8 @@ uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, cons
 uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashOutputs);
 uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
+/** The till op's approvers sign the house, the prevouts, the outputs, the annex and the vault moves. */
+uint256 HouseTillSigHash(const uint256& houseID, const CTransaction& tx);
 
 /** The per-coin reserve-proof challenge: sha256d over a domain tag, the house
  * identity (cross-house replay bar), the as-of height AND that height's block

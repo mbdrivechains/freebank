@@ -926,10 +926,8 @@ BOOST_AUTO_TEST_CASE(bill_discount_shape_rejections)
     reject([](BillDiscount& d, CMutableTransaction&) { d.vApproverSig[0].assign(81, 0x30); },
            "bad-bill-discount-approver-shape");
 
-    // -- reserve proofs (R-i7): every discount MINTS, so an empty set is
-    //    unconditionally invalid, and it costs no DB read to say so.
-    reject([](BillDiscount& d, CMutableTransaction&) { d.vReserveProofs.clear(); },
-           "bad-bill-discount-proofs-shape");
+    // -- reserve proofs (R-i7): gram-notes release - the set may be empty (the gold till caps a discount); a proof
+    //    present must still be well formed.
     reject([](BillDiscount& d, CMutableTransaction&) {
                d.vReserveProofs.push_back(d.vReserveProofs[0]);     // duplicate outpoint
            }, "bad-bill-discount-proofs-shape");

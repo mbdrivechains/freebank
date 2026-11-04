@@ -40,6 +40,7 @@
 #include <scheduler.h>
 #include <timedata.h>
 #include <txdb.h>
+#include <units.h>
 #include <txmempool.h>
 #include <torcontrol.h>
 #include <ui_interface.h>
@@ -357,6 +358,7 @@ void Shutdown()
         pbilltree.reset();
         phousetree.reset();
         ppooltree.reset();
+        punitsdb.reset();
     }
 #ifdef ENABLE_WALLET
     StopWallets();
@@ -552,6 +554,8 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-limitdescendantcount=<n>", strprintf("Do not accept transactions if any ancestor would have <n> or more in-mempool descendants (default: %u)", DEFAULT_DESCENDANT_LIMIT));
         strUsage += HelpMessageOpt("-limitdescendantsize=<n>", strprintf("Do not accept transactions if any ancestor would have more than <n> kilobytes of in-mempool descendants (default: %u).", DEFAULT_DESCENDANT_SIZE_LIMIT));
         strUsage += HelpMessageOpt("-vbparams=deployment:start:end", "Use given start/end times for specified version bits deployment (regtest-only)");
+        strUsage += HelpMessageOpt("-depositstartheight=<n>", "Credit only slot-130 treasury changes in L1 blocks at or above this L1 height, as a chain restarted on an L1 with a treasury history does (regtest-only; default: 0, all)");
+        strUsage += HelpMessageOpt("-housepoolheight=<n>", "Height from which house note pools are open (regtest-only; default: never, as on every public network)");
         strUsage += HelpMessageOpt("-dormant=<0|1>", "Run the chain dormant (no block after genesis), as FreeBank mainnet ships (regtest-only)");
         strUsage += HelpMessageOpt("-memberopguard=0", "Let a second member op for a house into the mempool, to test the block rule (regtest-only)");
     }
@@ -1490,6 +1494,29 @@ bool AppInitParameterInteraction()
         LogPrintf("This network is DORMANT: no block after genesis is valid and none is produced until a release "
                   "switches it on. Deposits to slot %u made meanwhile are credited, in order, once it is.\n", THIS_SIDECHAIN);
 
+    if (gArgs.IsArgSet("-depositstartheight")) {
+        // Gram-notes release (scope 7h): the gate for a chain restarted on an L1 whose treasury has a history.
+        if (!chainparams.MineBlocksOnDemand())
+            return InitError("-depositstartheight may only be set on regtest.");
+        const int64_t n = gArgs.GetArg("-depositstartheight", (int64_t)0);
+        if (n < 0 || n > std::numeric_limits<int>::max())
+            return InitError("-depositstartheight out of range");
+        UpdateDepositStartL1Height((int)n);
+        LogPrintf("Deposits count from L1 height %d (regtest)\n", (int)n);
+    }
+
+    if (gArgs.IsArgSet("-housepoolheight")) {
+        // Gram-notes release: house note pools stay closed until a later release sets the height (D-2026-10-31-8
+        // item 9). Regtest may open them so the pool gates keep exercising the code.
+        if (!chainparams.MineBlocksOnDemand())
+            return InitError("-housepoolheight may only be set on regtest.");
+        const int64_t n = gArgs.GetArg("-housepoolheight", (int64_t)std::numeric_limits<int>::max());
+        if (n < 0 || n > std::numeric_limits<int>::max())
+            return InitError("-housepoolheight out of range");
+        UpdateNotePoolHeight((int)n);
+        LogPrintf("House note pools open from height %d (regtest)\n", (int)n);
+    }
+
     if (gArgs.IsArgSet("-vbparams")) {
         // Allow overriding version bits parameters for testing
         if (!chainparams.MineBlocksOnDemand()) {
@@ -1830,6 +1857,14 @@ bool AppInitMain()
                 pbilltree.reset(new BillDB(nBillDBCache, false, fReset));
                 phousetree.reset(new HouseDB(nBillDBCache, false, fReset));
                 ppooltree.reset(new PoolDB(nBillDBCache, false, fReset));
+                punitsdb.reset(new CUnitsDB(nBillDBCache, false, fReset));
+                {
+                    std::string strUnitsError;
+                    if (!punitsdb->CheckOrWriteVersion(strUnitsError)) {
+                        strLoadError = strUnitsError;
+                        break;
+                    }
+                }
 
                 if (fReset) {
                     pblocktree->WriteReindexing(true);

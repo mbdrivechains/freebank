@@ -293,10 +293,25 @@ UniValue estimaterawfee(const JSONRPCRequest& request)
     return result;
 }
 
+UniValue getinclusionlog(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() > 1)
+        throw std::runtime_error(
+            "getinclusionlog ( count )\n"
+            "\nThe producer's inclusion log (gram-notes release, legal condition 6): the last count entries (default 50,\n"
+            "at most 1,000 kept since the node started; the full log is <datadir>/inclusion.log). Kinds: template (a block\n"
+            "template's height, the pool transactions it carries and those it leaves out), oracle-displace (a re-signed\n"
+            "submission replaced an earlier one: the latest valid one received wins), template-drop (a pool transaction\n"
+            "a template could not hold, dropped).\n");
+    const size_t nMax = request.params.size() > 0 && !request.params[0].isNull() ? (size_t)std::max(0, request.params[0].get_int()) : 50;
+    return InclusionLogRecent(nMax);
+}
+
 static const CRPCCommand commands[] =
 { //  category              name                      actor (function)         argNames
   //  --------------------- ------------------------  -----------------------  ----------
     { "mining",             "getmininginfo",          &getmininginfo,          {} },
+    { "mining",             "getinclusionlog",        &getinclusionlog,        {"count"} },
     { "mining",             "prioritisetransaction",  &prioritisetransaction,  {"txid","dummy","fee_delta"} },
 
     { "hidden",             "estimatefee",            &estimatefee,            {} },

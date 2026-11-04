@@ -723,6 +723,10 @@ cashes out through the house (`transferdeposit` the receipt to it) or by selling
 
 ### 4.7 Clearing pool (AMM)
 
+*From v1.1.0 house note pools are closed on every network until a later release opens them, once a second, unconnected
+block producer appears (`getblockchaininfo` shows `note_pools_open`). Gold-token pools are open: see 4.13. The commands
+below are for that later release, or for regtest with `-housepoolheight=0`.*
+
 ```bash
 $FB createpool $H 20000000 20000000 30 0.001        # <house = pool id> <note units> <base sats> [fee bps 1..100, default 30] [fee]; one pool per house, forever
 $FB getpool $H                                        # note_reserve, btx_reserve, lp_supply, fee_bps
@@ -801,7 +805,9 @@ regtest) — the stamp lives on each house record, so a house that just settled 
 cannot settle with C until its window passes; an `attesthouse` on either house displaces
 a pooled settlement.
 
-### 4.9 Gold oracle (consensus-inert)
+### 4.9 Gold oracle (consensus-inert; replaced in v1.1.0)
+
+*v1.1.0 replaces this with the price feed that payouts use: see 4.13. The commands below are the v1.0.x ones.*
 
 ```bash
 $W1 bondoraclesubmitter 0 1.0 0.001              # [id, 0 = new] [bond coins] [fee]; one new registration per block; the id is assigned at confirmation
@@ -877,6 +883,68 @@ $FB listassets                                  # every asset on the chain
 Units can't be created after the genesis, only burned (sent to `OP_RETURN`), and two assets can't
 be mixed in one transaction. Balances and coin selection never spend asset coins as ECX.
 `transferassetcontrol <asset_id> <address>` moves the control coin.
+
+### 4.13 Gram notes (v1.1.0)
+
+From v1.1.0 notes, bills and deposits count milligrams of gold, houses hold gold tokens, and payouts are in sECX at the
+chain's payout price (sats per gram). The rules apply from genesis. The earlier recipes still work, with every amount
+of a note, bill or deposit in mg, but a house can issue only once it holds gold.
+
+**1. The price.** Bonded reporters post observations, and a fix forms when a quorum of them report within six blocks.
+
+```bash
+$W bondoraclesubmitter 0 1.0 0.001          # three or more reporters (one new id per block); re-read ids: listoraclesubmitters
+$W submitoracleobs <id> '[{"stream":1,"value":<sats per gram>}]'          # each reporter; fee defaults to 0.0001
+$FB getgoldfix                                # payout_view_sats_per_gram (the 144-block median; null = stale), last fixes
+```
+
+**2. A gold token.** Creating one burns 1 g of gold's worth of sECX at the payout price, so the price must exist first.
+
+```bash
+$W createissuedtoken gold_mg GOLDA <backing contract 0x..> <backing address 0x..> <upstream company>   # id = the txid
+$W mintissued <token> 1000000000 "<address>"
+$W submitoracleobs <id> '[{"stream":1,"value":<sats/g>},{"stream":3,"subject":"<token>","value":<backing balance>,"aux":<eth block>,"aux2":<burn units paid>}]'
+$W issuerbond <token> 10                      # in sECX; it must be worth at least 1 kg at the price
+$FB getissuedtoken <token>                    # trusted, issuing_ok, supply, burns_queued, bond fields
+$W burnissued <token> 1000 <eth address>      # redeem to Ethereum: at least 1,000 units, never the zero address
+```
+
+**3. A house holding gold.** A token new to the house comes in by the partners' agreement (the M-of-N till op); after
+that any partner may pledge it to capital. Issuing needs counted capital of at least 10% of notes and deposits, and a
+till of at least 2% of notes.
+
+```bash
+$W movetill $H <token> 10000000               # into the till (M-of-N); out with a negative amount while open or stressed
+$W pledgegold $H 0 <token> 100000000          # partner 0's capital
+$FB gethousegold $H                           # counted and raw capital and till, caps, vaults, frozen, equity_mg, demand_interest_mg
+$W cleardustslot $H 0 <dust token> <token held>   # a token the house holds at most 1,000 mg of: swap it out mg for mg
+$W proveequity $H                             # anyone; refused unless equity is negative, then claims open
+```
+
+**4. Token pools.** One per gold token; creating one also burns 1 g.
+
+```bash
+$W createtokenpool <token> 600000 66000000 30 # units, sats, fee bps
+$W swaptoken <token> sell 5000                # or buy; swaps chain within a block
+$FB listtokenpools                            # every pool, and the chain's payout price
+```
+
+**Reporter notes.**
+
+- A report targets the next block only and binds the current tip, so it counts only if it reaches the block producer
+  before the producer's bid for that block. Re-sign it each block until it is in; the producer keeps your latest valid
+  report and logs any it replaced (`getinclusionlog`).
+- Streams: 1 gold/ECX in sats per gram; 2 gold/USD in cents per gram; 3 a token's backing; 4 a backing-address claim.
+- Backing (stream 3): `value` is the backing address's transferable balance in the token's units, as the minimum over
+  the window. `aux` is the Ethereum block cited. `aux2` is the units the backing address has sent to the burns'
+  Ethereum addresses, in total (units sent, before any transfer fee the token takes), and it includes units sent from
+  the backing address to `0x000000000000000000000000000000000000dEaD`. That
+  sink is how an issuer cures a burn it can't pay (an address the gold contract blacklists): it destroys the same
+  backing. A token whose burns older than 1,008 blocks are unpaid by more than max(10 g, 0.5% of supply) is
+  untrusted.
+- The quorum is max(3, half the reporters who reported that price in the last 24 blocks), capped at 7.
+- While there is one block producer, reporters forfeit nothing and are paid nothing. Both change in the release that
+  follows a second, unconnected producer.
 
 ---
 

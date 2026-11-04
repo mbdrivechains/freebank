@@ -27,7 +27,8 @@
 
 class CTransaction;
 
-/** True for the credit versions whose op and payload the input digests bind (11-17). */
+/** True for the credit versions whose op and payload the input digests bind (11-18; the gram-notes release added
+ *  the issued-token version 18 and binds every annex). */
 bool IsCreditBindingVersion(int32_t nVersion);
 
 /** SHA256d of the op and the payload's binding form; meaningful only when IsCreditBindingVersion(tx.nVersion). */

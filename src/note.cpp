@@ -3,9 +3,11 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <note.h>
+#include <bill.h>
 #include <token.h>
 
 #include <house.h>   // BLOCKS_PER_YEAR (deferral interest)
+#include <issued.h>  // IsGoldUnpayableScript
 
 #include <coins.h>   // Coin, for the shared payload-pure output tagger
 #include <consensus/validation.h>
@@ -80,6 +82,21 @@ uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint25
     ss << nHouseID;
     ss << nUnitsBurned;
     ss << hashOutputs;
+    return ss.GetHash();
+}
+
+uint256 NoteRedeemVaultSigHash(const uint256& houseID, const CTransaction& tx)
+{
+    CHashWriter hPrevouts(SER_GETHASH, 0);
+    for (const CTxIn& in : tx.vin)
+        hPrevouts << in.prevout;
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/redeem-vault");
+    ss << houseID;
+    ss << hPrevouts.GetHash();
+    ss << BillHashOutputs(tx);
+    ss << tx.vIssuedOut;
+    ss << tx.vVaultMove;
     return ss.GetHash();
 }
 
@@ -257,6 +274,26 @@ CAmount NoteDemandInterest(const CHouse& house, uint32_t nDemandTag, uint64_t nU
                NoteDeferralInterest(nUnits, I, nPayHeight, consensus.vDeferInterestSchedule);
     }
     return NoteDeferralInterest(nUnits, nStart, nEnd, consensus.vDeferInterestSchedule);
+}
+
+CAmount ClaimSatsEntitlement(uint64_t nUnits, uint64_t nGoldMg, const CAmount& amountPot, uint64_t nSnapshotUnits,
+                             uint64_t nSatsPerGram)
+{
+    if (nSatsPerGram == 0 || nGoldMg >= nUnits || nSnapshotUnits == 0 || amountPot <= 0)
+        return 0;
+    const unsigned __int128 prorata =
+        (unsigned __int128)nUnits * (unsigned __int128)amountPot / (unsigned __int128)nSnapshotUnits;
+    const unsigned __int128 par = (unsigned __int128)(nUnits - nGoldMg) * nSatsPerGram / 1000;
+    const unsigned __int128 take = prorata < par ? prorata : par;
+    return (CAmount)std::min<unsigned __int128>(take, (unsigned __int128)MAX_MONEY);
+}
+
+CAmount SeniorSatsReserved(uint64_t nSeniorMg, uint64_t nGoldMg, const CAmount& amountPot, uint64_t nSatsPerGram)
+{
+    if (amountPot <= 0 || nSeniorMg <= nGoldMg)
+        return 0;
+    const unsigned __int128 need = ((unsigned __int128)(nSeniorMg - nGoldMg) * nSatsPerGram + 999) / 1000;
+    return need < (unsigned __int128)amountPot ? (CAmount)need : amountPot;
 }
 
 CAmount NoteClaimEntitlement(uint64_t nUnits, const CAmount& amountPot, uint64_t nSnapshotUnits)
@@ -710,6 +747,13 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-proof");
             if (e.vchPayoutScript.empty() || e.vchPayoutScript.size() > MAX_TOKEN_PAYOUT_SCRIPT)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payout");
+            // Review round 1 (G8e): a payout script the collect couldn't pay gold to (unspendable, or another family's
+            // tagged script) would block every collect of the house for good.
+            {
+                const CScript scriptPay(e.vchPayoutScript.begin(), e.vchPayoutScript.end());
+                if (IsGoldUnpayableScript(scriptPay))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payout");
+            }
             if (e.nFeeBps > TOKEN_FEE_BPS_MAX || (e.nFeeBps == 0) != e.vchRelayerScript.empty() ||
                     e.vchRelayerScript.size() > MAX_TOKEN_RELAYER_SCRIPT)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-fee");

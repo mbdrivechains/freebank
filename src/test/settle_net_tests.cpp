@@ -292,7 +292,7 @@ BOOST_AUTO_TEST_CASE(net_shape_vectors)
     // Inputs: at least the bundles' coins.
     { CMutableTransaction m = good; m.vin.resize(2); BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-vin-size"); }
     // Payments: in the band, at or above the minimum, at the front, in house order, exact value.
-    { SettleNet x = n; x.vReceive[0] = 20200; BOOST_CHECK_EQUAL(ShapeReject(withPayload(x)), "bad-settle-band"); }
+    // (Gram-notes release: the band is contextual, at the payout price.)
     {
         SettleNet x = n;
         x.vReceive[0] = 19900;   // 0.5% under par: inside the band, if the output says so too
@@ -434,10 +434,10 @@ BOOST_AUTO_TEST_CASE(net_contextual_vectors)
         hs.erase(3);
         BOOST_CHECK_EQUAL(NetOpReject(mtx, hs, H), "bad-settle-unknown-house");
     }
-    // Ineligible: a stale attestation.
+    // Ineligible: a gold till below the floor (gram-notes release: see the exchange's vector).
     {
         std::map<uint32_t, CHouse> hs = s.houses;
-        hs[2].nLastAttestHeight = H - HOUSE_ATTEST_CADENCE - 1;
+        hs[2].amountLastAttestReserves = 1;
         BOOST_CHECK_EQUAL(NetOpReject(s.Build(n, hs), hs, H), "bad-settle-house-ineligible");
     }
     // Settled since its last attestation: refused until it attests again.

@@ -10,6 +10,7 @@
 #include <bill.h>
 #include <deposit.h>
 #include <oracle.h>
+#include <issued.h>
 #include <pool.h>
 #include <settle.h>
 #include <house.h>
@@ -257,6 +258,41 @@ void CWallet::DeriveNewChildKey(CWalletDB &walletdb, CKeyMetadata& metadata, CKe
     // update the chain model in the database
     if (!walletdb.WriteHDChain(hdChain))
         throw std::runtime_error(std::string(__func__) + ": Writing HD chain model failed");
+}
+
+/** Gram-notes release: the price a wallet payout binds (the tip's payout price) and mg -> sats at it, rounded up as
+ *  consensus does (validation.cpp MgToSats). */
+static bool WalletPayoutPrice(uint32_t& nPriceHeight, uint64_t& nPrice, std::string& strFail)
+{
+    nPriceHeight = (uint32_t)chainActive.Height();
+    if (!PayoutPriceForChecks((int)nPriceHeight, nPrice) || nPrice == 0) {
+        strFail = "No payout price (the price feed is stale and no pool is deep) - pay in gold, or wait for a price!";
+        return false;
+    }
+    return true;
+}
+static CAmount WalletMgToSats(uint64_t nMg, uint64_t nPrice)
+{
+    return (CAmount)std::min<unsigned __int128>(((unsigned __int128)nMg * nPrice + 999) / 1000, (unsigned __int128)MAX_MONEY);
+}
+/** A failed house's insolvency snapshot price and gold (R2-int-10): the stored ones, or what the next block's first
+ *  waterfall op will take (the payout price at the tip, the vaults now). False when there would be no price. */
+static bool WalletClaimSnapshot(const CHouse& house, uint64_t& nSatsPerGram, uint64_t& nGoldMg, std::string& strFail)
+{
+    nSatsPerGram = 0;
+    nGoldMg = 0;
+    if (house.status == HOUSE_STATUS_INSOLVENT) {
+        nSatsPerGram = house.nInsolventSatsPerGram;
+        nGoldMg = house.nInsolventGoldMg;
+    } else if (PayoutPriceForChecks(chainActive.Height(), nSatsPerGram)) {
+        for (const std::pair<const uint256, uint64_t>& g : HouseVaultFreeTotalsForChecks(house.nHouseID, chainActive.Height() + 1))
+            nGoldMg += g.second;
+    }
+    if (nSatsPerGram == 0) {
+        strFail = "No payout price yet - a failed house's claims wait for one (the snapshot ranks them in value)!";
+        return false;
+    }
+    return true;
 }
 
 bool CWallet::AddKeyPubKeyWithDB(CWalletDB &walletdb, const CKey& secret, const CPubKey &pubkey)
@@ -2279,6 +2315,11 @@ CAmount CWallet::GetAvailableBalance(const CCoinControl* coinControl) const
  *  (GetAvailableCredit: before, getbalance counted what listunspent hid, C7(b)). Asset coins are checked apart. */
 bool CWallet::IsCreditTaggedOutput(const CWalletTx& wtx, unsigned int i) const
 {
+    // Gram-notes release: an output the issued-units annex names carries token units (the same payload-pure rule
+    // AddCoins tags with); spent as a fee coin it would lose them, so CheckIssuedFlow refuses that spend.
+    if (HasIssuedAnnex(wtx.tx->nVersion) && FindIssuedOut(*wtx.tx, i))
+        return true;
+
     // Skip bill title & escrow outputs - locked to bill operations
     // Skip consensus-tagged v11 outputs. Decided by the SAME
     // payload-pure tagger consensus uses, so this skip cannot drift -
@@ -3555,7 +3596,13 @@ bool CWallet::RetireBill(std::string& strFail, uint256& txidOut, const uint32_t 
     }
 
     // Fund face + fee; the escrow input contributes its bond value
-    const CAmount nNeeded = bill.amount + nFee;
+    // Gram-notes release: the face is mg, paid in sECX at the tip's payout price.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    const CAmount amountFaceSats = WalletMgToSats((uint64_t)bill.amount, nPrice);
+    const CAmount nNeeded = amountFaceSats + nFee;
     const CAmount nTargetFunding = nNeeded > bill.amountEscrow ? nNeeded - bill.amountEscrow : CAmount(0);
 
     std::set<CInputCoin> setCoins;
@@ -3574,10 +3621,10 @@ bool CWallet::RetireBill(std::string& strFail, uint256& txidOut, const uint32_t 
     mtx.nBillOp = BILL_OP_RETIRE;
 
     // vout[0] = face payment to the current holder; change back to us
-    mtx.vout.push_back(CTxOut(bill.amount, BillScriptForPubKey(bill.vchHolderPubKey)));
+    mtx.vout.push_back(CTxOut(amountFaceSats, BillScriptForPubKey(bill.vchHolderPubKey)));
 
     CReserveKey reserveKey(this);
-    const CAmount nChange = bill.amountEscrow + nAmountRet - bill.amount - nFee;
+    const CAmount nChange = bill.amountEscrow + nAmountRet - amountFaceSats - nFee;
     if (nChange > 0) {
         CPubKey vchPubKey;
         if (!reserveKey.GetReservedKey(vchPubKey)) {
@@ -3601,6 +3648,7 @@ bool CWallet::RetireBill(std::string& strFail, uint256& txidOut, const uint32_t 
     // The retire signature binds the exact output set
     BillRetire retire;
     retire.nBillID = nBillID;
+    retire.nPriceHeight = nPriceHeight;
     const uint256 sighash = BillRetireSigHash(bill.billID, BillHashOutputs(mtx));
     if (!keyAcceptor.Sign(sighash, retire.vchAcceptorSig)) {
         strFail = "Failed to sign bill retirement!";
@@ -3963,6 +4011,17 @@ static void CollectWalletNoteCoins(CWallet* pwallet, uint32_t nHouseID,
 static bool HouseStateChangePending(uint32_t nHouseID);   // defined below (T-s6: settle-aware)
 static bool HouseFailFastEnabled();                       // defined below (A8: regtest-only escape)
 
+/** Gram-notes release: the issuing caps the wallet's fail-fasts check, from the house's counted gold (consensus's
+ *  GoldCapitalCapUnits / GoldTillCapUnits in validation.cpp). */
+static uint64_t WalletGoldCap(const CHouse& house, int nHeight, bool fTill)
+{
+    CGoldCount gold;
+    HouseGoldForChecks(house, nHeight, gold);
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
+    return fTill ? (uint64_t)((unsigned __int128)gold.nTillMg * 10000 / gp.nTillMinBps)
+                 : (uint64_t)((unsigned __int128)gold.nCapitalMg * 10000 / gp.nCapitalMinBps);
+}
+
 bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient)
 {
     strFail = "Unknown error!";
@@ -3988,25 +4047,17 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     // does not surface an ATMP rejection to the RPC caller - the house-review
     // precedent).
     {
-        if (house.nMintedUnits > (uint64_t)MAX_MONEY - nUnits ||
-                house.nMintedUnits + nUnits > HouseCapitalCapUnits(house)) {
-            strFail = "Mint would exceed the escrow cap (N + mint <= lambda * active escrow)!";
-            return false;
-        }
-        // A recent published attestation is still required (cadence/transparency);
-        // a never-attested house has a zero published reserve and cannot mint.
+        // Gram-notes release: the caps come from the house's counted gold (no attestation or proof needed).
         const int nNextHeight = chainActive.Height() + 1;
-        if ((uint32_t)nNextHeight < house.nLastAttestHeight ||
-                (uint32_t)nNextHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE) {
-            strFail = "Attestation is stale - attest the house's reserves before minting!";
+        if (house.nMintedUnits > (uint64_t)MAX_MONEY - nUnits ||
+                house.nMintedUnits + nUnits + house.nDepositUnits > WalletGoldCap(house, nNextHeight, false)) {
+            strFail = "Mint would exceed the capital cap (notes + deposits <= counted gold capital / 10%)!";
             return false;
         }
-        if (house.nMintedUnits + nUnits > HouseReserveCapUnits(house)) {
-            strFail = "Mint would exceed the published reserve cap (N + mint <= attested reserves / rho) - attest more liquid reserves first!";
+        if (house.nMintedUnits + nUnits > WalletGoldCap(house, nNextHeight, true)) {
+            strFail = "Mint would exceed the till cap (notes <= counted gold till / 2%) - move gold into the till first!";
             return false;
         }
-        // The rho-at-mint LIVENESS half (R-i7 / DR-1) is checked below, once the
-        // reserve proof is gathered: the binding cap is min(published, proven).
     }
 
     // Holder: the given P2PKH (v0.2.19 mintnote "address"), else a fresh key (Tx-9 hygiene). A members-only house
@@ -4082,33 +4133,10 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     // proof and starve the tx of anything to fund the dust+fee from; the house
     // only has to demonstrate it holds ENOUGH liquid reserve, not all of it. The
     // unproven (smaller) candidates then fund the mint.
-    const uint64_t needUnits = house.nMintedUnits + nUnits;
-    CAmount amountProven = 0;
+    // Gram-notes release: no reserve proof (the till is the gold till vault); every candidate funds the mint.
     std::vector<AttestProof> vReserveProofs;
-    size_t nProven = 0;
-    for (; nProven < vCand.size() && nProven < MAX_ATTEST_PROOFS; nProven++) {
-        if (((uint64_t)amountProven * 100) / HOUSE_RESERVE_FLOOR_PCT >= needUnits)
-            break;
-        const MintReserveCand& c = vCand[nProven];
-        CKey key;
-        if (!GetKey(c.keyid, key)) { strFail = "Lost a reserve key mid-build!"; return false; }
-        AttestProof proof;
-        proof.outpoint = c.outpoint;
-        const CPubKey pub = key.GetPubKey();
-        proof.vchPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
-        const uint256 challenge = HouseAttestChallenge(house.houseID, nAsOfHeight, hashAsOf, c.outpoint);
-        if (!key.Sign(challenge, proof.vchSig)) { strFail = "Failed to sign a reserve proof!"; return false; }
-        vReserveProofs.push_back(proof);
-        amountProven += c.txout.nValue;
-    }
-    // Fail-fast the rho cap on min(published, proven) reserves (consensus too).
-    const CAmount amountEff = std::min(house.amountLastAttestReserves, amountProven);
-    const uint64_t reserveCap = ((uint64_t)amountEff * 100) / HOUSE_RESERVE_FLOOR_PCT;
-    if (needUnits > reserveCap) {
-        strFail = "Mint would exceed the reserve cap (N + mint <= min(attested, live) reserves / rho) - "
-                  "attest and hold more liquid reserve coins before minting!";
-        return false;
-    }
+    const size_t nProven = 0;
+    (void)hashAsOf;
 
     // The unproven candidates (smaller coins) join the fee pool for funding.
     std::set<COutPoint> setProven;
@@ -4887,11 +4915,14 @@ bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHo
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
     if (vY.empty()) {
-        // Every uncollected claim, up to the per-tx limit.
+        // Every uncollected claim, up to the per-tx limits: claims, and the annex (one gold output per token per claim;
+        // review round 1, G8d).
+        const size_t nTokens = HouseVaultFreeTotalsForChecks(nHouseID, chainActive.Height() + 1).size();
+        const size_t nMax = std::min<size_t>(MAX_TOKEN_COLLECT_ENTRIES, nTokens ? MAX_ISSUED_OUTS / nTokens : MAX_TOKEN_COLLECT_ENTRIES);
         for (const auto& kv : phousetree->ListTokenClaims(nHouseID, uint256(), 100000)) {
             if (kv.second.nCollectHeight == 0)
                 vY.push_back(kv.first);
-            if (vY.size() >= MAX_TOKEN_COLLECT_ENTRIES)
+            if (vY.size() >= nMax)
                 break;
         }
     }
@@ -4917,22 +4948,41 @@ bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHo
     const CAmount amountPot = fMaterialized ? house.amountInsolventPot : amountLive;
     const uint64_t nSnapshotUnits = fMaterialized ? house.nInsolventUnits : house.nMintedUnits;
     const uint64_t nBase = house.nTokenBaseHeight ? house.nTokenBase : house.nTokenUnits;
+    uint64_t nSnapPrice = 0, nSnapGold = 0;
+    if (!WalletClaimSnapshot(house, nSnapPrice, nSnapGold, strFail))
+        return false;
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_TOKEN_COLLECT;
-    std::vector<CTxOut> vPay;
+    // Gram-notes release (5b): each claim's gold in kind, one output per token after its ECX (consensus requires it).
+    const std::vector<CVaultEntry> vGoldEntry = HouseVaultEntriesForChecks(nHouseID);
+    // The pot is the vaults less frozen gold (it stays until unfrozen or CLOSE); the moves draw on the entries.
+    std::map<uint256, uint64_t> mapGoldPot = HouseVaultFreeTotalsForChecks(nHouseID, chainActive.Height() + 1), mapGoldDue;
+    std::vector<std::pair<CTxOut, CIssuedOut>> vPay;   // an annex entry with a null token = a plain ECX output
     CAmount amountDue = 0;
     for (const uint256& y : vY) {
         CTokenClaim c;
         if (!phousetree->GetTokenClaim(nHouseID, y, c) || c.nCollectHeight != 0) { strFail = "A claim is unknown or already collected!"; return false; }
         const uint64_t u = TokenClaimUnits(c.nAmount, nBase, house.nTokenClaimed);
-        const CAmount amountEnt = NoteClaimEntitlement(u, amountPot, nSnapshotUnits);
+        const std::vector<std::pair<uint256, uint64_t>> vShare = GoldClaimShares(u, mapGoldPot, house.nMintedUnits);
+        uint64_t nGoldU = 0;
+        for (const std::pair<uint256, uint64_t>& g : vShare)
+            nGoldU += g.second;
+        const CAmount amountEnt = ClaimSatsEntitlement(u, nGoldU, amountPot, nSnapshotUnits, nSnapPrice);
         const CAmount amountFee = TokenRelayerFee(amountEnt, c.nFeeBps);
+        const CScript scriptPay(c.vchPayoutScript.begin(), c.vchPayoutScript.end());
         if (amountEnt - amountFee > 0)
-            vPay.push_back(CTxOut(amountEnt - amountFee, CScript(c.vchPayoutScript.begin(), c.vchPayoutScript.end())));
+            vPay.push_back(std::make_pair(CTxOut(amountEnt - amountFee, scriptPay), CIssuedOut()));
         if (amountFee > 0)
-            vPay.push_back(CTxOut(amountFee, CScript(c.vchRelayerScript.begin(), c.vchRelayerScript.end())));
+            vPay.push_back(std::make_pair(CTxOut(amountFee, CScript(c.vchRelayerScript.begin(), c.vchRelayerScript.end())), CIssuedOut()));
+        for (const std::pair<uint256, uint64_t>& g : vShare) {
+            CIssuedOut a;
+            a.tokenID = g.first;
+            a.nUnits = g.second;
+            vPay.push_back(std::make_pair(CTxOut(ISSUED_COIN_VALUE, scriptPay), a));
+            mapGoldDue[g.first] += g.second;
+        }
         amountDue += amountEnt;
     }
     // Escrow coins, largest first, until the payouts are covered; change back to escrow at vout[0].
@@ -4952,8 +5002,15 @@ bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHo
     col.fEscrowChange = amountEscrowIn > amountDue ? 1 : 0;
     if (col.fEscrowChange)
         mtx.vout.push_back(CTxOut(amountEscrowIn - amountDue, HouseEscrowScript(house.houseID)));
-    for (const CTxOut& out : vPay)
-        mtx.vout.push_back(out);
+    for (const std::pair<CTxOut, CIssuedOut>& p : vPay) {
+        if (!p.second.tokenID.IsNull()) {
+            CIssuedOut a = p.second;
+            a.nOut = (uint32_t)mtx.vout.size();
+            mtx.vIssuedOut.push_back(a);
+        }
+        mtx.vout.push_back(p.first);
+    }
+    mtx.vVaultMove = GoldClaimMoves(nHouseID, vGoldEntry, mapGoldDue);
     return SendFundedNoteOp(strFail, txidOut, mtx, amountEscrowIn, nFee, [&](CMutableTransaction& m, std::string&) {
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << col;
@@ -5270,7 +5327,8 @@ bool CWallet::ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHous
     return true;
 }
 
-bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t& nRemainingOut, uint32_t nHouseID, const CAmount& nFee)
+bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t& nRemainingOut, uint32_t nHouseID, const CAmount& nFee,
+                               bool fFromCapital)
 {
     strFail = "Unknown error!";
     nRemainingOut = 0;
@@ -5404,19 +5462,138 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     // Brassage incidence (Delta-2): the RUNNER bears the spread - it comes out
     // of the payout, and the house's out-of-pocket stays U + interest.
     const uint32_t nBps = HouseBrassageBps(house);
-    const CAmount amountSpread = HouseBrassageAmount(U, nBps);
-    const CAmount amountPayout = (CAmount)U + amountInterest - amountSpread;
+    const CAmount amountSpreadMg = HouseBrassageAmount(U, nBps);
+    const CAmount amountPayoutMg = (CAmount)U + amountInterest - amountSpreadMg;
+    // Gram-notes release: what's owed is mg, paid in sECX at the tip's payout price.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    CAmount amountPayout = WalletMgToSats((uint64_t)amountPayoutMg, nPrice);
+    const CAmount amountSpread = amountSpreadMg > 0 ? WalletMgToSats((uint64_t)amountSpreadMg, nPrice) : 0;
+
+    // R3-12: a suspended house pays its queue from its partners' gold capital - the largest token first, each token's
+    // draw split over its partners pro rata (CapitalDrawSplit, as consensus checks it), approved by the house's M.
+    // Consensus also wants the oldest demands first and equity positive; it refuses otherwise.
+    std::vector<uint32_t> vApproverIdx;
+    std::vector<CKey> vApproverKey;
+    std::vector<std::pair<uint256, uint64_t>> vGoldOut;
+    std::vector<CVaultMove> vCapitalMove;
+    CAmount nCapitalMarginMg = 0;
+    if (fFromCapital) {
+        if (HouseEffectiveStatus(house, nNextHeight) != HOUSE_STATUS_DEFERRED) { strFail = "Only a suspended house pays its queue from capital!"; return false; }
+        // What consensus will check (review round 1, G8f): oldest first, and equity positive at the price this pays at.
+        if (HouseQueueUnitsBeforeForChecks(nHouseID, NoteDemandHeightOf(vBurn[0].tag)) > 0) {
+            strFail = "An older queued demand must be paid first (capital pays the oldest demands first)!"; return false;
+        }
+        {
+            const std::vector<uint32_t> vOverdue = HouseOverdueBills(house, nNextHeight);
+            CCoinsViewCache& viewTip = *pcoinsTip;
+            int64_t nEquity = 0;
+            std::string strReason;
+            if (vOverdue.size() >= MAX_EQUITY_OVERDUE_BILLS ||
+                    !HouseEquityMg(house, nNextHeight, nPrice,
+                                   HouseEscrowPotAtTip(house, [&](const COutPoint& o, Coin& c) { return viewTip.GetCoin(o, c); }),
+                                   vOverdue, nEquity, strReason) || nEquity <= 0) {
+                strFail = "The house's equity isn't positive - capital can't pay the queue (it would favour these holders "
+                          "over the rest at insolvency)!";
+                return false;
+            }
+        }
+        for (uint32_t i = 0; i < house.vPartner.size() && vApproverIdx.size() < house.nThresholdM; i++) {
+            if (house.vPartner[i].status != HOUSE_PARTNER_ACTIVE)
+                continue;
+            CKey k;
+            if (GetKey(CPubKey(house.vPartner[i].vchPubKey).GetID(), k)) {
+                vApproverIdx.push_back(i);
+                vApproverKey.push_back(k);
+            }
+        }
+        if (vApproverIdx.size() < house.nThresholdM) { strFail = "This wallet doesn't hold enough of the house's partner keys!"; return false; }
+        std::map<uint256, std::vector<std::pair<uint32_t, uint64_t>>> mapEntries;
+        std::map<uint256, uint64_t> mapTotal, mapAll;
+        for (const CVaultEntry& e : HouseVaultEntriesForChecks(nHouseID)) {
+            mapAll[e.tokenID] += e.nUnits;
+            if (e.nKind != VAULT_CAPITAL)
+                continue;
+            mapEntries[e.tokenID].push_back(std::make_pair(e.nPartner, e.nUnits));
+            mapTotal[e.tokenID] += e.nUnits;
+        }
+        // G8f: per token at most what isn't frozen (consensus caps a draw at the house's units less its frozen ones),
+        // and only trusted tokens (the holder's floor counts no other).
+        for (const std::pair<const uint256, uint64_t>& f : HouseVaultFrozenForChecks(nHouseID)) {
+            const uint64_t nFree = mapAll[f.first] > f.second ? mapAll[f.first] - f.second : 0;
+            if (mapTotal.count(f.first))
+                mapTotal[f.first] = std::min(mapTotal[f.first], nFree);
+        }
+        for (auto it = mapTotal.begin(); it != mapTotal.end();)
+            it = (!IssuedTokenTrustedForChecks(it->first) || it->second == 0) ? mapTotal.erase(it) : std::next(it);
+        std::vector<std::pair<uint64_t, uint256>> vOrder;
+        for (const std::pair<const uint256, uint64_t>& t : mapTotal)
+            vOrder.push_back(std::make_pair(t.second, t.first));
+        std::sort(vOrder.begin(), vOrder.end(), [](const std::pair<uint64_t, uint256>& a, const std::pair<uint64_t, uint256>& b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        // Review round 1b: capital pays at most the units plus their interest at the next height (consensus caps it at
+        // the inclusion height's); the confirmation margin above that goes in sECX (nCapitalMarginMg, below).
+        const CAmount amountInterestNow = NoteDemandInterest(house, vBurn[0].tag, U, (uint32_t)nNextHeight, Params().GetConsensus());
+        const CAmount amountCapitalMg = std::min<CAmount>(amountPayoutMg, (CAmount)U + amountInterestNow - amountSpreadMg);
+        nCapitalMarginMg = amountPayoutMg > amountCapitalMg ? amountPayoutMg - amountCapitalMg : 0;
+        uint64_t nLeft = (uint64_t)std::max<CAmount>(0, amountCapitalMg);
+        for (const std::pair<uint64_t, uint256>& t : vOrder) {
+            if (nLeft == 0)
+                break;
+            const uint64_t nTake = std::min(nLeft, t.first);
+            for (const std::pair<const uint32_t, uint64_t>& p : CapitalDrawSplit(nTake, mapEntries[t.second])) {
+                CVaultMove m;
+                m.nHouseID = nHouseID;
+                m.nKind = VAULT_CAPITAL;
+                m.nPartner = p.first;
+                m.tokenID = t.second;
+                m.nDelta = -(int64_t)p.second;
+                vCapitalMove.push_back(m);
+            }
+            vGoldOut.push_back(std::make_pair(t.second, nTake));
+            nLeft -= nTake;
+        }
+        if (nLeft > 0) { strFail = "The partners' capital holds too little gold for this demand!"; return false; }
+        std::sort(vCapitalMove.begin(), vCapitalMove.end(), [](const CVaultMove& a, const CVaultMove& b) {
+            return std::make_tuple(a.nHouseID, a.nKind, a.nPartner, a.tokenID) < std::make_tuple(b.nHouseID, b.nKind, b.nPartner, b.tokenID);
+        });
+        amountPayout = 0;
+    }
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_REDEEM;
-    mtx.vout.push_back(CTxOut(amountPayout,
-        CScript(demChosen.vchPayoutScript.begin(), demChosen.vchPayoutScript.end())));
-    if (amountSpread > 0)
+    const CScript scriptDemandPayout(demChosen.vchPayoutScript.begin(), demChosen.vchPayoutScript.end());
+    CAmount nGoldDust = 0;
+    if (fFromCapital) {
+        for (const std::pair<uint256, uint64_t>& g : vGoldOut) {
+            CIssuedOut a;
+            a.nOut = (uint32_t)mtx.vout.size();
+            a.tokenID = g.first;
+            a.nUnits = g.second;
+            mtx.vIssuedOut.push_back(a);
+            mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, scriptDemandPayout));
+            nGoldDust += ISSUED_COIN_VALUE;
+        }
+        mtx.vVaultMove = vCapitalMove;
+    } else {
+        mtx.vout.push_back(CTxOut(amountPayout, scriptDemandPayout));
+    }
+    if (amountSpread > 0) {
+        // The brassage spread sits at vout[1] (AddCoins re-tags it as escrow): only when the payout is one output.
+        if (fFromCapital && vGoldOut.size() != 1) { strFail = "A capital payout in two tokens can't carry the brassage spread - move gold so one token covers it!"; return false; }
         mtx.vout.push_back(CTxOut(amountSpread, HouseEscrowScript(house.houseID)));
+    }
+    if (fFromCapital && nCapitalMarginMg > 0) {
+        amountPayout = WalletMgToSats((uint64_t)nCapitalMarginMg, nPrice);   // the margin, in sECX, to the same script
+        mtx.vout.push_back(CTxOut(amountPayout, scriptDemandPayout));
+    }
 
     const CAmount nBurnedDust = (CAmount)vBurn.size() * NOTE_DUST_VALUE;
-    const CAmount nTarget = amountPayout + amountSpread + nFee;
+    const CAmount nTarget = amountPayout + nGoldDust + amountSpread + nFee;
     const CAmount nRaise = nTarget > nBurnedDust ? nTarget - nBurnedDust : 0;
     std::vector<COutput> vCoins;
     AvailableCoins(vCoins, true);
@@ -5439,6 +5616,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     redeem.nHouseID = nHouseID;
     redeem.fBrassage = amountSpread > 0 ? 1 : 0;
     redeem.vchHolderPubKey = demChosen.vchHolderPubKey;
+    redeem.nPriceHeight = nPriceHeight;
     redeem.fPreAuthDischarge = 1;
     redeem.vPreAuthUnits = demChosen.vUnits;
     redeem.vchPayoutScript = demChosen.vchPayoutScript;
@@ -5452,6 +5630,18 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
         mtx.vin.push_back(CTxIn(cc.out, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // R3-12: the house's approvers sign the gold moves (over the prevouts, outputs, annex and moves), before the
+    // funding inputs sign the whole.
+    if (fFromCapital) {
+        const uint256 hVault = NoteRedeemVaultSigHash(house.houseID, CTransaction(mtx));
+        redeem.vApproverIndex = vApproverIdx;
+        redeem.vApproverSig.assign(vApproverKey.size(), std::vector<unsigned char>());
+        for (size_t k = 0; k < vApproverKey.size(); k++)
+            if (!vApproverKey[k].Sign(hVault, redeem.vApproverSig[k])) { strFail = "Approver signing failed!"; return false; }
+        CDataStream ssApproved(SER_NETWORK, PROTOCOL_VERSION);
+        ssApproved << redeem;
+        mtx.vchNotePayload = std::vector<unsigned char>(ssApproved.begin(), ssApproved.end());
+    }
 
     const CTransaction txToSign = mtx;
     int nIn = (int)vBurn.size();
@@ -5591,7 +5781,12 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
         amountInterest = NoteDemandInterest(houseB, nDemandTag, U,
             (uint32_t)nNextHeight + NOTE_REDEEM_INTEREST_MARGIN_BLOCKS, Params().GetConsensus());
     }
-    const CAmount amountPayout = (CAmount)U + amountInterest;
+    // Gram-notes release: U + interest is mg, paid in sECX at the tip's payout price.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    const CAmount amountPayout = WalletMgToSats((uint64_t)U + (uint64_t)amountInterest, nPrice);
 
     // Dynamic brassage (3.5): a redemption while the house is below the floor
     // pays a spread into the escrow pot. DR-2: demanded notes are NOT exempt.
@@ -5602,7 +5797,8 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     // whether the wallet should deduct it is a separate (open) monetary
     // choice - it would also change ordinary undemanded redemptions.
     const uint32_t nBps = HouseBrassageBps(houseB);
-    const CAmount amountSpread = HouseBrassageAmount(U, nBps);
+    const CAmount amountSpreadMg = HouseBrassageAmount(U, nBps);
+    const CAmount amountSpread = amountSpreadMg > 0 ? WalletMgToSats((uint64_t)amountSpreadMg, nPrice) : 0;
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
@@ -5633,6 +5829,7 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     redeem.nHouseID = nHouseID;
     redeem.fBrassage = amountSpread > 0 ? 1 : 0;
     redeem.vchHolderPubKey = spend[0].vchHolderPubKey;
+    redeem.nPriceHeight = nPriceHeight;
     if (!keyHolder.Sign(NoteRedeemSigHash(nHouseID, U, BillHashOutputs(mtx)), redeem.vchHolderSig)) {
         strFail = "Failed to sign note redeem!"; return false;
     }
@@ -5755,8 +5952,22 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
                 amountPot += coin.out.nValue;
         }
     }
-    const CAmount amountEntitlement = NoteClaimEntitlement(U, amountPot, nSnapshotUnits);
-    if (amountEntitlement <= 0) { strFail = "Zero entitlement - the escrow pot is empty!"; return false; }
+    // Gram-notes release (5b): the house's gold in kind - each token pro rata to what is left in its vaults (U over the
+    // units outstanding), no more than par in all; then sECX up to what par still owes, at the snapshot price.
+    uint64_t nSnapPrice = 0, nSnapGold = 0;
+    if (!WalletClaimSnapshot(house, nSnapPrice, nSnapGold, strFail))
+        return false;
+    const std::vector<CVaultEntry> vGoldEntry = HouseVaultEntriesForChecks(house.nHouseID);
+    std::vector<std::pair<uint256, uint64_t>> vGoldShare;
+    uint64_t nGoldMg = 0;
+    {
+        const std::map<uint256, uint64_t> mapPot = HouseVaultFreeTotalsForChecks(house.nHouseID, chainActive.Height() + 1);   // less frozen gold
+        vGoldShare = GoldClaimShares(U, mapPot, house.nMintedUnits);
+        for (const std::pair<uint256, uint64_t>& g : vGoldShare)
+            nGoldMg += g.second;
+    }
+    const CAmount amountEntitlement = ClaimSatsEntitlement(U, nGoldMg, amountPot, nSnapshotUnits, nSnapPrice);
+    if (amountEntitlement <= 0 && vGoldShare.empty()) { strFail = "Zero entitlement - the escrow pot is empty!"; return false; }
 
     // Select escrow coins (largest first) until the entitlement is covered
     std::vector<std::pair<COutPoint, CAmount>> vEscrowAll;
@@ -5783,13 +5994,32 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_CLAIM;
-    mtx.vout.push_back(CTxOut(amountEntitlement, NoteScriptForPubKey(spend[0].vchHolderPubKey)));
-    if (amountEscrowChange > 0)
-        mtx.vout.push_back(CTxOut(amountEscrowChange, HouseEscrowScript(house.houseID)));
+    if (amountEntitlement > 0) {
+        mtx.vout.push_back(CTxOut(amountEntitlement, NoteScriptForPubKey(spend[0].vchHolderPubKey)));
+        if (amountEscrowChange > 0)
+            mtx.vout.push_back(CTxOut(amountEscrowChange, HouseEscrowScript(house.houseID)));
+    }
 
-    // Fee: burned note dust first, plain coins for the rest
+    // The gold outputs, drawn from the vault entries in order.
+    CAmount nGoldDust = 0;
+    {
+        std::map<uint256, uint64_t> mapDue;
+        for (const std::pair<uint256, uint64_t>& g : vGoldShare) {
+            CIssuedOut o;
+            o.nOut = (uint32_t)mtx.vout.size();
+            o.tokenID = g.first;
+            o.nUnits = g.second;
+            mtx.vIssuedOut.push_back(o);
+            mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, NoteScriptForPubKey(spend[0].vchHolderPubKey)));
+            nGoldDust += ISSUED_COIN_VALUE;
+            mapDue[g.first] += g.second;
+        }
+        mtx.vVaultMove = GoldClaimMoves(house.nHouseID, vGoldEntry, mapDue);
+    }
+
+    // Fee: burned note dust first, plain coins for the rest (and the gold outputs' dust)
     const CAmount nBurnedDust = (CAmount)spend.size() * NOTE_DUST_VALUE;
-    const CAmount nRaise = nFee > nBurnedDust ? nFee - nBurnedDust : 0;
+    const CAmount nRaise = nFee + nGoldDust > nBurnedDust ? nFee + nGoldDust - nBurnedDust : 0;
     std::vector<COutput> vCoins;
     AvailableCoins(vCoins, true);
     std::set<CInputCoin> setCoins;
@@ -5797,7 +6027,7 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "Could not fund the claim fee!"; return false; }
 
     CReserveKey reserveKey(this);
-    const CAmount nChange = (nBurnedDust + nAmountRet) - nFee;
+    const CAmount nChange = (nBurnedDust + nAmountRet) - nFee - nGoldDust;
     if (nChange > 0) {
         CPubKey vchPubKey;
         if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
@@ -5809,7 +6039,7 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     claim.nHouseID = nHouseID;
     claim.fEscrowChange = amountEscrowChange > 0 ? 1 : 0;
     claim.vchHolderPubKey = spend[0].vchHolderPubKey;
-    if (!keyHolder.Sign(NoteClaimSigHash(nHouseID, U, BillHashOutputs(mtx)), claim.vchHolderSig)) {
+    if (!keyHolder.Sign(NoteClaimSigHash(nHouseID, U, CreditHashOutputs(CTransaction(mtx))), claim.vchHolderSig)) {
         strFail = "Failed to sign note claim!"; return false;
     }
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -5973,8 +6203,8 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
     // reserve proof: deposits are outside the liquidity machinery.
     if (house.nDepositUnits > (uint64_t)MAX_MONEY - nPrincipal ||
             house.nMintedUnits > (uint64_t)MAX_MONEY - (house.nDepositUnits + nPrincipal) ||
-            house.nMintedUnits + house.nDepositUnits + nPrincipal > HouseCapitalCapUnits(house)) {
-        strFail = "Origination would exceed the capital cap (N + D + principal <= lambda * active escrow)!";
+            house.nMintedUnits + house.nDepositUnits + nPrincipal > WalletGoldCap(house, chainActive.Height() + 1, false)) {
+        strFail = "Origination would exceed the capital cap (notes + deposits + principal <= counted gold capital / 10%)!";
         return false;
     }
 
@@ -6226,7 +6456,12 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     const uint32_t nPayHeight = (uint32_t)nNextHeight + WITHDRAW_CONFIRM_MARGIN;
     const uint32_t nBlocks = nPayHeight > dc.originationHeight ? nPayHeight - dc.originationHeight : 0;
     const CAmount amountInterest = DepositMaturityInterest(dc.principal, nBlocks, dc.rateBps);
-    const CAmount amountDue = (CAmount)dc.principal + amountInterest;
+    // Gram-notes release: principal + interest are mg, paid in sECX at the tip's payout price.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    const CAmount amountDue = WalletMgToSats((uint64_t)dc.principal + (uint64_t)amountInterest, nPrice);
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
@@ -6256,6 +6491,7 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     DepositWithdraw wd;
     wd.nHouseID = nHouseID;
     wd.vchHolderPubKey = dc.vchHolderPubKey;
+    wd.nPriceHeight = nPriceHeight;
     if (!keyHolder.Sign(DepositWithdrawSigHash(nHouseID, dc.principal, dc.maturityHeight, dc.originationHeight, BillHashOutputs(mtx)), wd.vchHolderSig)) {
         strFail = "Failed to sign the withdrawal!"; return false;
     }
@@ -6536,7 +6772,13 @@ bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& 
     static const uint32_t DISCHARGE_CONFIRM_MARGIN = 12;
     const uint32_t nPayHeight = (uint32_t)nNext + DISCHARGE_CONFIRM_MARGIN;
     const uint32_t nBlocks = nPayHeight > coin.nDepositOriginationHeight ? nPayHeight - coin.nDepositOriginationHeight : 0;
-    amountPaidOut = (CAmount)coin.nDepositPrincipal + DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps);
+    // Gram-notes release: principal + interest are mg, paid in sECX at the tip's payout price.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    amountPaidOut = WalletMgToSats((uint64_t)coin.nDepositPrincipal +
+                                   (uint64_t)DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps), nPrice);
 
     DepositDischarge dc;
     dc.nHouseID = coin.nHouseID;
@@ -6544,6 +6786,7 @@ bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& 
     dc.vchPayoutScript = vchPayout;
     dc.vchPreAuthSig = vchPreAuth;
     dc.nPrevProtestOpen = house.nProtestOpen;
+    dc.nPriceHeight = nPriceHeight;
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
     mtx.nDepositOp = DEPOSIT_OP_DISCHARGE;
@@ -6618,10 +6861,31 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
                 amountPot += coin.out.nValue;
         }
     }
-    // Deposits are JUNIOR: the tranche is what remains after notes take par.
-    const CAmount amountDepositPot = amountPot > (CAmount)nNoteSnapshot ? amountPot - (CAmount)nNoteSnapshot : 0;
-    const CAmount amountEntitlement = DepositClaimEntitlement(dc.principal, amountDepositPot, nDepositSnapshot);
-    if (amountEntitlement <= 0) { strFail = "Zero entitlement - the subordinated deposit tranche is empty (notes exhaust the pot)!"; return false; }
+    // Deposits are JUNIOR: the tranche is what remains after notes take par - in value: notes take the gold first,
+    // then sECX at the snapshot price (consensus SeniorSatsReserved).
+    uint64_t nSnapPrice = 0, nSnapGold = 0;
+    if (!WalletClaimSnapshot(house, nSnapPrice, nSnapGold, strFail))
+        return false;
+    const CAmount amountDepositPot = amountPot - SeniorSatsReserved(nNoteSnapshot, nSnapGold, amountPot, nSnapPrice);
+
+    // Gram-notes release (5b, decisions log 22): gold in kind once every note is claimed - each token pro rata to what
+    // is left in the vaults (principal over the principal outstanding), at most the principal in all.
+    std::vector<std::pair<uint256, uint64_t>> vGoldShare;
+    std::vector<CVaultEntry> vGoldEntry;
+    if (house.nDepositUnits > 0) {
+        vGoldEntry = HouseVaultEntriesForChecks(house.nHouseID);
+        // The gold beyond what the notes still outstanding can take at par (consensus DepositGoldPot).
+        const std::map<uint256, uint64_t> mapPot =
+            DepositGoldPot(HouseVaultFreeTotalsForChecks(house.nHouseID, chainActive.Height() + 1), house.nMintedUnits);
+        vGoldShare = GoldClaimShares(dc.principal, mapPot, house.nDepositUnits);
+    }
+    uint64_t nGoldMg = 0;
+    for (const std::pair<uint256, uint64_t>& g : vGoldShare)
+        nGoldMg += g.second;
+    const CAmount amountEntitlement = ClaimSatsEntitlement(dc.principal, nGoldMg, amountDepositPot, nDepositSnapshot, nSnapPrice);
+    if (amountEntitlement <= 0 && vGoldShare.empty()) {
+        strFail = "Zero entitlement - the subordinated deposit tranche is empty (notes exhaust the pot)!"; return false;
+    }
 
     // Select escrow coins (largest first) until the entitlement is covered.
     std::vector<std::pair<COutPoint, CAmount>> vEscrowAll;
@@ -6646,12 +6910,29 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
     mtx.nDepositOp = DEPOSIT_OP_CLAIM;
-    mtx.vout.push_back(CTxOut(amountEntitlement, DepositScriptForPubKey(dc.vchHolderPubKey)));
-    if (amountEscrowChange > 0)
-        mtx.vout.push_back(CTxOut(amountEscrowChange, HouseEscrowScript(house.houseID)));
+    if (amountEntitlement > 0) {
+        mtx.vout.push_back(CTxOut(amountEntitlement, DepositScriptForPubKey(dc.vchHolderPubKey)));
+        if (amountEscrowChange > 0)
+            mtx.vout.push_back(CTxOut(amountEscrowChange, HouseEscrowScript(house.houseID)));
+    }
 
-    // Fee: the burned receipt's dust first, plain coins for the rest.
-    const CAmount nRaise = nFee > DEPOSIT_DUST_VALUE ? nFee - DEPOSIT_DUST_VALUE : 0;
+    // The gold outputs, drawn from the vault entries in order.
+    CAmount nGoldDust = 0;
+    std::map<uint256, uint64_t> mapGoldDue;
+    for (const std::pair<uint256, uint64_t>& g : vGoldShare) {
+        CIssuedOut o;
+        o.nOut = (uint32_t)mtx.vout.size();
+        o.tokenID = g.first;
+        o.nUnits = g.second;
+        mtx.vIssuedOut.push_back(o);
+        mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, DepositScriptForPubKey(dc.vchHolderPubKey)));
+        nGoldDust += ISSUED_COIN_VALUE;
+        mapGoldDue[g.first] += g.second;
+    }
+    mtx.vVaultMove = GoldClaimMoves(house.nHouseID, vGoldEntry, mapGoldDue);
+
+    // Fee: the burned receipt's dust first, plain coins for the rest (and the gold outputs' dust).
+    const CAmount nRaise = nFee + nGoldDust > DEPOSIT_DUST_VALUE ? nFee + nGoldDust - DEPOSIT_DUST_VALUE : 0;
     std::vector<COutput> vCoins;
     AvailableCoins(vCoins, true);
     std::set<CInputCoin> setCoins;
@@ -6659,7 +6940,7 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     if (nRaise > 0 && !SelectCoins(vCoins, nRaise, setCoins, nAmountRet)) { strFail = "Could not fund the claim fee!"; return false; }
 
     CReserveKey reserveKey(this);
-    const CAmount nChange = (DEPOSIT_DUST_VALUE + nAmountRet) - nFee;
+    const CAmount nChange = (DEPOSIT_DUST_VALUE + nAmountRet) - nFee - nGoldDust;
     if (nChange > 0) {
         CPubKey vchPubKey;
         if (!reserveKey.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
@@ -6669,9 +6950,9 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
 
     DepositClaim clm;
     clm.nHouseID = nHouseID;
-    clm.fEscrowChange = amountEscrowChange > 0 ? 1 : 0;
+    clm.fEscrowChange = (amountEntitlement > 0 && amountEscrowChange > 0) ? 1 : 0;
     clm.vchHolderPubKey = dc.vchHolderPubKey;
-    if (!keyHolder.Sign(DepositClaimSigHash(nHouseID, dc.principal, BillHashOutputs(mtx)), clm.vchHolderSig)) {
+    if (!keyHolder.Sign(DepositClaimSigHash(nHouseID, dc.principal, CreditHashOutputs(CTransaction(mtx))), clm.vchHolderSig)) {
         strFail = "Failed to sign the deposit claim!"; return false;
     }
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -7607,7 +7888,7 @@ static bool SettlePreflight(uint32_t nA, uint32_t nB, CHouse& houseA, CHouse& ho
         strFail = "Unknown house!"; return false;
     }
     const int nHeight = chainActive.Height();
-    if (!HouseParEligible(houseA, nHeight) || !HouseParEligible(houseB, nHeight)) {
+    if (!GoldParEligible(houseA, nHeight) || !GoldParEligible(houseB, nHeight)) {
         strFail = "A house is not par-eligible (must be Open, at/above the reserve floor, and attested within one cadence)!";
         return false;
     }
@@ -7849,7 +8130,17 @@ bool CWallet::SignSettle(std::string& strFail, std::string& strHexTxOut,
     x.nCountBNotes = (uint16_t)(fOwnIsA ? pMine->size() : prop.vBundle.size());
     x.vchPresentKeyOfANotes = fOwnIsA ? prop.vchPresentKey : (*pMine)[0].vchHolderPubKey;
     x.vchPresentKeyOfBNotes = fOwnIsA ? (*pMine)[0].vchHolderPubKey : prop.vchPresentKey;
-    x.amountResidual = nMode == 1 ? (CAmount)dU : 0;   // exact par
+    // Gram-notes release: the netted mg is paid in sECX at exactly par at the tip's payout price.
+    if (nMode == 1) {
+        uint32_t nPriceHeight = 0;
+        uint64_t nPrice = 0;
+        if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+            return false;
+        x.nPriceHeight = nPriceHeight;
+        x.amountResidual = (CAmount)(((unsigned __int128)dU * nPrice) / 1000);   // exact par (the band takes rounding)
+    } else {
+        x.amountResidual = 0;
+    }
     x.nPrevMintedUnitsA = houseA.nMintedUnits;
     x.nPrevMintedUnitsB = houseB.nMintedUnits;
     x.nPrevLastSettleHeightA = houseA.nLastSettleHeight;
@@ -8108,7 +8399,7 @@ static bool NettingPreflight(const std::vector<uint32_t>& vHouseID, std::map<uin
     for (const uint32_t nID : vHouseID) {
         CHouse h;
         if (!phousetree->GetHouse(nID, h)) { strFail = strprintf("Unknown house %u!", nID); return false; }
-        if (!HouseParEligible(h, nNextHeight)) {
+        if (!GoldParEligible(h, nNextHeight)) {
             strFail = strprintf("House %u is not par-eligible (it must be Open, at or above the reserve floor, and "
                                 "attested within one cadence)!", nID);
             return false;
@@ -8172,6 +8463,15 @@ static bool BuildNettingTx(const SettleNetRoundV1& r, const std::map<uint32_t, C
 
     n.vReceive.assign(nHouses, 0);
     n.vPrevMintedUnits.assign(nHouses, 0);
+    uint32_t nNetPriceHeight = r.nPriceHeight;
+    uint64_t nNetPrice = 0;
+    if (nNetPriceHeight == 0) {
+        if (!WalletPayoutPrice(nNetPriceHeight, nNetPrice, strFail))
+            return false;
+    } else if (!PayoutPriceForChecks((int)nNetPriceHeight, nNetPrice) || nNetPrice == 0) {
+        strFail = "The round's price height has no payout price - start a new round!"; return false;
+    }
+    n.nPriceHeight = nNetPriceHeight;
     n.vPrevLastSettleHeight.assign(nHouses, 0);
     for (size_t i = 0; i < nHouses; i++) {
         const auto it = mapHouse.find(r.vHouseID[i]);
@@ -8185,7 +8485,8 @@ static bool BuildNettingTx(const SettleNetRoundV1& r, const std::map<uint32_t, C
                                     r.vHouseID[i], vNet[i], SETTLE_MIN_RESIDUAL);
                 return false;
             }
-            n.vReceive[i] = (CAmount)vNet[i];   // exact par
+            // Gram-notes release: the net is mg, received in sECX at exactly par at the round's price.
+            n.vReceive[i] = (CAmount)(((unsigned __int128)(uint64_t)vNet[i] * nNetPrice) / 1000);
             mtx.vout.push_back(CTxOut(n.vReceive[i], NoteScriptForPubKey(it->second.vchRedemptionDestPK)));
         }
     }
@@ -8193,7 +8494,9 @@ static bool BuildNettingTx(const SettleNetRoundV1& r, const std::map<uint32_t, C
     if (fFunding) {
         for (const SettleNetRoundPart& part : r.vPart) {
             const int64_t nNet = vNet[fnIndex(part.nHouseID)];
-            const CAmount nNeed = (nNet < 0 ? (CAmount)(-nNet) : 0) + (part.nHouseID == r.nStarter ? r.nFee : 0);
+            // G8a: a debtor owes its net in sECX at the round's price (rounded up; creditors receive it rounded down).
+            const CAmount nNeed = (nNet < 0 ? WalletMgToSats((uint64_t)(-nNet), nNetPrice) : 0) +
+                                  (part.nHouseID == r.nStarter ? r.nFee : 0);
             if (!part.fFunded) { strFail = strprintf("House %u has not funded its part yet!", part.nHouseID); return false; }
             CAmount nIn = 0;
             for (const COutPoint& out : part.vFunding) {
@@ -8336,6 +8639,11 @@ bool CWallet::CreateNetting(std::string& strFail, std::string& strRoundOut, std:
     r.nStarter = nOwnHouseID;
     r.nExpiryHeight = (uint32_t)chainActive.Height() + nExpiryBlocks;
     r.nFee = nFee;
+    // G8b: one price height for the whole round (a payload may bind a price at most 72 blocks back, so the round's
+    // expiry stays inside that).
+    r.nPriceHeight = (uint32_t)chainActive.Height();
+    if (r.nExpiryHeight > r.nPriceHeight + Params().GetConsensus().GramAt(chainActive.Height()).nPriceBackBlocks)
+        r.nExpiryHeight = r.nPriceHeight + Params().GetConsensus().GramAt(chainActive.Height()).nPriceBackBlocks;
     if (!JoinNettingPart(this, r, nOwnHouseID, nFee, vConsolidate, strFail))
         return false;
     strRoundOut = EncodeNettingRound(r);
@@ -8405,7 +8713,9 @@ bool CWallet::FundNetting(std::string& strFail, std::string& strRoundOut, uint32
     if (fStarter && (r.nFee < 0 || r.nFee > maxTxFee)) {
         strFail = strprintf("The round's fee %s is above -maxtxfee (%s)!", FormatMoney(r.nFee), FormatMoney(maxTxFee)); return false;
     }
-    const CAmount nNeed = (nNet < 0 ? (CAmount)(-nNet) : 0) + (fStarter ? r.nFee : 0);
+    uint64_t nFundPrice = 0;   // G8a: the round's price (BuildNettingTx above fixed n.nPriceHeight)
+    if (!PayoutPriceForChecks((int)n.nPriceHeight, nFundPrice) || nFundPrice == 0) { strFail = "No payout price at the round's height!"; return false; }
+    const CAmount nNeed = (nNet < 0 ? WalletMgToSats((uint64_t)(-nNet), nFundPrice) : 0) + (fStarter ? r.nFee : 0);
     // A round where every net is zero has no payments: the starter's change is then its one output, so fund enough
     // for change to be kept.
     const bool fNoPayments = std::none_of(vNet.begin(), vNet.end(), [](int64_t v) { return v > 0; });
@@ -8726,9 +9036,9 @@ static bool GatherHouseReserveProofs(CWallet* pwallet, const CHouse& house, uint
             if (COutPoint(out.tx->GetHash(), out.i) == op) { vFeePoolOut.push_back(out); break; }
         }
     }
-    // Shape check 10 refuses an empty proof set before any DB read, so catch it
-    // here with a diagnosis rather than as an opaque commit failure.
-    if (vProofsOut.empty()) {
+    // Gram-notes release: a discount proves no ECX reserve (the till cap is the counted gold till's), so an empty set is
+    // what a caller asking for none (nNeed 0) gets.
+    if (vProofsOut.empty() && needUnits > 0) {
         strFail = "The house holds no confirmed plain reserve coin to prove - a discount MINTS, "
                   "so the rho-at-mint proof set can never be empty!";
         return false;
@@ -8877,11 +9187,6 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
         strFail = "House is not effectively open (stressed/deferred/insolvent/wounddown) - discounting blocked!";
         return false;
     }
-    if ((uint32_t)nNextHeight < house.nLastAttestHeight ||
-            (uint32_t)nNextHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE) {
-        strFail = "Attestation is stale - attest the house's reserves before discounting!";
-        return false;
-    }
     if (bill.vchHolderPubKey == house.vchRedemptionDestPK) {
         strFail = "This house's own custody key holds the bill - a house cannot buy paper from itself!";
         return false;
@@ -8891,8 +9196,8 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
     const uint64_t nPrice = (uint64_t)prop.amountPrice;
     if (house.nMintedUnits > (uint64_t)MAX_MONEY - nPrice ||
             house.nMintedUnits + nPrice > (uint64_t)MAX_MONEY - house.nDepositUnits ||
-            house.nMintedUnits + nPrice + house.nDepositUnits > HouseCapitalCapUnits(house)) {
-        strFail = "Discount would exceed the capital cap (N + D + price <= lambda * active escrow)!";
+            house.nMintedUnits + nPrice + house.nDepositUnits > WalletGoldCap(house, nNextHeight, false)) {
+        strFail = "Discount would exceed the capital cap (notes + deposits + price <= counted gold capital / 10%)!";
         return false;
     }
     if (house.nLoanBookFace > LOAN_BOOK_MAX_FACE - (uint64_t)bill.amount) {
@@ -8913,13 +9218,13 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
     std::vector<AttestProof> vReserveProofs;
     std::vector<COutput> vFeePool;
     CAmount amountProven = 0;
-    if (!GatherHouseReserveProofs(this, house, house.nMintedUnits + nPrice, nAsOfHeight, hashAsOf,
+    // Gram-notes release: no reserve proof is needed (need 0 gathers none and leaves every coin to the fee pool); the
+    // till cap is the counted gold till's.
+    if (!GatherHouseReserveProofs(this, house, 0, nAsOfHeight, hashAsOf,
                                   nNextHeight, vReserveProofs, vFeePool, amountProven, strFail))
         return false;
-    const CAmount amountEffReserves = std::min(house.amountLastAttestReserves, amountProven);
-    if (house.nMintedUnits + nPrice > ((uint64_t)amountEffReserves * 100) / HOUSE_RESERVE_FLOOR_PCT) {
-        strFail = "Discount would exceed the reserve cap (N + price <= min(attested, live) reserves / rho) - "
-                  "attest and hold more liquid reserve coins first!";
+    if (house.nMintedUnits + nPrice > WalletGoldCap(house, nNextHeight, true)) {
+        strFail = "Discount would exceed the till cap (notes + price <= counted gold till / 2%) - move gold into the till first!";
         return false;
     }
 
@@ -9279,14 +9584,20 @@ bool CWallet::RecourseBill(std::string& strFail, uint256& txidOut, const uint32_
 
     // The floor (check 33) must beat the holder's best alternative under the
     // WHOLE op set, which is why it differs by status.
+    // Gram-notes release: the face is mg (valued at the tip's payout price); the escrow bond is sats.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    const CAmount amountFaceSats = WalletMgToSats((uint64_t)bill.amount, nPrice);
     CAmount amountFloor = 0;
     if (bill.status == BILL_STATUS_ACTIVE) {
-        amountFloor = std::max(bill.amount, bill.amountEscrow);
+        amountFloor = std::max(amountFaceSats, bill.amountEscrow);
     } else {
-        if (bill.amount <= bill.amountEscrow) {
+        if (amountFaceSats <= bill.amountEscrow) {
             strFail = "The escrow already covered the face - there is no deficiency to buy!"; return false;
         }
-        amountFloor = bill.amount - bill.amountEscrow;
+        amountFloor = amountFaceSats - bill.amountEscrow;
     }
 
     const CScript scriptHolder = BillScriptForPubKey(bill.vchHolderPubKey);
@@ -9336,6 +9647,7 @@ bool CWallet::RecourseBill(std::string& strFail, uint256& txidOut, const uint32_
     r.nBillID = nBillID;
     r.vchPayerPubKey = vchPayer;
     r.vchPrevHolderPubKey = bill.vchHolderPubKey;
+    r.nPriceHeight = nPriceHeight;
     {
         const CTransaction ctxDigest(mtx);
         if (!keyPayer.Sign(BillRecourseSigHash(r, bill.billID,
@@ -9393,7 +9705,13 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
         return false;
     }
 
-    const CAmount nNeeded = bill.amount + nFee;
+    // Gram-notes release: the face is mg, paid in sECX at the tip's payout price.
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (!WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    const CAmount amountFaceSats = WalletMgToSats((uint64_t)bill.amount, nPrice);
+    const CAmount nNeeded = amountFaceSats + nFee;
     const CAmount nTargetFunding = nNeeded > bill.amountEscrow ? nNeeded - bill.amountEscrow : CAmount(0);
     std::set<CInputCoin> setCoins;
     CAmount nAmountRet = 0;
@@ -9412,10 +9730,10 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
     // vout[0] = face to the current holder, which the discount pinned to the
     // house's custody key.
     const CScript scriptHolder = BillScriptForPubKey(bill.vchHolderPubKey);
-    mtx.vout.push_back(CTxOut(bill.amount, scriptHolder));
+    mtx.vout.push_back(CTxOut(amountFaceSats, scriptHolder));
 
     CReserveKey reserveKey(this);
-    const CAmount nChange = bill.amountEscrow + nAmountRet - bill.amount - nFee;
+    const CAmount nChange = bill.amountEscrow + nAmountRet - amountFaceSats - nFee;
     if (nChange < 0) { strFail = "Escrow + funding does not cover face + fee!"; return false; }
     if (nChange > 0) {
         CPubKey pubChange;
@@ -9449,6 +9767,7 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
     h.nPrevLoanBookFace = house.nLoanBookFace;
     h.nPrevLoanWtMatHi = house.nLoanWtMatHi;
     h.nPrevLoanWtMatLo = house.nLoanWtMatLo;
+    h.nPriceHeight = nPriceHeight;
     // The shipped retire digest, unchanged: cross-op replay is already dead
     // because op 3 rejects house-held bills and op 7 requires them.
     if (!keyAcceptor.Sign(BillRetireSigHash(bill.billID, BillHashOutputs(mtx)), h.vchAcceptorSig)) {
@@ -9549,7 +9868,13 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     // transaction non-standard, so it is raised to the dust line (paid to the house, never less than owed).
     const CScript scriptHolder = BillScriptForPubKey(bill.vchHolderPubKey);
     const CScript scriptPay = fIntoEscrow ? HouseEscrowScript(house.houseID) : scriptHolder;
-    CAmount amountRest = bill.amount - (CAmount)nUnitsBurned;
+    // Gram-notes release: what the notes don't cover is mg, paid in sECX at the tip's payout price.
+    const CAmount amountRestMg = bill.amount - (CAmount)nUnitsBurned;
+    uint32_t nPriceHeight = 0;
+    uint64_t nPrice = 0;
+    if (amountRestMg > 0 && !WalletPayoutPrice(nPriceHeight, nPrice, strFail))
+        return false;
+    CAmount amountRest = amountRestMg > 0 ? WalletMgToSats((uint64_t)amountRestMg, nPrice) : amountRestMg;
     if (fIntoEscrow && amountRest <= 0)
         amountRest = 1;   // op 10's vout[0] is always the escrow; raised to the dust line below
     if (amountRest > 0) {
@@ -9618,6 +9943,7 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     h.nPrevLoanBookFace = house.nLoanBookFace;
     h.nPrevLoanWtMatHi = house.nLoanWtMatHi;
     h.nPrevLoanWtMatLo = house.nLoanWtMatLo;
+    h.nPriceHeight = nPriceHeight;
     {
         const CTransaction ctxDigest(mtx);
         const uint256 hashPrevouts = BillHashPrevouts(ctxDigest), hashOutputs = BillHashOutputs(ctxDigest);
@@ -10509,6 +10835,12 @@ bool CWallet::WinddownHouse(std::string& strFail, uint256& txidOut, const uint32
         strFail = "House has term deposits outstanding; they must mature and be withdrawn before winding down!";
         return false;
     }
+    for (const CVaultEntry& e : HouseVaultEntriesForChecks(nHouseID)) {
+        if (e.nKind == VAULT_TILL) {   // review round 1 (G3d): the till can't move out after a wind-down
+            strFail = "House has gold in its till - move it out (movetill) before winding down!";
+            return false;
+        }
+    }
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_HOUSE_VERSION;
@@ -11067,12 +11399,26 @@ bool CWallet::BondOracleSubmitter(std::string& strFail, uint256& txidOut, uint32
 bool CWallet::SubmitOraclePrice(std::string& strFail, uint256& txidOut,
                                 uint32_t nSubmitterID, uint64_t nPriceMilligrams, const CAmount& nFee)
 {
+    // Gram-notes release: a price is one observation of the gold-per-ECX stream, in sats per gram (the parameter
+    // keeps its old name).
+    if (nPriceMilligrams < ORACLE_PRICE_MIN || nPriceMilligrams > ORACLE_PRICE_MAX) {
+        strFail = "Price out of range!"; return false;
+    }
+    COracleObs obs;
+    obs.nStream = ORACLE_STREAM_GOLD_ECX;
+    obs.nValue = nPriceMilligrams;
+    return SubmitOracleObs(strFail, txidOut, nSubmitterID, {obs}, nFee);
+}
+
+bool CWallet::SubmitOracleObs(std::string& strFail, uint256& txidOut, uint32_t nSubmitterID,
+                              std::vector<COracleObs> vObs, const CAmount& nFee)
+{
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
     if (nSubmitterID == 0) { strFail = "Invalid submitter id!"; return false; }
-    if (nPriceMilligrams < ORACLE_PRICE_MIN || nPriceMilligrams > ORACLE_PRICE_MAX) {
-        strFail = "Price out of range (milligrams of gold per 1000 ECX)!"; return false;
-    }
+    std::sort(vObs.begin(), vObs.end(), [](const COracleObs& a, const COracleObs& b) {
+        return a.nStream < b.nStream || (a.nStream == b.nStream && a.subject < b.subject);
+    });
 
     BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, cs_wallet);
@@ -11101,8 +11447,6 @@ bool CWallet::SubmitOraclePrice(std::string& strFail, uint256& txidOut,
         strFail = "This wallet does not hold the submitter's key!"; return false;
     }
 
-    CGoldFix fixPrev;
-    phousetree->GetGoldFix(fixPrev);      // stays null before the first fix
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_ORACLE_VERSION;
@@ -11130,10 +11474,7 @@ bool CWallet::SubmitOraclePrice(std::string& strFail, uint256& txidOut,
     OracleSubmit payload;
     payload.nSubmitterID = nSubmitterID;
     payload.nTargetHeight = (uint32_t)nHeight;
-    payload.nPriceMilligrams = nPriceMilligrams;
-    payload.nPrevRaw = fixPrev.nRaw;
-    payload.nPrevBraked = fixPrev.nBraked;
-    payload.nPrevFixHeight = fixPrev.nFixHeight;
+    payload.vObs = vObs;
     payload.nPrevOwnLastSubmitHeight = sub.nLastSubmitHeight;
     payload.hashPrevBlockBind = hashPrevBlock;
     {
@@ -11490,9 +11831,14 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
         // both seniors to 0; a settle after claims uses the frozen snapshots.)
         const uint64_t nNoteSnap = house.status == HOUSE_STATUS_INSOLVENT ? house.nInsolventUnits : house.nMintedUnits;
         const uint64_t nDepSnap = house.status == HOUSE_STATUS_INSOLVENT ? house.nInsolventDepositPrincipal : house.nDepositUnits;
-        const CAmount amountSenior = (CAmount)nNoteSnap + (CAmount)nDepSnap;
         const CAmount amountPot = house.status == HOUSE_STATUS_INSOLVENT ? house.amountInsolventPot : amountLive;
-        const CAmount amountResidual = amountPot > amountSenior ? amountPot - amountSenior : 0;
+        uint64_t nSnapPrice = 0, nSnapGold = 0;
+        if (!WalletClaimSnapshot(house, nSnapPrice, nSnapGold, strFail))
+            return false;
+        const CAmount amountSenior = SeniorSatsReserved(nNoteSnap + nDepSnap, nSnapGold, amountPot, nSnapPrice);
+        // Consensus pays at most what is live (review round 1, G3a); any gold left goes to the fund in this same
+        // transaction (review round 1b), built below.
+        const CAmount amountResidual = std::min(amountPot > amountSenior ? amountPot - amountSenior : 0, amountLive);
         if (amountResidual <= 0 || vSpend.empty()) {
             strFail = "No residual to settle (pot fully consumed by note + deposit claims)!";
             return false;
@@ -11542,18 +11888,49 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
             mtx.vin.push_back(CTxIn(out, CScript()));
         for (const auto& sh : vShare)
             mtx.vout.push_back(CTxOut(sh.second, NoteScriptForPubKey(house.vPartner[sh.first].vchPubKey)));
+        // Whatever gold is left goes to the fund, one output per token, frozen units riding on (consensus takes every
+        // vault entry whole, as at CLOSE).
+        CAmount nGoldDust = 0;
+        {
+            std::map<uint256, uint64_t> mapPot;
+            for (const CVaultEntry& e : HouseVaultEntriesForChecks(nHouseID)) {
+                mapPot[e.tokenID] += e.nUnits;
+                CVaultMove m;
+                m.nHouseID = nHouseID;
+                m.nKind = e.nKind;
+                m.nPartner = e.nPartner;
+                m.tokenID = e.tokenID;
+                m.nDelta = -(int64_t)e.nUnits;
+                mtx.vVaultMove.push_back(m);
+            }
+            std::sort(mtx.vVaultMove.begin(), mtx.vVaultMove.end(), [](const CVaultMove& a, const CVaultMove& b) {
+                return std::make_tuple(a.nHouseID, a.nKind, a.nPartner, a.tokenID) < std::make_tuple(b.nHouseID, b.nKind, b.nPartner, b.tokenID);
+            });
+            const std::map<uint256, uint64_t> mapFrozen = HouseVaultFrozenForChecks(nHouseID);
+            for (const std::pair<const uint256, uint64_t>& pot : mapPot) {
+                CIssuedOut o;
+                o.nOut = (uint32_t)mtx.vout.size();
+                o.tokenID = pot.first;
+                o.nUnits = pot.second;
+                const auto itF = mapFrozen.find(pot.first);
+                o.nFrozen = itF == mapFrozen.end() ? 0 : itF->second;
+                mtx.vIssuedOut.push_back(o);
+                mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, MutualFundScript()));
+                nGoldDust += ISSUED_COIN_VALUE;
+            }
+        }
 
-        // Fee from plain coins; change appended after the forced outputs
+        // Fee from plain coins (and the gold outputs' dust); change appended after the forced outputs
         std::vector<COutput> vCoins;
         AvailableCoins(vCoins, true);
         std::set<CInputCoin> setCoins;
         CAmount nAmountRet = 0;
-        if (!SelectCoins(vCoins, nFee, setCoins, nAmountRet)) {
+        if (!SelectCoins(vCoins, nFee + nGoldDust, setCoins, nAmountRet)) {
             strFail = "Could not fund the settle fee!";
             return false;
         }
         CReserveKey reserveKeySettle(this);
-        const CAmount nChange = nAmountRet - nFee;
+        const CAmount nChange = nAmountRet - nFee - nGoldDust;
         if (nChange > 0) {
             CPubKey vchPubKey;
             if (!reserveKeySettle.GetReservedKey(vchPubKey)) { strFail = "Keypool ran out!"; return false; }
@@ -11564,7 +11941,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
         HouseReclaim rec;
         rec.nHouseID = nHouseID;
         rec.nPartnerIndex = nPartnerIndex;
-        const uint256 sighash = HouseReclaimSigHash(house.houseID, nPartnerIndex, BillHashOutputs(mtx));
+        const uint256 sighash = HouseReclaimSigHash(house.houseID, nPartnerIndex, CreditHashOutputs(CTransaction(mtx)));
         if (!keyPartner.Sign(sighash, rec.vchSig)) {
             strFail = "Failed to sign settle!";
             return false;
@@ -11642,12 +12019,43 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
     mtx.nHouseOp = HOUSE_OP_RECLAIM;
     for (const COutPoint& out : partner.vOutPledge)
         mtx.vin.push_back(CTxIn(out, CScript()));
-    mtx.vout.push_back(CTxOut(nPledgeIn - nFee, GetScriptForDestination(CPubKey(partner.vchPubKey).GetID())));
+    // Review round 1 (G3c): the partner's gold capital leaves with the placeholder pledge, all of it (consensus
+    // requires every one of the partner's capital entries to move), one output per token to the partner's key; the
+    // outputs' dust comes out of the pledge.
+    std::vector<std::pair<uint256, uint64_t>> vGold;
+    for (const CVaultEntry& e : HouseVaultEntriesForChecks(nHouseID))
+        if (e.nKind == VAULT_CAPITAL && e.nPartner == nPartnerIndex && e.nUnits > 0)
+            vGold.push_back(std::make_pair(e.tokenID, e.nUnits));
+    const CAmount nGoldDust = (CAmount)vGold.size() * ISSUED_COIN_VALUE;
+    if (nPledgeIn <= nFee + nGoldDust) {
+        strFail = "Pledge value does not cover the fee and the gold outputs!";
+        return false;
+    }
+    const CScript scriptPartner = GetScriptForDestination(CPubKey(partner.vchPubKey).GetID());
+    mtx.vout.push_back(CTxOut(nPledgeIn - nFee - nGoldDust, scriptPartner));
+    for (const std::pair<uint256, uint64_t>& g : vGold) {
+        CIssuedOut a;
+        a.nOut = (uint32_t)mtx.vout.size();
+        a.tokenID = g.first;
+        a.nUnits = g.second;
+        mtx.vIssuedOut.push_back(a);
+        mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, scriptPartner));
+        CVaultMove m;
+        m.nHouseID = nHouseID;
+        m.nKind = VAULT_CAPITAL;
+        m.nPartner = nPartnerIndex;
+        m.tokenID = g.first;
+        m.nDelta = -(int64_t)g.second;
+        mtx.vVaultMove.push_back(m);
+    }
+    std::sort(mtx.vVaultMove.begin(), mtx.vVaultMove.end(), [](const CVaultMove& a, const CVaultMove& b) {
+        return std::make_tuple(a.nHouseID, a.nKind, a.nPartner, a.tokenID) < std::make_tuple(b.nHouseID, b.nKind, b.nPartner, b.tokenID);
+    });
 
     HouseReclaim rec;
     rec.nHouseID = nHouseID;
     rec.nPartnerIndex = nPartnerIndex;
-    const uint256 sighash = HouseReclaimSigHash(house.houseID, nPartnerIndex, BillHashOutputs(mtx));
+    const uint256 sighash = HouseReclaimSigHash(house.houseID, nPartnerIndex, CreditHashOutputs(CTransaction(mtx)));
     if (!keyPartner.Sign(sighash, rec.vchSig)) {
         strFail = "Failed to sign reclaim!";
         return false;
@@ -11739,8 +12147,11 @@ bool CWallet::CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amount
         for (size_t j = 0; j < house.vPartner.size(); j++)
             house.vPartner[j].amountInsolventPledge = vPledgeLive[j];
     }
-    const CAmount amountSenior = (CAmount)nUnits + (CAmount)nDeposit;
-    const CAmount amountResidual = amountPot > amountSenior ? amountPot - amountSenior : 0;
+    uint64_t nSnapPrice = 0, nSnapGold = 0;
+    if (!WalletClaimSnapshot(house, nSnapPrice, nSnapGold, strFail))
+        return false;
+    const CAmount amountSenior = SeniorSatsReserved(nUnits + nDeposit, nSnapGold, amountPot, nSnapPrice);
+    const CAmount amountResidual = std::min(amountPot > amountSenior ? amountPot - amountSenior : 0, amountLive);   // G3a
     CAmount amountPledgeSum = 0;
     for (const HousePartner& p : house.vPartner)
         if (p.status != HOUSE_PARTNER_SETTLED)
@@ -11766,14 +12177,47 @@ bool CWallet::CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amount
     if (amountFundOut > 0)
         mtx.vout.push_back(CTxOut(amountFundOut, MutualFundScript()));
 
-    // The fee (and any change) from this wallet's plain coins.
+    // Gram-notes release (5b): every vault entry's gold goes to the fund too, one fund output per token.
+    CAmount nGoldDust = 0;
+    {
+        const std::vector<CVaultEntry> vEntry = HouseVaultEntriesForChecks(house.nHouseID);
+        std::map<uint256, uint64_t> mapPot;
+        for (const CVaultEntry& e : vEntry) {
+            mapPot[e.tokenID] += e.nUnits;
+            CVaultMove m;
+            m.nHouseID = house.nHouseID;
+            m.nKind = e.nKind;
+            m.nPartner = e.nPartner;
+            m.tokenID = e.tokenID;
+            m.nDelta = -(int64_t)e.nUnits;
+            mtx.vVaultMove.push_back(m);
+        }
+        std::sort(mtx.vVaultMove.begin(), mtx.vVaultMove.end(), [](const CVaultMove& a, const CVaultMove& b) {
+            return std::make_tuple(a.nHouseID, a.nKind, a.nPartner, a.tokenID) < std::make_tuple(b.nHouseID, b.nKind, b.nPartner, b.tokenID);
+        });
+        // Frozen vault gold rides into the fund still frozen (consensus carries the house's freeze records there).
+        const std::map<uint256, uint64_t> mapFrozen = HouseVaultFrozenForChecks(house.nHouseID);
+        for (const std::pair<const uint256, uint64_t>& pot : mapPot) {
+            CIssuedOut o;
+            o.nOut = (uint32_t)mtx.vout.size();
+            o.tokenID = pot.first;
+            o.nUnits = pot.second;
+            const auto itFrozen = mapFrozen.find(pot.first);
+            o.nFrozen = itFrozen == mapFrozen.end() ? 0 : itFrozen->second;
+            mtx.vIssuedOut.push_back(o);
+            mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, MutualFundScript()));
+            nGoldDust += ISSUED_COIN_VALUE;
+        }
+    }
+
+    // The fee (and any change, and the gold outputs' dust) from this wallet's plain coins.
     std::vector<COutput> vCoins;
     AvailableCoins(vCoins, true /* fOnlySafe */);
     std::set<CInputCoin> setCoins;
     CAmount nAmountRet = 0;
-    if (!SelectCoins(vCoins, nFee, setCoins, nAmountRet)) { strFail = "Could not collect coins for the fee!"; return false; }
+    if (!SelectCoins(vCoins, nFee + nGoldDust, setCoins, nAmountRet)) { strFail = "Could not collect coins for the fee!"; return false; }
     CReserveKey reserveKey(this);
-    const CAmount nChange = nAmountRet - nFee;
+    const CAmount nChange = nAmountRet - nFee - nGoldDust;
     if (nChange > 0) {
         CPubKey pubChange;
         if (!reserveKey.GetReservedKey(pubChange, true)) { strFail = "Keypool ran out, please call keypoolrefill first!"; return false; }
@@ -13316,7 +13760,7 @@ bool CWallet::IsUnconfirmedAssetTx(const CWalletTx& wtx) const
         Coin coin;
         if (!pcoinsTip->GetCoin(txin.prevout, coin))
             return true;
-        if (coin.IsAssetColoured())
+        if (coin.IsV10Asset())
             return true;
     }
     return false;
@@ -13330,7 +13774,7 @@ bool CWallet::IsOutputAssetColoured(const CWalletTx& wtx, unsigned int n, int nD
     if (nDepth <= 0)
         return false;    // the caller tests IsUnconfirmedAssetTx for the whole tx
     Coin coin;
-    return pcoinsTip->GetCoin(COutPoint(wtx.GetHash(), n), coin) && coin.IsAssetColoured();
+    return pcoinsTip->GetCoin(COutPoint(wtx.GetHash(), n), coin) && coin.IsV10Asset();
 }
 
 void CWallet::AvailableAssets(std::vector<std::pair<COutPoint, Coin>>& vOut, const uint256& assetID) const
@@ -13348,7 +13792,7 @@ void CWallet::AvailableAssets(std::vector<std::pair<COutPoint, Coin>>& vOut, con
             if ((IsMine(wtx.tx->vout[i]) & ISMINE_SPENDABLE) == ISMINE_NO)
                 continue;
             Coin coin;
-            if (!pcoinsTip->GetCoin(COutPoint(entry.first, i), coin) || !coin.IsAssetColoured())
+            if (!pcoinsTip->GetCoin(COutPoint(entry.first, i), coin) || !coin.IsV10Asset())
                 continue;
             if (!assetID.IsNull() && coin.assetID != assetID)
                 continue;

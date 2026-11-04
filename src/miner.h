@@ -264,4 +264,16 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
 
 bool CreateDepositTx(CMutableTransaction& depositTx);
 
+// Gram-notes release (GOLD_USD_SCOPE.md 7j; legal condition 6, "no discretion"): the producer's inclusion log -
+// node-side, not consensus. Each block template this node builds (its height, the pool transactions it carries and the
+// ones it leaves out, logged when that set changes), each oracle re-sign that displaced an earlier submission (the fixed
+// rule: the latest valid one received wins), and each transaction a template had to drop. JSON lines appended to
+// <datadir>/inclusion.log; the last 1,000 entries also kept for getinclusionlog.
+class UniValue;
+void InclusionLogTemplate(int nHeight, const std::vector<uint256>& vIncluded,
+                          const std::vector<std::pair<uint256, std::string>>& vLeftOut);
+void InclusionLogDisplace(uint32_t nSubmitter, const uint256& txidOld, const uint256& txidNew);
+void InclusionLogDrop(const uint256& txid, const std::string& strReason);
+UniValue InclusionLogRecent(size_t nMax);
+
 #endif // BITCOIN_MINER_H

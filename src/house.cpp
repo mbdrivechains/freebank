@@ -4,6 +4,7 @@
 
 #include <house.h>
 
+#include <bill.h>
 #include <chainparams.h>
 #include <consensus/validation.h>
 #include <hash.h>
@@ -209,6 +210,21 @@ uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const 
     return ss.GetHash();
 }
 
+uint256 HouseTillSigHash(const uint256& houseID, const CTransaction& tx)
+{
+    CHashWriter hPrevouts(SER_GETHASH, 0);
+    for (const CTxIn& in : tx.vin)
+        hPrevouts << in.prevout;
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankHouse/till");
+    ss << houseID;
+    ss << hPrevouts.GetHash();
+    ss << BillHashOutputs(tx);
+    ss << tx.vIssuedOut;
+    ss << tx.vVaultMove;
+    return ss.GetHash();
+}
+
 uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
@@ -310,13 +326,12 @@ bool IsValidHouseClassID(const std::string& strClassID)
 // lifted and every protest-era episode would expire into insolvency).
 static uint32_t AttestFamilyStressOrigin(const CHouse& house, int nHeight)
 {
-    uint32_t nStress = house.nStressSinceHeight;
-    const uint32_t nDeadline = house.nLastAttestHeight
-                             + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE;
-    if (nHeight >= 0 && (uint32_t)nHeight > nDeadline &&
-        (nStress == 0 || nDeadline + 1 < nStress))
-        nStress = nDeadline + 1;
-    return nStress;
+    // Gram-notes release (design draft 9, R3-4): stress starts only on unpaid demand - the protest origin below. A
+    // missed attestation no longer starts it (a house's gold till is exact on-chain), and ATTEST no longer writes a
+    // ratio-breach origin for an open house (a till below the floor only stops issuing). nStressSinceHeight is
+    // written only while a house is deferred, as its recovery test's "not yet" (validation.cpp, ATTEST).
+    (void)nHeight;
+    return house.nStressSinceHeight;
 }
 
 uint32_t HouseStressOrigin(const CHouse& house, int nHeight)
@@ -350,6 +365,9 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
 {
     if (house.status == HOUSE_STATUS_WOUNDDOWN) return HOUSE_STATUS_WOUNDDOWN;
     if (house.status == HOUSE_STATUS_INSOLVENT) return HOUSE_STATUS_INSOLVENT; // materialized
+    // Gram-notes release (R3-1): equity proven negative - claims open from that block, for good.
+    if (house.nEquityNegativeHeight != 0 && nHeight >= 0 && (uint32_t)nHeight >= house.nEquityNegativeHeight)
+        return HOUSE_STATUS_INSOLVENT;
 
     // Option clause (3.5): an invoked deferral REPLACES the ordinary stress
     // clock - the whole point is to stop the par drain and buy time for reflux
@@ -445,6 +463,9 @@ uint32_t HouseInsolventSince(const CHouse& house, int nHeight)
 {
     if (house.status == HOUSE_STATUS_WOUNDDOWN || HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
         return 0;
+    // An EQUITY op is refused once a house is insolvent by any route, so its height is the first.
+    if (house.nEquityNegativeHeight != 0)
+        return house.nEquityNegativeHeight;
     if (house.nDeferInvokedHeight != 0)
         return HouseDeferInsolventHeight(house);
     // The ordinary stress path: insolvent at the stress origin + the window (HouseEffectiveStatus). The origin is
@@ -739,7 +760,7 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-house-coinbase");
 
-    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_CLOSE)
+    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_EQUITY)
         return state.DoS(100, false, REJECT_INVALID, "bad-house-op");
 
     // Register: 64 partners x (33B key + 72B sig + amount) + declaration
@@ -811,6 +832,23 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
         HouseClose cl;
         if (!DecodeHousePayload(tx.vchHousePayload, cl) || cl.nHouseID == 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payload");
+    }
+    else
+    if (tx.nHouseOp == HOUSE_OP_EQUITY) {
+        HouseEquity eq;
+        if (!DecodeHousePayload(tx.vchHousePayload, eq) || eq.nHouseID == 0 ||
+                eq.vOverdueBillID.size() > MAX_EQUITY_OVERDUE_BILLS)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-equity-payload");
+    }
+    else
+    if (tx.nHouseOp == HOUSE_OP_TILL) {
+        HouseTill till;
+        if (!DecodeHousePayload(tx.vchHousePayload, till) || till.nHouseID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-payload");
+        if (!CheckApproverShape(till.vApproverIndex, till.vApproverSig) || till.vApproverIndex.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-approvers");
+        if (tx.vVaultMove.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-empty");
     }
     else
     if (tx.nHouseOp == HOUSE_OP_RECLAIM) {

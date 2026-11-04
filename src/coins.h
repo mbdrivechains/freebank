@@ -44,7 +44,11 @@
 //! v3 (v0.2.18, D-2026-10-03-1): a coloured coin carries its asset's full
 //! genesis txid (uint256 assetID, written only when a colour flag is set) in
 //! both the coin and the undo record, replacing the uint32 counter id.
-static const int FREEBANK_DISK_FORMAT_VERSION = 3;
+//!
+//! v4 (gram-notes release, docs-local/GOLD_USD_SCOPE.md): issued-token coins
+//! (fIssued; assetID = the token's id, nIssuedUnits, nIssuedFrozen), appended
+//! last in both records, the rest written only when fIssued is set.
+static const int FREEBANK_DISK_FORMAT_VERSION = 4;
 
 /**
  * A UTXO entry.
@@ -128,9 +132,19 @@ public:
     //! the spend gate pins ownership by script comparison, never a lookup.
     bool fOracleBond;
 
+    //! Gram-notes release (issued.h): does this coin carry issued-token units?
+    //! assetID then holds the token's id (its CREATE txid), so IsAssetColoured()
+    //! is true and every guard that keeps coloured coins out of an op keeps
+    //! issued coins out too, until that op opts in (the annex rule).
+    bool fIssued;
+    uint64_t nIssuedUnits;
+    //! The frozen part of nIssuedUnits as the annex created the coin; a later
+    //! FREEZE / UNFREEZE is held in the units DB by outpoint, which wins.
+    uint64_t nIssuedFrozen;
+
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) {}
 
     void SetBill(bool fEscrowIn, uint32_t nBillIDIn) {
         fBill = !fEscrowIn;
@@ -175,6 +189,13 @@ public:
         fOracleBond = true;
     }
 
+    void SetIssued(const uint256& tokenID, uint64_t nUnits, uint64_t nFrozen) {
+        fIssued = true;
+        assetID = tokenID;
+        nIssuedUnits = nUnits;
+        nIssuedFrozen = nFrozen;
+    }
+
     void Clear() {
         out.SetNull();
         fCoinBase = false;
@@ -199,10 +220,13 @@ public:
         fLpShare = false;
         nLpUnits = 0;
         fOracleBond = false;
+        fIssued = false;
+        nIssuedUnits = 0;
+        nIssuedFrozen = 0;
     }
 
     //! empty constructor
-    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), assetID(), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false) { }
+    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), assetID(), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) { }
 
     bool IsCoinBase() const {
         return fCoinBase;
@@ -224,6 +248,12 @@ public:
     //! guard that keeps asset coins out of an op uses this, never one field.
     bool IsAssetColoured() const {
         return fBitAsset || fBitAssetControl || !assetID.IsNull();
+    }
+
+    //! A v10 asset coin (units or control), as opposed to an issued-token coin,
+    //! which is coloured too: the asset rules and the asset RPCs read these.
+    bool IsV10Asset() const {
+        return IsAssetColoured() && !fIssued;
     }
 
     template<typename Stream>
@@ -256,6 +286,13 @@ public:
         // format break: bump FREEBANK_DISK_FORMAT_VERSION so the startup gate
         // demands the reindex, instead of leaving it to whoever notices.
         ::Serialize(s, fOracleBond);
+        // v4 (gram-notes release): the issued-token units; assetID holds the token id.
+        ::Serialize(s, fIssued);
+        if (fIssued) {
+            ::Serialize(s, assetID);
+            ::Serialize(s, nIssuedUnits);
+            ::Serialize(s, nIssuedFrozen);
+        }
     }
 
     template<typename Stream>
@@ -288,6 +325,14 @@ public:
         ::Unserialize(s, fLpShare);
         ::Unserialize(s, nLpUnits);
         ::Unserialize(s, fOracleBond);
+        ::Unserialize(s, fIssued);
+        nIssuedUnits = 0;
+        nIssuedFrozen = 0;
+        if (fIssued) {
+            ::Unserialize(s, assetID);
+            ::Unserialize(s, nIssuedUnits);
+            ::Unserialize(s, nIssuedFrozen);
+        }
     }
 
     bool IsSpent() const {

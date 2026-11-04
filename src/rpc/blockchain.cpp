@@ -1087,7 +1087,12 @@ UniValue gettxout(const JSONRPCRequest& request)
     ScriptPubKeyToUniv(coin.out.scriptPubKey, o, true);
     ret.pushKV("scriptPubKey", o);
     ret.pushKV("coinbase", (bool)coin.fCoinBase);
-    if (coin.IsAssetColoured()) {
+    if (coin.fIssued) {
+        UniValue issued(UniValue::VOBJ);
+        issued.pushKV("token_id", coin.assetID.GetHex());
+        issued.pushKV("units", (uint64_t)coin.nIssuedUnits);
+        ret.pushKV("issued", issued);
+    } else if (coin.IsAssetColoured()) {
         UniValue asset(UniValue::VOBJ);
         asset.pushKV("asset_id", coin.assetID.GetHex());
         asset.pushKV("kind", coin.fBitAsset ? "units" : "control");
@@ -1211,6 +1216,7 @@ UniValue getblockchaininfo(const JSONRPCRequest& request)
             "  \"chain\": \"xxxx\",              (string) current network name (main, beta, regtest)\n"
             "  \"dormant\": true|false,        (boolean) v0.2.19: true while this network has no valid block after genesis\n"
             "                                  (FreeBank mainnet until a release switches it on)\n"
+            "  \"note_unit\": \"mg\",            (string) gram-notes release: what a note, bill, deposit or gold token unit counts (milligrams of gold, from genesis); absent on older builds (sats of sECX)\n"
             "  \"blocks\": xxxxxx,             (numeric) the current number of blocks processed in the server\n"
             "  \"headers\": xxxxxx,            (numeric) the current number of headers we have validated\n"
             "  \"bestblockhash\": \"...\",       (string) the hash of the currently best block\n"
@@ -1259,6 +1265,12 @@ UniValue getblockchaininfo(const JSONRPCRequest& request)
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("chain",                 Params().NetworkIDString());
     obj.pushKV("dormant",               Params().GetConsensus().fChainDormant);
+    // Gram-notes release: notes, bills, deposits and gold tokens count milligrams of gold, from genesis on every
+    // network this build runs (older builds: absent, and their notes count sats of sECX).
+    obj.pushKV("note_unit",             "mg");
+    // House note pools (createpool, swapnote, ...) open from a height a later release sets (D-2026-10-31-8 item 9);
+    // gold-token pools are open. Absent on older builds.
+    obj.pushKV("note_pools_open",       chainActive.Height() + 1 >= Params().GetConsensus().nNotePoolHeight);
     obj.pushKV("blocks",                (int)chainActive.Height());
     obj.pushKV("headers",               pindexBestHeader ? pindexBestHeader->nHeight : -1);
     obj.pushKV("bestblockhash",         chainActive.Tip()->GetBlockHash().GetHex());

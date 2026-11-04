@@ -270,36 +270,36 @@ BOOST_AUTO_TEST_CASE(settle_band_max_magnitude)
     // (MAX_MONEY): far below the band -> the helper must REJECT cleanly, and
     // the point of the vector is that the u128 arithmetic cannot overflow on
     // the way to that answer.
-    BOOST_CHECK(!SettleResidualInBand(U, 0, 1, MAX_MONEY));
+    BOOST_CHECK(!SettleResidualInBand(U, 0, 1, MAX_MONEY, 1000));
 
     // Max payable case: dU == MAX_MONEY, residual == MAX_MONEY (exact par).
-    BOOST_CHECK(SettleResidualInBand((uint64_t)MAX_MONEY, 0, 1, MAX_MONEY));
+    BOOST_CHECK(SettleResidualInBand((uint64_t)MAX_MONEY, 0, 1, MAX_MONEY, 1000));
 
     // Exact band edges at a clean magnitude: parValue = 10^12.
     const uint64_t par = 1000000000000ULL;
     const CAmount lo = (CAmount)(par * (10000 - SETTLE_PAR_BAND_BPS) / 10000);   // 0.995 * par
     const CAmount hi = (CAmount)(par * (10000 + SETTLE_PAR_BAND_BPS) / 10000);   // 1.005 * par
-    BOOST_CHECK(SettleResidualInBand(par, 0, 1, lo));         // exactly at the low edge
-    BOOST_CHECK(SettleResidualInBand(par, 0, 1, hi));         // exactly at the high edge
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, lo - 1));    // one sat below
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, hi + 1));    // one sat above
-    BOOST_CHECK(SettleResidualInBand(par, 0, 1, (CAmount)par)); // exact par
+    BOOST_CHECK(SettleResidualInBand(par, 0, 1, lo, 1000));         // exactly at the low edge
+    BOOST_CHECK(SettleResidualInBand(par, 0, 1, hi, 1000));         // exactly at the high edge
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, lo - 1, 1000));    // one sat below
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, hi + 1, 1000));    // one sat above
+    BOOST_CHECK(SettleResidualInBand(par, 0, 1, (CAmount)par, 1000)); // exact par
 
     // Envelope violations reject cleanly (never overflow).
-    BOOST_CHECK(!SettleResidualInBand(U + 1, 0, 1, MAX_MONEY));
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, MAX_MONEY + 1));
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, -1));
+    BOOST_CHECK(!SettleResidualInBand(U + 1, 0, 1, MAX_MONEY, 1000));
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, MAX_MONEY + 1, 1000));
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, -1, 1000));
 
     // Mode discipline.
-    BOOST_CHECK(SettleResidualInBand(50000, 50000, 0, 0));      // pure swap
-    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 0, 1));     // mode 0 with residual
-    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 1, 0));     // mode 1 with dU == 0
-    BOOST_CHECK(!SettleResidualInBand(60000, 45000, 0, 0));     // dU != 0 must be mode 1
+    BOOST_CHECK(SettleResidualInBand(50000, 50000, 0, 0, 1000));      // pure swap
+    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 0, 1, 1000));     // mode 0 with residual
+    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 1, 0, 1000));     // mode 1 with dU == 0
+    BOOST_CHECK(!SettleResidualInBand(60000, 45000, 0, 0, 1000));     // dU != 0 must be mode 1
     // Min-residual floor: dU below SETTLE_MIN_RESIDUAL cannot be mode 1.
     BOOST_CHECK(!SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL - 1, 50000, 1,
-                                      SETTLE_MIN_RESIDUAL - 1));
+                                      SETTLE_MIN_RESIDUAL - 1, 1000));
     BOOST_CHECK(SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL, 50000, 1,
-                                     SETTLE_MIN_RESIDUAL));
+                                     SETTLE_MIN_RESIDUAL, 1000));
 }
 
 BOOST_AUTO_TEST_CASE(settle_tx_trailer_roundtrip)
@@ -455,12 +455,8 @@ BOOST_AUTO_TEST_CASE(settle_shape_vectors)
     { CMutableTransaction m = ShapeValidTx(x, pkA, pkB);
       x.nMode = 0; x.nUnitsBNotes = 60000; x.amountResidual = 5; m.vchSettlePayload = Encode(x);   // mode 0 + residual
       BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-mode"); }
-    // Band edges: one sat outside either boundary (dU = 15000, band = 50 bps
-    // -> [14925, 15075]).
-    { CMutableTransaction m = ShapeValidTx(x, pkA, pkB); x.amountResidual = 14924; m.vchSettlePayload = Encode(x);
-      BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-band"); }
-    { CMutableTransaction m = ShapeValidTx(x, pkA, pkB); x.amountResidual = 15076; m.vchSettlePayload = Encode(x);
-      BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-band"); }
+    // (Gram-notes release: the band needs the payout price, so it moved to the contextual check; its edges are the
+    // SettleResidualInBand vectors.)
     // Residual output: wrong value, non-P2PKH, missing.
     { CMutableTransaction m = ShapeValidTx(x, pkA, pkB); m.vout[0].nValue = 14999;
       BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-residual-out"); }
@@ -731,11 +727,11 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
         CMutableTransaction mtx = BuildSignedSettle(x, hA, hB, apprA, apprB, presA, presB, 1);
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, {{1, hA}}, H), "bad-settle-unknown-house");
     }
-    // Ineligible: attestation older than one cadence (Open still tolerates it;
-    // par-clearing does not - the J6 recency conjunct).
+    // Ineligible: a gold till below the floor (gram-notes release: the till is exact, so recency no longer matters; the
+    // fixture's emulation maps the till from the attested figure).
     {
         CHouse stale = hB;
-        stale.nLastAttestHeight = H - HOUSE_ATTEST_CADENCE - 1;
+        stale.amountLastAttestReserves = 1;
         CMutableTransaction mtx = BuildSignedSettle(x, hA, stale, apprA, apprB, presA, presB, 1);
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, {{1, hA}, {2, stale}}, H), "bad-settle-house-ineligible");
     }

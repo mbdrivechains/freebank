@@ -284,6 +284,10 @@ struct BillRetire {
     uint32_t nBillID;
     std::vector<unsigned char> vchAcceptorSig;    // over BillRetireSigHash
 
+    // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
+    // nPriceBackBlocks back; 0 when nothing is paid in sECX).
+    uint32_t nPriceHeight = 0;
+
     BillRetire() : nBillID(0) {}
 
     ADD_SERIALIZE_METHODS
@@ -292,6 +296,7 @@ struct BillRetire {
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nBillID);
         READWRITE(vchAcceptorSig);
+        READWRITE(nPriceHeight);
     }
 };
 
@@ -397,6 +402,10 @@ struct BillRecourse {
     std::vector<unsigned char> vchPrevHolderPubKey;       // prior; == bill.vchHolderPubKey
     std::vector<unsigned char> vchPayerSig;               // over BillRecourseSigHash
 
+    // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
+    // nPriceBackBlocks back; 0 when nothing is paid in sECX).
+    uint32_t nPriceHeight = 0;
+
     BillRecourse() : nBillID(0) {}
 
     ADD_SERIALIZE_METHODS
@@ -407,6 +416,7 @@ struct BillRecourse {
         READWRITE(vchPayerPubKey);
         READWRITE(vchPrevHolderPubKey);
         READWRITE(vchPayerSig);
+        READWRITE(nPriceHeight);
     }
 };
 
@@ -425,6 +435,10 @@ struct BillHRetire {
     uint64_t nPrevLoanWtMatLo;
     std::vector<unsigned char> vchAcceptorSig;            // over BillRetireSigHash
 
+    // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
+    // nPriceBackBlocks back; 0 when nothing is paid in sECX).
+    uint32_t nPriceHeight = 0;
+
     BillHRetire() : nBillID(0), nOwnerHouseID(0), amountFace(0), nBillMaturityHeight(0),
                     nPrevLoanBookFace(0), nPrevLoanWtMatHi(0), nPrevLoanWtMatLo(0) {}
 
@@ -440,6 +454,7 @@ struct BillHRetire {
         READWRITE(nPrevLoanWtMatHi);
         READWRITE(nPrevLoanWtMatLo);
         READWRITE(vchAcceptorSig);
+        READWRITE(nPriceHeight);
     }
 };
 
@@ -464,6 +479,10 @@ struct BillHRetireNotes {
     uint64_t nPrevLoanWtMatLo;
     std::vector<unsigned char> vchAcceptorSig;            // over BillHRetireNotesSigHash
 
+    // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
+    // nPriceBackBlocks back; 0 when nothing is paid in sECX).
+    uint32_t nPriceHeight = 0;
+
     BillHRetireNotes() : nBillID(0), nOwnerHouseID(0), amountFace(0), nBillMaturityHeight(0), nUnitsBurned(0),
                          nPrevMintedUnits(0), nPrevLoanBookFace(0), nPrevLoanWtMatHi(0), nPrevLoanWtMatLo(0) {}
 
@@ -481,6 +500,7 @@ struct BillHRetireNotes {
         READWRITE(nPrevLoanWtMatHi);
         READWRITE(nPrevLoanWtMatLo);
         READWRITE(vchAcceptorSig);
+        READWRITE(nPriceHeight);
     }
 };
 

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <deposit.h>
+#include <issued.h>   // CreditHashOutputs
 
 #include <bill.h>           // BillHashOutputs
 #include <coins.h>
@@ -583,6 +584,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
         h.nInsolventHeight = 900;               // v0.2.28: E for the collect-then-pay gate (the book is empty: open)
         h.nMintedUnits = 0; h.nInsolventUnits = 0;
         h.amountInsolventPot = 1000000;
+        h.nInsolventSatsPerGram = 1000;         // gram-notes release: the snapshot's price (1 mg = 1 sat)
         h.nDepositUnits = P; h.nInsolventDepositPrincipal = P;
         h.SetDepositWtMaturity((unsigned __int128)P * MAT);
         return h;
@@ -590,7 +592,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
 
     // Sign over a payout == entitlement (par = principal here, since pot >> par).
     CMutableTransaction tmp = build((CAmount)P, std::vector<unsigned char>(70, 0x30));
-    const uint256 sighash = DepositClaimSigHash(H, P, BillHashOutputs(CTransaction(tmp)));
+    const uint256 sighash = DepositClaimSigHash(H, P, CreditHashOutputs(CTransaction(tmp)));
     std::vector<unsigned char> sig; BOOST_REQUIRE(keyHolder.Sign(sighash, sig));
 
     // Not insolvent -> refused (the subordinated waterfall is only at insolvency).
@@ -624,7 +626,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
             if (o == rOut) { c = receipt; return true; } if (o == eOut) { c = makeEscrow(2 * (CAmount)P); return true; } return false; };
         // Sign over the larger payout so the sig passes and the entitlement check fires.
         CMutableTransaction t2 = build(2 * (CAmount)P, std::vector<unsigned char>(70, 0x30));
-        const uint256 sh2 = DepositClaimSigHash(H, P, BillHashOutputs(CTransaction(t2)));
+        const uint256 sh2 = DepositClaimSigHash(H, P, CreditHashOutputs(CTransaction(t2)));
         std::vector<unsigned char> s2; BOOST_REQUIRE(keyHolder.Sign(sh2, s2));
         CMutableTransaction mtx = build(2 * (CAmount)P, s2);
         CValidationState state; CHouse houseOut; bool fChanged = false;

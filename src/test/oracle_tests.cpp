@@ -40,8 +40,8 @@ bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int n
                           const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
                           const std::function<bool(uint32_t, COracleSubmitter&)>& fnGetSubmitter,
                           const std::function<bool(const std::vector<unsigned char>&)>& fnHaveKey,
-                          const CGoldFix& fixPrev, uint32_t nNextSubmitterID,
-                          COracleSubmitter& subOut, bool& fFreshBondOut, uint64_t& nPriceOut,
+                          uint32_t nNextSubmitterID,
+                          COracleSubmitter& subOut, bool& fFreshBondOut, std::vector<COracleObs>& vObsOut,
                           bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(oracle_tests, BasicTestingSetup)
@@ -51,10 +51,10 @@ static OracleSubmit FilledSubmit()
     OracleSubmit x;
     x.nSubmitterID = 3;
     x.nTargetHeight = 1000;
-    x.nPriceMilligrams = 800000000;        // ~800 kg gold per 1000 ECX, mg
-    x.nPrevRaw = 790000000;
-    x.nPrevBraked = 795000000;
-    x.nPrevFixHeight = 999;
+    COracleObs obs;                        // gram-notes release: one gold-per-ECX observation
+    obs.nStream = ORACLE_STREAM_GOLD_ECX;
+    obs.nValue = 110000;                   // sats per gram
+    x.vObs = {obs};
     x.nPrevOwnLastSubmitHeight = 998;
     x.hashPrevBlockBind = uint256S("0x11");
     x.vchSig.assign(70, 0xAB);
@@ -149,10 +149,9 @@ BOOST_AUTO_TEST_CASE(oracle_digest_sensitivity)
     // every VALUE field moves the digest
     { OracleSubmit y = x; y.nSubmitterID++;            BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
     { OracleSubmit y = x; y.nTargetHeight++;           BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
-    { OracleSubmit y = x; y.nPriceMilligrams++;        BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
-    { OracleSubmit y = x; y.nPrevRaw++;                BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
-    { OracleSubmit y = x; y.nPrevBraked++;             BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
-    { OracleSubmit y = x; y.nPrevFixHeight++;          BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
+    { OracleSubmit y = x; y.vObs[0].nValue++;          BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
+    { OracleSubmit y = x; y.vObs[0].nStream = ORACLE_STREAM_GOLD_USD;
+                                                       BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
     { OracleSubmit y = x; y.nPrevOwnLastSubmitHeight++; BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
     { OracleSubmit y = x; y.hashPrevBlockBind = uint256S("0x22");
                                                        BOOST_CHECK(OracleSubmitSigHash(y, hp, ho) != base); }
@@ -187,19 +186,25 @@ BOOST_AUTO_TEST_CASE(oracle_shape_gates)
       BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-submitter-id"); }
     { OracleSubmit x = FilledSubmit(); x.nTargetHeight = 0;
       BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-target-height"); }
-    { OracleSubmit x = FilledSubmit(); x.nPriceMilligrams = 0;
+    { OracleSubmit x = FilledSubmit(); x.vObs[0].nValue = 0;
       BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-price-range"); }
-    { OracleSubmit x = FilledSubmit(); x.nPriceMilligrams = ORACLE_PRICE_MAX + 1;
+    { OracleSubmit x = FilledSubmit(); x.vObs[0].nValue = ORACLE_PRICE_MAX + 1;
       BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-price-range"); }
-    // genesis-priors consistency [C-4]: nPrevFixHeight == 0 iff both views zero
-    { OracleSubmit x = FilledSubmit(); x.nPrevFixHeight = 0;
-      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-genesis-priors"); }
-    { OracleSubmit x = FilledSubmit(); x.nPrevFixHeight = 0; x.nPrevRaw = 0; x.nPrevBraked = 0;
+    // Gram-notes release: the observation list's own rules.
+    { OracleSubmit x = FilledSubmit(); x.vObs.clear();
+      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-obs-count"); }
+    { OracleSubmit x = FilledSubmit(); x.vObs.push_back(x.vObs[0]);   // the same stream twice
+      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-obs-order"); }
+    { OracleSubmit x = FilledSubmit(); x.vObs[0].subject = uint256S("0x01");   // a price names no token
+      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-price-range"); }
+    { OracleSubmit x = FilledSubmit(); COracleObs b; b.nStream = ORACLE_STREAM_BACKING;   // no token named
+      b.nValue = 5; b.nAux = 19000000; x.vObs.push_back(b);
+      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-backing-obs"); }
+    { OracleSubmit x = FilledSubmit(); COracleObs b; b.nStream = ORACLE_STREAM_BACKING;
+      b.subject = uint256S("0x01"); b.nValue = 5; b.nAux = 19000000; x.vObs.push_back(b);
       BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), ""); }
-    { OracleSubmit x = FilledSubmit(); x.nPrevRaw = 0;   // half-genesis: range gate catches it
-      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-prior-range"); }
-    { OracleSubmit x = FilledSubmit(); x.nPrevBraked = ORACLE_PRICE_MAX + 1;
-      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-prior-range"); }
+    { OracleSubmit x = FilledSubmit(); x.vObs[0].nStream = 9;
+      BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-obs-stream"); }
     { OracleSubmit x = FilledSubmit(); x.vchSig.clear();
       BOOST_CHECK_EQUAL(ShapeReject(OracleTx(ORACLE_OP_SUBMIT, Encode(x))), "bad-oracle-sig"); }
 
@@ -370,10 +375,11 @@ static CMutableTransaction BuildSubmitTx(const CKey& key, uint32_t nID, uint32_t
     OracleSubmit x;
     x.nSubmitterID = nID;
     x.nTargetHeight = nH;
-    x.nPriceMilligrams = nPrice;
-    x.nPrevRaw = fixPrev.nRaw;
-    x.nPrevBraked = fixPrev.nBraked;
-    x.nPrevFixHeight = fixPrev.nFixHeight;
+    (void)fixPrev;   // gram-notes release: a submission binds no fix priors
+    COracleObs obs;
+    obs.nStream = ORACLE_STREAM_GOLD_ECX;
+    obs.nValue = nPrice;
+    x.vObs = {obs};
     x.nPrevOwnLastSubmitHeight = nOwnPrev;
     x.hashPrevBlockBind = hashPrev;
     CMutableTransaction mtx;
@@ -427,8 +433,13 @@ BOOST_AUTO_TEST_CASE(oracle_contextual_gates)
         subOut = COracleSubmitter();
         fFresh = false;
         nPrice = 0;
-        if (CheckOracleOperation(CTransaction(mtx), state, nAt, fnAnchor, fnGet, fnHaveKey,
-                                 fix, nNext, subOut, fFresh, nPrice))
+        (void)fix;
+        std::vector<COracleObs> vObs;
+        const bool fOk = CheckOracleOperation(CTransaction(mtx), state, nAt, fnAnchor, fnGet, fnHaveKey,
+                                              nNext, subOut, fFresh, vObs);
+        if (!vObs.empty())
+            nPrice = vObs[0].nValue;
+        if (fOk)
             return std::string("");
         return state.GetRejectReason();
     };
@@ -567,12 +578,14 @@ BOOST_AUTO_TEST_CASE(oracle_contextual_gates)
     BOOST_CHECK_EQUAL(Run(sub1, fixNull, 0), "bad-oracle-bond-height");
     db[1].nBondHeight = H - 10;
 
-    // fix priors mismatch: the DB moved after signing
+    // Gram-notes release: a fix that moved after signing no longer fails the submission (it binds no fix priors);
+    // the observations come out as signed.
     CGoldFix fixLive;
     fixLive.nRaw = 810000000;
     fixLive.nBraked = 805000000;
     fixLive.nFixHeight = H - 1;
-    BOOST_CHECK_EQUAL(Run(sub1, fixLive, 0), "bad-oracle-priors-mismatch");
+    BOOST_CHECK_EQUAL(Run(sub1, fixLive, 0), "");
+    BOOST_CHECK_EQUAL(nPrice, 800000000U);
     // own-stamp prior mismatch
     db[1].nLastSubmitHeight = H - 3;
     BOOST_CHECK_EQUAL(Run(sub1, fixNull, 0), "bad-oracle-priors-mismatch");
@@ -612,14 +625,14 @@ BOOST_AUTO_TEST_CASE(oracle_contextual_gates)
         CValidationState state;
         COracleSubmitter subTmp;
         bool fTmp = false;
-        uint64_t nTmp = 0;
+        std::vector<COracleObs> vTmp;
         auto fnForked = [&](uint32_t nH, uint256& hashOut) {
             if ((int)nH > H + 2) return false;
             hashOut = uint256S("0xf0f0");   // a different branch entirely
             return true;
         };
         BOOST_CHECK(!CheckOracleOperation(CTransaction(sub1), state, H + 1, fnForked,
-                                          fnGet, fnHaveKey, fixNull, 0, subTmp, fTmp, nTmp));
+                                          fnGet, fnHaveKey, 0, subTmp, fTmp, vTmp));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-oracle-branch");
     }
 
@@ -628,10 +641,10 @@ BOOST_AUTO_TEST_CASE(oracle_contextual_gates)
         CValidationState state;
         COracleSubmitter subTmp;
         bool fTmp = false;
-        uint64_t nTmp = 0;
+        std::vector<COracleObs> vTmp;
         auto fnNoAnchor = [](uint32_t, uint256&) { return false; };
         BOOST_CHECK(!CheckOracleOperation(CTransaction(sub1), state, H, fnNoAnchor,
-                                          fnGet, fnHaveKey, fixNull, 0, subTmp, fTmp, nTmp));
+                                          fnGet, fnHaveKey, 0, subTmp, fTmp, vTmp));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-oracle-branch");
     }
 

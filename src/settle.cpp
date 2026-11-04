@@ -45,13 +45,14 @@ uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevou
     ss << x.nPrevLastSettleHeightA;
     ss << x.nPrevLastSettleHeightB;
     ss << x.nExpiryHeight;
+    ss << x.nPriceHeight;   // gram-notes release: the price the residual's band is read at
     ss << hashPrevouts;   // coins consumed on connect - the MINT-replay lesson
     ss << hashOutputs;    // pins the residual destination + the whole output set
     return ss.GetHash();
 }
 
 bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
-                          uint8_t nMode, CAmount amountResidual)
+                          uint8_t nMode, CAmount amountResidual, uint64_t nSatsPerGram)
 {
     // Hard-bound the envelope regardless of caller discipline.
     if (nUnitsANotes > SETTLE_MAX_UNITS || nUnitsBNotes > SETTLE_MAX_UNITS)
@@ -68,12 +69,14 @@ bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
     if ((CAmount)dU < SETTLE_MIN_RESIDUAL)
         return false;
 
-    // |dU|*(10^4 - band) <= residual*10^4 <= |dU|*(10^4 + band), all u128:
-    // dU <= 3*MAX_MONEY < 2^53 and (10^4 + band) < 2^14, so each product
-    // < 2^67 - far inside the 128-bit envelope (named ceiling: SETTLE_MAX_UNITS).
-    const unsigned __int128 lo = (unsigned __int128)dU * (10000 - SETTLE_PAR_BAND_BPS);
-    const unsigned __int128 hi = (unsigned __int128)dU * (10000 + SETTLE_PAR_BAND_BPS);
-    const unsigned __int128 res = (unsigned __int128)(uint64_t)amountResidual * 10000;
+    // Gram-notes release: dU is mg; the residual is sats. Without a price (the context-free shape check) only the
+    // structure above is checked; with one, |dU| at the price in sats, +/- the band:
+    // |dU|*price*(10^4 - band) <= residual*10^4*1000 <= |dU|*price*(10^4 + band), all u128 (dU < 2^53, price < 2^53).
+    if (nSatsPerGram == 0)
+        return true;
+    const unsigned __int128 lo = (unsigned __int128)dU * nSatsPerGram * (10000 - SETTLE_PAR_BAND_BPS);
+    const unsigned __int128 hi = (unsigned __int128)dU * nSatsPerGram * (10000 + SETTLE_PAR_BAND_BPS);
+    const unsigned __int128 res = (unsigned __int128)(uint64_t)amountResidual * 10000 * 1000;
     return lo <= res && res <= hi;
 }
 
@@ -128,6 +131,7 @@ uint256 SettleNetSigHash(const SettleNet& n, const uint256& hashPrevouts, const 
     ss << n.vPresentKey;
     ss << n.vBundle;
     ss << n.nExpiryHeight;
+    ss << n.nPriceHeight;
     ss << hashPrevouts;
     ss << hashOutputs;
     return ss.GetHash();
@@ -303,7 +307,7 @@ static bool CheckSettleNetShape(const CTransaction& tx, CValidationState& state)
                 return state.DoS(100, false, REJECT_INVALID, "bad-settle-net-receive");
             continue;
         }
-        if (!SettleResidualInBand((uint64_t)vNet[i], 0, 1, n.vReceive[i]))
+        if (!SettleResidualInBand((uint64_t)vNet[i], 0, 1, n.vReceive[i], 0))   // the band itself needs the price
             return state.DoS(100, false, REJECT_INVALID, "bad-settle-band");
         if (nOut >= tx.vout.size() || !IsSettleP2PKHShape(tx.vout[nOut].scriptPubKey) ||
                 tx.vout[nOut].nValue != n.vReceive[i])
@@ -363,7 +367,7 @@ bool CheckSettleTransactionShape(const CTransaction& tx, CValidationState& state
     if (x.nMode > 1 || (x.nMode == 1) != (dU != 0) ||
             (x.nMode == 0 && x.amountResidual != 0))
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-mode");
-    if (!SettleResidualInBand(x.nUnitsANotes, x.nUnitsBNotes, x.nMode, x.amountResidual))
+    if (!SettleResidualInBand(x.nUnitsANotes, x.nUnitsBNotes, x.nMode, x.amountResidual, 0))   // band: contextual
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-band");
 
     // Mode 1: the residual output is pinned at vout[0], P2PKH, exact value.

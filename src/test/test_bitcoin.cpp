@@ -4,6 +4,9 @@
 
 #include <test/test_bitcoin.h>
 
+#include <house.h>
+#include <issued.h>
+
 #include <chainparams.h>
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
@@ -53,10 +56,21 @@ BasicTestingSetup::BasicTestingSetup(const std::string& chainName)
         fCheckBlockIndex = true;
         SelectParams(chainName);
         noui_connect();
+        // Gram-notes release: the issuing caps count a house's gold vaults. The older unit tests build houses with
+        // ECX escrow and attested ECX reserves; emulate the pre-gram caps from those (capital cap lambda x escrow,
+        // till cap 10 x attested reserves), so their boundaries keep their meaning.
+        g_nPayoutPriceTestOverride = 1000;   // 1 mg = 1 sat: the older payment tests' arithmetic
+        g_fnGoldForChecksTestOverride = [](const CHouse& house, int, CGoldCount& count) {
+            const uint32_t nTierIdx = house.nTier <= MAX_HOUSE_TIER ? house.nTier : 0;
+            count.nCapitalMg = (uint64_t)((unsigned __int128)HOUSE_LAMBDA_X10[nTierIdx] * (uint64_t)house.ActiveEscrow() / 100);
+            count.nTillMg = (uint64_t)house.amountLastAttestReserves / 5;
+        };
 }
 
 BasicTestingSetup::~BasicTestingSetup()
 {
+        g_fnGoldForChecksTestOverride = nullptr;
+        g_nPayoutPriceTestOverride = 0;
         ECC_Stop();
 }
 

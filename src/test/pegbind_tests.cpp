@@ -618,6 +618,36 @@ PEGBIND_BOTH_LAYOUTS(honest_deposit_block)
     BOOST_CHECK_EQUAL(TipForTest()->nHeight, 2);
 }
 
+// Gram-notes release (scope 7h): a chain restarted on an L1 whose treasury has a history credits only the treasury
+// changes from its deposit start height. A block carrying a record from an L1 block below it is refused
+// (bad-deposit-l1); one at the start connects. (deposit_start_roundtrip covers the builder on a real stack.)
+PEGBIND_BOTH_LAYOUTS(deposit_start_height_rule)
+{
+    PegChain chain(layout, scriptCoinbase);
+    const TestKey alice;
+    const uint256 hashL1a = ArithToUint256(arith_uint256(0xb1));   // L1 height 1
+    const uint256 hashL1b = ArithToUint256(arith_uint256(0xb2));   // L1 height 2: the start
+    const uint256 hashE1 = ArithToUint256(arith_uint256(0xe5)), hashE2 = ArithToUint256(arith_uint256(0xe6));
+    MainCacheScope cache({ArithToUint256(arith_uint256(0xb0)), hashL1a, hashL1b, hashE1, hashE2});
+    struct StartScope {
+        StartScope() { UpdateDepositStartL1Height(2); }
+        ~StartScope() { UpdateDepositStartL1Height(0); }
+    } start;
+
+    uint32_t nBurn1 = 0;
+    const CMutableTransaction dtx1 = MakeDepositTx(layout, {COutPoint(ArithToUint256(arith_uint256(0xd5)), 0)},
+                                                   5 * COIN, alice.strAddress, nBurn1);
+    const SidechainDeposit dOld = MakeDepositRecord(dtx1, nBurn1, alice.strAddress, 5 * COIN, hashL1a);
+    L1ListsDeposit(chain.oracle, dOld, 5 * COIN, 0);
+    chain.Reject(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, dOld); }), hashE1),
+                 "bad-deposit-l1", "a deposit one L1 block below the start");
+
+    const SidechainDeposit dNew = MakeDepositRecord(dtx1, nBurn1, alice.strAddress, 5 * COIN, hashL1b);
+    L1ListsDeposit(chain.oracle, dNew, 5 * COIN, 0);
+    chain.Connect(OnL1(chain.Block({}, [&](CMutableTransaction& cb) { AddDepositToCoinbase(cb, dNew); }), hashE2),
+                  "a deposit at the start");
+}
+
 // P3 step 1: an honest bundle block connects in both layouts, and the next
 // block commits to it in its header and coinbase. The fail commit that ends
 // it goes through the L1Oracle seam: UNKNOWN is a state.Error (not marked,
@@ -1333,13 +1363,17 @@ BOOST_AUTO_TEST_CASE(c1_bmm_three_answers)
     }
     BOOST_CHECK_EQUAL(BmmVerdict(block), "no:no-prev-commit:100");
 
-    // During -reindex / -loadblock / replay the list is filled to the
-    // enforcer's tip first: an L1 block missing from it is off the L1's main
-    // chain, a definite no (the import reader stops a file at a state.Error)
+    // During -reindex / -loadblock / replay an L1 block missing from the list
+    // is refreshed for, and judged by its height (gram-notes release, inbox
+    // note 2026-10-27; replay_l1_behind_or_side_branch below). With no L1 to
+    // refresh from, it can't tell: nothing is marked.
     block = Block(ArithToUint256(arith_uint256(0xa9)), hashE);
     const bool fReindexSaved = fReindex;
+    const int nTriesSaved = g_nImportL1WaitTries;
     fReindex = true;
-    BOOST_CHECK_EQUAL(BmmVerdict(block), "no:bad-mc-prev:0");
+    g_nImportL1WaitTries = 1;
+    BOOST_CHECK_EQUAL(BmmVerdict(block), "cant-tell");
+    g_nImportL1WaitTries = nTriesSaved;
     fReindex = fReindexSaved;
 }
 
@@ -1609,6 +1643,25 @@ struct FakeL1Client : public L1Client {
         hashBlock = vChain[nHeight];
         return true;
     }
+    // Headers the L1 knows beyond its chain (side branches), and header times (replay fix tests)
+    std::map<uint256, int> mapHeight;
+    std::map<uint256, uint32_t> mapHeaderTime;
+    bool GetBlockHeight(const uint256& hashBlock, int& nHeight) override
+    {
+        for (size_t h = 0; h < vChain.size(); h++)
+            if (vChain[h] == hashBlock) { nHeight = (int)h; return true; }
+        auto it = mapHeight.find(hashBlock);
+        if (it == mapHeight.end()) return false;
+        nHeight = it->second;
+        return true;
+    }
+    bool GetBlockTime(const uint256& hashBlock, uint32_t& nTime) override
+    {
+        auto it = mapHeaderTime.find(hashBlock);
+        if (it == mapHeaderTime.end()) return false;
+        nTime = it->second;
+        return true;
+    }
     bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override
     {
         vHash.clear();
@@ -1633,6 +1686,86 @@ struct FakeL1Client : public L1Client {
     bool HaveSpentWithdrawalBundle(const uint256&) override { return false; }
     bool HaveFailedWithdrawalBundle(const uint256&) override { return false; }
 };
+
+// Gram-notes release (inbox note 2026-10-27): a block replay after an unclean stop marked a good block invalid when
+// the L1 came back a block behind it. Now an L1 block missing from the list just refreshed from the L1 is a definite
+// no only when its height (the coinbase's commit of its parent, on the list, plus one) is at or below the list's tip;
+// above it the L1 hasn't got there yet: can't tell, nothing marked.
+BOOST_AUTO_TEST_CASE(replay_l1_behind_or_side_branch)
+{
+    FakeL1Client l1;
+    TestL1Oracle oracle;
+    const uint256 hashG = ArithToUint256(arith_uint256(0xc3000)), hashP = ArithToUint256(arith_uint256(0xc3001)),
+                  hashE = ArithToUint256(arith_uint256(0xc3002)), hashX = ArithToUint256(arith_uint256(0xc3012)),
+                  hashF = ArithToUint256(arith_uint256(0xc3003));
+    oracle.mapTime[hashE] = 1790001200;
+    CBlock block;
+    block.hashPrevBlock = ArithToUint256(arith_uint256(0x5d));
+    block.hashMainchainBlock = hashE;
+    block.nTime = 1790001200;
+    block.hashMerkleRoot = ArithToUint256(arith_uint256(0xb900));
+    {
+        CMutableTransaction cb;
+        cb.vin.resize(1);
+        cb.vin[0].prevout.SetNull();
+        cb.vout.push_back(CTxOut(0, GeneratePrevBlockCommit(hashP, block.hashPrevBlock)));
+        block.vtx.push_back(MakeTransactionRef(std::move(cb)));
+    }
+    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::YES;   // the enforcer keeps old answers
+    const bool fReindexSaved = fReindex;
+    const int nTriesSaved = g_nImportL1WaitTries;
+    fReindex = true;
+    g_nImportL1WaitTries = 1;
+
+    // The L1 came back at P: E (P's child) is above its tip - wait, mark nothing
+    l1.vChain = {hashG, hashP};
+    {
+        MainCacheScope cache({hashG, hashP});
+        BOOST_CHECK_EQUAL(BmmVerdict(block), "cant-tell");
+    }
+    // The L1's main chain holds another block at E's height: E is on a side branch
+    l1.vChain = {hashG, hashP, hashX, hashF};
+    {
+        MainCacheScope cache({hashG, hashP});
+        BOOST_CHECK_EQUAL(BmmVerdict(block), "no:bad-mc-prev:0");
+    }
+    // The L1 caught up: the refresh puts E on the list and the block passes
+    l1.vChain = {hashG, hashP, hashE};
+    {
+        MainCacheScope cache({hashG, hashP});
+        BOOST_CHECK_EQUAL(BmmVerdict(block), "yes");
+    }
+    // The parent the coinbase commits to isn't on the list either: the L1's header of E gives its height
+    // (review 11-04: this fallback had no test). E's header at height 2, the L1's main chain at 3: a side branch.
+    const uint256 hashQ = ArithToUint256(arith_uint256(0xc3021));   // the committed parent, unknown
+    CBlock block2 = block;
+    {
+        CMutableTransaction cb(*block2.vtx[0]);
+        cb.vout[0] = CTxOut(0, GeneratePrevBlockCommit(hashQ, block2.hashPrevBlock));
+        block2.vtx[0] = MakeTransactionRef(std::move(cb));
+        block2.hashMerkleRoot = ArithToUint256(arith_uint256(0xb901));
+    }
+    l1.vChain = {hashG, hashP, hashX, hashF};
+    l1.mapHeight[hashE] = 2;
+    {
+        MainCacheScope cache({hashG, hashP});
+        BOOST_CHECK_EQUAL(BmmVerdict(block2), "no:bad-mc-prev:0");
+    }
+    // Neither E nor its parent known to the L1: can't tell, until the L1's tip is two hours past the block's time
+    l1.mapHeight.clear();
+    l1.mapHeaderTime[hashF] = block2.nTime + 3600;
+    {
+        MainCacheScope cache({hashG, hashP});
+        BOOST_CHECK_EQUAL(BmmVerdict(block2), "cant-tell");
+    }
+    l1.mapHeaderTime[hashF] = block2.nTime + 3 * 3600;
+    {
+        MainCacheScope cache({hashG, hashP});
+        BOOST_CHECK_EQUAL(BmmVerdict(block2), "no:bad-mc-prev:0");
+    }
+    g_nImportL1WaitTries = nTriesSaved;
+    fReindex = fReindexSaved;
+}
 
 BOOST_AUTO_TEST_CASE(c2_lower_l1_tip_on_same_chain_is_not_a_reorg)
 {

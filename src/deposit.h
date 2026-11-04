@@ -141,8 +141,10 @@ struct DepositWithdraw {
     uint32_t nHouseID;
     std::vector<unsigned char> vchHolderPubKey;           // must hash to the burned receipt input; receives payout
     std::vector<unsigned char> vchHolderSig;
+    // Gram-notes release: the height whose payout price values the sECX paid (at most nPriceBackBlocks back).
+    uint32_t nPriceHeight;
 
-    DepositWithdraw() : nHouseID(0) {}
+    DepositWithdraw() : nHouseID(0), nPriceHeight(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -151,6 +153,7 @@ struct DepositWithdraw {
         READWRITE(nHouseID);
         READWRITE(vchHolderPubKey);
         READWRITE(vchHolderSig);
+        READWRITE(nPriceHeight);
     }
 };
 
@@ -265,8 +268,9 @@ struct DepositDischarge {
     std::vector<unsigned char> vchPayoutScript;
     std::vector<unsigned char> vchPreAuthSig;
     uint32_t nPrevProtestOpen;
+    uint32_t nPriceHeight;   // gram-notes release: as DepositWithdraw
 
-    DepositDischarge() : nHouseID(0), nPrevProtestOpen(0) {}
+    DepositDischarge() : nHouseID(0), nPrevProtestOpen(0), nPriceHeight(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -277,6 +281,7 @@ struct DepositDischarge {
         READWRITE(vchPayoutScript);
         READWRITE(vchPreAuthSig);
         READWRITE(nPrevProtestOpen);
+        READWRITE(nPriceHeight);
     }
 };
 

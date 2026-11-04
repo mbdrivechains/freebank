@@ -1966,6 +1966,47 @@ void CConnman::ThreadOpenAddedConnections()
 }
 
 // if successful, this moves the passed grant to the constructed node
+void CConnman::NoteInvalidHeaderPeer(const CNode* pnode)
+{
+    const int64_t nNow = GetTime();
+    LOCK(cs_invalidHeaderBackoff);
+    // By address and by the name it was dialled as, once each (for an addrman peer both are the address).
+    std::vector<std::string> vKey{pnode->addr.ToStringIPPort()};
+    const std::string strName = pnode->GetAddrName();
+    if (!strName.empty() && strName != vKey.front())
+        vKey.push_back(strName);
+    for (const std::string& strKey : vKey) {
+        if (strKey.empty())
+            continue;
+        std::pair<int64_t, int64_t>& entry = mapInvalidHeaderBackoff[strKey];
+        entry = NextInvalidHeaderBackoff(entry, nNow);
+        LogPrintf("peer %s announced a block we hold as invalid: not redialling it for %d s\n", strKey, entry.second);
+    }
+    // Keep the map small: drop entries long expired.
+    for (auto it = mapInvalidHeaderBackoff.begin(); it != mapInvalidHeaderBackoff.end();) {
+        if (nNow > it->second.first + 2 * it->second.second + 3600)
+            it = mapInvalidHeaderBackoff.erase(it);
+        else
+            ++it;
+    }
+}
+
+std::pair<int64_t, int64_t> CConnman::NextInvalidHeaderBackoff(const std::pair<int64_t, int64_t>& entry, int64_t nNow)
+{
+    // A repeat soon after the last back-off ended (within twice its length) doubles it, up to an hour; otherwise
+    // start again at 60 s.
+    const bool fRepeat = entry.second > 0 && nNow < entry.first + 2 * entry.second;
+    const int64_t nBackoff = fRepeat ? std::min<int64_t>(entry.second * 2, 3600) : 60;
+    return {nNow + nBackoff, nBackoff};
+}
+
+bool CConnman::InInvalidHeaderBackoff(const std::string& strKey)
+{
+    LOCK(cs_invalidHeaderBackoff);
+    auto it = mapInvalidHeaderBackoff.find(strKey);
+    return it != mapInvalidHeaderBackoff.end() && GetTime() < it->second.first;
+}
+
 void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant *grantOutbound, const char *pszDest, bool fOneShot, bool fFeeler, bool manual_connection)
 {
     //
@@ -1977,6 +2018,10 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
     if (!fNetworkActive) {
         return;
     }
+    // Automatic dials only: an operator's -connect, -addnode or addnode onetry always goes (it may follow a
+    // reconsiderblock).
+    if (!manual_connection && InInvalidHeaderBackoff(pszDest ? std::string(pszDest) : addrConnect.ToStringIPPort()))
+        return;
     if (!pszDest) {
         if (IsLocal(addrConnect) ||
             FindNode(static_cast<CNetAddr>(addrConnect)) || IsBanned(addrConnect) ||

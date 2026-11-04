@@ -1426,8 +1426,10 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
                 break;   // can't happen (see above); take the full path
             if (mi->second->nStatus & BLOCK_FAILED_MASK) {
                 LogPrint(BCLog::NET, "peer=%d: invalid header received (known invalid)\n", pfrom->GetId());
-                if (punish_duplicate_invalid)
+                if (punish_duplicate_invalid) {
                     pfrom->fDisconnect = true;
+                    connman->NoteInvalidHeaderPeer(pfrom);   // gram-notes release: and don't redial it straight away
+                }
                 return false;
             }
             pindexLast = mi->second;
@@ -1479,6 +1481,8 @@ bool static ProcessHeadersMessage(CNode *pfrom, CConnman *connman, const std::ve
                 // with ours (eg block->nVersion softforks, MTP violations,
                 // etc), and not just the duplicate-invalid case.
                 pfrom->fDisconnect = true;
+                // Gram-notes release: and don't redial it straight away.
+                connman->NoteInvalidHeaderPeer(pfrom);
             }
             return false;
         }

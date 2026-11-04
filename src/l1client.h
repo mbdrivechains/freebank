@@ -177,6 +177,11 @@ public:
     virtual bool GetWorkScore(const uint256& hash, int& nWorkScore) = 0;
     virtual bool ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle) = 0;
     virtual bool GetBlockHash(int nHeight, uint256& hashBlock) = 0;
+    /** Gram-notes release (replay fix): the height of L1 block hashBlock, on the main chain or not, if the L1 knows
+     *  its header (the enforcer keeps the headers of blocks it disconnected). False when it can't say. */
+    virtual bool GetBlockHeight(const uint256& hashBlock, int& nHeight) { return false; }
+    /** Gram-notes release (replay fix): the header time of L1 block hashBlock, if the L1 knows its header. */
+    virtual bool GetBlockTime(const uint256& hashBlock, uint32_t& nTime) { return false; }
 
     /**
      * Batched backward walk for cold header-cache sync: up to nMax hashes

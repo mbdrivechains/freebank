@@ -174,6 +174,12 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     void SetNetworkActive(bool active);
     void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant *grantOutbound = nullptr, const char *strDest = nullptr, bool fOneShot = false, bool fFeeler = false, bool manual_connection = false);
+    /** Gram-notes release (inbox note 2026-10-27): a peer dropped for announcing a block we hold as invalid is not
+     *  redialled for a while (60 s, doubling per repeat to an hour), by its address and by the name it was dialled
+     *  as. Before, a node that had marked a good block invalid redialled its only seed every 2 s for 11 hours. */
+    void NoteInvalidHeaderPeer(const CNode* pnode);
+    /** The schedule: entry = (redial after, back-off s) from the last time, {0, 0} if none. Returns the new entry. */
+    static std::pair<int64_t, int64_t> NextInvalidHeaderBackoff(const std::pair<int64_t, int64_t>& entry, int64_t nNow);
     bool CheckIncomingNonce(uint64_t nonce);
 
     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func);
@@ -393,6 +399,9 @@ private:
     CCriticalSection cs_vOneShots;
     std::vector<std::string> vAddedNodes GUARDED_BY(cs_vAddedNodes);
     CCriticalSection cs_vAddedNodes;
+    CCriticalSection cs_invalidHeaderBackoff;
+    std::map<std::string, std::pair<int64_t, int64_t>> mapInvalidHeaderBackoff;   // key -> (redial after, back-off s)
+    bool InInvalidHeaderBackoff(const std::string& strKey);
     std::vector<CNode*> vNodes;
     std::list<CNode*> vNodesDisconnected;
     mutable CCriticalSection cs_vNodes;

@@ -7,6 +7,7 @@
 #include <bill.h>
 #include <deposit.h>
 #include <house.h>
+#include <issued.h>
 #include <note.h>
 #include <oracle.h>
 #include <pool.h>
@@ -223,6 +224,16 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
             // Pool outputs (Phase 3.7) self-tag from the payload via the single
             // shared tagger - connect == rollforward == mempool by construction.
             ApplyPoolCoinTags(tx, i, coin);
+
+            // Issued-token units (gram-notes release) self-tag from the annex, the same way; an issuer BOND's
+            // vout[0] is bond escrow (the shape check pinned its script), tagged like the oracle bond.
+            ApplyIssuedCoinTags(tx, i, coin);
+            if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_BOND && i == 0)
+                coin.SetOracleBond();
+            // A token pool op's custody pair (vout[0] token, vout[1] sats; the shape check pinned the script) is
+            // escrow too: the pool script is anyone-can-spend, the tag its protection.
+            if (tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) && i < 2)
+                coin.SetOracleBond();
 
             // Oracle bond escrow (Phase G-1) self-tags from the tx alone: the
             // shape gate pinned vout[0] of every BOND as the bond script, so

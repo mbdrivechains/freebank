@@ -3,6 +3,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <pool.h>
+#include <chainparams.h>  // UpdateNotePoolHeight
+#include <limits>
 
 #include <bill.h>           // BillHashOutputs
 #include <coins.h>
@@ -29,7 +31,15 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                         CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired);
 
-BOOST_FIXTURE_TEST_SUITE(pool_tests, BasicTestingSetup)
+// Gram-notes release: house note pools are closed on every network until a later release sets nNotePoolHeight
+// (D-2026-10-31-8 item 9). These tests exercise the pool rules, so they open the pools; pool_closed_until_height
+// checks the closure itself.
+struct NotePoolsOpenSetup : public BasicTestingSetup {
+    NotePoolsOpenSetup() { UpdateNotePoolHeight(0); }
+    ~NotePoolsOpenSetup() { UpdateNotePoolHeight(std::numeric_limits<int>::max()); }
+};
+
+BOOST_FIXTURE_TEST_SUITE(pool_tests, NotePoolsOpenSetup)
 
 //
 // T-c1: pure math + record + DB. No tx surface yet.
@@ -1368,6 +1378,26 @@ static std::string PoolCtxRetire(const CMutableTransaction& mtx, int nHeight,
     return state.GetRejectReason();
 }
 
+BOOST_AUTO_TEST_CASE(pool_closed_until_height)
+{
+    // Every house note pool op is refused below nNotePoolHeight, before any payload or DB check.
+    const auto fnNoPool = [](uint32_t, CPool&) { return false; };
+    const auto fnNoHouse = [](uint32_t, CHouse&) { return false; };
+    for (uint8_t op : {POOL_OP_CREATE, POOL_OP_ADD_LIQ, POOL_OP_REMOVE_LIQ, POOL_OP_SWAP, POOL_OP_RETIRE}) {
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_POOL_VERSION;
+        mtx.nPoolOp = op;
+        CPool poolOut;
+        UpdateNotePoolHeight(500);
+        BOOST_CHECK_EQUAL(PoolCtxReject(mtx, 499, fnNoPool, fnNoHouse, poolOut), "bad-pool-closed");
+        // At the height the closure no longer applies: the op fails on its own checks instead.
+        BOOST_CHECK(PoolCtxReject(mtx, 500, fnNoPool, fnNoHouse, poolOut) != "bad-pool-closed");
+        UpdateNotePoolHeight(std::numeric_limits<int>::max());
+        BOOST_CHECK_EQUAL(PoolCtxReject(mtx, 1000000, fnNoPool, fnNoHouse, poolOut), "bad-pool-closed");
+        UpdateNotePoolHeight(0);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(pool_contextual_create)
 {
     CKey partnerKey, creatorKey;
@@ -1430,9 +1460,10 @@ BOOST_AUTO_TEST_CASE(pool_contextual_create)
     auto fnNoHouse = [](uint32_t, CHouse&) { return false; };
     BOOST_CHECK_EQUAL(PoolCtxReject(mtx, 1100, fnNoPool, fnNoHouse, poolOut), "bad-pool-unknown-house");
 
-    // Not effectively Open (missed attestation cadence -> derived Stressed).
+    // Not effectively Open (gram-notes release: a live protest - an unpaid demand - is what stresses a house now).
     CHouse houseStale = houseOpen;
-    houseStale.nLastAttestHeight = 100;
+    houseStale.nProtestOpen = 1;
+    houseStale.nProtestHeight = 1000;
     auto fnGetStale = [&](uint32_t nID, CHouse& h) {
         if (nID != 7) return false;
         h = houseStale;

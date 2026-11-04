@@ -7,6 +7,7 @@
 
 #include <bill.h>
 #include <house.h>
+#include <issued.h>
 #include <note.h>
 #include <deposit.h>
 #include <oracle.h>
@@ -1018,6 +1019,14 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
             // ATMP guard, so real tags cannot enable a premature chain.
             if (ptx->nVersion == TRANSACTION_POOL_VERSION)
                 ApplyPoolCoinTags(*ptx, outpoint.n, coin);
+            // Issued-token units (gram-notes release): an unconfirmed coin carries its annex's units, so a child can
+            // spend it with its units counted.
+            ApplyIssuedCoinTags(*ptx, outpoint.n, coin);
+            // An unconfirmed issuer bond stays tagged: the bond script is anyone-can-spend, the tag its protection.
+            if (ptx->nVersion == TRANSACTION_TOKEN_VERSION && ptx->nIssuedOp == ISSUED_OP_BOND && outpoint.n == 0)
+                coin.SetOracleBond();
+            if (ptx->nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(ptx->nIssuedOp) && outpoint.n < 2)
+                coin.SetOracleBond();   // a pool's unconfirmed custody pair: the next swap can chain on it
 
             // Oracle bond escrow (Phase G-1) stays tagged while unconfirmed for
             // the sharpest version of the reason bills/houses do: the bond script

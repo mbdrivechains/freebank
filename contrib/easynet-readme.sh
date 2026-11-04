@@ -11,16 +11,13 @@ The same source as FreeBank v$VER, built with \`configure --with-easynet\`: its 
 mbdrivechains' CPU-mined test network with eCash's rules (L1 magic ea5e4e04, reset 4, release easynet-4 or later).
 Not for beta or mainnet.
 
-- FreeBank network magic fb4bea03, P2P port 28455, RPC port 28454, data directory \`easynet\`.
+- FreeBank network magic fb4bea05, P2P port 28455, RPC port 28454, data directory \`easynet\`.
 - Fixed seed 163.47.9.132:28455. The easynet L1 node is reachable at 163.47.9.132:28533.
 - Run it against an easynet L1 node and enforcer (slot 130, \`--fork=ecash\`): github.com/mbdrivechains/bitcoin,
   releases easynet-N.
-- Upgrading from an earlier FreeBank easynet build: swap the binaries and keep the data directory (no \`-reindex\`).
-  Deposits the earlier build left uncredited are credited in the next block. Don't start a fresh FreeBank chain on
-  an L1 whose treasury has already paid a withdrawal: it would credit every deposit again.
-- From FreeBank block 600 (v1.0.2 and later), a credit transaction's input signatures also cover its operation and
-  payload. Upgrade every node and wallet before 600. Until then an upgraded node and wallet take no credit
-  transaction (\`credit-binding-not-active\`). A node still on an earlier build at 600 rejects the first such block:
-  after upgrading, \`reconsiderblock\` it or restart with \`-reindex\`. A credit transaction an earlier wallet signed
-  and that is still pending at 600 can never confirm: \`abandontransaction\` it.
+- **v1.1.0 (gram notes) starts a new FreeBank-easynet chain** on the same L1: a new genesis and magic (was
+  fb4bea03). Start from an empty data directory; move the old one aside. The new chain credits only slot-130 treasury
+  changes in L1 blocks from 1,100: the treasury's money before it belongs to the old chain (a fresh chain would
+  otherwise credit every deposit again after its withdrawals were paid). Credit signatures bind from genesis.
+- Upgrading between builds of the same chain: swap the binaries and keep the data directory (no \`-reindex\`).
 EOF

@@ -29,10 +29,7 @@ uint256 OracleSubmitSigHash(const OracleSubmit& x, const uint256& hashPrevouts,
     ss << std::string("FreeBankOracle/submit");
     ss << x.nSubmitterID;
     ss << x.nTargetHeight;
-    ss << x.nPriceMilligrams;
-    ss << x.nPrevRaw;
-    ss << x.nPrevBraked;
-    ss << x.nPrevFixHeight;
+    ss << x.vObs;
     ss << x.nPrevOwnLastSubmitHeight;
     ss << x.hashPrevBlockBind;   // branch bind [C-5]: a reorg invalidates the sig
     ss << hashPrevouts;          // R-i6: bind prevouts wherever a payload sig authorizes
@@ -138,16 +135,36 @@ bool CheckOracleTransactionShape(const CTransaction& tx, CValidationState& state
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-submitter-id");
         if (x.nTargetHeight == 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-target-height");
-        if (x.nPriceMilligrams < ORACLE_PRICE_MIN || x.nPriceMilligrams > ORACLE_PRICE_MAX)
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-price-range");
-        // Prior views obey the same envelope; genesis binding is consistent
-        // context-free: no fix yet iff both prev views are zero [C-4].
-        if ((x.nPrevFixHeight == 0) != (x.nPrevRaw == 0 && x.nPrevBraked == 0))
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-genesis-priors");
-        if (x.nPrevFixHeight != 0 &&
-            (x.nPrevRaw < ORACLE_PRICE_MIN || x.nPrevRaw > ORACLE_PRICE_MAX ||
-             x.nPrevBraked < ORACLE_PRICE_MIN || x.nPrevBraked > ORACLE_PRICE_MAX))
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-prior-range");
+        // Gram-notes release: the observations. At least one, at most MAX_ORACLE_OBS, sorted by (stream, subject)
+        // with no repeat; a price stream has no subject and its value is in the price envelope; a token stream names
+        // its token.
+        if (x.vObs.empty() || x.vObs.size() > MAX_ORACLE_OBS)
+            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-obs-count");
+        for (size_t k = 0; k < x.vObs.size(); k++) {
+            const COracleObs& o = x.vObs[k];
+            if (k > 0) {
+                const COracleObs& p = x.vObs[k - 1];
+                if (o.nStream < p.nStream || (o.nStream == p.nStream && !(p.subject < o.subject)))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-oracle-obs-order");
+            }
+            switch (o.nStream) {
+            case ORACLE_STREAM_GOLD_ECX:
+            case ORACLE_STREAM_GOLD_USD:
+                if (!o.subject.IsNull() || o.nValue < ORACLE_PRICE_MIN || o.nValue > ORACLE_PRICE_MAX || o.nAux || o.nAux2)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-oracle-price-range");
+                break;
+            case ORACLE_STREAM_BACKING:
+                if (o.subject.IsNull() || o.nValue > (uint64_t)MAX_MONEY || o.nAux == 0)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-oracle-backing-obs");
+                break;
+            case ORACLE_STREAM_CLAIM:
+                if (o.subject.IsNull() || o.nValue != 1 || o.nAux == 0 || o.nAux2)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-oracle-claim-obs");
+                break;
+            default:
+                return state.DoS(100, false, REJECT_INVALID, "bad-oracle-obs-stream");
+            }
+        }
         if (!IsWellFormedSig(x.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig");
         return true;

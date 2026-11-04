@@ -5,6 +5,7 @@
 #include <consensus/tx_verify.h>
 
 #include <asset.h>
+#include <issued.h>
 
 #include <bill.h>
 #include <house.h>
@@ -191,6 +192,13 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
             return state.DoS(100, false, REJECT_INVALID, "bad-asset-genesis-coinbase");
         std::string strReason;
         if (!CheckAssetGenesisShape(tx, strReason))
+            return state.DoS(100, false, REJECT_INVALID, strReason);
+    }
+
+    // Gram-notes release: the issued-units annex (versions 11-18) and the v18 token ops' payloads.
+    {
+        std::string strReason;
+        if (!CheckIssuedShape(tx, strReason))
             return state.DoS(100, false, REJECT_INVALID, strReason);
     }
 
@@ -453,6 +461,18 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     CScript expectedOracleBondScript;
     bool fHaveOracleBond = false;
     CAmount nOracleBondIn = 0;
+    // Gram-notes release: an issuer bond coin (IssuedBondScript) is spent only by its own token's BOND (consolidating
+    // into the new bond) or UNBOND withdrawal; ConnectIssuedTx checks the value and the delay.
+    CScript expectedIssuedBondScript;
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_BOND) {
+        IssuedBond ib;
+        if (DecodeIssuedPayload(tx.vchIssuedPayload, ib))
+            expectedIssuedBondScript = IssuedBondScript(ib.tokenID);
+    } else if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_UNBOND) {
+        IssuedUnbond iu;
+        if (DecodeIssuedPayload(tx.vchIssuedPayload, iu) && iu.fWithdraw)
+            expectedIssuedBondScript = IssuedBondScript(iu.tokenID);
+    }
     if (tx.nVersion == TRANSACTION_ORACLE_VERSION && tx.nOracleOp == ORACLE_OP_BOND) {
         OracleBond ob;
         if (DecodeOraclePayload(tx.vchOraclePayload, ob)) {
@@ -630,7 +650,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nHouseEscrowIn++;
         }
         else if (tx.nVersion == TRANSACTION_HOUSE_VERSION &&
-                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow)) {
+                ((coin.IsAssetColoured() && !coin.fIssued) || coin.fBill || coin.fBillEscrow)) {
+            // Gram-notes release: issued-token coins may go into a house op; CheckIssuedFlow lets only the vault ops
+            // (TOPUP, RECLAIM, TILL) take them, and only into a vault or back out as annex outputs.
             return state.DoS(100, false, REJECT_INVALID, "bad-house-colored-input");
         }
 
@@ -686,7 +708,20 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // rest. No unbond-withdraw op exists in the scaffold - deliberate,
         // the delay is decorative while inert (spec s2) - so until promotion
         // a bond leaves escrow only by consolidating into a new bond.
-        if (coin.fOracleBond) {
+        uint256 poolToken;
+        if (coin.fOracleBond && IsIssuedBondScript(coin.out.scriptPubKey)) {
+            if (expectedIssuedBondScript.empty() || coin.out.scriptPubKey != expectedIssuedBondScript)
+                return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-issuer-bond");
+        } else if (coin.fOracleBond && IsTokenPoolScript(coin.out.scriptPubKey, &poolToken)) {
+            // Gram-notes release: a token pool's custody pair is spent only by that pool's ADD / REMOVE / SWAP, the
+            // token side at vin[0] and the sats side at vin[1].
+            const bool fPoolOp = tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) &&
+                                 tx.nIssuedOp != ISSUED_OP_POOL_CREATE && IssuedPoolOpToken(tx) == poolToken;
+            if (!fPoolOp)
+                return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-pool-custody");
+            if ((coin.fIssued && i != 0) || (!coin.fIssued && i != 1))
+                return state.DoS(100, false, REJECT_INVALID, "bad-issued-pool-custody-position");
+        } else if (coin.fOracleBond) {
             if (!fHaveOracleBond)
                 return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-oracle-bond");
             if (coin.out.scriptPubKey != expectedOracleBondScript)
@@ -1438,6 +1473,13 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         AssetTags assetTags;
         std::string strReason;
         if (!ComputeAssetTags(tx, vSpentCoins, assetTags, strReason))
+            return state.DoS(100, false, REJECT_INVALID, strReason);
+    }
+
+    // Gram-notes release: issued-token units are conserved per token, and move only where an annex states them.
+    {
+        std::string strReason;
+        if (!CheckIssuedFlow(tx, vSpentCoins, strReason))
             return state.DoS(100, false, REJECT_INVALID, strReason);
     }
 

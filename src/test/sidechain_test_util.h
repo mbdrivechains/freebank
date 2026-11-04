@@ -16,6 +16,7 @@
 #include "miner.h"
 #include "sidechain.h"
 #include "txdb.h"
+#include "units.h"
 #include "uint256.h"
 #include "util.h"
 #include "validation.h"
@@ -104,7 +105,7 @@ protected:
     }
 };
 
-/** In-memory house/bill/pool/asset DBs for one test. A real connect reads
+/** In-memory house/bill/pool/asset/units DBs for one test. A real connect reads
  *  their best-block markers and flushes them; TestingSetup, under which no
  *  block ever connects, does not create them. */
 struct SideDBScope {
@@ -112,16 +113,19 @@ struct SideDBScope {
     std::unique_ptr<BillDB> bill;
     std::unique_ptr<HouseDB> house;
     std::unique_ptr<PoolDB> pool;
+    std::unique_ptr<CUnitsDB> units;
     SideDBScope()
     {
         asset.swap(passettree);
         bill.swap(pbilltree);
         house.swap(phousetree);
         pool.swap(ppooltree);
+        units.swap(punitsdb);
         passettree.reset(new BitAssetDB(1 << 20, true /* fMemory */));
         pbilltree.reset(new BillDB(1 << 20, true /* fMemory */));
         phousetree.reset(new HouseDB(1 << 20, true /* fMemory */));
         ppooltree.reset(new PoolDB(1 << 20, true /* fMemory */));
+        punitsdb.reset(new CUnitsDB(1 << 20, true /* fMemory */));
     }
     ~SideDBScope()
     {
@@ -129,6 +133,7 @@ struct SideDBScope {
         pbilltree.swap(bill);
         phousetree.swap(house);
         ppooltree.swap(pool);
+        punitsdb.swap(units);
     }
 };
 

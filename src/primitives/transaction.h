@@ -30,6 +30,69 @@ static const int TRANSACTION_DEPOSIT_VERSION = 14;   // Phase 3.8 term deposits
 static const int TRANSACTION_POOL_VERSION = 15;      // Phase 3.7 AMM pools
 static const int TRANSACTION_SETTLE_VERSION = 16;    // Phase 3.7 pt2 settlement (SETTLE_EXCHANGE)
 static const int TRANSACTION_ORACLE_VERSION = 17;    // Phase G-1 gold oracle (consensus-inert)
+static const int TRANSACTION_TOKEN_VERSION = 18;     // gram-notes release: issued tokens (issued.h)
+
+/** Gram-notes release: the versions that carry the issued-units annex (vIssuedOut) after their payload. */
+inline bool HasIssuedAnnex(int32_t nVersion)
+{
+    return nVersion >= TRANSACTION_BILL_VERSION && nVersion <= TRANSACTION_TOKEN_VERSION;
+}
+
+/** One entry of a transaction's issued-units annex (gram-notes release, issued.h): output nOut carries nUnits of the
+ *  issued token tokenID, nFrozen of them frozen. Entries are sorted by nOut, at most one per output. */
+struct CIssuedOut
+{
+    uint32_t nOut = 0;
+    uint256 tokenID;
+    uint64_t nUnits = 0;
+    uint64_t nFrozen = 0;
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nOut);
+        READWRITE(tokenID);
+        READWRITE(nUnits);
+        READWRITE(nFrozen);
+    }
+
+    friend bool operator==(const CIssuedOut& a, const CIssuedOut& b)
+    {
+        return a.nOut == b.nOut && a.tokenID == b.tokenID && a.nUnits == b.nUnits && a.nFrozen == b.nFrozen;
+    }
+};
+
+/** Gram-notes release: a move of issued-token units into (nDelta > 0) or out of (nDelta < 0) a house's gold vault in
+ *  the units DB - its owners' capital (nKind 0, per partner) or its till (nKind 1, nPartner 0). Units into a vault leave
+ *  circulation; units out of one come back as annex outputs. Sorted by (house, kind, partner, token), one entry each. */
+static const uint8_t VAULT_CAPITAL = 0;
+static const uint8_t VAULT_TILL = 1;
+struct CVaultMove
+{
+    uint32_t nHouseID = 0;
+    uint8_t nKind = 0;
+    uint32_t nPartner = 0;
+    uint256 tokenID;
+    int64_t nDelta = 0;
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nKind);
+        READWRITE(nPartner);
+        READWRITE(tokenID);
+        READWRITE(nDelta);
+    }
+
+    friend bool operator==(const CVaultMove& a, const CVaultMove& b)
+    {
+        return a.nHouseID == b.nHouseID && a.nKind == b.nKind && a.nPartner == b.nPartner && a.tokenID == b.tokenID &&
+               a.nDelta == b.nDelta;
+    }
+};
 
 /** An outpoint - a combination of a transaction hash and an index n into its vout */
 class COutPoint
@@ -308,6 +371,16 @@ inline void UnserializeTransaction(TxType& tx, Stream& s) {
         s >> tx.nOracleOp;
         s >> tx.vchOraclePayload;
     }
+
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION) {
+        s >> tx.nIssuedOp;
+        s >> tx.vchIssuedPayload;
+    }
+
+    if (HasIssuedAnnex(tx.nVersion)) {
+        s >> tx.vIssuedOut;
+        s >> tx.vVaultMove;
+    }
 }
 
 template<typename Stream, typename TxType>
@@ -385,6 +458,16 @@ inline void SerializeTransaction(const TxType& tx, Stream& s) {
         s << tx.nOracleOp;
         s << tx.vchOraclePayload;
     }
+
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION) {
+        s << tx.nIssuedOp;
+        s << tx.vchIssuedPayload;
+    }
+
+    if (HasIssuedAnnex(tx.nVersion)) {
+        s << tx.vIssuedOut;
+        s << tx.vVaultMove;
+    }
 }
 
 
@@ -401,7 +484,7 @@ public:
     // adapting relay policy by bumping MAX_STANDARD_VERSION, and then later date
     // bumping the default CURRENT_VERSION at which point both CURRENT_VERSION and
     // MAX_STANDARD_VERSION will be equal.
-    static const int32_t MAX_STANDARD_VERSION=17;
+    static const int32_t MAX_STANDARD_VERSION=18;
 
     // The local variables are made const to prevent unintended modification
     // without updating the cached hash value. However, CTransaction is not
@@ -440,6 +523,12 @@ public:
 
     const uint8_t nOracleOp;
     const std::vector<unsigned char> vchOraclePayload;
+
+    const uint8_t nIssuedOp;
+    const std::vector<unsigned char> vchIssuedPayload;
+
+    const std::vector<CIssuedOut> vIssuedOut;   // versions 11-18 (HasIssuedAnnex)
+    const std::vector<CVaultMove> vVaultMove;   // versions 11-18: moves into / out of house gold vaults
 
 private:
     /** Memory only. */
@@ -550,6 +639,12 @@ struct CMutableTransaction
 
     uint8_t nOracleOp = 0;
     std::vector<unsigned char> vchOraclePayload;
+
+    uint8_t nIssuedOp = 0;
+    std::vector<unsigned char> vchIssuedPayload;
+
+    std::vector<CIssuedOut> vIssuedOut;   // versions 11-18 (HasIssuedAnnex)
+    std::vector<CVaultMove> vVaultMove;   // versions 11-18: moves into / out of house gold vaults
 
     CMutableTransaction();
     CMutableTransaction(const CTransaction& tx);

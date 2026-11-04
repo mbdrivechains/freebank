@@ -888,19 +888,20 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
     c.nHeight = 1;
     c.fCoinBase = false;
 
-    BOOST_CHECK_EQUAL(::GetSerializeSize(c, SER_DISK, CLIENT_VERSION), (size_t)62);
+    // v4 (gram-notes release): +1 for the fIssued flag.
+    BOOST_CHECK_EQUAL(::GetSerializeSize(c, SER_DISK, CLIENT_VERSION), (size_t)63);
 
     const TxInUndoSerializer undoser(&c);
-    BOOST_CHECK_EQUAL(::GetSerializeSize(undoser, SER_DISK, CLIENT_VERSION), (size_t)63);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(undoser, SER_DISK, CLIENT_VERSION), (size_t)64);
 
     // v3 (v0.2.18): a coloured coin carries its full 32-byte genesis txid, in
     // the coin and in the undo record, and round-trips it.
     Coin a = c;
     a.fBitAsset = true;
     a.assetID = uint256S("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-    BOOST_CHECK_EQUAL(::GetSerializeSize(a, SER_DISK, CLIENT_VERSION), (size_t)94);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(a, SER_DISK, CLIENT_VERSION), (size_t)95);
     const TxInUndoSerializer undoserA(&a);
-    BOOST_CHECK_EQUAL(::GetSerializeSize(undoserA, SER_DISK, CLIENT_VERSION), (size_t)95);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(undoserA, SER_DISK, CLIENT_VERSION), (size_t)96);
     {
         CDataStream ss(SER_DISK, CLIENT_VERSION);
         ss << a;
@@ -915,6 +916,22 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
         BOOST_CHECK(u.fBitAsset && u.assetID == a.assetID);
     }
 
+    // v4 (gram-notes release): an issued-token coin adds its token id (32), units (8) and frozen units (8), in the
+    // coin and in the undo record, and round-trips them.
+    Coin t = c;
+    t.SetIssued(uint256S("aa"), 1000, 40);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(t, SER_DISK, CLIENT_VERSION), (size_t)(63 + 48));
+    const TxInUndoSerializer undoserT(&t);
+    BOOST_CHECK_EQUAL(::GetSerializeSize(undoserT, SER_DISK, CLIENT_VERSION), (size_t)(64 + 48));
+    {
+        CDataStream ssu(SER_DISK, CLIENT_VERSION);
+        ssu << undoserT;
+        Coin u;
+        TxInUndoDeserializer undodeser(&u);
+        ssu >> undodeser;
+        BOOST_CHECK(u.fIssued && u.assetID == t.assetID && u.nIssuedUnits == 1000u && u.nIssuedFrozen == 40u);
+    }
+
     // v2 evidence (D-3): the block-index entry grew hashLastDeposit. A
     // default-constructed entry (all-zero VARINTs, no file positions) pins the
     // fixed-field layout: 1 (stream version varint, 0) + 3 (height/status/tx)
@@ -925,7 +942,7 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
 
     // A bump without updating the pins above is also a mistake - the sizes are
     // the evidence for the version, so they move together.
-    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 3);
+    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 4);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

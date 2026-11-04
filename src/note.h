@@ -409,8 +409,16 @@ struct NoteRedeem {
     std::vector<uint64_t> vPreAuthUnits;
     std::vector<unsigned char> vchPayoutScript;
     std::vector<unsigned char> vchPreAuthSig;
+    // ---- Gram-notes release (GOLD_USD_SCOPE.md step 6) ---------------------
+    // nPriceHeight: the height whose payout price values the sECX paid (0 = none: a payout wholly in gold, or a
+    // holder-signed par redemption, which the holder's signature alone protects). At most nPriceBackBlocks back.
+    // Gold paid from the house's till vault (vault moves, TILL, out) counts mg for mg and needs the house's M-of-N
+    // over NoteRedeemVaultSigHash; it is how a house pays in kind when no price exists (R3-9).
+    uint32_t nPriceHeight;
+    std::vector<uint32_t> vApproverIndex;
+    std::vector<std::vector<unsigned char>> vApproverSig;
 
-    NoteRedeem() : nHouseID(0), fBrassage(0), fPreAuthDischarge(0) {}
+    NoteRedeem() : nHouseID(0), fBrassage(0), fPreAuthDischarge(0), nPriceHeight(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -424,8 +432,14 @@ struct NoteRedeem {
         READWRITE(vPreAuthUnits);
         READWRITE(vchPayoutScript);
         READWRITE(vchPreAuthSig);
+        READWRITE(nPriceHeight);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
     }
 };
+
+/** Gram-notes release: what the house's approvers sign for a redemption paid (partly) from its till vault. */
+uint256 NoteRedeemVaultSigHash(const uint256& houseID, const CTransaction& tx);
 
 /** CLAIM (Phase 3.4, ARCH s7 Option a-2): at effective-Insolvent, the holder
  * burns note coin(s) of the house (U units) and takes AT MOST the pro-rata
@@ -552,6 +566,16 @@ CAmount NoteDemandInterest(const CHouse& house, uint32_t nDemandTag, uint64_t nU
  * 128-bit intermediate (the product overflows uint64). Returns 0 if
  * nSnapshotUnits == 0. */
 CAmount NoteClaimEntitlement(uint64_t nUnits, const CAmount& amountPot, uint64_t nSnapshotUnits);
+
+/** Gram-notes release (R2-int-10): the sECX a claim of nUnits mg takes from a failed house's pot when it also takes
+ *  nGoldMg of gold - its pro-rata share of the (tranche) pot, floor(nUnits x amountPot / nSnapshotUnits), but no more than
+ *  par still owes after the gold, floor((nUnits - nGoldMg) x nSatsPerGram / 1000). 0 when nSatsPerGram is 0. */
+CAmount ClaimSatsEntitlement(uint64_t nUnits, uint64_t nGoldMg, const CAmount& amountPot, uint64_t nSnapshotUnits,
+                             uint64_t nSatsPerGram);
+
+/** The sECX of the pot the first nSeniorMg of claims (in value) need once they have taken the gold:
+ *  ceil(max(0, nSeniorMg - nGoldMg) x nSatsPerGram / 1000), at most the pot. Rounded up: the senior tranche's side. */
+CAmount SeniorSatsReserved(uint64_t nSeniorMg, uint64_t nGoldMg, const CAmount& amountPot, uint64_t nSatsPerGram);
 
 /** A partner's residual share at whole-house settlement: distributes
  * amountResidual pro-rata by pledge over amountPledgeSum. 128-bit; 0 if the

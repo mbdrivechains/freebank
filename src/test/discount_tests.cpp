@@ -326,7 +326,9 @@ BOOST_AUTO_TEST_CASE(discount_bill_and_house_rejections)
     // (Status is DERIVED - setting the stored char would prove nothing.)
     check([](Scene& s) { s.house.nDeferInvokedHeight = (uint32_t)H - 10; }, noPre,
           "bad-bill-discount-house-status");
-    check([](Scene& s) { s.house.nLastAttestHeight = 1; }, noPre,
+    // Gram-notes release: a missed attestation no longer stresses a house (only an unpaid demand does), so the second
+    // derived-status vector is a live protest.
+    check([](Scene& s) { s.house.nProtestOpen = 1; s.house.nProtestHeight = (uint32_t)H - 5; }, noPre,
           "bad-bill-discount-house-status");
     // The title must land on the house's CONSENSUS-known custody key.
     check([](Scene& s) { s.house.vchRedemptionDestPK = Pub(s.stranger); }, noPre,
@@ -340,15 +342,9 @@ BOOST_AUTO_TEST_CASE(discount_bill_and_house_rejections)
               s.house.nDepositUnits = (uint64_t)HouseCapitalCapUnits(s.house) - (uint64_t)PRICE + 1;
           }, noPre, "bad-bill-discount-capital-cap");
 
-    // -- 18/19: rho-at-mint ------------------------------------------------
-    check(noScene, [](BillDiscount& d, CMutableTransaction&) { d.nAsOfHeight = (uint32_t)H; },
-          "bad-bill-discount-reserve-future");
-    check(noScene, [](BillDiscount& d, CMutableTransaction&) { d.nAsOfHeight = 1; },
-          "bad-bill-discount-reserve-stale");
-    // The published figure binds only jointly with what is proven live: a house
-    // that attested reserves it has since spent cannot discount against them.
-    check([](Scene& s) { s.coinReserve.out.nValue = 1000; }, noPre,
-          "bad-bill-discount-reserve-cap");
+    // -- 18/19: the till floor ---------------------------------------------
+    // Gram-notes release: the till is the house's gold till vault (the fixture's emulation maps it from the attested
+    // figure); the reserve-proof liveness vectors went with the proofs.
     check([](Scene& s) { s.house.amountLastAttestReserves = 1000; }, noPre,
           "bad-bill-discount-reserve-cap");
 

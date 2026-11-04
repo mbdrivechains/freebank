@@ -107,7 +107,9 @@ bool ComputeAssetTags(const CTransaction& tx, const std::vector<const Coin*>& vS
     CAmount nUnitsIn = 0;
     int nControl = 0;
     for (const Coin* coin : vSpent) {
-        if (!coin || !coin->IsAssetColoured())
+        // Issued-token coins (gram-notes release) are coloured but no asset: their own rule (CheckIssuedFlow) moves
+        // them, and CheckTxInputs refuses them in the versions that move assets.
+        if (!coin || !coin->IsV10Asset())
             continue;
         if (coin->assetID.IsNull() || (coin->fBitAsset && coin->fBitAssetControl)) {
             strReason = "bad-asset-input-tag"; return false;

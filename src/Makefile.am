@@ -83,6 +83,8 @@ BITCOIN_CORE_H = \
   blockencodings.h \
   bmmcache.h \
   asset.h \
+  issued.h \
+  pricefeed.h \
   chain.h \
   chainparams.h \
   chainparamsbase.h \
@@ -169,6 +171,7 @@ BITCOIN_CORE_H = \
   timedata.h \
   torcontrol.h \
   txdb.h \
+  units.h \
   txmempool.h \
   ui_interface.h \
   undo.h \
@@ -242,6 +245,9 @@ libbitcoin_server_a_SOURCES = \
   timedata.cpp \
   torcontrol.cpp \
   txdb.cpp \
+  units.cpp \
+  issued_connect.cpp \
+  pricefeed.cpp \
   txmempool.cpp \
   ui_interface.cpp \
   validation.cpp \
@@ -271,6 +277,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/init.cpp \
   wallet/rpcdump.cpp \
   wallet/rpcwallet.cpp \
+  wallet/issued_wallet.cpp \
   wallet/wallet.cpp \
   wallet/walletdb.cpp \
   wallet/walletutil.cpp \
@@ -344,6 +351,7 @@ libbitcoin_common_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
 libbitcoin_common_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libbitcoin_common_a_SOURCES = \
   asset.cpp \
+  issued.cpp \
   base58.cpp \
   bech32.cpp \
   bill.cpp \

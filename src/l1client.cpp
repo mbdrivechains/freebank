@@ -72,6 +72,8 @@ public:
     bool GetWorkScore(const uint256& hash, int& nWorkScore) override;
     bool ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle) override;
     bool GetBlockHash(int nHeight, uint256& hashBlock) override;
+    bool GetBlockHeight(const uint256& hashBlock, int& nHeight) override;
+    bool GetBlockTime(const uint256& hashBlock, uint32_t& nTime) override;
     bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override;
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
@@ -109,6 +111,8 @@ public:
     bool GetWorkScore(const uint256& hash, int& nWorkScore) override;
     bool ListWithdrawalBundleStatus(std::vector<uint256>& vHashWithdrawalBundle) override;
     bool GetBlockHash(int nHeight, uint256& hashBlock) override;
+    bool GetBlockHeight(const uint256& hashBlock, int& nHeight) override;
+    bool GetBlockTime(const uint256& hashBlock, uint32_t& nTime) override;
     bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override;
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
@@ -880,6 +884,25 @@ bool EnforcerL1Client::GetChainTip(L1BlockHeader& header)
         return false;
 
     return ParseEnforcerChainTip(result, header);
+}
+
+bool EnforcerL1Client::GetBlockHeight(const uint256& hashBlock, int& nHeight)
+{
+    std::vector<L1BlockHeader> vHeader;
+    if (!GetHeaderInfos(hashBlock, 0, vHeader) || vHeader.empty() || vHeader.front().hashBlock != hashBlock)
+        return false;
+    nHeight = vHeader.front().nHeight;
+    return nHeight >= 0;
+}
+
+bool EnforcerL1Client::GetBlockTime(const uint256& hashBlock, uint32_t& nTime)
+{
+    std::vector<L1BlockHeader> vHeader;
+    if (!GetHeaderInfos(hashBlock, 0, vHeader) || vHeader.empty() || vHeader.front().hashBlock != hashBlock ||
+            vHeader.front().nTime == 0)
+        return false;
+    nTime = vHeader.front().nTime;
+    return true;
 }
 
 bool EnforcerL1Client::GetHeaderInfos(const uint256& hashBlock, uint32_t nMaxAncestors, std::vector<L1BlockHeader>& vHeader)
@@ -1750,6 +1773,17 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         SidechainDeposit& deposit = vRecord[i];
         if (psidechaintree && psidechaintree->HaveDepositOutpoint(COutPoint(vTxid[i], deposit.nBurnIndex)))
             continue;
+        // Gram-notes release (scope 7h, review 11-04): a treasury change below the chain's deposit start belongs to
+        // the chain that ran before; it is never recorded here, so skip it before reading its L1 block (else every
+        // template reads them all again, and one unreadable old block would stop every new deposit).
+        if (L1BlockBelowDepositStart(deposit.hashMainchainBlock)) {
+            static std::atomic<bool> fLogged{false};
+            if (!fLogged.exchange(true))
+                LogPrintf("Enforcer client: treasury changes below L1 height %d (the first: %s) belong to the chain that ran "
+                          "before this one's deposit start: skipped\n", Params().GetConsensus().nDepositStartL1Height,
+                          vTxid[i].ToString());
+            continue;
+        }
         int nTx = -1;
         if (hashBlockHeld != deposit.hashMainchainBlock)
             hashBlockHeld = RestGetBlock(deposit.hashMainchainBlock, vchBlockHeld) ? deposit.hashMainchainBlock : uint256();
@@ -3105,6 +3139,34 @@ bool JsonRpcL1Client::GetBlockHash(int nHeight, uint256& hashBlock)
     hashBlock = uint256S(strHash);
 
     return (!hashBlock.IsNull());
+}
+
+bool JsonRpcL1Client::GetBlockHeight(const uint256& hashBlock, int& nHeight)
+{
+    // 'getblockheader' answers with the height for a block on a side branch too
+    std::string json;
+    json.append("{\"jsonrpc\": \"1.0\", \"id\":\"SidechainClient\", ");
+    json.append("\"method\": \"getblockheader\", \"params\": [\"" + hashBlock.ToString() + "\"] }");
+    boost::property_tree::ptree ptree;
+    if (!SendRequestToMainchain(json, ptree))
+        return false;
+    nHeight = ptree.get("result.height", -1);
+    return nHeight >= 0;
+}
+
+bool JsonRpcL1Client::GetBlockTime(const uint256& hashBlock, uint32_t& nTime)
+{
+    std::string json;
+    json.append("{\"jsonrpc\": \"1.0\", \"id\":\"SidechainClient\", ");
+    json.append("\"method\": \"getblockheader\", \"params\": [\"" + hashBlock.ToString() + "\"] }");
+    boost::property_tree::ptree ptree;
+    if (!SendRequestToMainchain(json, ptree))
+        return false;
+    const int64_t n = ptree.get("result.time", (int64_t)0);
+    if (n <= 0 || n > std::numeric_limits<uint32_t>::max())
+        return false;
+    nTime = (uint32_t)n;
+    return true;
 }
 
 bool JsonRpcL1Client::GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash)

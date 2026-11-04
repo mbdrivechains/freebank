@@ -60,6 +60,22 @@ void CChainParams::UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64
     consensus.vDeployments[d].nTimeout = nTimeout;
 }
 
+void CChainParams::UpdateNotePoolHeight(int nHeight)
+{
+    consensus.nNotePoolHeight = nHeight;
+}
+
+void CChainParams::UpdateDepositStartL1Height(int nHeight)
+{
+    consensus.nDepositStartL1Height = nHeight;
+}
+
+void CChainParams::UpdateCreateFeeForTest(uint64_t nCreateFeeMg)
+{
+    for (Consensus::GramStep& step : consensus.vGramSchedule)
+        step.p.nCreateFeeMg = nCreateFeeMg;
+}
+
 /**
  * Main network
  */
@@ -115,6 +131,12 @@ public:
         // APPEND a step at a future height, never edit a past one.
         consensus.vDeferInterestSchedule = {{0, 1000}};
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
+        // Gram-notes release: one entry from genesis (the figures are proposals until the Monte Carlo sets them).
+        consensus.vGramSchedule = {{0, Consensus::GramParams()}};
+        consensus.nFullForfeitHeight = std::numeric_limits<int>::max();
+        consensus.nDollarPoolHeight = std::numeric_limits<int>::max();
+        consensus.nNotePoolHeight = std::numeric_limits<int>::max();
+        consensus.nDepositStartL1Height = 0;
         consensus.nDeferSilenceWindow = 4032;  // ~4 weeks after 2 missed cadences
         consensus.nTokenClaimWindow = 4032;    // the token claim window: ~4 weeks from insolvency
         consensus.nSuspensionCap = 52560;          // v0.2.28: 12 months suspended, then insolvent
@@ -291,35 +313,35 @@ public:
  * its own identity: magic, genesis, ports and data directory ("easynet"), so it
  * never mixes with beta or mainnet and can run beside a beta node. Fixed seed
  * 163.47.9.132:28455, no DNS seed. An easynet build (configure --with-easynet) runs
- * it with no flag. When easynet's L1 resets and FreeBank-easynet starts a new chain, the magic's last byte
- * follows it (not on reset 4: see below).
+ * it with no flag. Each new FreeBank-easynet chain takes the next magic last byte (03 for L1 resets 3 and 4, 05 for
+ * the v1.1.0 restart on reset 4): it no longer follows the L1's reset number.
  */
 class CEasynetParams : public CBetaParams {
 public:
     CEasynetParams() {
         strNetworkID = "easynet";
 
-        // Its own network; the last byte followed easynet's L1 magic (ea5e4e03, reset 2026-10-13). Kept at 03 on
-        // reset 4 (ea5e4e04, 2026-10-29): FreeBank-easynet must carry its reset-4 chain on in place (a chain started
-        // fresh on an L1 whose treasury already paid out would credit every deposit again, DEPOSITS_664_SPEC), and
-        // -reindex finds blocks by this magic, so a bump would hide every block written before it. The L1 pin keeps
-        // reset-3 and reset-4 nodes apart.
+        // Its own network. Gram-notes release (v1.1.0, scope 7h): FreeBank-easynet restarts as a fresh chain on the same
+        // L1 (reset 4), so the last byte moves to 05: the old chain's blocks and peers stay apart (-reindex finds blocks
+        // by this magic, and the old chain is moved aside, not carried on). Before: 03, kept on reset 4 so the
+        // reset-4 chain carried on in place. The L1 pin keeps reset-3 and reset-4 nodes apart.
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;
-        pchMessageStart[3] = 0x03;
+        pchMessageStart[3] = 0x05;
         nDefaultPort = 28455;
 
-        genesis = CreateGenesisBlock("FreeBank easynet genesis: easynet slot 130, 2026-10-12",
+        genesis = CreateGenesisBlock("FreeBank easynet genesis 2: gram notes (v1.1.0), easynet slot 130, 2026-11-04",
                                      CScript() << OP_RETURN,
-                                     1791800000, 1, 0);
+                                     1793750400, 1, 0);   // 2026-11-04 00:00Z: before every L1 block it will use
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0xbd474c68aeeeb97dcc82df8d54d5f7461ce1e7ad6b8c372df190343573e6daf9"));
-        // Its chain already holds unbound credit transactions (houses from block 231), so it binds from here: 286
-        // blocks past height 314 on 2026-10-31, ~52 h at ~11 min a block; set again at the release build to about a
-        // day after it. Every easynet node and wallet upgrades before it; until then an upgraded node takes no credit
-        // transaction.
-        consensus.nCreditBindingHeight = 600;
+        assert(consensus.hashGenesisBlock == uint256S("0x14796ddc0c8aac3af9ce728d506ad7d44ab5885bee2bf89d9703ea19af6e83f4"));
+        // The fresh chain binds credit signatures from genesis.
+        consensus.nCreditBindingHeight = 0;
+        // ...and credits only treasury changes from L1 block 1,100 (scope 7h): the 23.3 ECX of the old chain's money
+        // in the treasury at L1 1,099 (sequence 7, three bundles paid, none pending; easynet 2026-11-04 01:11Z) stays
+        // the old chain's. Each later deposit credits what it added (DEPOSITS_664_SPEC).
+        consensus.nDepositStartL1Height = 1100;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
 
         vSeeds.clear();
@@ -358,6 +380,11 @@ public:
         consensus.nDemandWindow = 12;  // B3: gate-testable; ~8.4h on the 30s demo signet
         consensus.vDeferInterestSchedule = {{0, 1000}};  // same as main (10%/yr from block 0)
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
+        consensus.vGramSchedule = {{0, Consensus::GramParams()}};   // same as main
+        consensus.nFullForfeitHeight = std::numeric_limits<int>::max();
+        consensus.nDollarPoolHeight = std::numeric_limits<int>::max();
+        consensus.nNotePoolHeight = std::numeric_limits<int>::max();
+        consensus.nDepositStartL1Height = 0;
         consensus.nDeferSilenceWindow = 40;    // gate-testable silence clock (main: 4032)
         consensus.nTokenClaimWindow = 20;      // gate-testable claim window (main: 4032)
         consensus.nSuspensionCap = 400;        // gate-testable (main: 52560); above the silence clock (2x144+1+40)
@@ -465,6 +492,21 @@ void SelectParams(const std::string& network)
 void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime, int64_t nTimeout)
 {
     globalChainParams->UpdateVersionBitsParameters(d, nStartTime, nTimeout);
+}
+
+void UpdateNotePoolHeight(int nHeight)
+{
+    globalChainParams->UpdateNotePoolHeight(nHeight);
+}
+
+void UpdateDepositStartL1Height(int nHeight)
+{
+    globalChainParams->UpdateDepositStartL1Height(nHeight);
+}
+
+void UpdateCreateFeeForTest(uint64_t nCreateFeeMg)
+{
+    globalChainParams->UpdateCreateFeeForTest(nCreateFeeMg);
 }
 
 void UpdateChainDormantForTest(bool fDormant)

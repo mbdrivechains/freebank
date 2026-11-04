@@ -24,12 +24,51 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > and follows eCash, but no FreeBank block after genesis is valid until a later release switches the
 > chain on; deposits made meanwhile are credited, in order, then. v1.0.1 changes how deposits are
 > credited and v1.0.2 what a credit transaction's signatures cover (below); while mainnet is dormant,
-> both run it exactly as v1.0.0 does, and the mainnet M1 names v1.0.0. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
+> both run it exactly as v1.0.0 does, and the mainnet M1 names v1.0.0. **v1.1.0, the gram-notes release, changes the
+> rules from genesis** (below): it runs mainnet, still dormant, and easynet, which restarts on it; every network on it
+> starts fresh. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
 
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
 > gotchas, parameters, glossary) written so you can hand it to an AI assistant and be walked
 > through running your own FreeBank.
+
+## Gram notes (v1.1.0)
+
+From v1.1.0, notes, bills and deposits count **milligrams of gold**, and houses hold gold. The rules apply from genesis
+on every network the release runs.
+
+- **Units and payouts.** Notes, bills, deposits and gold tokens count mg of gold (`getblockchaininfo` shows
+  `note_unit: "mg"`). Payouts are in sECX at the chain's payout price, in sats per gram; each payout binds a price
+  height at most 72 blocks back. With no price, issuing stops and payouts wait. Redemption never stops.
+- **Gold tokens.** A coin kind for tokens issued on FreeBank against gold held on Ethereum: create, mint, burn (to an
+  Ethereum address, at least 1,000 units), transfer, freeze, and issuer bonds. A token counts in a house only while it
+  is *trusted*:
+  - an issuer bond worth at least 1 kg;
+  - fresh backing reports covering its supply;
+  - its backing address its own;
+  - its burns paid, beyond a small threshold.
+
+  Creating a token or a pool burns 1 g of gold's worth of sECX.
+- **Price feed.** Bonded reporters post gold/ECX, gold/USD, token backing and backing-address claims. A fix needs a
+  quorum of the reporters active on that price, between 3 and 7. The payout price is the 144-block median, and no
+  more than 5% above a deep token pool's average.
+- **Houses hold gold.**
+  - Owners' capital of at least 10% of notes and deposits, and a till of at least 2% of notes, in gold-token vaults.
+  - No more than half from one company, contract or token.
+  - At most 8 tokens per house; a new one comes in only by the partners' agreement.
+  - An issuer's freeze on house gold counts zero after 30 days.
+  - Anyone can prove a house's equity negative (`proveequity`), which opens claims.
+- **Failed houses** pay in value at a snapshot price: notes first, pro rata in gold then sECX; deposits after; what is
+  left goes to the noteholders' mutual fund.
+- **Token pools**, one per gold token, with swaps that chain within a block and LP shares. **House note pools are
+  closed** until a second, unconnected block producer appears (`getblockchaininfo` shows `note_pools_open`).
+- Also in v1.1.0:
+  - the block producer's inclusion log (`getinclusionlog`);
+  - a dormant exit to ECX reserves, which needs two years of daily prices first;
+  - a fix for a node that marked a good block invalid when its eCash node came back behind after a power cut.
+
+Details: [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md), section 4.13.
 
 ## What works today
 

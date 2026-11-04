@@ -5008,12 +5008,15 @@ UniValue dischargedemands(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
             "dischargedemands\n"
             "\nArguments:\n"
             "1. \"id\"     (numeric, required) the house ID number (this wallet must fund its payouts)\n"
             "2. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "3. fromcapital (boolean, optional, default false) gram-notes release (R3-12): a suspended house pays the\n"
+            "               demand in gold from its partners' capital, split pro rata, oldest demands first, while its\n"
+            "               equity is positive (this wallet must hold M partner keys)\n"
             "\nDischarge the OLDEST outstanding pre-auth demand against the house\n"
             "(B3): pay the pre-authorised script the consensus floor - par inside\n"
             "the window, par + the chain rate (10%/yr) after it: from window lapse for a B3\n"
@@ -5036,7 +5039,8 @@ UniValue dischargedemands(const JSONRPCRequest& request)
     ObserveSafeMode();
     const uint32_t nHouseID = request.params[0].get_int();
     CAmount nFee = 100000;
-    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+    if (request.params.size() >= 2 && !request.params[1].isNull()) nFee = AmountFromValue(request.params[1]);
+    const bool fFromCapital = request.params.size() >= 3 && request.params[2].get_bool();
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -5045,7 +5049,7 @@ UniValue dischargedemands(const JSONRPCRequest& request)
     uint256 txid;
     uint32_t nRemaining = 0;
     std::string strFail = "";
-    if (!pwallet->DischargeDemands(strFail, txid, nRemaining, nHouseID, nFee)) {
+    if (!pwallet->DischargeDemands(strFail, txid, nRemaining, nHouseID, nFee, fFromCapital)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -5685,6 +5689,10 @@ UniValue createpool(const JSONRPCRequest& request)
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, pwallet->cs_wallet);
+
+    if (chainActive.Height() + 1 < Params().GetConsensus().nNotePoolHeight)
+        throw JSONRPCError(RPC_MISC_ERROR, "House note pools are closed on this network until a later release opens "
+                                           "them (getblockchaininfo note_pools_open); gold-token pools are open");
 
     uint256 txid;
     std::string strFail = "";
@@ -6915,37 +6923,30 @@ UniValue submitoracleprice(const JSONRPCRequest& request)
             "submitoracleprice\n"
             "\nArguments:\n"
             "1. \"id\"     (numeric, required) this wallet's submitter ID\n"
-            "2. \"price\"  (numeric, required) milligrams of gold per 1000 ECX\n"
-            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
-            "\nSubmit one gold price. It becomes valid at the next height and\n"
-            "stays valid for a short window of blocks on the branch it was signed\n"
-            "against, so missing one block template is survivable. Re-submit every\n"
-            "block anyway: a re-sign displaces your own pooled one, and only ONE\n"
-            "of your outstanding submissions can ever confirm.\n"
-            "\nQUORUM IS PER BLOCK: a fix forms only when enough DISTINCT\n"
-            "submitters land in the SAME block. Submitters that scatter across\n"
-            "blocks are each credited for liveness while no fix ever forms.\n"
-            "\nUNITS: the chain stores milligrams of gold per 1000 ECX. A rates\n"
-            "feed quoting grams per ECX must multiply by 1e6.\n"
-            "\nThe median of a block's submissions becomes the raw fix once a\n"
-            "quorum of distinct submitters is present; the braked view follows it\n"
-            "up freely but is limited on the way down. Consensus-INERT: nothing\n"
-            "in the credit rules reads either view yet.\n"
+            "2. \"price\"  (numeric, required) the gold price in SATS OF sECX PER GRAM of gold (gram-notes release)\n"
+            "3. \"fee\"    (numeric or string, optional) default 0.0001\n"
+            "\nSubmit one gold price observation (stream 1, the same as submitoracleobs id\n"
+            "[{\"stream\":1,\"value\":price}]). It counts toward a fix while it is your latest observation within the\n"
+            "price window; a fix forms once a quorum of the stream's recent reporters have one in the window, and\n"
+            "the payout price follows the 144-block median of fixes (with the deep trusted pools).\n"
+            "\nUNITS: sats per gram. If ECX trades at E dollars and gold at G dollars a gram, the price is\n"
+            "G / E x 1e8. (Before the gram-notes release this RPC took milligrams of gold per 1000 ECX - an old\n"
+            "driver sending that unit would report a price wildly off; values outside 1 .. 1e15 are refused.)\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
-            + HelpExampleCli("submitoracleprice", "1 800000000")
-            + HelpExampleRpc("submitoracleprice", "1, 800000000")
+            + HelpExampleCli("submitoracleprice", "1 110000")
+            + HelpExampleRpc("submitoracleprice", "1, 110000")
         );
 
     ObserveSafeMode();
 
     const uint32_t nSubmitterID = request.params[0].get_int();
     const int64_t nPriceSigned = request.params[1].get_int64();
-    if (nPriceSigned <= 0)
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Price must be positive!");
+    if (nPriceSigned <= 0 || nPriceSigned > 1000000000000000LL)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Price must be 1 .. 1e15 sats per gram!");
     const uint64_t nPrice = (uint64_t)nPriceSigned;
 
-    CAmount nFee = 100000;
+    CAmount nFee = 10000;
     if (request.params.size() >= 3 && !request.params[2].isNull())
         nFee = AmountFromValue(request.params[2]);
 
@@ -8241,7 +8242,7 @@ static const CRPCCommand commands[] =
     { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout", "plain"} },
     { "notes",              "upgradedemand",                    &upgradedemand,                 {"id", "units", "fee", "payout"} },
     { "notes",              "protestnote",                      &protestnote,                   {"id", "fee"} },
-    { "notes",              "dischargedemands",                 &dischargedemands,              {"id", "fee"} },
+    { "notes",              "dischargedemands",                 &dischargedemands,              {"id", "fee", "fromcapital"} },
     { "notes",              "listmynotes",                      &listmynotes,                   {} },
     { "deposits",           "originatedeposit",                 &originatedeposit,              {"id", "principal", "ratebps", "maturity", "fee", "address"} },
     { "deposits",           "transferdeposit",                  &transferdeposit,               {"id", "principal", "fee", "address"} },
@@ -8287,8 +8288,11 @@ static const CRPCCommand commands[] =
     { "oracle",             "submitoracleprice",                &submitoracleprice,             {"id", "price", "fee"} },
 };
 
+void RegisterIssuedRPCCommands(CRPCTable& t);   // wallet/issued_wallet.cpp (gram-notes release)
+
 void RegisterWalletRPCCommands(CRPCTable &t)
 {
     for (unsigned int vcidx = 0; vcidx < ARRAYLEN(commands); vcidx++)
         t.appendCommand(commands[vcidx].name, &commands[vcidx]);
+    RegisterIssuedRPCCommands(t);
 }

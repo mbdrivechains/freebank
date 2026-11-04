@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <list>
 #include <map>
 #include <mutex>
@@ -38,7 +39,9 @@ class BMMCache;
 class BitAssetDB;
 class BillDB;
 class HouseDB;
+struct CHouse;
 class PoolDB;
+class CUnitsDB;
 class ConnectTrace;
 class CBlockIndex;
 class CBlockTreeDB;
@@ -460,6 +463,11 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state);
  *  L1 view lags). Headers that fail to connect meanwhile are this node's doing,
  *  not the peer's (net_processing). */
 extern std::atomic<int64_t> g_nLastBmmUnknown;
+/** Gram-notes release (replay fix): how many 5 s tries the import waits for the L1 to reach a block (unit tests: 1). */
+extern std::atomic<int> g_nImportL1WaitTries;
+/** Gram-notes release (scope 7h): is this L1 block on our list below the chain's deposit start height? False when the
+ *  start is 0 or the block is not on the list (CheckDepositWithL1 then decides). */
+bool L1BlockBelowDepositStart(const uint256& hashMainBlock);
 
 /** v0.2.23: send the pending withdrawal bundle to the enforcer again while eCash has not seen it (scheduled). */
 void MaybeReproposeWithdrawalBundle();
@@ -564,8 +572,21 @@ extern std::unique_ptr<BitAssetDB> passettree;
 
 /** Global variable that points to the active bill tree (protected by cs_main) */
 extern std::unique_ptr<BillDB> pbilltree;
+
+/** Gram-notes release (R3-1): a house's equity in mg at a price - gold in its vaults + amountEscrow (its sECX escrow) at
+ *  nSatsPerGram + its loan book at face less vOverdueBill - notes - deposits. Each listed bill must be in its book, not
+ *  retired, and unpaid GramParams::nBillOverdueBlocks past maturity at nHeight (read from the bill DB). False with
+ *  strReason ("no-price", "no-bills", "duplicate-bill", "bill-not-overdue") otherwise. */
+bool HouseEquityMg(const CHouse& house, int nHeight, uint64_t nSatsPerGram, const CAmount& amountEscrow,
+                   const std::vector<uint32_t>& vOverdueBill, int64_t& nEquityMg, std::string& strReason);
+/** The bills in a house's book overdue at nHeight (sorted, at most MAX_EQUITY_OVERDUE_BILLS). */
+std::vector<uint32_t> HouseOverdueBills(const CHouse& house, int nHeight);
+/** A house's live sECX escrow pot (pledges, claim change, the deferral till) against a coin view. */
+CAmount HouseEscrowPotAtTip(const CHouse& house, const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin);
 extern std::unique_ptr<HouseDB> phousetree;
 extern std::unique_ptr<PoolDB> ppooltree;
+/** Global variable that points to the units DB (blocks/Units/, gram-notes release) */
+extern std::unique_ptr<CUnitsDB> punitsdb;
 
 /**
  * Return the spend height, which is one more than the inputs.GetBestBlock().

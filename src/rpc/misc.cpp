@@ -33,6 +33,9 @@
 #include <sidechainclient.h>
 #include <timedata.h>
 #include <txdb.h>
+#include <units.h>
+#include <issued.h>
+#include <pricefeed.h>
 #include <util.h>
 #include <validationinterface.h>
 #include <utilstrencodings.h>
@@ -1938,9 +1941,22 @@ static UniValue HouseToJSON(const CHouse& house)
     // The BINDING cap is the min of the two (3.5 D2): capital (lambda*escrow)
     // and reserve (attested till / rho). Publish all three - the market prices
     // which constraint is binding.
-    obj.pushKV("mintcapunits", HouseMintCapUnits(house));
-    obj.pushKV("capitalcapunits", HouseCapitalCapUnits(house));
-    obj.pushKV("reservecapunits", HouseReserveCapUnits(house));
+    // Gram-notes release: a house issues against counted gold, so the caps are in mg from its gold (gethousegold has
+    // the detail): capital = counted capital / nCapitalMinBps less the deposits (the room for notes under it), reserve =
+    // counted till / nTillMinBps, mint = the lower. The binding cap is the mint cap.
+    {
+        const int nTip = chainActive.Height();
+        const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nTip);
+        CUnitsView viewUnits(punitsdb.get());
+        CGoldCount gold;
+        HouseGoldCounted(viewUnits, house, nTip, gp, false, gold);
+        const uint64_t nCapitalCap = (uint64_t)((unsigned __int128)gold.nCapitalMg * 10000 / gp.nCapitalMinBps);
+        const uint64_t nCapitalNotes = nCapitalCap > house.nDepositUnits ? nCapitalCap - house.nDepositUnits : 0;
+        const uint64_t nTillCap = (uint64_t)((unsigned __int128)gold.nTillMg * 10000 / gp.nTillMinBps);
+        obj.pushKV("mintcapunits", std::min(nCapitalNotes, nTillCap));
+        obj.pushKV("capitalcapunits", nCapitalNotes);
+        obj.pushKV("reservecapunits", nTillCap);
+    }
     // The attested ratio and the redemption spread it implies (3.5). Published
     // so a holder can see the cost of the exit BEFORE they take it - the whole
     // deterrent depends on the fee being known ex ante.
@@ -1983,10 +1999,12 @@ static UniValue HouseToJSON(const CHouse& house)
         // Settlement (Phase 3.7 pt2): the per-house cadence stamp + the derived
         // par-eligibility the clearing board keys its "par lamp" on.
         obj.pushKV("lastsettleheight", (uint64_t)house.nLastSettleHeight);
-        obj.pushKV("pareligible", HouseParEligible(house, chainActive.Height()));
+        obj.pushKV("pareligible", GoldParEligible(house, chainActive.Height()));
         if (house.nInsolventHeight != 0) {
             obj.pushKV("insolventheight", (uint64_t)house.nInsolventHeight);
             obj.pushKV("insolventunits", house.nInsolventUnits);
+            obj.pushKV("insolvent_sats_per_gram", house.nInsolventSatsPerGram);   // the snapshot's price (R2-int-10)
+            obj.pushKV("insolvent_gold_mg", house.nInsolventGoldMg);              // the snapshot's gold
             obj.pushKV("insolventpot", ValueFromAmount(house.amountInsolventPot));
         }
         obj.pushKV("escrowchangeoutputs", (uint64_t)house.vOutEscrowChange.size());
@@ -2294,17 +2312,15 @@ UniValue getgoldfix(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 0)
         throw std::runtime_error(
             "getgoldfix\n"
-            "\nThe on-chain gold fix: one shared price, in milligrams of gold\n"
-            "per 1000 ECX. Returns null before the first fix has ever formed.\n"
+            "\nThe price feed (gram-notes release): the gold price's payout view in sats per gram and each\n"
+            "price stream's last fix. Prices come from bonded reporters' observations (pricefeed.h).\n"
             "\nResult:\n"
             "{\n"
-            "  \"raw\":         n,  the median of the last quorum block's submissions\n"
-            "  \"braked\":      n,  the damped view: tracks raw up freely, bounded down\n"
-            "  \"fixheight\":   n,  height at which this fix formed\n"
-            "  \"ageblocks\":   n   tip - fixheight (derived, not stored)\n"
+            "  \"payout_view_sats_per_gram\": n,  the median of the last 144 blocks' gold fixes (null = stale)\n"
+            "  \"stale\":       bool,\n"
+            "  \"gold_ecx_last_fix\": {\"value\", \"reporters\", \"fixheight\", \"ageblocks\"} or null,\n"
+            "  \"gold_usd_last_fix\": {...} or null (US cents per gram)\n"
             "}\n"
-            "\nConsensus-INERT in this phase: both views are maintained and served,\n"
-            "but nothing in the credit rules reads them.\n"
             "\nExamples:\n"
             + HelpExampleCli("getgoldfix", "")
             + HelpExampleRpc("getgoldfix", "")
@@ -2312,19 +2328,33 @@ UniValue getgoldfix(const JSONRPCRequest& request)
 
     LOCK(cs_main);
 
-    CGoldFix fix;
-    // No fix yet is a normal state, not an error - the chain runs from genesis
-    // with no price until a quorum first forms.
-    if (!phousetree->GetGoldFix(fix) || fix.IsNull())
-        return NullUniValue;
-
-    UniValue obj(UniValue::VOBJ);
-    obj.pushKV("raw", (uint64_t)fix.nRaw);
-    obj.pushKV("braked", (uint64_t)fix.nBraked);
-    obj.pushKV("fixheight", (uint64_t)fix.nFixHeight);
+    // Gram-notes release: the price feed in the units DB (pricefeed.h). No price yet is a normal state, not an error.
     const int nTip = chainActive.Height();
-    if (nTip >= 0 && (uint32_t)nTip >= fix.nFixHeight)
-        obj.pushKV("ageblocks", (uint64_t)((uint32_t)nTip - fix.nFixHeight));
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nTip);
+    CUnitsView units(punitsdb.get());
+    UniValue obj(UniValue::VOBJ);
+    uint64_t nView = 0;
+    const bool fView = PriceFeedPayoutView(units, nTip, gp, nView);
+    obj.pushKV("payout_view_sats_per_gram", fView ? UniValue((uint64_t)nView) : NullUniValue);
+    obj.pushKV("stale", !fView);
+    for (uint8_t nStream : {ORACLE_STREAM_GOLD_ECX, ORACLE_STREAM_GOLD_USD}) {
+        const std::vector<std::pair<UnitsKey, UnitsValue>> v = units.Scan(UnitsKey(UNITS_ORACLE_FIX).U8(nStream).Hash(uint256()), UnitsKey(), SIZE_MAX);
+        UniValue last(UniValue::VNULL);
+        if (!v.empty()) {
+            CPriceFix fix;
+            CDataStream ss(v.back().second, SER_DISK, CLIENT_VERSION);
+            ss >> fix;
+            const std::vector<unsigned char>& k = v.back().first.v;
+            const uint32_t nH = ((uint32_t)k[34] << 24) | ((uint32_t)k[35] << 16) | ((uint32_t)k[36] << 8) | (uint32_t)k[37];
+            last = UniValue(UniValue::VOBJ);
+            last.pushKV("value", (uint64_t)fix.nValue);
+            last.pushKV("reporters", (uint64_t)fix.nCount);
+            last.pushKV("fixheight", (uint64_t)nH);
+            if (nTip >= 0 && (uint32_t)nTip >= nH)
+                last.pushKV("ageblocks", (uint64_t)((uint32_t)nTip - nH));
+        }
+        obj.pushKV(nStream == ORACLE_STREAM_GOLD_ECX ? "gold_ecx_last_fix" : "gold_usd_last_fix", last);
+    }
     return obj;
 }
 

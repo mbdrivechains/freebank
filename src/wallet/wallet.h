@@ -6,6 +6,7 @@
 #ifndef BITCOIN_WALLET_WALLET_H
 #define BITCOIN_WALLET_WALLET_H
 
+#include <functional>
 #include <amount.h>
 #include <coins.h>
 #include <policy/feerate.h>
@@ -704,6 +705,21 @@ private:
 
 
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
+struct IssuedCreate;
+struct COracleObs;
+
+/** One of the wallet's issued-token coins (gram-notes release, issued.h). */
+struct CVaultFreezeTarget;   // issued.h (5b: a freeze on a house vault)
+struct CIssuedWalletCoin
+{
+    COutPoint outpoint;
+    uint256 tokenID;
+    uint64_t nUnits = 0;
+    uint64_t nFrozen = 0;   // a FREEZE / UNFREEZE record if any, else the annex's
+    CTxOut txout;
+    int nDepth = 0;
+};
+
 /**
  * A CWallet is an extension of a keystore, which also maintains a set of transactions and balances,
  * and provides the ability to create new transactions.
@@ -1179,7 +1195,8 @@ public:
      * (pay the pre-authorised script the consensus floor). One tx per call -
      * a discharge takes the house slot, so batching would self-collide.
      * nRemainingOut = further dischargeable demands found after this one. */
-    bool DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t& nRemainingOut, uint32_t nHouseID, const CAmount& nFee);
+    bool DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t& nRemainingOut, uint32_t nHouseID, const CAmount& nFee,
+                          bool fFromCapital = false);
     /** Insolvency waterfall (3.4): burn nUnits and take the pro-rata
      * entitlement from the house's escrow pot. */
     bool ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
@@ -1327,6 +1344,55 @@ public:
                              uint32_t nSubmitterID, const CAmount& amountBond, const CAmount& nFee);
     bool SubmitOraclePrice(std::string& strFail, uint256& txidOut,
                            uint32_t nSubmitterID, uint64_t nPriceMilligrams, const CAmount& nFee);
+    /** Gram-notes release: one submission of any observations (oracle.h streams: prices, backing reports, claims). */
+    bool SubmitOracleObs(std::string& strFail, uint256& txidOut, uint32_t nSubmitterID, std::vector<COracleObs> vObs,
+                         const CAmount& nFee);
+
+    /** Gram-notes release: issued tokens (wallet/issued_wallet.cpp). CreateIssuedToken takes a new issuer key (and a
+     *  freeze key if asked) from the keypool and fills them into `create`. Each op funds its outputs and fee from
+     *  plain ECX, puts plain change after the annex's outputs, signs the token key's payload signature once inputs and
+     *  outputs are final, then the inputs. */
+    void ListIssuedCoins(const uint256& tokenID, std::vector<CIssuedWalletCoin>& vOut) const;
+    bool CreateIssuedToken(std::string& strFail, uint256& tokenIDOut, IssuedCreate& create, bool fFreezeKey, const CAmount& nFee);
+    bool MintIssued(std::string& strFail, uint256& txidOut, const uint256& tokenID, uint64_t nUnits,
+                    const CTxDestination& dest, const CAmount& nFee);
+    bool SendIssued(std::string& strFail, uint256& txidOut, const uint256& tokenID, uint64_t nUnits,
+                    const CTxDestination& dest, const CAmount& nFee);
+    bool BurnIssued(std::string& strFail, uint256& txidOut, const uint256& tokenID, uint64_t nUnits,
+                    const std::vector<unsigned char>& vchEthDest, const CAmount& nFee);
+    bool FreezeIssued(std::string& strFail, uint256& txidOut, const uint256& tokenID,
+                      const std::vector<COutPoint>& vOutpoint, const std::vector<uint64_t>& vFrozen, bool fFreeze,
+                      const CAmount& nFee, const std::vector<CVaultFreezeTarget>& vVault = {});
+    bool CommitIssuedTx(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx,
+                        const std::vector<CIssuedWalletCoin>& vTokenIn, const CAmount& nFee,
+                        const std::function<bool(const CTransaction&)>& fnPayload,
+                        const std::vector<std::pair<COutPoint, CTxOut>>& vEscrowIn = {});
+    /** Token pools (step 4): create, add or remove liquidity, swap ("sell" token units for sats, or buy). Each builds on
+     *  the pool's current custody pair, chaining on a pending pool op in the mempool. */
+    bool CreateTokenPool(std::string& strFail, uint256& txidOut, const uint256& tokenID, uint64_t nUnits,
+                         const CAmount& nSats, uint32_t nFeeBps, const CAmount& nFee);
+    bool AddTokenLiquidity(std::string& strFail, uint256& txidOut, const uint256& tokenID, uint64_t nUnits,
+                           const CAmount& nFee, const CAmount& nMaxSats = 0);
+    bool RemoveTokenLiquidity(std::string& strFail, uint256& txidOut, const uint256& tokenID, uint64_t nLp,
+                              const CAmount& nFee);
+    bool SwapToken(std::string& strFail, uint256& txidOut, const uint256& tokenID, bool fSell, uint64_t nAmountIn,
+                   const CAmount& nFee, uint64_t nMinOut = 0);
+    bool BondIssuer(std::string& strFail, uint256& txidOut, const uint256& tokenID, const CAmount& nAmount,
+                    const CAmount& nFee);
+    /** Gold vaults (step 5): a partner pledges gold into the house's capital (a TOPUP); the house moves gold into or
+     *  out of its till (TILL, approved by the partners whose keys this wallet holds). */
+    bool PledgeGold(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint32_t nPartnerIndex,
+                    const uint256& tokenID, uint64_t nUnits, const CAmount& nFee);
+    /** D-2026-11-04-1 (3a): take the partner's whole capital entry of a dust token (the house holds at most
+     *  HOUSE_DUST_SLOT_MG of it) out to this wallet, adding nAddUnits (>= the units taken) of a token the house holds. */
+    bool ClearDustSlot(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint32_t nPartnerIndex,
+                       const uint256& tokenClear, const uint256& tokenAdd, uint64_t nAddUnits, const CAmount& nFee);
+    bool MoveTill(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const uint256& tokenID, int64_t nDelta,
+                  const CAmount& nFee);
+    /** Equity proof (R3-1): prove a house's equity negative at the tip's payout price, listing its overdue bills;
+     *  opens claims. Refuses (equity in nEquityOut) when it isn't negative. */
+    bool ProveEquity(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const CAmount& nFee, int64_t& nEquityOut,
+                     std::vector<uint32_t>& vOverdueOut);
 
     void ListAccountCreditDebit(const std::string& strAccount, std::list<CAccountingEntry>& entries);
     bool AddAccountingEntry(const CAccountingEntry&);

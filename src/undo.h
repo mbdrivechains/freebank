@@ -71,6 +71,13 @@ public:
         // any bond consolidation restore the coin UNTAGGED - free to sweep, and
         // a consensus split between reorged and freshly-synced nodes.
         ::Serialize(s, txout->fOracleBond);
+        // v4 (gram-notes release): the issued-token units, as Coin::Serialize.
+        ::Serialize(s, txout->fIssued);
+        if (txout->fIssued) {
+            ::Serialize(s, txout->assetID);
+            ::Serialize(s, txout->nIssuedUnits);
+            ::Serialize(s, txout->nIssuedFrozen);
+        }
     }
 
     explicit TxInUndoSerializer(const Coin* coin) : txout(coin) {}
@@ -118,6 +125,14 @@ public:
         ::Unserialize(s, txout->fLpShare);
         ::Unserialize(s, txout->nLpUnits);
         ::Unserialize(s, txout->fOracleBond);
+        ::Unserialize(s, txout->fIssued);
+        txout->nIssuedUnits = 0;
+        txout->nIssuedFrozen = 0;
+        if (txout->fIssued) {
+            ::Unserialize(s, txout->assetID);
+            ::Unserialize(s, txout->nIssuedUnits);
+            ::Unserialize(s, txout->nIssuedFrozen);
+        }
     }
 
     explicit TxInUndoDeserializer(Coin* coin) : txout(coin) {}

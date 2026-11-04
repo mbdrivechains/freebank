@@ -14,8 +14,10 @@
 #include <note.h>
 #include <script/standard.h>
 #include <streams.h>
+#include <test/sidechain_test_util.h>   // SideDBScope (the equity proof reads the bill DB)
 #include <test/test_bitcoin.h>
 #include <utilstrencodings.h>
+#include <validation.h>        // HouseOverdueBills, pbilltree
 #include <version.h>
 
 #include <functional>
@@ -600,14 +602,12 @@ BOOST_AUTO_TEST_CASE(house_effective_status_derivation)
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 1000), HOUSE_STATUS_OPEN);
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nDeadline), HOUSE_STATUS_OPEN);
 
-    // Missed cadence: lazily Stressed from deadline + 1, no writes
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nDeadline + 1), HOUSE_STATUS_STRESSED);
+    // Gram-notes release: a missed cadence no longer stresses a house (stress starts only on unpaid demand); it
+    // stays Open past the deadline, with nothing stored.
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nDeadline + 1), HOUSE_STATUS_OPEN);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nDeadline + 1 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_OPEN);
     BOOST_CHECK_EQUAL(house.nStressSinceHeight, 0); // nothing stored
-
-    // Window expiry: lazily Insolvent from stressOrigin + WINDOW
     const uint32_t nLazyOrigin = nDeadline + 1;
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nLazyOrigin + HOUSE_STRESSED_WINDOW - 1), HOUSE_STATUS_STRESSED);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nLazyOrigin + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_INSOLVENT);
 
     // Ratio-breach stress (tx-written by ATTEST): stressed immediately, even
     // while the cadence clock is fresh
@@ -618,11 +618,11 @@ BOOST_AUTO_TEST_CASE(house_effective_status_derivation)
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(hRatio, 2000 + HOUSE_STRESSED_WINDOW - 1), HOUSE_STATUS_STRESSED);
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(hRatio, 2000 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_INSOLVENT);
 
-    // Earlier-origin rule: if the (derived) missed-cadence origin precedes the
-    // stored ratio origin, the earlier origin drives the window clock
-    CHouse hBoth = house;              // lastAttest = 1000 -> lazy origin = nDeadline+1
-    hBoth.nStressSinceHeight = nLazyOrigin + 500;  // later ratio-stress record
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hBoth, nLazyOrigin + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_INSOLVENT);
+    // A stored origin alone drives the window clock (the missed-cadence origin is gone).
+    CHouse hBoth = house;
+    hBoth.nStressSinceHeight = nLazyOrigin + 500;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hBoth, nLazyOrigin + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_STRESSED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hBoth, nLazyOrigin + 500 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_INSOLVENT);
     // ...and a stored origin EARLIER than the lazy one wins unchanged
     CHouse hEarly = house;
     hEarly.nStressSinceHeight = 1500;  // ratio breach well before the cadence deadline
@@ -678,14 +678,8 @@ BOOST_AUTO_TEST_CASE(house_attest_floor_logic)
     BOOST_CHECK_EQUAL(HouseAttestNewStressOrigin(hStressed, 149999, 1100), 1050);
     BOOST_CHECK_EQUAL(HouseAttestNewStressOrigin(hStressed, 150000, 1100), 0);
 
-    // Lazily-stressed house (missed cadence): a below-floor or in-band attest
-    // MATERIALIZES the lazy origin (deadline + 1), not the attest height
-    CHouse hLazy = house;
-    const uint32_t nLazyOrigin = 1000 + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;
-    const int nLate = (int)nLazyOrigin + 10;
-    BOOST_CHECK_EQUAL(HouseAttestNewStressOrigin(hLazy, 50000, nLate), nLazyOrigin);
-    BOOST_CHECK_EQUAL(HouseAttestNewStressOrigin(hLazy, 120000, nLate), nLazyOrigin);
-    BOOST_CHECK_EQUAL(HouseAttestNewStressOrigin(hLazy, 150000, nLate), 0);
+    // (Gram-notes release: no lazy missed-cadence origin to materialize any more; ATTEST connect no longer calls
+    // this helper for an open house - validation.cpp's gold-till recovery test replaced it.)
 
     // Zero liabilities: any report (even 0 reserves) is a recovery - a house
     // with no notes outstanding cannot be liquidity-stressed
@@ -864,14 +858,13 @@ static void CheckSilenceClock(uint32_t nSilence)
     hProtest.nProtestHeight = 1150;
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(hProtest, (int)nInsolvent - 1), HOUSE_STATUS_DEFERRED);
 
-    // An OPEN/STRESSED house keeps today's clock: stress from the missed
-    // deadline + 1, insolvent HOUSE_STRESSED_WINDOW (1,008) later.
+    // Gram-notes release: an OPEN house that misses its cadence stays Open (stress starts only on unpaid demand).
     CHouse hOpen = house;
     hOpen.nDeferInvokedHeight = 0;
     hOpen.nStressSinceHeight = 0;
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)nDeadline), HOUSE_STATUS_OPEN);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)nDeadline + 1), HOUSE_STATUS_STRESSED);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)(nDeadline + 1 + HOUSE_STRESSED_WINDOW)), HOUSE_STATUS_INSOLVENT);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)nDeadline + 1), HOUSE_STATUS_OPEN);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(hOpen, (int)(nDeadline + 1 + HOUSE_STRESSED_WINDOW)), HOUSE_STATUS_OPEN);
 }
 
 BOOST_AUTO_TEST_CASE(house_suspended_silence_clock)
@@ -1549,8 +1542,8 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
     // BOTH this pin and the addendum arithmetic together, or the synthesis
     // silently builds a malformed record and the migration it claims to prove
     // proves nothing.
-    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 12);   // fired again at v9 -> v10 (members-only flags, 1 byte)
-                                                // and at v10 -> v11 (token backing, 1 u64)
+    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 13);   // fired again at v9 -> v10 (members-only flags, 1 byte),
+                                                // v10 -> v11 (token backing, 1 u64) and v12 -> v13 (gram snapshot)
 
     CHouse back;
     CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
@@ -1588,7 +1581,8 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
         static const size_t V10_ADDENDUM = sizeof(uint8_t);
         static const size_t V11_ADDENDUM = sizeof(uint64_t);
         static const size_t V12_ADDENDUM = 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t);   // the token claim totals
-        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM + V12_ADDENDUM));
+        static const size_t V13_ADDENDUM = 2 * sizeof(uint64_t) + sizeof(uint32_t);       // the gram snapshot + equity
+        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM + V12_ADDENDUM + V13_ADDENDUM));
         CDataStream ssV7(b, SER_NETWORK, PROTOCOL_VERSION);
         CHouse h7;
         ssV7 >> h7;                                   // must not throw
@@ -1620,11 +1614,14 @@ namespace {
 static CHouse MakeFailedHouse(CAmount pot)
 {
     CHouse house = MakeGuardHouse();
+    // Gram-notes release: the old missed-cadence origin, stored (it no longer derives).
+    house.nStressSinceHeight = house.nLastAttestHeight + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;
     house.status = HOUSE_STATUS_INSOLVENT;
     house.nInsolventHeight = 1500;
     house.nInsolventUnits = 100;
     house.nMintedUnits = 40;                     // 60 units already claimed or burned
     house.amountInsolventPot = pot;
+    house.nInsolventSatsPerGram = 1000;   // gram-notes release: the snapshot price (1 mg = 1 sat)
     house.vPartner[0].amountInsolventPledge = pot / 2;
     house.vPartner[1].amountInsolventPledge = pot / 2;
     return house;
@@ -1751,6 +1748,83 @@ BOOST_AUTO_TEST_CASE(mutual_fund_output_is_locked)
     }
     // It can never pass for an escrow script either.
     BOOST_CHECK(!IsHouseEscrowScript(MutualFundScript()));
+}
+
+// Gram-notes release (R3-1): anyone proves a house's equity negative and claims open; a bill unpaid 432 blocks past
+// maturity counts zero, but only when listed and really overdue.
+BOOST_AUTO_TEST_CASE(house_equity_proof)
+{
+    sidechain_test::SideDBScope sideDBs;
+    CHouse house = MakeGuardHouse();
+    house.nMintedUnits = 3000;
+    const int nH = 2000;
+    auto run = [&](const CHouse& h, int nHeight, const HouseEquity& eq, CHouse& out) {
+        auto fnGetHouse = [&](uint32_t id, CHouse& o) { if (id == h.nHouseID) { o = h; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
+            if (o == COutPoint(uint256S("a0"), 0) || o == COutPoint(uint256S("a1"), 0)) {
+                c = GuardEscrowCoin(h.nHouseID, 1000);
+                return true;
+            }
+            return false;
+        };
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+        mtx.nHouseOp = HOUSE_OP_EQUITY;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << eq;
+        mtx.vchHousePayload.assign(ss.begin(), ss.end());
+        CValidationState state;
+        const bool f = CheckHouseOperation(CTransaction(mtx), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
+                                           fnGetCoin, GuardNoBlock, out);
+        return f ? std::string("OK") : state.GetRejectReason();
+    };
+    HouseEquity eq;
+    eq.nHouseID = house.nHouseID;
+    eq.nPriceHeight = 0;   // the unit-test price (1 mg = 1 sat) at the block before
+    CHouse out;
+
+    // Escrow 2,000 sats = 2,000 mg against 1,500 mg of notes: positive, refused.
+    CHouse rich = house;
+    rich.nMintedUnits = 1500;
+    BOOST_CHECK_EQUAL(run(rich, nH, eq, out), "bad-house-equity-positive");
+
+    // A performing bill of 5,000 in the book: 2,000 + 5,000 - 3,000 > 0, refused...
+    CBill bill;
+    bill.nBillID = 1;
+    bill.billID = uint256S("b1");
+    bill.amount = 5000;
+    bill.nMaturityHeight = 1000;
+    bill.nOwnerHouseID = house.nHouseID;
+    CBill other = bill;
+    other.nBillID = 2;
+    other.billID = uint256S("b2");
+    other.nOwnerHouseID = house.nHouseID + 1;
+    BOOST_REQUIRE(pbilltree->WriteBills({bill, other}));
+    CHouse book = house;
+    book.nLoanBookFace = 5000;
+    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "bad-house-equity-positive");
+    // ...listed overdue (unpaid past maturity + 432) it counts zero: 2,000 - 3,000 < 0, accepted.
+    eq.vOverdueBillID = {1};
+    BOOST_CHECK_EQUAL(run(book, 1432, eq, out), "bad-house-equity-bill-not-overdue");   // not yet overdue
+    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "OK");
+    BOOST_CHECK_EQUAL(out.nEquityNegativeHeight, (uint32_t)nH);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(out, nH), HOUSE_STATUS_INSOLVENT);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(out, nH - 1), HOUSE_STATUS_OPEN);
+    BOOST_CHECK_EQUAL(HouseInsolventSince(out, nH + 10), (uint32_t)nH);
+    // Once insolvent, no second proof.
+    BOOST_CHECK_EQUAL(run(out, nH + 1, eq, out), "bad-house-equity-not-open");
+    // Another house's bill, or the same bill twice, can't be listed.
+    eq.vOverdueBillID = {2};
+    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "bad-house-equity-bill-not-overdue");
+    eq.vOverdueBillID = {1, 1};
+    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "bad-house-equity-duplicate-bill");
+    // The wallet's list: this house's overdue bills only.
+    BOOST_CHECK(HouseOverdueBills(book, nH) == std::vector<uint32_t>{1});
+    BOOST_CHECK(HouseOverdueBills(book, 1432).empty());
+
+    // No bills, no gold, escrow below the notes: negative outright.
+    eq.vOverdueBillID.clear();
+    BOOST_CHECK_EQUAL(run(house, nH, eq, out), "OK");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

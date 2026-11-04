@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <issued.h>
 #include <rpc/server.h>
 #include <rpc/client.h>
 
@@ -512,10 +513,10 @@ BOOST_AUTO_TEST_CASE(rpc_txtouniv_weight_and_credit)
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_SETTLE_VERSION, 2), "op_2"); // PRESENT is reserved
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT), "submit");
     const std::vector<std::pair<int, int>> vLastOp = {
-        {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW}, {TRANSACTION_HOUSE_VERSION, HOUSE_OP_CLOSE},
+        {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW}, {TRANSACTION_HOUSE_VERSION, HOUSE_OP_EQUITY},
         {TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST}, {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DISCHARGE},
         {TRANSACTION_POOL_VERSION, POOL_OP_RETIRE}, {TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE},
-        {TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT}};
+        {TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT}, {TRANSACTION_TOKEN_VERSION, ISSUED_OP_POOL_SWAP}};
     for (const auto& fam : vLastOp) {
         for (int op = 1; op <= fam.second; op++)
             BOOST_CHECK_MESSAGE(CreditOpName(fam.first, op).compare(0, 3, "op_") != 0,

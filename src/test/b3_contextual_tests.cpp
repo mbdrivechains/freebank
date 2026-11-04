@@ -715,11 +715,12 @@ BOOST_AUTO_TEST_CASE(b4_stress_origin_derivation_table)
         house.nProtestHeight = (uint32_t)H - 50;
         BOOST_CHECK_EQUAL(HouseStressOrigin(house, H), (uint32_t)H - 50);   // protest earlier
     }
-    // (c') earliest-wins against the derived missed-cadence origin, both ways.
+    // (c') earliest-wins against a stored origin, both ways (gram-notes release: the missed-cadence origin no longer
+    // derives, so the same earliest-wins merge is shown against a stored one).
     {
         CHouse house = MakeOpenHouse(1, H, 2 * U);
-        house.nLastAttestHeight = 1000;   // deadline+1 = 1001 + MISS_N*CADENCE
         const uint32_t nCadenceOrigin = 1000 + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;
+        house.nStressSinceHeight = nCadenceOrigin;
         house.nProtestOpen = 1;
         house.nProtestHeight = nCadenceOrigin - 100;
         BOOST_CHECK_EQUAL(HouseStressOrigin(house, H), nCadenceOrigin - 100);

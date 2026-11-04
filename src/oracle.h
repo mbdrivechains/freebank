@@ -65,8 +65,8 @@ static const uint8_t ORACLE_OP_SUBMIT = 2;   // one bonded price observation, on
 static const uint64_t ORACLE_PRICE_MIN = 1;
 static const uint64_t ORACLE_PRICE_MAX = ((uint64_t)1 << 53) - 1;
 
-// Payload ceiling (largest realistic op: BOND with pubkey + sig + priors).
-static const size_t MAX_ORACLE_PAYLOAD = 512;
+// Payload ceiling (gram-notes release: a SUBMIT with MAX_ORACLE_OBS observations, 65 bytes each, plus the rest).
+static const size_t MAX_ORACLE_PAYLOAD = 2304;
 
 // Brake units: parts-per-million of the braked value, per elapsed block,
 // with elapsed capped at Consensus::Params::nOracleBrakeElapsedCap (one
@@ -77,17 +77,48 @@ static const size_t MAX_ORACLE_PAYLOAD = 512;
 // (The constants themselves live in chainparams - the nSettleCadence
 // precedent; consensus-critical, deliberately NOT runtime-settable.)
 
+/** Gram-notes release (docs-local/GOLD_USD_SCOPE.md step 3; design draft 9 "The price feed"): what a reporter
+ * reports. One submission carries any number of observations, at most one per (stream, subject). */
+static const uint8_t ORACLE_STREAM_GOLD_ECX = 1;   // value = sats per gram of gold (the payout price's oracle side)
+static const uint8_t ORACLE_STREAM_GOLD_USD = 2;   // value = US cents per gram of gold
+static const uint8_t ORACLE_STREAM_BACKING = 3;    // subject = issued token: value = its backing account's
+                                                   //   transferable balance in the token's units, the minimum over
+                                                   //   the reporting window (R2-fix-3); aux = the Ethereum block
+                                                   //   cited; aux2 = the units of the token's burns paid
+                                                   //   out on Ethereum, in total (R2-ops-7, D-2026-11-04-1)
+static const uint8_t ORACLE_STREAM_CLAIM = 4;      // subject = issued token: value 1 = its backing address's claim
+                                                   //   (an Ethereum transaction naming slot 130 and the token's id,
+                                                   //   from an externally owned account) seen; aux = its Ethereum block
+static const size_t MAX_ORACLE_OBS = 32;
+
+struct COracleObs {
+    uint8_t nStream = 0;
+    uint256 subject;            // null for the price streams
+    uint64_t nValue = 0;
+    uint64_t nAux = 0;
+    uint64_t nAux2 = 0;
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nStream);
+        READWRITE(subject);
+        READWRITE(nValue);
+        READWRITE(nAux);
+        READWRITE(nAux2);
+    }
+};
+
 /** ORACLE_OP_SUBMIT payload. Leading 8 bytes = {nSubmitterID, nTargetHeight}
  * (the version-wide memcpy guard contract [F-2pat]: dense u32 id assigned by
  * BOND at connect - 33-byte pubkeys are un-memcpy-able as guard keys).
  *
- * Prior-state binding (ATTEST pattern, one nPrev* per mutated field): all
- * submissions in one block legitimately bind the SAME pre-block fix state
- * (the median applies post-loop); connect requires byte-exact equality, so
- * DisconnectBlock restores from any one payload alone. The braked view is
- * path-dependent (asym clamp) and is only restorable BECAUSE it is bound
- * here. Genesis binding is context-free-checkable: nPrevFixHeight == 0 iff
- * both prev views are 0.
+ * Gram-notes release: the observations go to the units DB, whose per-block
+ * undo restores them, so a submission binds no fix priors any more (they
+ * made every submission in a block bind one shared pre-block state and
+ * failed all of them whenever a fix moved). nPrevOwnLastSubmitHeight stays:
+ * it restores the submitter record and makes a payload single-use.
  *
  * hashPrevBlockBind: the digest AND payload carry the parent block hash -
  * branch binding kills the sequencer's stale-vs-fresh selection option
@@ -99,12 +130,8 @@ struct OracleSubmit {
     uint32_t nSubmitterID;                     // LEADING; dense id, >= 1
     uint32_t nTargetHeight;                    // FIRST height at which this may
                                                //   connect; valid through
-                                               //   +nOracleOpWindow-1 (see the
-                                               //   window note at the top)
-    uint64_t nPriceMilligrams;                 // mg gold per 1000 ECX, in envelope
-    uint64_t nPrevRaw;                         // priors, ATTEST pattern
-    uint64_t nPrevBraked;
-    uint32_t nPrevFixHeight;
+                                               //   +nOracleOpWindow-1
+    std::vector<COracleObs> vObs;              // sorted by (stream, subject), unique
     uint32_t nPrevOwnLastSubmitHeight;         // ALSO the single-use mechanism:
                                                //   bumped on every inclusion, so
                                                //   at most ONE of a submitter's
@@ -117,9 +144,7 @@ struct OracleSubmit {
                                                //   an immediate-parent equality
     std::vector<unsigned char> vchSig;         // submitter sig (excluded from digest)
 
-    OracleSubmit() : nSubmitterID(0), nTargetHeight(0), nPriceMilligrams(0),
-                     nPrevRaw(0), nPrevBraked(0), nPrevFixHeight(0),
-                     nPrevOwnLastSubmitHeight(0) {}
+    OracleSubmit() : nSubmitterID(0), nTargetHeight(0), nPrevOwnLastSubmitHeight(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -127,10 +152,7 @@ struct OracleSubmit {
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nSubmitterID);
         READWRITE(nTargetHeight);
-        READWRITE(nPriceMilligrams);
-        READWRITE(nPrevRaw);
-        READWRITE(nPrevBraked);
-        READWRITE(nPrevFixHeight);
+        READWRITE(vObs);
         READWRITE(nPrevOwnLastSubmitHeight);
         READWRITE(hashPrevBlockBind);
         READWRITE(vchSig);
