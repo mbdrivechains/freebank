@@ -3,21 +3,29 @@
 [![guix-linux](https://github.com/mbdrivechains/freebank/actions/workflows/guix.yml/badge.svg)](https://github.com/mbdrivechains/freebank/actions/workflows/guix.yml)
 
 **Credit creation on a BIP 300/301 drivechain.** FreeBank is a Bitcoin sidechain for
-free banking — *discount houses* issuing redeemable credit notes against attested
-reserves, and *bills of exchange* backed by an escrow bond — in the lineage of Scottish
-free banking (1716–1845), cryptographically translated. It runs as a CUSF/BIP 300–301
-sidechain alongside the drivechain enforcer.
+credit, in the lineage of Scottish free banking (1716–1845): *discount houses* issuing
+redeemable credit notes against attested reserves, and *bills of exchange* backed by an
+escrow bond, cryptographically translated. It runs as a CUSF/BIP 300–301 sidechain
+alongside the drivechain enforcer.
 
 This is an exploration. It may or may not work out — but it illustrates just another
 possibility that drivechains open up: not only new execution environments or scaling, but
-new *monetary* arrangements settling against Bitcoin.
+new credit arrangements settling against Bitcoin.
 
 FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 
-> **Notice.** FreeBank is software. It is experimental and has not been audited; real money
-> can be lost. Houses are run by independent operators, not by the FreeBank developers, and
-> each operator is responsible for any licence its jurisdiction requires. FreeBank is not
-> offered where using it would be unlawful.
+> **Notice.** FreeBank is experimental, open-source software. It has not been audited, and you can lose what you put
+> into it. FreeBank is not a bank. Nothing on it is insured or guaranteed by any government or by its developers.
+>
+> Houses are run by independent operators, not by FreeBank's developers. A house can suspend payment or fail, and its
+> notes may not be paid in full. Notes are denominated in grams of gold and paid in sECX (ECX held on FreeBank) at an
+> on-chain price. Moving sECX back to eCash is slow and needs eCash miners' approval, and sECX can trade below ECX.
+>
+> Running a house, issuing tokens, reporting prices or lending to consumers may need a licence where you do it.
+> Nothing here is an offer of a financial product, or financial, legal or tax advice. FreeBank is not offered where
+> using it would be unlawful. You are responsible for the laws and taxes that apply to you.
+>
+> The full notice: [NOTICE.md](NOTICE.md).
 
 > **Which release runs which network.** v1.0.0 and later run **FreeBank mainnet**, slot 130 on
 > eCash mainnet (eCash leaves Bitcoin at block 973,728). v1.0.0 ships it **dormant**: the node runs

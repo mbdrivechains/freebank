@@ -2,9 +2,22 @@
 
 **A knowledge document for people — and for their AI assistants.**
 
+> **Notice.** FreeBank is experimental, open-source software. It has not been audited, and you can lose what you put
+> into it. FreeBank is not a bank. Nothing on it is insured or guaranteed by any government or by its developers.
+>
+> Houses are run by independent operators, not by FreeBank's developers. A house can suspend payment or fail, and its
+> notes may not be paid in full. Notes are denominated in grams of gold and paid in sECX (ECX held on FreeBank) at an
+> on-chain price. Moving sECX back to eCash is slow and needs eCash miners' approval, and sECX can trade below ECX.
+>
+> Running a house, issuing tokens, reporting prices or lending to consumers may need a licence where you do it.
+> Nothing here is an offer of a financial product, or financial, legal or tax advice. FreeBank is not offered where
+> using it would be unlawful. You are responsible for the laws and taxes that apply to you.
+>
+> The full notice: [NOTICE.md](NOTICE.md).
+
 This file is meant to be *complete enough on its own* that you can hand it to an AI
 assistant (paste it, attach it, or point the assistant at this URL) and ask it to walk
-you through running FreeBank, standing up a bank, issuing credit, and understanding what
+you through running FreeBank, standing up a house, issuing credit, and understanding what
 is happening on the chain. Every command in it was taken from a passing integration test
 or from the source of the shipped release (the current release is v0.2.25), and the quick start in
 section 3 was run verbatim against the v0.2.25 release binaries. Where something is designed but
@@ -88,6 +101,36 @@ ECX notes, are planned for a later release. They open only once ECX markets are 
 | **Assets** | Anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in the coins that carry it (v0.2.18). A token is only as good as its issuer; tickers are not unique. | Yes |
 | **Gold oracle** | Bonded submitters post a gold price; the fix is a braked lower median. **Consensus-inert**: nothing in consensus reads it. | Yes, inert |
 | Two-wallet bill issuance tooling, automatic clearing sweeps, gold notes, cash-credit lines | — | **Not built** (section 8 says which are designed) |
+
+### Before you take on a role
+
+**Roles that may need a licence.** In many countries:
+- issuing notes payable on demand and lending them out may be banking or deposit-taking;
+- gram notes may be financial products, such as derivatives;
+- lending to consumers needs a licence, buy-now-pay-later-style credit included;
+- holding tokens for others, or issuing your own against them, is custody and token issuance;
+- paying out sECX for notes may count as a crypto-asset service;
+- customer-check, sanctions and reporting laws apply to anyone serving the public;
+- knowingly false prices are an offence.
+
+If you take on any of these roles, the law where you do it is your responsibility, not the developers'.
+
+At the point where you take on each role:
+
+- **Running a house** (charter a house, mint notes, take term deposits, discount a bill): Running a house for others
+  (issuing notes, lending them out, taking deposits or discounting bills) may be banking, deposit-taking or a
+  financial service where you do it, and need a licence. Gram notes may count as financial products, such as
+  derivatives. That is your responsibility, not FreeBank's developers'.
+- **Issuing tokens** (create a token, mint, burn): Issuing tokens against gold or dollar tokens you hold for others is
+  custody and token issuance, which needs a licence in most countries.
+- **Reporting prices** (bond a submitter, submit prices): Your reports set what others are paid. Knowingly false or
+  manipulated prices are an offence in many countries.
+- **Pools** (add to a pool, create a pool): Pool shares can lose value against what you put in. A token is only as
+  good as its issuer.
+- **Bills** (issue a bill, sell it to a house): Bills are for trade between businesses. Credit to consumers,
+  buy-now-pay-later-style credit included, needs a licence in many countries.
+
+The full notice is [NOTICE.md](NOTICE.md).
 
 ---
 
@@ -409,7 +452,7 @@ bmm 3
 $FB listunspent 1 | grep -c '"amount"'    # several confirmed coins
 ```
 
-### 3.7 Your first bank: register → attest → mint → redeem
+### 3.7 Your first house: register → attest → mint → redeem
 
 ```bash
 # registerhouse <tier 0-3> <threshold M> "<classid, 1-16 chars [a-z0-9], unique>" <denommg> "<pledges, coin amounts>" <fee> [type]
@@ -1547,7 +1590,7 @@ and the enforcer's seed under `/mnt/vol/enforcer/wallet/` if you enabled its wal
 stays in your own account, never something to hand to anyone; and keep the provider token off the box
 altogether.
 
-### 5.6 The first bank and loan on alpha, as it happened (2026-09-05)
+### 5.6 The first house and loan on alpha, as it happened (2026-09-05)
 
 *History: alpha has since been replaced by the beta (2.3), and the project no longer runs an alpha
 node, so 5.3 will not reach this chain; the table and txids below are a record.*
