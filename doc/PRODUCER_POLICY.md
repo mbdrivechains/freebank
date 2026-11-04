@@ -1,18 +1,31 @@
 # Who produces FreeBank blocks, and what they include
 
-## The current producer
+## Block production until 31 October 2027 (v1.1.0)
 
-FreeBank blocks are blind-merged-mined: anyone running a FreeBank node with an eCash wallet can bid for the right to
-produce the next block. At launch, one producer runs the seed node `seed.ecxfreebank.com` and bids for every block. It
-does so for twelve months from the mainnet launch, until **31 October 2027**. After that date it stops bidding, and blocks come from whoever bids.
+Until 31 October 2027 Michael Blowes bids to produce FreeBank blocks on eCash, so that blocks keep coming while few
+others bid. Anyone may bid, and the highest bid wins. For that period:
 
-The producer is a block producer only. It runs no house, no money changer and no custody, and it takes no protocol fee:
-FreeBank has none.
+- His bid is a fixed **2,000 sats (0.00002 ECX) per eCash block**, paid as the fee of the bid transaction, published
+  here, and is never raised to beat another bidder. The bidding stops on 31 October 2027.
+- His block producer includes every valid transaction it receives - price and backing reports and pool swaps
+  included - and publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder). Where a
+  reporter sends two reports for one block, the producer keeps the latest valid one it received, by a fixed rule, and
+  the log records the replacement.
+- He, any entity he controls, and anyone acting for him hold no gram notes, gold or dollar tokens, pool shares or stake
+  in any house; post no issuer bond and put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any
+  issuer or house; buy nothing to support a price and rescue no house.
+
+The no-forfeit rule for price reporters ends at a height that a later release sets once a second, unconnected bidder
+is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
+
+The producer is a block producer only. It runs no house, no money changer and no custody. FreeBank has no protocol
+fee: no part of any transaction is set aside for a developer or a foundation. A block's coinbase pays whoever produced it the
+block's transaction fees plus 1,000 sats per deposit, and the fee for creating a token or a pool is burned.
 
 ## What every block includes
 
-The seed node includes every valid transaction it receives. From v0.2.19 it fills each block in this order (until then,
-by fee rate alone):
+The producer includes every valid transaction it receives. From v0.2.19 it fills each block in this order (until
+then, by fee rate alone):
 
 1. **Transactions that run a house's solvency clock, oldest first**: redemptions and discharges, demands, protests,
    insolvency claims, term-deposit withdrawals and claims, and house attestations. They may use up to half of each

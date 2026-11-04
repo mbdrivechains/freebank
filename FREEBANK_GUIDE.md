@@ -585,6 +585,11 @@ $FB claimbillescrow "$ID2" 0.001; bmm 6             # the holder takes the bond;
 $FB recoursebill "$ID2" 0.001; bmm 6
 ```
 
+**Units from v1.1.0.** A bill's face and a discount's price are mg of gold. On v1.1.0 `issuebill`, `proposediscount`
+and the bill listings still use the 8-decimal form, so the `1` above is 100,000,000 mg (100 kg), and `signdiscount`'s
+`max_deficiency` and `max_loss` are not meaningful. From v1.1.1 they take and show whole mg (`face_mg`, `price_mg`),
+like `mintnote`.
+
 Bill status letters: `a` active, `r` retired, `d` defaulted. `issuebill` is still a
 *single-wallet handshake* (v0.2.25): the issuing wallet plays drawer, acceptor and initial holder
 with fresh keys (so above, the same wallet later claims the bond). Consensus already
@@ -931,9 +936,9 @@ $FB listtokenpools                            # every pool, and the chain's payo
 
 **Reporter notes.**
 
-- A report targets the next block only and binds the current tip, so it counts only if it reaches the block producer
-  before the producer's bid for that block. Re-sign it each block until it is in; the producer keeps your latest valid
-  report and logs any it replaced (`getinclusionlog`).
+- A report is signed for the next block and binds the current tip. It stays valid for 6 blocks (3 on regtest), so it
+  counts once a block producer includes it within that window; after that, or after a reorg below the tip it bound,
+  sign a new one. The producer keeps your latest valid report and logs any it replaced (`getinclusionlog`).
 - Streams: 1 gold/ECX in sats per gram; 2 gold/USD in cents per gram; 3 a token's backing; 4 a backing-address claim.
 - Backing (stream 3): `value` is the backing address's transferable balance in the token's units, as the minimum over
   the window. `aux` is the Ethereum block cited. `aux2` is the units the backing address has sent to the burns'
@@ -943,8 +948,8 @@ $FB listtokenpools                            # every pool, and the chain's payo
   backing. A token whose burns older than 1,008 blocks are unpaid by more than max(10 g, 0.5% of supply) is
   untrusted.
 - The quorum is max(3, half the reporters who reported that price in the last 24 blocks), capped at 7.
-- While there is one block producer, reporters forfeit nothing and are paid nothing. Both change in the release that
-  follows a second, unconnected producer.
+- While there is one block producer, reporters forfeit nothing and are paid nothing. Both change at a height that a
+  later release sets once a second, unconnected bidder is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
 
 ---
 
@@ -1249,6 +1254,24 @@ testing, nothing more. For real money, run your own validated stack (5.2).
    refuses to start with an identity-mismatch error, BitWindow's node is not on the eCash beta. This path only
    *follows* the chain; to produce blocks yourself, bid via `refreshbmm` (5.2) or mine them (5.4).
 ### 5.4 Producing blocks yourself
+
+**Block production until 31 October 2027 (v1.1.0).** Until 31 October 2027 Michael Blowes bids to produce FreeBank blocks on eCash, so that blocks keep coming while few
+others bid. Anyone may bid, and the highest bid wins. For that period:
+
+- His bid is a fixed **2,000 sats (0.00002 ECX) per eCash block**, paid as the fee of the bid transaction, published
+  here, and is never raised to beat another bidder. The bidding stops on 31 October 2027.
+- His block producer includes every valid transaction it receives - price and backing reports and pool swaps
+  included - and publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder). Where a
+  reporter sends two reports for one block, the producer keeps the latest valid one it received, by a fixed rule, and
+  the log records the replacement.
+- He, any entity he controls, and anyone acting for him hold no gram notes, gold or dollar tokens, pool shares or stake
+  in any house; post no issuer bond and put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any
+  issuer or house; buy nothing to support a price and rescue no house.
+
+The no-forfeit rule for price reporters ends at a height that a later release sets once a second, unconnected bidder
+is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
+
+The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
 
 *Written on alpha (September 2026). The pieces below carry over to the beta; the difficulty and
 block-cost figures are alpha's, so check the beta's current difficulty before you rent hash.*

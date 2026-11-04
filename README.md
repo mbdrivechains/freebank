@@ -70,6 +70,26 @@ on every network the release runs.
 
 Details: [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md), section 4.13.
 
+### Block production until 31 October 2027
+
+Until 31 October 2027 Michael Blowes bids to produce FreeBank blocks on eCash, so that blocks keep coming while few
+others bid. Anyone may bid, and the highest bid wins. For that period:
+
+- His bid is a fixed **2,000 sats (0.00002 ECX) per eCash block**, paid as the fee of the bid transaction, published
+  here, and is never raised to beat another bidder. The bidding stops on 31 October 2027.
+- His block producer includes every valid transaction it receives - price and backing reports and pool swaps
+  included - and publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder). Where a
+  reporter sends two reports for one block, the producer keeps the latest valid one it received, by a fixed rule, and
+  the log records the replacement.
+- He, any entity he controls, and anyone acting for him hold no gram notes, gold or dollar tokens, pool shares or stake
+  in any house; post no issuer bond and put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any
+  issuer or house; buy nothing to support a price and rescue no house.
+
+The no-forfeit rule for price reporters ends at a height that a later release sets once a second, unconnected bidder
+is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
+
+The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
+
 ## What works today
 
 - **BIP 300/301 sidechain**: activates into a slot, advances by blind-merged-mining (BMM),
