@@ -567,7 +567,7 @@ $FB registerhouse 3 2 "club"    1000 "[0.3,0.3,0.3]"  0.001   # tier 3: multi-pa
 ```bash
 BODY=$(head -c 64 /dev/urandom | xxd -p -c 256)     # the (encrypted) commercial body; bill id = hash of it
 NOW=$($FB getblockcount)
-$FB issuebill "$BODY" 1 0.75 $((NOW + 200)) 5 0.001  # <body hex> <face coins> <escrow bond coins> <maturity height> [grace blocks=1008] [fee]; prints {"txid","bill_id"}
+$FB issuebill "$BODY" 100000000 0.75 $((NOW + 200)) 5 0.001  # <body hex> <face, whole mg (here 100 kg)> <escrow bond, sECX> <maturity height> [grace blocks=1008] [fee]; prints {"txid","bill_id"}
                                                     # (the issuing wallet must hold the bond + fees spendable: ~0.76 coin here; section 3 leaves ~2.99)
 bmm 6
 ID=$($FB listbills | python3 -c "import json,sys; print(json.load(sys.stdin)[-1]['id'])")
@@ -577,7 +577,7 @@ $FB retirebill "$ID" 0.001; bmm 6                   # drawee pays face to the ho
 
 # default path: a second bill with a short maturity, left unpaid (the issuing wallet needs ~0.76 coin spendable: bond + fees)
 BODY2=$(head -c 64 /dev/urandom | xxd -p -c 256); NOW=$($FB getblockcount)
-$FB issuebill "$BODY2" 1 0.75 $((NOW + 20)) 5 0.001; bmm 6
+$FB issuebill "$BODY2" 100000000 0.75 $((NOW + 20)) 5 0.001; bmm 6
 ID2=$($FB listbills | python3 -c "import json,sys; print(json.load(sys.stdin)[-1]['id'])")
 bmm 30                                              # past maturity (20) + grace (5)
 $FB claimbillescrow "$ID2" 0.001; bmm 6             # the holder takes the bond; status "d"
@@ -585,10 +585,10 @@ $FB claimbillescrow "$ID2" 0.001; bmm 6             # the holder takes the bond;
 $FB recoursebill "$ID2" 0.001; bmm 6
 ```
 
-**Units from v1.1.0.** A bill's face and a discount's price are mg of gold. On v1.1.0 `issuebill`, `proposediscount`
-and the bill listings still use the 8-decimal form, so the `1` above is 100,000,000 mg (100 kg), and `signdiscount`'s
-`max_deficiency` and `max_loss` are not meaningful. From v1.1.1 they take and show whole mg (`face_mg`, `price_mg`),
-like `mintnote`.
+**Units from v1.1.0.** A bill's face and a discount's price are whole mg of gold, as notes are: `issuebill` and
+`proposediscount` take them that way, and `getbill`, `listbills`, `listmybills` and `listloanbook` show `face_mg`.
+The escrow bond is sECX. `signdiscount` shows `face_mg`, `price_mg`, the bond, and `max_deficiency` / `max_loss` in
+sECX at the payout price. (Before v1.1.0 these were 8-decimal coin amounts.)
 
 Bill status letters: `a` active, `r` retired, `d` defaulted. `issuebill` is still a
 *single-wallet handshake* (v0.2.25): the issuing wallet plays drawer, acceptor and initial holder
@@ -606,10 +606,10 @@ proves live reserves and pays its fee from a coin outside the proof set) and the
 ```bash
 $W1 attesthouse $H1 0.001; bmm 4                                    # signdiscount (like mintnote) needs an attestation <= 144 blocks old
 BODY=$(head -c 64 /dev/urandom | xxd -p -c 256); NOW=$($FB getblockcount)
-$W2 issuebill "$BODY" 0.5 0.4 $((NOW + 400)) 5 0.001; bmm 6         # face 0.5 coins, bond 0.4
+$W2 issuebill "$BODY" 50000000 0.4 $((NOW + 400)) 5 0.001; bmm 6    # face 50,000,000 mg (50 kg), bond 0.4 sECX
 ID=$($W2 listmybills | python3 -c "import json,sys; print(json.load(sys.stdin)[-1]['id'])")
 
-PROP=$($W2 proposediscount $ID $H1 0.475 200 | python3 -c "import json,sys; print(json.load(sys.stdin)['proposal'])")   # seller: <bill> <house> <price in COINS <= face - despite `help` saying units> [expiry blocks, default 252, max 1008]; 5% discount
+PROP=$($W2 proposediscount $ID $H1 47500000 200 | python3 -c "import json,sys; print(json.load(sys.stdin)['proposal'])")   # seller: <bill> <house> <price, whole mg of notes, <= face> [expiry blocks, default 252, max 1008]; 5% discount
 HEX=$($W1 signdiscount "$PROP" 0.001 | python3 -c "import json,sys; print(json.load(sys.stdin)['hex'])")            # house: mints the note leg, proves reserves, signs; pays the fee
 $W2 completediscount "$HEX"                                                                                       # seller: re-verifies terms, signs title, broadcasts; prints {"txid": "..."}
 bmm 6
@@ -1959,13 +1959,13 @@ arguments (default 0.001 coin). "Wallet" RPCs run in a wallet (`-rpcwallet=<name
 | `listmywithdrawals` · `getwithdrawal` · `getwithdrawalbundle` · `rebroadcastwithdrawalbundle` | node | `getwithdrawal id` | 4.10 |
 | `refreshbmm` | node | `amount [createnew] [prevblock]` | 3.5 |
 | `getmainchainblockcount` · `getmainchainblockhash` | node | `getmainchainblockhash height` | 3.4 |
-| `issuebill` | wallet | `bodyhex amount escrow maturityheight [graceblocks] [fee]` | 4.2 |
+| `issuebill` | wallet | `bodyhex face_mg escrow maturityheight [graceblocks] [fee]` | 4.2 |
 | `endorsebill` | wallet | `id topubkey [fee]` | 4.2 |
 | `retirebill` · `claimbillescrow` · `recoursebill` | wallet | `id [fee]` | 4.2 |
 | `getnewbillpubkey` | wallet | — | 4.2 |
 | `listbills` · `getbill` | node | `getbill id` | 4.2 |
 | `listmybills` | wallet | — (adds `roles`) | 4.3 |
-| `proposediscount` | wallet | `billid houseid price [expiryblocks]` | 4.3 |
+| `proposediscount` | wallet | `billid houseid price_mg [expiryblocks]` | 4.3 |
 | `signdiscount` | wallet | `proposalhex [fee]` | 4.3 |
 | `completediscount` | wallet | `signedhex` | 4.3 |
 | `listloanbook` | node | `houseid` | 4.3 |
