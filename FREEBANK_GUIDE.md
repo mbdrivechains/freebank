@@ -78,24 +78,23 @@ of trusted**.
 Mechanically, FreeBank is a BIP 300/301 drivechain (a C++ fork of the MIT-licensed
 BitAssets sidechain chassis, itself Bitcoin Core lineage). It has **no coin of its own,
 no premine, no subsidy**: the only money inside it is mainchain coin that was deposited
-through the two-way peg. Everything a house issues is a liability denominated in — and
-redeemable for — that pegged coin.
+through the two-way peg. Everything a house issues is a liability paid in that pegged coin.
 
-The unit is ECX, the chain's own coin, which moves one-for-one with ECX on the eCash mainchain
-through the drivechain peg. Notes, bills and reserves are all counted and redeemed in ECX.
-**Later: a gold unit (☉).** Notes in grams of gold, backed by wrapped gold and kept apart from
-ECX notes, are planned for a later release. They open only once ECX markets are deep enough.
+From v1.1.0, notes, bills and deposits are denominated in grams of gold (counted in milligrams) and paid in sECX, ECX
+held on FreeBank, at the chain's gold price. Moving sECX back to eCash is slow and needs eCash miners' approval, and on
+FreeBank it can trade below ECX. A house holds its owners' capital and its till in gold tokens, counted on the chain.
+Releases before v1.1.0 count everything in ECX.
 
 ### The instruments, in one screen
 
 | Instrument | What it is | Built? |
 |---|---|---|
 | **Bill of exchange** | A unique, stateful IOU between a drawer (seller), a drawee/acceptor (buyer, who posts an escrow bond) and a holder (current owner). Matures at a block height; endorsable; defaulted bills pay the bond to the holder; liable parties can be pursued by recourse. | Yes |
-| **Discount house** | A registered, escrow-bonded, M-of-N-governed issuer of notes and term deposits. Proves its liquid reserves on-chain every ~144 blocks. Lifecycle: Open → Stressed → Suspended (`deferred` in the RPCs) → Insolvent / Wound-down. Open to anyone, or (v0.2.19) members-only or redeem-only, for co-ops. | Yes |
-| **Notes** | The money. Per-house credit claims minted against reserves, transferred bearer-style, redeemed at par (1 unit = 1 sat). Holders can formally demand par; houses discharge demands unilaterally; a lapsed demand can be protested. | Yes |
+| **Discount house** | A registered, escrow-bonded, M-of-N-governed issuer of notes and term deposits. From v1.1.0 the chain counts its capital and till in gold tokens; it still attests on-chain to suspend, to reopen, and before netting again after a settlement (before v1.1.0 it proved its liquid reserves every ~144 blocks). Lifecycle: Open → Stressed → Suspended (`deferred` in the RPCs) → Insolvent / Wound-down. Open to anyone, or (v0.2.19) members-only or redeem-only, for co-ops. | Yes |
+| **Notes** | Per-house credit claims, transferred bearer-style. From v1.1.0, denominated in grams of gold (1 unit = 1 mg) and paid in sECX at the on-chain gold price, at par while the house is Open; before v1.1.0, in ECX (1 unit = 1 sat). Holders can formally demand payment; houses discharge demands unilaterally; a lapsed demand can be protested. | Yes |
 | **Discounting** | A house buys a bill from its holder, paying with notes minted in the same operation — the act of credit creation. Books the bill as a loan asset under a match-funding rule. | Yes |
 | **Term deposits** | Time-locked loans to a house at a per-receipt rate; transferable whole; junior to notes. | Yes |
-| **Clearing pool** | One constant-product AMM per house between its notes and the base coin — the secondary market that prices stressed paper. | Yes |
+| **Clearing pool** | One constant-product AMM per house between its notes and the base coin — the secondary market that prices stressed paper. From v1.1.0 house note pools are closed until a second, unconnected block producer appears (`note_pools_open`); gold-token pools are open (4.13). | Yes |
 | **Settlement between houses** | Houses present each other's notes, the notes are burned, and only the net is paid at par in ECX. Two houses settle bilaterally (±0.5%); from v0.2.22 any number net in one round (the Edinburgh exchange). Every house signs. | Yes |
 | **Token records** | A house may run a Chaumian mint (Cashu-style bearer tokens, off-chain). The chain records each mint (notes locked as backing) and each burn (backing released as notes), and from v0.2.21 token holders can claim at a failed house without its partners. The mint and the token wallet are separate software. | Yes (the on-chain records) |
 | **Assets** | Anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in the coins that carry it (v0.2.18). A token is only as good as its issuer; tickers are not unique. | Yes |
