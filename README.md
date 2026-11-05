@@ -4,8 +4,8 @@
 
 **Credit creation on a BIP 300/301 drivechain.** FreeBank is a Bitcoin sidechain for
 credit, in the lineage of Scottish free banking (1716–1845): *discount houses* issuing
-redeemable credit notes against attested reserves, and *bills of exchange* backed by an
-escrow bond, cryptographically translated. It runs as a CUSF/BIP 300–301 sidechain
+redeemable credit notes, with their capital and till counted on the chain, and *bills of
+exchange* with an escrow bond, cryptographically translated. It runs as a CUSF/BIP 300–301 sidechain
 alongside the drivechain enforcer.
 
 This is an exploration. It may or may not work out — but it illustrates just another
@@ -67,6 +67,8 @@ on every network the release runs.
   - At most 8 tokens per house; a new one comes in only by the partners' agreement.
   - An issuer's freeze on house gold counts zero after 30 days.
   - Anyone can prove a house's equity negative (`proveequity`), which opens claims.
+  - Issuing needs no attestation, and a missed or low attestation no longer stresses a house: stress starts only with
+    a protested, unpaid demand. Attestations still count while a house is suspended, and before a house that has settled nets again.
 - **Failed houses** pay in value at a snapshot price: notes first, pro rata in gold then sECX; deposits after; what is
   left goes to the noteholders' mutual fund.
 - **Token pools**, one per gold token, with swaps that chain within a block and LP shares. **House note pools are
@@ -123,7 +125,8 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   RPCs: `registerhouse`, `listhouses`, `attesthouse`, and friends.
 - **Credit notes**: per-house redeemable credit claims. Issuance is
   **reserve-gated at mint** — a mint must prove live reserves against the cap; notes
-  transfer person-to-person; the issuing house redeems at par from reserves.
+  transfer person-to-person; the issuing house redeems at par from reserves. From v1.1.0 the caps count the
+  house's gold on the chain, with no reserve proof (Gram notes, above).
 - **Bearer redemption** (the holder's teeth): a note holder places a formal *demand* for
   par. Against an open house this **pre-authorises** the payout — the note coins move into
   a consensus-enforced custody script and the house **discharges** them unilaterally,
@@ -160,11 +163,13 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   *Stressed*; an expired recovery window derives *Insolvent* — both computed at read time
   from on-chain heights (inherently reorg-safe). Insolvency triggers a waterfall:
   noteholders claim pro-rata from the locked escrow pot, then a whole-house residual
-  settlement.
+  settlement. From v1.1.0 a missed cadence or a low attestation no longer stresses an open house (stress starts
+  only with a protested, unpaid demand), and a failed house pays as Gram notes, above, says.
 - **The option clause**, translated from the Scottish record: a stressed house may suspend
   redemption, paying interest at the protocol rate on demanded notes until it pays, with its till locked into the
   claim pot. From v0.2.18 a suspension has no end date: it ends when the house reopens (an
-  attestation back above its floor) or when its silence makes it insolvent. Holders' demands
+  attestation back above its floor; from v1.1.0, with its counted gold till back at 2% of its notes) or when its
+  silence makes it insolvent. Holders' demands
   queue and the house may pay them alone. A consensus redemption spread (*brassage*) adds
   run-friction.
 - **Term deposits**: time-locked deposits with a consensus interest floor and transferable
@@ -182,8 +187,8 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   the coins that carry it, for example a token for gold a custodian holds. The asset's id is the
   txid that created it; tickers are not unique, and a token is only as good as its issuer. RPCs:
   `createasset`, `transferasset`, `transferassetcontrol`, `listmyassets`, `listassets`.
-- **The unit is ECX.** v0.2.17 removed the gram display (`getgramrate` and the `*_grams` RPC
-  fields). Gold notes backed by wrapped gold are planned for a later release.
+- **The unit up to v1.0.x is ECX.** v0.2.17 removed the gram display (`getgramrate` and the `*_grams` RPC
+  fields). From v1.1.0 notes count mg of gold (Gram notes, above).
 
 ## Robustness
 

@@ -481,6 +481,9 @@ $FB gethouse $H                # mintedunits: 30000000
 You have registered a bank, proven its reserves, issued credit money, moved it, and
 redeemed it. Every step is a consensus-validated transaction on your sidechain.
 
+*This is the v1.0.x recipe. On v1.1.0 amounts are mg, and the house needs gold capital and a gold till before it mints
+(4.13, step 3); minting no longer needs the attestation.*
+
 ### 3.8 Peg out (optional)
 
 ```bash
@@ -751,6 +754,10 @@ is not cleared by it. A house that became Stressed by *missing* its cadence must
 always returns an error) and `-deferwindow` is refused at startup. To try it on regtest,
 advance ~290 blocks without attesting (7.1) or restart `freebankd` with `-attestcadence=4`.
 
+*From v1.1.0 a house is stressed only by a protested, unpaid demand (4.4), and only paying it clears that. The
+attestation that reopens a suspended house is one with its counted gold till back at 2% of its notes, not 15%. To try
+it on regtest, let a pre-authorised demand lapse and protest it; missing attestations no longer stresses a house.*
+
 ### 4.6 Term deposits
 
 ```bash
@@ -937,6 +944,11 @@ be mixed in one transaction. Balances and coin selection never spend asset coins
 From v1.1.0 notes, bills and deposits count milligrams of gold, houses hold gold tokens, and payouts are in sECX at the
 chain's payout price (sats per gram). The rules apply from genesis. The earlier recipes still work, with every amount
 of a note, bill or deposit in mg, but a house can issue only once it holds gold.
+
+Issuing needs no attestation, and a missed or low attestation no longer stresses a house: stress starts only with a
+protested, unpaid demand (4.4). Attestations still count in three places: `deferhouse` needs one at most 144 blocks old;
+while a house is suspended, an attestation with its counted gold till back at 2% of its notes reopens it, and silence
+turns it Insolvent (4.5); and a house that has settled before must attest again before its next netting round (4.8).
 
 **1. The price.** Bonded reporters post observations, and a fix forms when a quorum of them report within six blocks.
 
@@ -1746,6 +1758,10 @@ touches it.
 ## 7. Gotchas — symptom, cause, fix
 
 ### 7.1 Houses and attestation
+
+*From v1.1.0 an open house that stops attesting is not stressed, and minting and discounting need no attestation
+(4.13). The cadence still binds a suspended house: one that goes silent turns Insolvent (4.5). The bullets below are
+the v1.0.x rules.*
 
 - **A house attests zero reserves from a single-coin wallet.** Symptom: from v0.2.23
   `attesthouse` refuses because the attestation would prove zero while the house last proved
