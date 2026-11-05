@@ -7,6 +7,11 @@ tokens or report prices, and don't check anyone who does.
 **You can lose what you put in.** The software is experimental and has not been audited; it may have bugs. Your
 keys are yours alone: nobody, including the developers, can recover your funds or reverse a payment.
 
+**Blocks can stop.** FreeBank has new blocks only while someone bids for them on eCash. Until 31 Oct 2027 its developer
+bids a fixed amount so that blocks keep coming ([doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md)); anyone may bid, and
+the highest bid wins. After that date, if nobody bids, FreeBank stops: coins on it can't move or be withdrawn until
+someone does.
+
 **Not a bank, no guarantee.** FreeBank is not a bank. Nothing on it is insured or guaranteed by any government or
 by its developers.
 
