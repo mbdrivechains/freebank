@@ -23,7 +23,7 @@ uint256 BillIDFromBody(const std::vector<unsigned char>& vchBody)
     return hash;
 }
 
-uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey)
+uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/issue");
@@ -35,6 +35,7 @@ uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAm
     ss << vchDrawerPubKey;
     ss << vchAcceptorPubKey;
     ss << vchHolderPubKey;
+    ss << nRefHouseID;   // Gold B: the reference house is part of the acceptance
     return ss.GetHash();
 }
 
@@ -439,9 +440,8 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
         if (!CheckBillApproverShape(d.vApproverIndex, d.vApproverSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-approver-shape");
 
-        // Gram-notes release: the rho-at-mint ECX reserve proof set (R-i7) no longer counts - a discount's cap is the
-        // counted gold till's (GOLD_USD_SCOPE.md call 1, decision 15) - so the set may be empty; any proof present
-        // must still be well formed.
+        // Gold B (GOLD_B.md §5): the reserve proof set (R-i7) is the till this discount proves (none: a till of 0);
+        // every proof must be well formed.
         if (d.vReserveProofs.size() > MAX_ATTEST_PROOFS)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-proofs-shape");
         std::set<COutPoint> setProof;

@@ -234,9 +234,10 @@ CMutableTransaction BuildIssue(World& w, WBill& keysOut)
 
     const CAmount amountEscrow = 1 + (CAmount)InsecureRandRange((uint64_t)is.amount + (uint64_t)is.amount / 2);
     const uint256 billID = BillIDFromBody(is.vchEncryptedBody);
+    is.nRefHouseID = 1;   // Gold B: the reference house
     const uint256 sighash = BillIssueSigHash(billID, is.amount, amountEscrow,
             is.nMaturityHeight, is.nGraceBlocks,
-            is.vchDrawerPubKey, is.vchAcceptorPubKey, is.vchHolderPubKey);
+            is.vchDrawerPubKey, is.vchAcceptorPubKey, is.vchHolderPubKey, is.nRefHouseID);
     BOOST_REQUIRE(keysOut.drawer.Sign(sighash, is.vchDrawerSig));
     BOOST_REQUIRE(keysOut.acceptor.Sign(sighash, is.vchAcceptorSig));
 

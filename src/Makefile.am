@@ -84,7 +84,6 @@ BITCOIN_CORE_H = \
   bmmcache.h \
   asset.h \
   issued.h \
-  pricefeed.h \
   chain.h \
   chainparams.h \
   chainparamsbase.h \
@@ -122,6 +121,7 @@ BITCOIN_CORE_H = \
   netbase.h \
   netmessagemaker.h \
   noui.h \
+  notices.h \
   policy/corepolicy.h \
   policy/feerate.h \
   policy/fees.h \
@@ -148,13 +148,13 @@ BITCOIN_CORE_H = \
   script/standard.h \
   bill.h \
   house.h \
+  houserate.h \
   note.h \
   cashu.h \
   token.h \
   deposit.h \
   pool.h \
   settle.h \
-  oracle.h \
   enforcerconnect.h \
   l1client.h \
   sidechain.h \
@@ -246,8 +246,8 @@ libbitcoin_server_a_SOURCES = \
   torcontrol.cpp \
   txdb.cpp \
   units.cpp \
+  houserate.cpp \
   issued_connect.cpp \
-  pricefeed.cpp \
   txmempool.cpp \
   ui_interface.cpp \
   validation.cpp \
@@ -362,7 +362,6 @@ libbitcoin_common_a_SOURCES = \
   deposit.cpp \
   pool.cpp \
   settle.cpp \
-  oracle.cpp \
   chainparams.cpp \
   coins.cpp \
   compressor.cpp \

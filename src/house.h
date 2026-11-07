@@ -54,18 +54,37 @@ static const uint8_t HOUSE_OP_MEMBER_PURGE  = 14; // delete records whose remova
 // (2 years after insolvency), ANYONE closes a failed house: partners get exactly their residual, the rest of the
 // escrow goes to the mutual fund output, and every claim refuses from then on. No signature: every output is pinned.
 static const uint8_t HOUSE_OP_CLOSE         = 15;
-// Gram-notes release (GOLD_USD_SCOPE.md step 5, decisions log 15): move gold into or out of the house's till vault (the
-// units DB), approved by the house's M-of-N. A house op, so the one-op-per-house-per-block rule keeps it and a DEFER
-// apart.
-static const uint8_t HOUSE_OP_TILL          = 16;
-// Gram-notes release (R3-1): anyone proves a house's equity negative, which opens claims (Insolvent from that block).
-static const uint8_t HOUSE_OP_EQUITY        = 17;
+// 16 was TILL (gold into or out of the till vault) and 18 TILL_DECLARE: both retired with the gold vaults (Gold B,
+// D-2026-11-07-1); the shape check refuses them.
+static const uint8_t HOUSE_OP_RETIRED_TILL         = 16;
+static const uint8_t HOUSE_OP_RETIRED_TILL_DECLARE = 18;
+// 17 was EQUITY (anyone proved a house's equity negative, later its overdue bills above its escrow): retired by
+// D-2026-11-07-3 - the chain can't see a bad loan unless the house lets it show, so a house closes only when it doesn't
+// pay a demand. The shape check refuses it.
+static const uint8_t HOUSE_OP_RETIRED_EQUITY       = 17;
+// Gold B (D-2026-11-07-1; GOLD_B.md §1; houserate.h): the house's own binding rate. POST sets the bid and ask, signed by
+// the rate key; SETKEY registers that key, approved by the house's M-of-N. The house record doesn't change: the rate and
+// the key live in the units DB.
+static const uint8_t HOUSE_OP_RATE          = 19;
+// Gold B (GOLD_B.md §2): the house's charter - the gold tokens (on Ethereum) it pays in kind, each with the partners'
+// related-issuer declaration. ADD takes effect at once, REMOVE 30 days after it is posted, RELATED restates the
+// declaration; all approved by the house's M-of-N. The chain checks nothing on Ethereum: the charter is a statement.
+static const uint8_t HOUSE_OP_CHARTER       = 20;
+static const uint8_t HOUSE_OP_MAX           = HOUSE_OP_CHARTER;
+static const uint8_t HOUSE_CHARTER_ADD     = 0;
+static const uint8_t HOUSE_CHARTER_REMOVE  = 1;
+static const uint8_t HOUSE_CHARTER_RELATED = 2;
+static const size_t MAX_CHARTER_TOKENS = 8;   // live entries (not yet removed) per house
+static const uint8_t HOUSE_RATE_POST   = 0;
+static const uint8_t HOUSE_RATE_SETKEY = 1;
+/** A related-issuer declaration (legal 2026-11-05): "related" = the token's issuer, or whoever controls its backing
+ *  address, is a partner or key-holder of the house; or controls, is controlled by or is under common control with
+ *  one; or is a close family member of one; or acts for one. 0 is never declared: it means no declaration exists
+ *  (tokens admitted before the field, on easynet). */
+static const uint8_t HOUSE_RELATED_UNDECLARED = 0;
+static const uint8_t HOUSE_RELATED_NO         = 1;
+static const uint8_t HOUSE_RELATED_YES        = 2;
 static const size_t MAX_EQUITY_OVERDUE_BILLS = 1000;
-// A partner's gold pledge has a minimum (decisions log 16; provisional until the Monte Carlo sets figures).
-static const uint64_t HOUSE_MIN_GOLD_PLEDGE_MG = 10000;
-// D-2026-11-04-1 (3a): a token the house holds at most this much of in all its vaults is a dust slot: a partner may
-// take their whole entry of it out in a TOPUP that puts at least as many mg of the house's other tokens in.
-static const uint64_t HOUSE_DUST_SLOT_MG = 1000;
 
 // House-type flags, fixed at registration (spec 4.0). REDEEM_ONLY only together with MEMBERS_ONLY.
 static const uint8_t HOUSE_FLAG_MEMBERS_ONLY = 1;
@@ -143,6 +162,10 @@ static const size_t MAX_HOUSE_CLASS_ID_BYTES = 16;
 // (integration gates cannot mine a week of blocks) - init.cpp rejects the
 // arg on any other network.
 extern uint32_t HOUSE_STRESSED_WINDOW;
+// Gold B (D-2026-11-07-2/-3): one cure per 180 days (in blocks, as the stressed window: ~180 days at 10-minute blocks).
+// A cure is a protest episode: a fresh one starting within this many blocks of the last one's start (CHouse::
+// nProtestHeight, never cleared) finds no cure - the house is insolvent from that block (CHouse::nNoCureHeight).
+static const uint32_t HOUSE_CURE_SPACING_BLOCKS = 25920;
 
 //
 // Reserve attestation (Phase 3.4). All PROVISIONAL (A-1); GovernX-mutable
@@ -238,7 +261,7 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // (NOTE_OP_LOCK was reserved inert).
 // v12 (token holders' claim at a failed house, gateway docs/freebank/TOKEN_CLAIM_DESIGN.md draft 3): the claim
 // totals. A v11 record reads as 0: no claim op existed.
-static const uint8_t HOUSE_SER_VERSION = 13;
+static const uint8_t HOUSE_SER_VERSION = 14;   // 14 = Gold B: one cure per 180 days (nNoCureHeight, D-2026-11-07-3)
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -267,6 +290,27 @@ struct HousePartner {
         READWRITE(status);
         READWRITE(nTailUnlockHeight);
         READWRITE(amountInsolventPledge);
+    }
+};
+
+/** Gold B ramp (GOLD_B.md §5): a tranche of a partner's escrow - the pledge and the block it arrived. REGISTER, ADMIT
+ *  and TOPUP add one; the issuing capacity counts each at a multiple that grows with its clean age. */
+struct CEscrowTranche {
+    uint32_t nPartner;
+    CAmount amount;
+    uint32_t nStartHeight;
+
+    CEscrowTranche() : nPartner(0), amount(0), nStartHeight(0) {}
+    CEscrowTranche(uint32_t nPartnerIn, CAmount amountIn, uint32_t nStartIn)
+        : nPartner(nPartnerIn), amount(amountIn), nStartHeight(nStartIn) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nPartner);
+        READWRITE(amount);
+        READWRITE(nStartHeight);
     }
 };
 
@@ -428,8 +472,18 @@ struct CHouse {
     // rest up to par; partners what is left. Written with nInsolventHeight (a snapshot always has a price).
     uint64_t nInsolventSatsPerGram;
     uint64_t nInsolventGoldMg;
-    // v13: the height an EQUITY op proved equity negative (0 = never). Insolvent from then on.
+    // v13: the height the retired EQUITY op proved equity negative. Gold B: always 0 (the op is retired,
+    // D-2026-11-07-3); the field stays in the record layout.
     uint32_t nEquityNegativeHeight;
+    // v14 (Gold B, D-2026-11-07-2/-3): the height a fresh protest episode found no cure available - it started within
+    // HOUSE_CURE_SPACING_BLOCKS of the last episode's start - so the house is insolvent from it (0 = none).
+    uint32_t nNoCureHeight;
+    // v14 (Gold B ramp, GOLD_B.md §5): the escrow tranches (bounded by MAX_HOUSE_PLEDGE_OUTPOINTS per partner).
+    std::vector<CEscrowTranche> vEscrowTranche;
+    // v14 (Gold B; design 2026-11-08): a suspension's recovery that re-arms a live protest CONTINUES the cure that was
+    // running when the suspension began, with the clock blocks it had left (floored at a day): the window from the
+    // re-arm (nDeferEndedHeight). 0 = no re-arm recorded (a fresh cure's full HOUSE_STRESSED_WINDOW).
+    uint32_t nCureLeft;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -443,7 +497,7 @@ struct CHouse {
                nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0), nTokenUnits(0),
                nTokenClaimed(0), nTokenClaims(0), nTokenCollected(0), nTokenBase(0), nTokenBaseHeight(0),
                nTokenPaid(0), nTokenWriteOff(0), nTokenWriteOffHeight(0), nInsolventSatsPerGram(0),
-               nInsolventGoldMg(0), nEquityNegativeHeight(0) {}
+               nInsolventGoldMg(0), nEquityNegativeHeight(0), nNoCureHeight(0), nCureLeft(0) {}
 
     bool IsMembersOnly() const { return (nFlags & HOUSE_FLAG_MEMBERS_ONLY) != 0; }
     bool IsRedeemOnly() const { return (nFlags & HOUSE_FLAG_REDEEM_ONLY) != 0; }
@@ -590,6 +644,12 @@ struct CHouse {
             READWRITE(nInsolventSatsPerGram);
             READWRITE(nInsolventGoldMg);
             READWRITE(nEquityNegativeHeight);
+        }
+        // v14: the no-cure height. A v13 record predates Gold B: 0.
+        if (nSerVersion >= 14) {
+            READWRITE(nNoCureHeight);
+            READWRITE(vEscrowTranche);
+            READWRITE(nCureLeft);
         }
     }
 
@@ -774,6 +834,7 @@ struct HouseAttest {
     uint32_t nPrevDeferRenewals;
     uint32_t nPrevDeferCumBlocks;
     uint32_t nPrevDeferEndedHeight;
+    uint32_t nPrevCureLeft;                // Gold B: undo prior of CHouse::nCureLeft (a recovery sets it)
     CAmount amountReserves;                // must equal the sum of proof coin values
     std::vector<AttestProof> vProofs;      // <= MAX_ATTEST_PROOFS, unique outpoints
     std::vector<uint32_t> vApproverIndex;  // strictly ascending, M-of-N
@@ -783,7 +844,7 @@ struct HouseAttest {
                     nPrevLastAttestHeight(0), nPrevStressSince(0),
                     amountPrevReserves(0), nPrevDeferInvokedHeight(0),
                     nPrevDeferRenewals(0), nPrevDeferCumBlocks(0),
-                    nPrevDeferEndedHeight(0), amountReserves(0) {}
+                    nPrevDeferEndedHeight(0), nPrevCureLeft(0), amountReserves(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -799,6 +860,7 @@ struct HouseAttest {
         READWRITE(nPrevDeferRenewals);
         READWRITE(nPrevDeferCumBlocks);
         READWRITE(nPrevDeferEndedHeight);
+        READWRITE(nPrevCureLeft);
         READWRITE(amountReserves);
         READWRITE(vProofs);
         READWRITE(vApproverIndex);
@@ -864,29 +926,13 @@ struct HouseRenew {
     }
 };
 
+
 /** RELEASE (Phase 3.5 D11): once the clause has been LIFTED (the house is
  * effectively Open again), the house takes its locked till back out of consensus
  * custody so it can pay the queued holders. Valid only at effective Open, spends
  * only reserve-lock coins, M-of-N approved with the destination bound. While the
  * house is Stressed, Deferred or Insolvent the till stays where the holders can
  * reach it. */
-struct HouseTill {
-    uint32_t nHouseID;
-    std::vector<uint32_t> vApproverIndex;
-    std::vector<std::vector<unsigned char>> vApproverSig;
-
-    HouseTill() : nHouseID(0) {}
-
-    ADD_SERIALIZE_METHODS
-
-    template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action) {
-        READWRITE(nHouseID);
-        READWRITE(vApproverIndex);
-        READWRITE(vApproverSig);
-    }
-};
-
 struct HouseRelease {
     uint32_t nHouseID;
     std::vector<uint32_t> vApproverIndex;
@@ -909,22 +955,71 @@ struct HouseRelease {
  * pattern. Valid when partner status == tail AND height >= nTailUnlockHeight. */
 /** CLOSE (v0.2.28): the house id is the whole payload - the outputs are fixed by the rules, and the undo reverts the
  * partner statuses (and a same-block materialization) exactly as the partners' settle's does. */
-/** HOUSE_OP_EQUITY payload: the house, the price height (at most nPriceBackBlocks back), and the bills in its book that
- *  are unpaid nBillOverdueBlocks past maturity (they count zero). No signature: anyone may prove it. */
-struct HouseEquity {
-    uint32_t nHouseID;
-    uint32_t nPriceHeight;
-    std::vector<uint32_t> vOverdueBillID;
 
-    HouseEquity() : nHouseID(0), nPriceHeight(0) {}
+/** HOUSE_OP_RATE payload (Gold B). POST: nBid, nAsk (sats per gram) and vchRateSig, the rate key's signature over
+ *  HouseRateSigHash; no approvers, no key. SETKEY: vchRatePubKey (33 bytes, compressed) and the M-of-N approvers over
+ *  the same hash; nBid = nAsk = 0, no rate signature. */
+struct HouseRate {
+    uint32_t nHouseID;
+    uint8_t nKind;
+    uint64_t nBid;
+    uint64_t nAsk;
+    std::vector<unsigned char> vchRatePubKey;
+    std::vector<unsigned char> vchRateSig;
+    std::vector<uint32_t> vApproverIndex;
+    std::vector<std::vector<unsigned char>> vApproverSig;
+
+    HouseRate() : nHouseID(0), nKind(HOUSE_RATE_POST), nBid(0), nAsk(0) {}
 
     ADD_SERIALIZE_METHODS
 
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nHouseID);
-        READWRITE(nPriceHeight);
-        READWRITE(vOverdueBillID);
+        READWRITE(nKind);
+        READWRITE(nBid);
+        READWRITE(nAsk);
+        READWRITE(vchRatePubKey);
+        READWRITE(vchRateSig);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
+    }
+};
+
+/** HOUSE_OP_CHARTER payload (Gold B). ADD: the token (chain id, contract, decimals, grams per token as nGramsNum /
+ *  nGramsDen) and nRelated. REMOVE: nIndex, the entry to remove. RELATED: nIndex and the new nRelated. The M-of-N
+ *  approvers sign HouseCharterSigHash. */
+struct HouseCharter {
+    uint32_t nHouseID;
+    uint8_t nKind;
+    uint64_t nChainID;
+    std::vector<unsigned char> vchContract;   // 20 bytes
+    uint8_t nDecimals;
+    uint64_t nGramsNum;
+    uint64_t nGramsDen;
+    uint8_t nRelated;                         // HOUSE_RELATED_UNDECLARED / _NO / _YES
+    uint32_t nIndex;
+    std::vector<uint32_t> vApproverIndex;
+    std::vector<std::vector<unsigned char>> vApproverSig;
+
+    HouseCharter() : nHouseID(0), nKind(HOUSE_CHARTER_ADD), nChainID(0), nDecimals(0), nGramsNum(0), nGramsDen(0),
+                     nRelated(0), nIndex(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nKind);
+        READWRITE(nChainID);
+        READWRITE(vchContract);
+        READWRITE(nDecimals);
+        READWRITE(nGramsNum);
+        READWRITE(nGramsDen);
+        READWRITE(nRelated);
+        READWRITE(nIndex);
+        READWRITE(vApproverIndex);
+        READWRITE(vApproverSig);
     }
 };
 
@@ -1098,7 +1193,13 @@ uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, 
 uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
 /** The till op's approvers sign the house, the prevouts, the outputs, the annex and the vault moves. */
-uint256 HouseTillSigHash(const uint256& houseID, const CTransaction& tx);
+/** HOUSE_OP_RATE (Gold B): what the rate key (POST) or the approvers (SETKEY) sign - the house, the kind, the rate, the key,
+ *  and the transaction's prevouts and outputs (an approval can't be replayed into another transaction). By house number,
+ *  which ConnectIssuedTx has without the house record. */
+uint256 HouseRateSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseRate& rate);
+/** HOUSE_OP_CHARTER (Gold B): what the approvers sign - the payload without its signatures, and the transaction's
+ *  prevouts and outputs. */
+uint256 HouseCharterSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseCharter& charter);
 
 /** The per-coin reserve-proof challenge: sha256d over a domain tag, the house
  * identity (cross-house replay bar), the as-of height AND that height's block
@@ -1171,19 +1272,45 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight);
  * HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1 + nDeferSilenceWindow
  * (the silence clock starts the block after the missed-cadence deadline, the
  * same origin an open house's stress clock uses). 0 if not suspended. */
-uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house);
+uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house, int nNow = -1);
 
 /** v0.2.28: nDeferInvokedHeight + nSuspensionCap, saturated; 0 if not suspended. */
-uint32_t HouseDeferCapInsolventHeight(const CHouse& house);
+uint32_t HouseDeferCapInsolventHeight(const CHouse& house, int nNow = -1);
 
-/** v0.2.28: the height a suspended house turns Insolvent = min(silence, cap); 0 if not suspended. */
-uint32_t HouseDeferInsolventHeight(const CHouse& house);
+/** v0.2.28: the height a suspended house turns Insolvent = min(silence, cap); 0 if not suspended. Gold B: each span is
+ *  clock time (ClockDeadlineHeight), searched up to nNow (the height being judged; -1: estimate from the start). */
+uint32_t HouseDeferInsolventHeight(const CHouse& house, int nNow = -1);
+
+/** Gold B clocks in time (GOLD_B.md §6): the credit layer's windows count clock blocks - 600 s each of chain active time
+ *  (houserate.h CChainClock) - so sparse blocks don't stretch them. The server installs g_fnClockAt
+ *  (ClockBlocksForChecks); without it, and on regtest, the clock is the height. Stored starts stay real heights. */
+typedef int64_t (*ClockAtFn)(int nHeight);
+extern ClockAtFn g_fnClockAt;
+int64_t ClockAtHeight(int nHeight);
+/** Clock blocks from block nStart to block nNow (0 if nNow <= nStart). */
+int64_t ClockSince(uint32_t nStart, int nNow);
+/** The first height at which nSpan clock blocks have run since block nStart: searched in [nStart, nNow] when they have
+ *  run by nNow; otherwise an estimate, nNow plus the clock blocks still to run (exact when the clock is the height).
+ *  nNow < nStart estimates from nStart. Saturated at UINT32_MAX. "Reached at nHeight" == nHeight >= the result. */
+uint32_t ClockDeadlineHeight(uint32_t nStart, uint64_t nSpan, int nNow);
+/** A term from nStart (a bill's issue, a deposit's origination) to the target height nTarget its payload named, plus
+ *  nAfter: the first height that much clock time has run, as ClockDeadlineHeight. The term counts nTarget - nStart
+ *  clock blocks; nStart 0 or past nTarget counts from nTarget. Exact (nTarget + nAfter) when the clock is the height. */
+uint32_t TermDeadlineHeight(uint32_t nStart, uint32_t nTarget, uint64_t nAfter, int nNow);
 
 /** E for the token holders' claim (v0.2.21): the height from which the chain counts the house insolvent, or 0 if it is
  * not insolvent at nHeight. Insolvency is absorbing - once insolvent, every op that could move these inputs (ATTEST,
  * TOPUP, REDEEM, DEFER) is refused - so E never moves. A materialized house (status stored INSOLVENT) is derived from
  * the same fields: materializing changes none of them. A house wound down is never insolvent. */
 uint32_t HouseInsolventSince(const CHouse& house, int nHeight);
+
+/** Gold B (D-2026-11-07-2/-3): a protest op starting a FRESH episode (nProtestOpen was 0) calls this before it writes
+ * the protest heights. Within HOUSE_CURE_SPACING_BLOCKS of the last episode's start there is no cure: nNoCureHeight =
+ * nHeight, insolvent from this block. Otherwise the episode is the house's cure (Stressed for HOUSE_STRESSED_WINDOW). */
+void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight);
+/** The cure window from stress origin nStress: a re-armed protest's time left (CHouse::nCureLeft), else
+ *  HOUSE_STRESSED_WINDOW. */
+uint64_t HouseCureWindow(const CHouse& house, uint32_t nStress);
 
 /** v0.2.28 (FAILED_HOUSE_DESIGN.md B, "collect, then pay"): at an insolvent house, payouts (note/deposit CLAIM, token
  * COLLECT, the partners' settle, CLOSE) wait until the loan book is empty or nCollectWindow blocks past E. Monotonic:

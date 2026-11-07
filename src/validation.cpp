@@ -37,13 +37,14 @@
 #include <script/sigcache.h>
 #include <script/standard.h>
 #include <bill.h>
+#include <houserate.h>
+#include <crypto/sha256.h>
 #include <house.h>
 #include <note.h>
 #include <token.h>
 #include <cashu.h>
 #include <deposit.h>
 #include <pool.h>
-#include <oracle.h>
 #include <settle.h>
 #include <sidechainclient.h>
 #include <l1client.h>
@@ -54,7 +55,6 @@
 #include <txdb.h>
 #include <units.h>
 #include <issued.h>
-#include <pricefeed.h>
 #include <txmempool.h>
 #include <ui_interface.h>
 #include <undo.h>
@@ -445,38 +445,88 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
 bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                              const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                              std::vector<CHouse>& vHousesOut, bool fMempool = false);
-/** Gram-notes release (GOLD_USD_SCOPE.md step 5): the issuing caps from counted gold. Notes and deposits <= counted
- *  capital / nCapitalMinBps; notes <= counted till / nTillMinBps. Below either the house simply can't issue (a no-issue
- *  flag, never a stress origin: R2-int-1, R3-4). */
-/** The capital cap without the price gate (review round 1b): EXIT and the tail RECLAIM must not hang on the feed. */
-static uint64_t GoldCapitalCapUnitsNoPriceGate(const CHouse& house, int nHeight)
+/** Gold B (D-2026-11-07-1; GOLD_B.md §5): the issuing caps from the house's sECX in mg at its 30-day highest ask. Notes
+ *  and deposits <= escrow / nCapitalMinBps; notes <= till / nTillMinBps, where the till is sECX the house proved it
+ *  controls (amountTillSats). Below either the house simply can't issue (never a stress origin: R2-int-1, R3-4). A house
+ *  that has posted no rate has caps of 0. */
+static uint64_t CapitalCapUnits(const CHouse& house, int nHeight)
 {
-    CGoldCount gold;
-    HouseGoldForChecksNoPriceGate(house, nHeight, gold);
-    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    return (uint64_t)((unsigned __int128)gold.nCapitalMg * 10000 / gp.nCapitalMinBps);
+    CHouseCapital cap;
+    if (!HouseCapitalForChecks(house, nHeight, 0, cap))
+        return 0;
+    const uint64_t nCap = cap.nCapacityMg;   // the ramp (GOLD_B §5): each escrow tranche at its multiple, at most the floor's
+    // Pending swaps are still owed (GOLD_B.md §4): they use up the room as the notes they were.
+    const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
+    return nCap > nPending ? nCap - nPending : 0;
 }
-static uint64_t GoldCapitalCapUnits(const CHouse& house, int nHeight)
+static uint64_t TillCapUnits(const CHouse& house, int nHeight, CAmount amountTillSats)
 {
-    CGoldCount gold;
-    HouseGoldForChecks(house, nHeight, gold);
+    CHouseCapital cap;
+    if (!HouseCapitalForChecks(house, nHeight, amountTillSats, cap))
+        return 0;
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    return (uint64_t)((unsigned __int128)gold.nCapitalMg * 10000 / gp.nCapitalMinBps);
+    const uint64_t nCap = (uint64_t)((unsigned __int128)cap.nTillMg * 10000 / gp.nTillMinBps);
+    const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
+    return nCap > nPending ? nCap - nPending : 0;
 }
-/** Gram-notes release (step 6): the payout price a payload binds - at a height before this one, at most
- *  nPriceBackBlocks back (R2-ops-11), so a price move after signing can't invalidate a signed payout. */
-static bool BoundPayoutPrice(uint32_t nPriceHeight, int nHeight, bool fMempool, CValidationState& state,
-                             const std::string& strPrefix, uint64_t& nSatsPerGram)
+/** Gold B (D-2026-11-07-1; GOLD_B.md §1, §3): the house rate a payload names, checked against the chain. BID = the
+ *  house's bid in effect at nHeight (what its notes and deposits pay, and brassage); ASK30 = its highest ask of the last
+ *  30 days (what bills repay at). A mismatch is honest (the house posted between signing and mining): no ban. */
+enum class HouseRateKind { BID, ASK30, ASK90 };
+static bool BoundHouseRate(uint32_t nHouseID, uint64_t nRateNamed, int nHeight, HouseRateKind kind,
+                           CValidationState& state, const std::string& strPrefix, uint64_t& nSatsPerGram,
+                           int nAnchorHeight = 0)
 {
-    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    if (g_nPayoutPriceTestOverride && nPriceHeight == 0)
-        nPriceHeight = (uint32_t)(nHeight - 1);   // unit tests only (see issued.h)
-    if (nPriceHeight == 0 || (int64_t)nPriceHeight >= (int64_t)nHeight ||
-            (int64_t)nHeight - (int64_t)nPriceHeight > (int64_t)gp.nPriceBackBlocks)
-        return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, strPrefix + "-price-height");
-    if (!PayoutPriceForChecks((int)nPriceHeight, nSatsPerGram) || nSatsPerGram == 0)
-        return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, strPrefix + "-no-price");   // chain state: no ban
+    // nAnchorHeight: the house has failed at that height (E) - its windows end there (an insolvent house can't post, so
+    // a window running on would only lose its highs; review 2026-11-07).
+    uint64_t nBid = 0, nAsk = 0;
+    const uint32_t nDays = kind == HouseRateKind::ASK90 ? 90 : 30;
+    const bool fHave = kind == HouseRateKind::BID ? HouseRateForChecks(nHouseID, nHeight, nBid, nAsk)
+                     : nAnchorHeight > 0 ? HouseRateMaxAtForChecks(nHouseID, nAnchorHeight, nDays, nBid, nAsk)
+                                         : HouseRateMaxForChecks(nHouseID, nHeight, nDays, nBid, nAsk);
+    nSatsPerGram = kind == HouseRateKind::BID ? nBid : nAsk;
+    if (!fHave || nSatsPerGram == 0)
+        return state.DoS(0, false, REJECT_INVALID, strPrefix + "-no-rate");   // chain state: no ban
+    if (g_nHouseRateTestOverride && nRateNamed == 0)
+        nRateNamed = nSatsPerGram;   // unit tests only (see houserate.h)
+    // An ask is what a payer (a drawee) pays at: naming a higher one only pays more, and lets a cautious payer get past
+    // a house that raises its ask in the same block (review 2026-11-07). A bid binds exactly.
+    if (kind != HouseRateKind::BID && nRateNamed > nSatsPerGram) {
+        nSatsPerGram = nRateNamed;
+        return true;
+    }
+    if (nRateNamed != nSatsPerGram)
+        return state.DoS(0, false, REJECT_INVALID, strPrefix + "-rate");
     return true;
+}
+/** GOLD_B §3: a formal demand fixes the rate at the demand. A house-alone discharge (note pre-auth, deposit) pays at the
+ *  higher of the bid now and the bid recorded when the demand connected, so a bid cut can't shrink what it owes. */
+static bool BoundDischargeRate(uint32_t nHouseID, uint64_t nRateNamed, int nHeight, uint32_t nDemandHeight,
+                               CValidationState& state, const std::string& strPrefix, uint64_t& nSatsPerGram)
+{
+    uint64_t nBid = 0, nAsk = 0;
+    if (!HouseRateForChecks(nHouseID, nHeight, nBid, nAsk) || nBid == 0)
+        return state.DoS(0, false, REJECT_INVALID, strPrefix + "-no-rate");
+    nSatsPerGram = std::max(nBid, nDemandHeight ? DemandBidForChecks(nHouseID, nDemandHeight) : 0);
+    if (g_nHouseRateTestOverride && nRateNamed == 0)
+        nRateNamed = nSatsPerGram;
+    if (nRateNamed != nSatsPerGram)
+        return state.DoS(0, false, REJECT_INVALID, strPrefix + "-rate");
+    return true;
+}
+/** Gold B (GOLD_B.md §3): the settlement band of a set of houses - the lowest bid and the highest ask in effect. */
+static bool SettleBandForChecks(const std::vector<uint32_t>& vHouseID, int nHeight, uint64_t& nLo, uint64_t& nHi)
+{
+    nLo = 0;
+    nHi = 0;
+    for (const uint32_t nID : vHouseID) {
+        uint64_t nBid = 0, nAsk = 0;
+        if (!HouseRateForChecks(nID, nHeight, nBid, nAsk) || nBid == 0)
+            return false;
+        nLo = nLo == 0 ? nBid : std::min(nLo, nBid);
+        nHi = std::max(nHi, nAsk);
+    }
+    return nLo != 0;
 }
 /** mg -> sats at a price, rounded up (the payer's side). */
 static CAmount MgToSats(uint64_t nMg, uint64_t nSatsPerGram)
@@ -484,25 +534,9 @@ static CAmount MgToSats(uint64_t nMg, uint64_t nSatsPerGram)
     return (CAmount)std::min<unsigned __int128>(((unsigned __int128)nMg * nSatsPerGram + 999) / 1000, (unsigned __int128)MAX_MONEY);
 }
 
-static uint64_t GoldTillCapUnits(const CHouse& house, int nHeight)
-{
-    CGoldCount gold;
-    HouseGoldForChecks(house, nHeight, gold);
-    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    return (uint64_t)((unsigned __int128)gold.nTillMg * 10000 / gp.nTillMinBps);
-}
-
 static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           std::vector<CHouse>& vHousesOut, bool fMempool = false);
-
-bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
-                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
-                          const std::function<bool(uint32_t, COracleSubmitter&)>& fnGetSubmitter,
-                          const std::function<bool(const std::vector<unsigned char>&)>& fnHaveKey,
-                          uint32_t nNextSubmitterID,
-                          COracleSubmitter& subOut, bool& fFreshBondOut, std::vector<COracleObs>& vObsOut,
-                          bool fMempool = false);
 
 /** Verify a reserve proof set (declared outpoints + per-coin recency signatures)
  * against the live UTXO state, summing the proven liquid value into amountOut.
@@ -554,7 +588,7 @@ static bool VerifyReserveProofs(const uint256& houseID, uint32_t nAsOfHeight,
         if (coin.IsAssetColoured() || coin.fBill ||
                 coin.fBillEscrow || coin.fHouseEscrow || coin.fNote ||
                 coin.fDeposit || coin.fPoolEscrow || coin.fLpShare ||
-                coin.fOracleBond)
+                coin.fCustody)
             return state.DoS(100, false, REJECT_INVALID, prefix + "-coin-tagged");
 
         // v1 script restriction: single-key P2PKH / P2WPKH matching the declared
@@ -616,18 +650,30 @@ static CAmount HouseLiveEscrowPot(const CHouse& house,
 static bool MaterializeInsolvency(CHouse& house, int nHeight,
                                   const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin)
 {
-    // Gram-notes release (R2-int-10): the snapshot ranks the tranches in value, so it needs a price - the payout price
-    // at the block before this one (a signer knows it). With none, the first waterfall op waits for one.
-    uint64_t nSatsPerGram = 0;
-    if (nHeight < 1 || !PayoutPriceForChecks(nHeight - 1, nSatsPerGram) || nSatsPerGram == 0)
+    // Gold B (D-2026-11-07-1; GOLD_B.md §6): the snapshot values every gram claim at the house's highest bid of the 90
+    // days before failure (not 30: an insider would only need to lowball for a month to shrink every claim). A house
+    // that never posted a rate never issued (issuing needs a fresh rate), so there is always one.
+    const uint32_t nE = HouseInsolventSince(house, nHeight);   // before the status changes (E, the failure)
+    // The 90 days end at the failure E, not at the first claim (review 2026-11-07: a window running on past E would
+    // lose the highs and could fall to a cut bid).
+    uint64_t nSatsPerGram = 0, nAskUnused = 0;
+    if (nHeight < 1 || !HouseRateMaxAtForChecks(house.nHouseID, nE ? (int)nE : nHeight, 90, nSatsPerGram, nAskUnused) ||
+            nSatsPerGram == 0)
         return false;
     house.nInsolventSatsPerGram = nSatsPerGram;
-    house.nInsolventGoldMg = 0;
-    for (const std::pair<const uint256, uint64_t>& g : HouseVaultFreeTotalsForChecks(house.nHouseID, nHeight))
-        house.nInsolventGoldMg += g.second;
+    house.nInsolventGoldMg = 0;   // Gold B: no gold on FreeBank (the field stays in the record layout, always 0)
     house.status = HOUSE_STATUS_INSOLVENT;
     house.nInsolventHeight = (uint32_t)nHeight;
-    house.nInsolventUnits = house.nMintedUnits;
+    // Gold B waterfall (GOLD_B.md §6): the noteholders' rank also holds the house's pending swaps (their notes left
+    // circulation, the house still owes them) and the shortfalls it paid within the lapse before it failed (E).
+    {
+        const Consensus::GramParams& gpW = Params().GetConsensus().GramAt(nHeight);
+        const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
+        const uint64_t nShortfall = HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(nE ? (int)nE : nHeight),
+                                                                  (int64_t)gpW.nShortfallLapseSecs / 600);
+        house.nInsolventUnits = (uint64_t)std::min<unsigned __int128>(
+            (unsigned __int128)house.nMintedUnits + nPending + nShortfall, (unsigned __int128)MAX_MONEY);
+    }
     house.amountInsolventPot = HouseLiveEscrowPot(house, fnGetCoin);
     // Freeze the JUNIOR deposit tranche denominator (Phase 3.8). The deposit pot
     // is DERIVED at claim time as max(0, pot - nInsolventUnits) - the residual the
@@ -654,49 +700,11 @@ static bool MaterializeInsolvency(CHouse& house, int nHeight,
     return true;
 }
 
-bool HouseEquityMg(const CHouse& house, int nHeight, uint64_t nSatsPerGram, const CAmount& amountEscrow,
-                   const std::vector<uint32_t>& vOverdueBill, int64_t& nEquityMg, std::string& strReason)
+static bool BillOverdueAt(const CBill& bill, int nHeight, const Consensus::GramParams& gp)
 {
-    if (nSatsPerGram == 0) { strReason = "no-price"; return false; }
-    if (!pbilltree) { strReason = "no-bills"; return false; }
-    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    std::set<uint32_t> setBill;
-    unsigned __int128 nOverdue = 0;
-    for (uint32_t nBillID : vOverdueBill) {
-        if (!setBill.insert(nBillID).second) { strReason = "duplicate-bill"; return false; }
-        CBill bill;
-        if (!pbilltree->GetBill(nBillID, bill) || bill.nOwnerHouseID != house.nHouseID ||
-                bill.status == BILL_STATUS_RETIRED || bill.amount <= 0 ||
-                PricedHeightSince(bill.nMaturityHeight, nHeight) <=
-                    (int64_t)bill.nMaturityHeight + (int64_t)std::max(gp.nBillOverdueBlocks, bill.nGraceBlocks)) {
-            strReason = "bill-not-overdue"; return false;
-        }
-        nOverdue += (uint64_t)bill.amount;
-    }
-    // Gold: each valued token (trusted, or within its grace - review round 1, G1d), less any freeze past its grace.
-    unsigned __int128 nAssets = 0;
-    {
-        const std::map<uint256, uint64_t> mapZero = HouseVaultFrozenZeroForChecks(house.nHouseID, nHeight);
-        const uint32_t nGrace = gp.nFreezeGraceBlocks;
-        for (const std::pair<const uint256, uint64_t>& g : HouseVaultTotalsForChecks(house.nHouseID)) {
-            if (!IssuedTokenValuedForChecks(g.first, nHeight, nGrace))
-                continue;
-            const auto itZero = mapZero.find(g.first);
-            const uint64_t nZero = itZero == mapZero.end() ? 0 : std::min(itZero->second, g.second);
-            nAssets += g.second - nZero;
-        }
-    }
-    if (amountEscrow > 0)
-        nAssets += (unsigned __int128)(uint64_t)amountEscrow * 1000 / nSatsPerGram;
-    const unsigned __int128 nBook = house.nLoanBookFace;
-    nAssets += nBook > nOverdue ? nBook - nOverdue : 0;
-    // D-2026-11-04-1 (3c): and the interest its demanded notes have accrued (design: "queued claims").
-    const unsigned __int128 nLiab = (unsigned __int128)house.nMintedUnits + house.nDepositUnits +
-                                    HouseDemandInterestForChecks(house, nHeight);
-    const __int128 nEq = (__int128)nAssets - (__int128)nLiab;
-    nEquityMg = nEq > (__int128)std::numeric_limits<int64_t>::max() ? std::numeric_limits<int64_t>::max() :
-                nEq < (__int128)std::numeric_limits<int64_t>::min() ? std::numeric_limits<int64_t>::min() : (int64_t)nEq;
-    return true;
+    // Clock time from issue (GOLD_B §6): unpaid more than max(overdue, grace) past maturity.
+    return nHeight >= 0 && (uint32_t)nHeight >= TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight,
+            (uint64_t)std::max(gp.nBillOverdueBlocks, bill.nGraceBlocks) + 1, nHeight);
 }
 
 std::vector<uint32_t> HouseOverdueBills(const CHouse& house, int nHeight)
@@ -707,18 +715,11 @@ std::vector<uint32_t> HouseOverdueBills(const CHouse& house, int nHeight)
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
     for (const CBill& bill : pbilltree->GetBills()) {
         if (bill.nOwnerHouseID == house.nHouseID && bill.status != BILL_STATUS_RETIRED && bill.amount > 0 &&
-                PricedHeightSince(bill.nMaturityHeight, nHeight) >
-                    (int64_t)bill.nMaturityHeight + (int64_t)std::max(gp.nBillOverdueBlocks, bill.nGraceBlocks) &&
-                v.size() < MAX_EQUITY_OVERDUE_BILLS)
+                BillOverdueAt(bill, nHeight, gp) && v.size() < MAX_EQUITY_OVERDUE_BILLS)
             v.push_back(bill.nBillID);
     }
     std::sort(v.begin(), v.end());
     return v;
-}
-
-CAmount HouseEscrowPotAtTip(const CHouse& house, const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin)
-{
-    return HouseLiveEscrowPot(house, fnGetCoin);
 }
 
 bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHeight, const CAmount& nTxFee,
@@ -1005,7 +1006,7 @@ static bool TokenClaimStillValid(const CTransaction& tx, int nHeight)
     if (!TokenClaimYs(tx, nHouseID, setY) || !phousetree->GetHouse(nHouseID, house))
         return false;
     const uint32_t nE = HouseInsolventSince(house, nHeight);
-    if (nE == 0 || (uint64_t)nHeight >= (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
+    if (nE == 0 || (uint32_t)nHeight >= ClockDeadlineHeight(nE, Params().GetConsensus().nTokenClaimWindow, nHeight))
         return false;
     for (const uint256& y : setY) {
         CTokenClaim c;
@@ -1085,7 +1086,9 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
              mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
              mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
-             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT || mtx.nNoteOp == NOTE_OP_SWAP ||
+             mtx.nNoteOp == NOTE_OP_SWAP_PAY || mtx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
+             mtx.nNoteOp == NOTE_OP_SWAP_CLAIM) &&
             mtx.vchNotePayload.size() >= 4) {
         memcpy(&nA, mtx.vchNotePayload.data(), 4);
         return nA != 0;
@@ -1171,41 +1174,6 @@ static bool SpendsPooledOrDescendant(const std::set<uint256>& setInPrevouts, CTx
     return false;
 }
 
-/** SLOT-KEYED oracle-slot extraction (T-o3, the reorg-F5 rule transplanted to
- * the v17 family). Returns true iff mtx takes an oracle slot: EVERY
- * well-formed v17 op does - a SUBMIT or returning BOND takes its submitter's
- * one-op-per-block slot (nSubmitterID != 0), a fresh BOND takes the single
- * per-block fresh-registration slot (nSubmitterID == 0, fFreshBond true).
- * nSubmitterID is the leading-4-bytes of BOTH payloads (the leading-8 ATMP
- * contract, oracle.h). Oracle slots are DISJOINT from house slots by
- * construction - v17 touches no CHouse record and GetHouseSlotIDs ignores
- * v17 - so the two helpers partition the guard space and neither caller
- * consults the other (the cross-family audit, spec s6 T-o3). */
-static bool GetOracleSlotID(const CTransaction& mtx, uint32_t& nSubmitterID, bool& fFreshBond,
-                            uint32_t* pnTargetHeight = nullptr)
-{
-    nSubmitterID = 0;
-    fFreshBond = false;
-    if (pnTargetHeight)
-        *pnTargetHeight = 0;
-    // The leading-EIGHT contract (oracle.h): {u32 nSubmitterID, u32
-    // nTargetHeight} lead BOTH payloads, so a guard can key on either without
-    // decoding. The target height became guard-relevant with the validity
-    // window - two of one submitter's ops can now be valid at once, and
-    // displacement must prefer the fresher.
-    if (mtx.nVersion != TRANSACTION_ORACLE_VERSION || mtx.vchOraclePayload.size() < 8)
-        return false;
-    if (mtx.nOracleOp != ORACLE_OP_SUBMIT && mtx.nOracleOp != ORACLE_OP_BOND)
-        return false;
-    memcpy(&nSubmitterID, mtx.vchOraclePayload.data(), 4);
-    if (pnTargetHeight)
-        memcpy(pnTargetHeight, mtx.vchOraclePayload.data() + 4, 4);
-    if (mtx.nOracleOp == ORACLE_OP_SUBMIT)
-        return nSubmitterID != 0;   // shape rejects id-0 submits; guard-key mirrors it
-    fFreshBond = (nSubmitterID == 0);
-    return true;
-}
-
 static void EvictStaleHouseNoteOps()
 {
     AssertLockHeld(cs_main);
@@ -1249,31 +1217,6 @@ static void EvictStaleHouseNoteOps()
 
         auto fnGetPool = [](uint32_t nID, CPool& pool) { return ppooltree->GetPool(nID, pool); };
 
-        // Oracle closures + priors, lazy-loaded on the first v17 (the
-        // ConnectBlock pattern): confirmed DB state IS the pre-block state
-        // every pooled v17 must bind.
-        bool fOracleLoaded = false;
-        uint32_t nOracleSubIDNext = 0;
-        auto fnGetOracleSub = [](uint32_t nID, COracleSubmitter& sub) {
-            return phousetree->GetOracleSubmitter(nID, sub);
-        };
-        auto fnHaveOracleKey = [](const std::vector<unsigned char>& vchKey) {
-            uint32_t nDummy;
-            return phousetree->GetOracleSubmitterIDByKey(vchKey, nDummy);
-        };
-        // The window's anchor: the block at nTargetHeight-1 on THIS branch.
-        // Mempool-side that is always the active chain (same idiom as the
-        // attestation as-of resolver above).
-        auto fnGetOracleAnchor = [](uint32_t nH, uint256& hashOut) {
-            if ((int64_t)nH > (int64_t)chainActive.Height())
-                return false;
-            const CBlockIndex* p = chainActive[(int)nH];
-            if (!p)
-                return false;
-            hashOut = p->GetBlockHash();
-            return true;
-        };
-
         for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
             const CTransaction& mtx = mi->GetTx();
             const bool fHouseTx = (mtx.nVersion == TRANSACTION_HOUSE_VERSION);
@@ -1281,7 +1224,6 @@ static void EvictStaleHouseNoteOps()
             const bool fDepositTx = (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION);
             const bool fPoolTx = (mtx.nVersion == TRANSACTION_POOL_VERSION);
             const bool fSettleTx = (mtx.nVersion == TRANSACTION_SETTLE_VERSION);
-            const bool fOracleTx = (mtx.nVersion == TRANSACTION_ORACLE_VERSION);
             // ◄T-d5: v11 joins the sweep keyed UNCONDITIONALLY on the version,
             // never on a per-op list. EVERY bill op can be staled by a chain
             // event that spends no coin it holds: ops 5/7/8 read house state
@@ -1290,7 +1232,7 @@ static void EvictStaleHouseNoteOps()
             // codebase's own lesson applies verbatim - do NOT enumerate
             // staleness causes; re-run the real contextual check at tip+1.
             const bool fBillTx = (mtx.nVersion == TRANSACTION_BILL_VERSION);
-            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fOracleTx && !fBillTx)
+            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fBillTx)
                 continue;
 
             CValidationState stateStale;
@@ -1373,29 +1315,6 @@ static void EvictStaleHouseNoteOps()
                 bool fHouseChanged = false, fPoolRetired = false;
                 if (!CheckPoolOperation(mtx, stateStale, nNextHeight, fnGetPool, fnGetHouse,
                         poolResult, houseResult, fHouseChanged, fPoolRetired))
-                    fStale = true;
-            } else { // fOracleTx: an op is valid from its nTargetHeight for
-                     // nOracleOpWindow heights, on the branch its bind anchors
-                     // to. So a tip change does NOT automatically strand it -
-                     // it goes stale only when the window is exhausted, the
-                     // branch moved out from under its anchor, or its priors
-                     // were overtaken (a fix landing kills every older payload;
-                     // an inclusion kills that submitter's other outstanding
-                     // ones). Re-run the real contextual check, never a height
-                     // list - which is why this arm needed no change when the
-                     // point rule became a window.
-                if (!fOracleLoaded) {
-                    fOracleLoaded = true;
-                    uint32_t nLastSub = 0;
-                    phousetree->GetLastOracleSubmitterID(nLastSub);
-                    nOracleSubIDNext = nLastSub + 1;
-                }
-                COracleSubmitter subResult;
-                bool fFreshBond = false;
-                std::vector<COracleObs> vObs;
-                if (!CheckOracleOperation(mtx, stateStale, nNextHeight, fnGetOracleAnchor,
-                        fnGetOracleSub, fnHaveOracleKey, nOracleSubIDNext,
-                        subResult, fFreshBond, vObs, true /* fMempool */))
                     fStale = true;
             }
 
@@ -2155,14 +2074,6 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             CHouse houseResult;
             if (!CheckHouseOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnHaveHouseHash, fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult, true))
                 return error("%s: CheckHouseOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
-            if ((!tx.vVaultMove.empty() || tx.nHouseOp == HOUSE_OP_CLOSE || tx.nHouseOp == HOUSE_OP_RECLAIM ||
-                 tx.nHouseOp == HOUSE_OP_WINDDOWN) && !IsHouseRegisterOp(tx.nHouseOp)) {
-                CHouse houseBefore;
-                CUnitsView unitsVault(punitsdb.get());
-                if (!fnGetHouse(houseResult.nHouseID, houseBefore) ||
-                        !CheckHouseVaultMoves(tx, houseBefore, GetSpendHeight(view), unitsVault, state))
-                    return error("%s: CheckHouseVaultMoves: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
-            }
 
             // A non-register incoming op targets an EXISTING house (dense id
             // from the DB); a mempool REGISTER's house is not in the DB yet, so
@@ -2220,7 +2131,9 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 else if (!fIncomingRegister && mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                         (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
                          mtx.nNoteOp == NOTE_OP_DEMAND || mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
-             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT || mtx.nNoteOp == NOTE_OP_SWAP ||
+             mtx.nNoteOp == NOTE_OP_SWAP_PAY || mtx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
+             mtx.nNoteOp == NOTE_OP_SWAP_CLAIM) &&
                         mtx.vchNotePayload.size() >= 4) {
                     uint32_t nTheirs = 0;
                     memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID leads every note payload
@@ -2300,6 +2213,25 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // which is exactly the parent-state the reserve proof needs, so it doubles
             // as fnGetProofCoin here (a mempool spend of a reserve coin does not evict
             // the mint - it can still ride the next block).
+            // Gold B (security stage A N1, 2026-11-08, reproduced): at most one pooled swap op per hash lock. SWAP_DONE
+            // and SWAP_EXPIRE take no house slot, and a SWAP's lock is unique chain-wide across houses, so without this
+            // any number of copies, each on its own coin, passed the pool while a block can hold only one: the
+            // template dropped them one per try and, past MAX_TEMPLATE_EVICTIONS, built blocks from no pool txs, an
+            // inclusion halt at no cost (re-sending the dropped copies kept every block empty). Checked before any
+            // contextual work; the scan decodes swap ops only.
+            if (IsNoteSwapOp(tx.nNoteOp)) {
+                uint256 hashMine;
+                if (!NoteSwapOpHashLock(tx, hashMine))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
+                for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                    const CTransaction& mtx = mi->GetTx();
+                    if (mtx.nVersion != TRANSACTION_NOTE_VERSION || !IsNoteSwapOp(mtx.nNoteOp))
+                        continue;
+                    uint256 hashTheirs;
+                    if (NoteSwapOpHashLock(mtx, hashTheirs) && hashTheirs == hashMine)
+                        return state.DoS(0, false, REJECT_DUPLICATE, "swap-op-pending");
+                }
+            }
             if (IsTokenClaimOp(tx.nNoteOp)) {
                 // v0.2.21: a token CLAIM takes no house slot, so two pooled claims must not share a token (Y): the
                 // second would make a block that holds both invalid. Checked before any curve work (review L2).
@@ -2338,7 +2270,9 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM ||
                              mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_PROTEST ||
                              mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
-             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT || mtx.nNoteOp == NOTE_OP_SWAP ||
+             mtx.nNoteOp == NOTE_OP_SWAP_PAY || mtx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
+             mtx.nNoteOp == NOTE_OP_SWAP_CLAIM) &&
                             mtx.vchNotePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4); // nHouseID is the leading field
@@ -2439,7 +2373,9 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
                              mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
-             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT || mtx.nNoteOp == NOTE_OP_SWAP ||
+             mtx.nNoteOp == NOTE_OP_SWAP_PAY || mtx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
+             mtx.nNoteOp == NOTE_OP_SWAP_CLAIM) &&
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -2509,7 +2445,9 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                     } else if (mtx.nVersion == TRANSACTION_NOTE_VERSION &&
                             (mtx.nNoteOp == NOTE_OP_MINT || mtx.nNoteOp == NOTE_OP_REDEEM || mtx.nNoteOp == NOTE_OP_CLAIM ||
                              mtx.nNoteOp == NOTE_OP_LOCK || mtx.nNoteOp == NOTE_OP_UNLOCK ||
-             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT) &&
+             mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT || mtx.nNoteOp == NOTE_OP_SWAP ||
+             mtx.nNoteOp == NOTE_OP_SWAP_PAY || mtx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
+             mtx.nNoteOp == NOTE_OP_SWAP_CLAIM) &&
                             mtx.vchNotePayload.size() >= 4) {
                         memcpy(&nTheirs, mtx.vchNotePayload.data(), 4);
                         fTheirsHouseChanging = true;
@@ -2527,124 +2465,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         }
 
         // The incomer's parent txids, hoisted ONCE for every displacement site
-        // below (v17 oracle, and the house-slot mirror guard). Both consult it
+        // below (the house-slot mirror guard). Both consult it
         // through SpendsPooledOrDescendant, which walks the pooled entry's
         // descendant set - so this set must be built out here, never rebuilt
         // per pooled entry, or the walk becomes O(pool^2) per arrival.
         std::set<uint256> setInPrevouts;
         for (const CTxIn& in : tx.vin)
             setInPrevouts.insert(in.prevout.hash);
-
-        // Contextual oracle checks (Phase G-1, T-o3). Every v17 op is height-
-        // AND branch-bound to exactly the next block on this tip, so admission
-        // runs the REAL contextual check at tip+1 with the same closures
-        // ConnectBlock uses (confirmed DB state IS the pre-block state a
-        // pooled op must bind; there is no unconfirmed-chaining to layer in).
-        // Then the slot guards: consensus allows ONE oracle op per submitter
-        // per block and ONE fresh bond per block, and v17 slot collisions
-        // spend no common coin, so two pooled ops in one slot would brick our
-        // own BMM template inside TestBlockValidity (the DR-2 class). One
-        // exception (spec s3, the ATTEST-displaces rationale transplanted): a
-        // newer SUBMIT for the same submitter DISPLACES the pooled one - a
-        // submitter's own residue must never block the duty the fix depends
-        // on. (A re-sign that respends the same funding outpoint takes the
-        // RBF/conflict path long before this block; displacement covers
-        // re-signs funded from a different outpoint.)
-        if (tx.nVersion == TRANSACTION_ORACLE_VERSION) {
-            auto fnGetOracleSub = [](uint32_t nID, COracleSubmitter& sub) {
-                return phousetree->GetOracleSubmitter(nID, sub);
-            };
-            auto fnHaveOracleKey = [](const std::vector<unsigned char>& vchKey) {
-                uint32_t nDummy;
-                return phousetree->GetOracleSubmitterIDByKey(vchKey, nDummy);
-            };
-            uint32_t nLastSub = 0;
-            phousetree->GetLastOracleSubmitterID(nLastSub);
-            COracleSubmitter subResult;
-            bool fFreshBond = false;
-            std::vector<COracleObs> vObs;
-            auto fnGetOracleAnchor = [](uint32_t nH, uint256& hashOut) {
-                if ((int64_t)nH > (int64_t)chainActive.Height())
-                    return false;
-                const CBlockIndex* p = chainActive[(int)nH];
-                if (!p)
-                    return false;
-                hashOut = p->GetBlockHash();
-                return true;
-            };
-            if (!CheckOracleOperation(tx, state, GetSpendHeight(view), fnGetOracleAnchor,
-                    fnGetOracleSub, fnHaveOracleKey, nLastSub + 1,
-                    subResult, fFreshBond, vObs, true /* fMempool */))
-                return error("%s: CheckOracleOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
-
-            const bool fIncomingSubmit = (tx.nOracleOp == ORACLE_OP_SUBMIT);
-            const uint32_t nInID = fFreshBond ? 0 : subResult.nSubmitterID;
-            uint32_t nInTarget = 0;
-            {
-                uint32_t nDummyID = 0;
-                bool fDummyFresh = false;
-                GetOracleSlotID(tx, nDummyID, fDummyFresh, &nInTarget);
-            }
-            std::vector<CTransactionRef> vDisplace;
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                const CTransaction& mtx = mi->GetTx();
-                uint32_t nTheirs = 0, nTheirTarget = 0;
-                bool fTheirsFresh = false;
-                if (!GetOracleSlotID(mtx, nTheirs, fTheirsFresh, &nTheirTarget))
-                    continue;
-                if (fFreshBond) {
-                    // One fresh registration per block: while one is pooled, a
-                    // second waits (same key would collide at dup-key inside
-                    // the template, different keys at the fresh-bond slot). A
-                    // pooled op on an EXISTING id cannot collide with a fresh
-                    // registration - the id it will be assigned is not in the
-                    // DB yet, so no admitted op can reference it.
-                    if (fTheirsFresh)
-                        return state.DoS(0, false, REJECT_DUPLICATE, "oracle-op-in-mempool");
-                } else if (!fTheirsFresh && nTheirs == nInID) {
-                    // NEVER displace a tx the incomer SPENDS. A re-sign is
-                    // routinely funded from its predecessor's 0-conf change
-                    // (the predecessor's own inputs are already spent-in-wallet,
-                    // so AvailableCoins offers exactly that change), and the
-                    // window made this the common case rather than a rarity -
-                    // under the old one-block rule the predecessor was swept and
-                    // abandoned before a re-sign existed. Evicting it here
-                    // removes the incomer's parent while the incomer is not yet
-                    // in the pool to be removed with it: CheckInputs then passes
-                    // off a cached coin whose parent is gone, and
-                    // CheckInputsFromMempoolAndCache aborts the node on
-                    // assert(!coinFromDisk.IsSpent()). Every peer holding the
-                    // predecessor runs the same path, so one submitter's routine
-                    // per-block re-sign would abort the network.
-                    //
-                    // ◄T-d5: this test was DIRECT-PARENT only and that was not
-                    // enough - removeRecursive takes the whole descendant set,
-                    // so a re-sign funded from a GRANDCHILD (the predecessor's
-                    // change consumed by an ordinary send, whose change funds
-                    // the re-sign) aborted identically. Now shared with the
-                    // house-slot displacement below, which had no test at all.
-                    const bool fSpendsPooled = SpendsPooledOrDescendant(setInPrevouts, pool, mi);
-                    // Displace only with a submission signed at or after the
-                    // pooled one. Under the validity window both can be live at
-                    // once, so an unconditional displace would let out-of-order
-                    // relay (or a hostile peer replaying a stale-but-valid
-                    // re-sign) swap a fresher price for a staler one.
-                    if (!fSpendsPooled && fIncomingSubmit && mtx.nOracleOp == ORACLE_OP_SUBMIT &&
-                            nInTarget >= nTheirTarget)
-                        vDisplace.push_back(mi->GetSharedTx());
-                    else
-                        return state.DoS(0, false, REJECT_DUPLICATE, "oracle-op-in-mempool");
-                }
-            }
-            for (const CTransactionRef& ref : vDisplace) {
-                LogPrintf("%s: newer oracle submission for submitter %u displaces pooled %s\n",
-                          __func__, nInID, ref->GetHash().ToString());
-                InclusionLogDisplace(nInID, ref->GetHash(), tx.GetHash());
-                // EXPIRY, not CONFLICT: the MempoolEntryRemoved wallet-wedge
-                // rationale, verbatim from the ATTEST displacement below.
-                pool.removeRecursive(*ref, MemPoolRemovalReason::EXPIRY);
-            }
-        }
 
         // THE UNIVERSAL HOUSE-SLOT MIRROR GUARD, slot-keyed on BOTH sides
         // (T-s5, widened ◄T-d5): the INCOMING tx takes a house slot and the
@@ -3605,6 +3432,15 @@ static bool BillVerifyStrict(const std::vector<unsigned char>& vchPubKey,
  * houseOut + fHouseChanged and take that house's one-op-per-block slot.
  * RECOURSE deliberately does not - it mutates no house record at all.
  */
+/** A bill's reference house's failure height, if it has failed (its windows then end there); else 0. */
+static int RefHouseAnchor(uint32_t nRefHouseID, int nHeight, const std::function<bool(uint32_t, CHouse&)>& fnGetHouse)
+{
+    CHouse ref;
+    if (nRefHouseID == 0 || !fnGetHouse(nRefHouseID, ref) || HouseEffectiveStatus(ref, nHeight) != HOUSE_STATUS_INSOLVENT)
+        return 0;
+    return (int)HouseInsolventSince(ref, nHeight);
+}
+
 bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHeight, const CAmount& nTxFee,
                         const std::function<bool(uint32_t, CBill&)>& fnGetBill,
                         const std::function<bool(const uint256&)>& fnHaveBillHash,
@@ -3645,9 +3481,19 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // acceptor signature IS the acceptance (D5). Binding tx.vout[1].nValue
         // stops a relay observer from replaying the payload with a token escrow
         // bond (the bond is the holder's default-recovery collateral).
+        // Gold B (GOLD_B.md §3): the reference house whose ask governs sECX repayment while the bill is privately held. It
+        // must exist and have posted a rate, so "the drawee can always discharge" holds from issue.
+        {
+            CHouse houseRef;
+            uint64_t nRefBid = 0, nRefAsk = 0;
+            if (issue.nRefHouseID == 0 || !fnGetHouse(issue.nRefHouseID, houseRef))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-ref-house");
+            if (!HouseRateForChecks(issue.nRefHouseID, nHeight, nRefBid, nRefAsk))
+                return state.DoS(0, false, REJECT_INVALID, "bad-bill-issue-ref-no-rate");
+        }
         const uint256 sighash = BillIssueSigHash(billID, issue.amount,
                 tx.vout[1].nValue, issue.nMaturityHeight, issue.nGraceBlocks,
-                issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey);
+                issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey, issue.nRefHouseID);
         if (!CPubKey(issue.vchDrawerPubKey).VerifyStrict(sighash, issue.vchDrawerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-drawer-sig");
         if (!CPubKey(issue.vchAcceptorPubKey).VerifyStrict(sighash, issue.vchAcceptorSig))
@@ -3664,6 +3510,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         billOut.vchDrawerPubKey = issue.vchDrawerPubKey;
         billOut.vchAcceptorPubKey = issue.vchAcceptorPubKey;
         billOut.vchHolderPubKey = issue.vchHolderPubKey;
+        billOut.nRefHouseID = issue.nRefHouseID;
         billOut.status = BILL_STATUS_ACTIVE;
         billOut.txidIssue = tx.GetHash();
         billOut.outEscrow = COutPoint(tx.GetHash(), 1);
@@ -3734,10 +3581,11 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!CPubKey(bill.vchAcceptorPubKey).VerifyStrict(sighash, retire.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-sig");
 
-        // Retirement is the drawee paying face to the current holder. Gram-notes release: the face is mg, paid in sECX at
-        // the bound payout price.
+        // Retirement is the drawee paying face to the current holder. The face is mg, paid in sECX at the reference
+        // house's highest ask of the last 30 days (Gold B, GOLD_B.md §3).
         uint64_t nRetirePrice = 0;
-        if (!BoundPayoutPrice(retire.nPriceHeight, nHeight, true, state, "bad-bill-retire", nRetirePrice))
+        if (!BoundHouseRate(bill.nRefHouseID, retire.nRateNamed, nHeight, HouseRateKind::ASK30, state, "bad-bill-retire",
+                            nRetirePrice, RefHouseAnchor(bill.nRefHouseID, nHeight, fnGetHouse)))
             return false;
         if (BillValuePaidTo(tx, bill.vchHolderPubKey) < MgToSats((uint64_t)bill.amount, nRetirePrice))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-payment");
@@ -3765,7 +3613,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // Default: only past maturity + grace (uint64 sum - cannot wrap); counting only blocks with a payout price (the
         // no-price path: nothing falls overdue while none exists)
-        if (PricedHeightSince(bill.nMaturityHeight, nHeight) <= (int64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+        if ((uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-claim-early");
 
         // The holder signs the exact output set - where the escrow goes is
@@ -3797,12 +3645,16 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-inactive");
         if (bill.nOwnerHouseID != 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-already-held");
-        if ((uint32_t)nHeight >= bill.nMaturityHeight)
+        if ((uint32_t)nHeight >= TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, 0, nHeight))   // matured (clock time)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-matured");
         // v0.2.28 (FAILED_HOUSE_DESIGN.md B(i), Michael 2026-10-16): a house buys no bill whose maturity PLUS grace
         // lies further ahead than the collection window, so a failed house's book always runs off - repaid, or
         // defaulted and its bond claimed - before its holders are paid.
-        if ((uint64_t)bill.nMaturityHeight + bill.nGraceBlocks > (uint64_t)nHeight + Params().GetConsensus().nCollectWindow)
+        // In clock time (review 2026-11-07): the term left from issue, plus grace, within the collection window.
+        const uint32_t nIssueT = (bill.nIssuedHeight != 0 && bill.nIssuedHeight <= bill.nMaturityHeight) ? bill.nIssuedHeight
+                                                                                                       : bill.nMaturityHeight;
+        const int64_t nLeftT = (int64_t)(bill.nMaturityHeight - nIssueT) + (int64_t)bill.nGraceBlocks - ClockSince(nIssueT, nHeight);
+        if (nLeftT > (int64_t)Params().GetConsensus().nCollectWindow)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-tenor");
         // The two bill facts every house delta is computed from, pinned
         // byte-exact. This is what makes the crash-replay arm and the
@@ -3853,17 +3705,26 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-seller-side-payment");
         }
 
+        // Gold B (GOLD_B.md §1): issuing needs a rate posted within GramParams::nRateRefreshSecs (review 2026-11-07).
+        if (!HouseRateFreshForChecks(house.nHouseID, (int64_t)Params().GetConsensus().GramAt(nHeight).nRateRefreshSecs))
+            return state.DoS(0, false, REJECT_INVALID, "bad-bill-discount-rate-stale");
         // -- 17: capital cap (CM-2) - the NOTE_OP_MINT conjunct verbatim ---
         const uint64_t nPrice = (uint64_t)d.amountPrice;
         if (house.nMintedUnits > (uint64_t)MAX_MONEY - nPrice ||
                 house.nMintedUnits + nPrice > (uint64_t)MAX_MONEY - house.nDepositUnits ||
-                house.nMintedUnits + nPrice + house.nDepositUnits > GoldCapitalCapUnits(house, nHeight))
+                house.nMintedUnits + nPrice + house.nDepositUnits > CapitalCapUnits(house, nHeight))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-capital-cap");
 
         // -- 18/19: the till floor -----------------------------------------
-        // Gram-notes release: the till is the house's gold till vault (exact on-chain, so no attestation or reserve
-        // proof is read); a discount mints, so it needs the till a NOTE_OP_MINT does.
-        if (house.nMintedUnits + nPrice > GoldTillCapUnits(house, nHeight))
+        // Gold B (GOLD_B.md §5; design 2026-11-07): a discount mints, so it needs the till floor too - read from the sECX
+        // this discount itself proves unspent (R-i7's proof primitive), as MINT's; no proofs, a till of 0. Discounting is
+        // the main way a house issues, so attest-then-spend must not work here.
+        CAmount amountTill = 0;
+        if (!d.vReserveProofs.empty() &&
+                !VerifyReserveProofs(house.houseID, d.nAsOfHeight, d.vReserveProofs, tx.vin, nHeight, fnGetProofCoin,
+                                     fnGetBlockHash, amountTill, state, "bad-bill-discount-reserve", fMempool))
+            return false;
+        if (house.nMintedUnits + nPrice > TillCapUnits(house, nHeight, amountTill))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-reserve-cap");
 
         // -- 20: book envelope ---------------------------------------------
@@ -3990,13 +3851,17 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             const uint64_t nRestMg = (uint64_t)(hr.amountFace - (CAmount)hr.nUnitsBurned);
             if (nRestMg > 0) {
                 uint64_t nPrice = 0;
-                if (!BoundPayoutPrice(hr.nPriceHeight, nHeight, true, state, "bad-bill-hretireescrow", nPrice))
+                // GOLD_B §6: a failed house's bills are collected at its 90-day highest ask (a suspended one's at 30).
+                const bool fFailed = HouseEffectiveStatus(house, nHeight) == HOUSE_STATUS_INSOLVENT;
+                const HouseRateKind kind = fFailed ? HouseRateKind::ASK90 : HouseRateKind::ASK30;
+                if (!BoundHouseRate(bill.nOwnerHouseID, hr.nRateNamed, nHeight, kind, state, "bad-bill-hretireescrow",
+                                    nPrice, fFailed ? (int)HouseInsolventSince(house, nHeight) : 0))
                     return false;
                 amountOwed = MgToSats(nRestMg, nPrice);
             }
         } else {
             // Anyone, but only once the drawee has defaulted (op 8's maturity gate); the whole bond goes in.
-            if (PricedHeightSince(bill.nMaturityHeight, nHeight) <= (int64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+            if ((uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
                 return state.DoS(10, false, REJECT_INVALID, "bad-bill-hclaimescrow-early");
             amountOwed = bill.amountEscrow;
         }
@@ -4089,7 +3954,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         CAmount amountRest = 0;
         if (amountRestMg > 0) {
             uint64_t nPrice = 0;
-            if (!BoundPayoutPrice(hn.nPriceHeight, nHeight, true, state, "bad-bill-hretirenotes", nPrice))
+            if (!BoundHouseRate(hn.nOwnerHouseID, hn.nRateNamed, nHeight, HouseRateKind::ASK30, state,
+                                "bad-bill-hretirenotes", nPrice))
                 return false;
             amountRest = MgToSats((uint64_t)amountRestMg, nPrice);
         }
@@ -4180,14 +4046,15 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                     BillRetireSigHash(bill.billID, BillHashOutputs(tx)), hr.vchAcceptorSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-sig");
             // Face paid to the current holder - which check 12 pinned to the
-            // house's custody key when the discount happened. Gram-notes release: mg, paid at the bound price.
+            // house's custody key when the discount happened. mg, paid at the house's 30-day highest ask (Gold B).
             uint64_t nPrice = 0;
-            if (!BoundPayoutPrice(hr.nPriceHeight, nHeight, true, state, "bad-bill-hretire", nPrice))
+            if (!BoundHouseRate(nOwnerHouseID, hr.nRateNamed, nHeight, HouseRateKind::ASK30, state, "bad-bill-hretire",
+                                nPrice))
                 return false;
             if (BillValuePaidTo(tx, bill.vchHolderPubKey) < MgToSats((uint64_t)amountFace, nPrice))
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-payment");
         } else {
-            if (PricedHeightSince(bill.nMaturityHeight, nHeight) <= (int64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+            if ((uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
                 return state.DoS(10, false, REJECT_INVALID, "bad-bill-hclaim-early");
             // The QUORUM replaces the single holder signature of op 4: the
             // custody key alone must never direct the escrow payout.
@@ -4241,7 +4108,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (bill.status != BILL_STATUS_ACTIVE && bill.status != BILL_STATUS_DEFAULTED)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-status");
         if (bill.status == BILL_STATUS_ACTIVE &&
-                PricedHeightSince(bill.nMaturityHeight, nHeight) <= (int64_t)bill.nMaturityHeight + bill.nGraceBlocks)
+                (uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-recourse-early");
 
         // -- 31: the prior -------------------------------------------------
@@ -4283,7 +4150,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // flows has to re-prove.
         // Gram-notes release: the face is mg (valued at the bound payout price); the escrow bond is sats.
         uint64_t nRecoursePrice = 0;
-        if (!BoundPayoutPrice(r.nPriceHeight, nHeight, true, state, "bad-bill-recourse", nRecoursePrice))
+        if (!BoundHouseRate(bill.nRefHouseID, r.nRateNamed, nHeight, HouseRateKind::ASK30, state, "bad-bill-recourse",
+                            nRecoursePrice, RefHouseAnchor(bill.nRefHouseID, nHeight, fnGetHouse)))
             return false;
         const CAmount amountFaceSats = MgToSats((uint64_t)bill.amount, nRecoursePrice);
         CAmount amountFloor = 0;
@@ -4357,8 +4225,10 @@ static bool VerifyHouseApprovers(const CHouse& house, const std::vector<uint32_t
 static CAmount GetHouseLiabilities(const CHouse& house)
 {
     // Notes (N) + term deposits (D, Phase 3.8): both are on-chain liabilities the
-    // WINDDOWN / final-settle gates must see as outstanding.
-    return (CAmount)house.nMintedUnits + (CAmount)house.nDepositUnits;
+    // WINDDOWN / final-settle gates must see as outstanding. Gold B (review 2026-11-07): and pending swaps - their notes
+    // left circulation but the house still owes them, so a house can't wind down past them.
+    return (CAmount)house.nMintedUnits + (CAmount)house.nDepositUnits +
+           (CAmount)HousePendingSwapUnitsForChecks(house.nHouseID);
 }
 
 bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nHeight,
@@ -4417,6 +4287,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             partner.vOutPledge.push_back(COutPoint(tx.GetHash(), i));
             partner.status = HOUSE_PARTNER_ACTIVE;
             houseOut.vPartner.push_back(partner);
+            houseOut.vEscrowTranche.emplace_back((uint32_t)i, reg.vPledgeAmount[i], (uint32_t)nHeight);   // the ramp
         }
         return true;
     }
@@ -4457,6 +4328,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         partner.amountPledge += tx.vout[0].nValue;
         partner.vOutPledge.push_back(COutPoint(tx.GetHash(), 0));
+        house.vEscrowTranche.emplace_back(topup.nPartnerIndex, tx.vout[0].nValue, (uint32_t)nHeight);   // the ramp: new escrow at 1x
         // Canonical order: the RECLAIM undo path sorts restored lists, so
         // every write path must sort too or reorged and fresh-synced nodes
         // end with byte-divergent records.
@@ -4500,6 +4372,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         partner.vchPubKey = admit.vchNewPubKey;
         partner.amountPledge = tx.vout[0].nValue;
         partner.vOutPledge.push_back(COutPoint(tx.GetHash(), 0));
+        house.vEscrowTranche.emplace_back((uint32_t)house.vPartner.size(), tx.vout[0].nValue, (uint32_t)nHeight);   // the ramp
         partner.status = HOUSE_PARTNER_ACTIVE;
         house.vPartner.push_back(partner);
         houseOut = house;
@@ -4543,7 +4416,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         {
             CHouse houseAfter = house;
             houseAfter.vPartner[ex.nPartnerIndex].status = HOUSE_PARTNER_TAIL;
-            if (house.nMintedUnits + house.nDepositUnits > GoldCapitalCapUnitsNoPriceGate(houseAfter, nHeight))
+            if (house.nMintedUnits + house.nDepositUnits > CapitalCapUnits(houseAfter, nHeight))
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-exit-cap");
         }
 
@@ -4722,12 +4595,9 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-close-fund");
         }
         // Past the pinned outputs only the closer's change: no escrow-shaped coin (it would enter the UTXO set
-        // untagged) and no second sECX fund output. Gram-notes release (5b): the house's gold goes to the fund too, one
-        // output per token carrying an annex entry (CheckHouseVaultMoves pins those to the fund script).
+        // untagged) and no second sECX fund output.
         for (size_t o = nPinned; o < tx.vout.size(); o++) {
-            const bool fGoldToFund = IsMutualFundScript(tx.vout[o].scriptPubKey) && FindIssuedOut(tx, (uint32_t)o) &&
-                                     tx.vout[o].nValue == ISSUED_COIN_VALUE;
-            if (IsHouseEscrowScript(tx.vout[o].scriptPubKey) || (IsMutualFundScript(tx.vout[o].scriptPubKey) && !fGoldToFund))
+            if (IsHouseEscrowScript(tx.vout[o].scriptPubKey) || IsMutualFundScript(tx.vout[o].scriptPubKey))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-close-stray");
         }
 
@@ -4776,8 +4646,15 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             // AND every deposit has been claimed.
             if (house.nMintedUnits != 0 || house.nDepositUnits != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-notes-outstanding");
-            // (Review round 1b: any gold still in the vaults goes to the fund in this same transaction -
-            // CheckHouseVaultMoves.)
+            // Gold B (review 2026-11-07): pending swaps and the shortfalls the snapshot counted rank with the notes, so the
+            // partners wait for those claims too (CLOSE still ends a house whose claimants never come).
+            {
+                const uint32_t nEs = HouseInsolventSince(house, nHeight);
+                const int64_t nLapse = (int64_t)Params().GetConsensus().GramAt(nHeight).nShortfallLapseSecs / 600;
+                if (HousePendingSwapUnitsForChecks(house.nHouseID) != 0 ||
+                        HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(nEs ? (int)nEs : nHeight), nLapse) != 0)
+                    return state.DoS(10, false, REJECT_INVALID, "bad-house-settle-swaps-outstanding");
+            }
             // v0.2.28 (B): collect, then pay - the partners come last, after the book has run off too.
             if (!HouseCollectionDone(house, nHeight))
                 return state.DoS(10, false, REJECT_INVALID, "bad-house-settle-collecting");
@@ -4927,7 +4804,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // Gram-notes release (G10): the tail partner's gold isn't in the counted capital any more, but it still backs
         // claims - so it may leave only while the house's counted gold capital covers notes and deposits at the floor.
         if (chEff == HOUSE_STATUS_OPEN && house.nMintedUnits + house.nDepositUnits != 0) {
-            if (house.nMintedUnits + house.nDepositUnits > GoldCapitalCapUnitsNoPriceGate(house, nHeight))
+            if (house.nMintedUnits + house.nDepositUnits > CapitalCapUnits(house, nHeight))
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-reclaim-cap");
         }
 
@@ -4998,7 +4875,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 att.nPrevDeferInvokedHeight != house.nDeferInvokedHeight ||
                 att.nPrevDeferRenewals != house.nDeferRenewals ||
                 att.nPrevDeferCumBlocks != house.nDeferCumBlocks ||
-                att.nPrevDeferEndedHeight != house.nDeferEndedHeight)
+                att.nPrevDeferEndedHeight != house.nDeferEndedHeight || att.nPrevCureLeft != house.nCureLeft)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-attest-priors");
 
         // Per-proof verification against the PARENT-chain UTXO state (order-
@@ -5019,16 +4896,16 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 house.nThresholdM, state, "bad-house-attest-approver"))
             return false;
 
-        // Gram-notes release: ATTEST never starts stress (a till below the floor only stops issuing, R3-4). For a
-        // deferred house it is the recovery test: its counted gold till back at the floor, with no restore buffer
-        // (design draft 9, R3-4).
+        // ATTEST never starts stress (a till below the floor only stops issuing, R3-4). For a deferred house it is the
+        // recovery test: the till this attestation proves (in mg at the house's 30-day highest ask, Gold B) back at the
+        // floor, with no restore buffer (design draft 9, R3-4).
         uint32_t nNewStress = 0;
         if (house.nDeferInvokedHeight != 0) {
-            CGoldCount gold;
-            HouseGoldForChecks(house, nHeight, gold);
+            CHouseCapital cap;
+            const bool fCap = HouseCapitalForChecks(house, nHeight, amountSum, cap);
             const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
             const uint64_t nFloor = (uint64_t)((unsigned __int128)house.nMintedUnits * gp.nTillMinBps / 10000);
-            if (gold.nTillMg < nFloor)
+            if (!fCap || cap.nTillMg < nFloor)
                 nNewStress = house.nStressSinceHeight ? house.nStressSinceHeight : (uint32_t)nHeight;
         }
 
@@ -5039,6 +4916,18 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // recover leaves the clause running - and, v0.2.18, resets the silence
         // clock (it moves nLastAttestHeight below).
         if (house.nDeferInvokedHeight != 0 && nNewStress == 0) {
+            // Gold B (design 2026-11-08): a live protest re-arms here (house.cpp) - the SAME demand, so the cure that ran
+            // when the suspension began continues with the time it had left, floored at a day; never a fresh week, so
+            // defer / recover cycles can't buy time. The cure's start was the protest or the previous re-arm.
+            if (house.ProtestLive()) {
+                const bool fWasRearm = house.nDeferEndedHeight != 0 && house.nDeferEndedHeight > house.nProtestHeight;
+                const uint32_t nCureStart = fWasRearm ? house.nDeferEndedHeight : house.nProtestHeight;
+                const uint64_t nWindow = (fWasRearm && house.nCureLeft != 0) ? house.nCureLeft : HOUSE_STRESSED_WINDOW;
+                const int64_t nElapsed = ClockSince(nCureStart, (int)house.nDeferInvokedHeight);
+                const uint64_t nLeft = (int64_t)nWindow > nElapsed ? nWindow - (uint64_t)nElapsed : 0;
+                const uint64_t nFloor = std::min<uint64_t>(144, HOUSE_STRESSED_WINDOW);
+                house.nCureLeft = (uint32_t)std::max(nLeft, nFloor);
+            }
             house.nDeferCumBlocks += (uint32_t)nHeight > house.nDeferInvokedHeight
                                    ? (uint32_t)nHeight - house.nDeferInvokedHeight : 0;
             house.nDeferInvokedHeight = 0;
@@ -5110,7 +4999,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // frozen on first detection" - which was pure theatre against plain
         // key-signed coins - into a rule consensus can actually enforce.
         if (nHeight < 0 || (uint32_t)nHeight < house.nLastAttestHeight ||
-                (uint32_t)nHeight - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE)
+                ClockSince(house.nLastAttestHeight, nHeight) > (int64_t)HOUSE_ATTEST_CADENCE)
             return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-defer-attest-stale");
         if (tx.vout[0].scriptPubKey != HouseEscrowScript(house.houseID))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-lock-script");
@@ -5138,47 +5027,45 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         return true;
     }
 
-    if (tx.nHouseOp == HOUSE_OP_EQUITY) {
-        // Gram-notes release (design draft 9, R3-1; D-2026-10-31-9): anyone may prove a house's equity negative, which
-        // opens claims - the house is Insolvent from this block, for good. Equity (HouseEquityMg) = gold in its vaults +
-        // its sECX escrow at the bound price + its loan book at face less the overdue bills listed - notes - deposits.
-        // Bills are read as they stood at the block's start: every op that moves a bill into or out of a house's book
-        // takes the house's slot, as this op does, so none shares its block.
-        HouseEquity eq;
-        if (!DecodeHousePayload(tx.vchHousePayload, eq))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-equity-payload");
+    if (tx.nHouseOp == HOUSE_OP_CHARTER) {
+        // Gold B (GOLD_B.md §2): the charter's tokens. Approved here by the M-of-N; ConnectIssuedTx applies it to the
+        // units DB (the add / remove / related rules). A live house only. The house record doesn't change.
+        HouseCharter ch;
+        if (!DecodeHousePayload(tx.vchHousePayload, ch))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-payload");
         CHouse house;
-        if (!fnGetHouse(eq.nHouseID, house))
+        if (!fnGetHouse(ch.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
-        const char cStatus = HouseEffectiveStatus(house, nHeight);
-        if (cStatus == HOUSE_STATUS_INSOLVENT || cStatus == HOUSE_STATUS_WOUNDDOWN)
-            return state.DoS(0, false, REJECT_INVALID, "bad-house-equity-not-open");
-        uint64_t nSatsPerGram = 0;
-        if (!BoundPayoutPrice(eq.nPriceHeight, nHeight, fMempool, state, "bad-house-equity", nSatsPerGram))
+        const char chEffStatus = HouseEffectiveStatus(house, nHeight);
+        if (chEffStatus != HOUSE_STATUS_OPEN && chEffStatus != HOUSE_STATUS_STRESSED &&
+                chEffStatus != HOUSE_STATUS_DEFERRED)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-closed");
+        if (!VerifyHouseApprovers(house, ch.vApproverIndex, ch.vApproverSig, HouseCharterSigHash(ch.nHouseID, tx, ch),
+                                  house.nThresholdM, state, "bad-house-charter-approver"))
             return false;
-        int64_t nEquityMg = 0;
-        std::string strReason;
-        if (!HouseEquityMg(house, nHeight, nSatsPerGram, HouseLiveEscrowPot(house, fnGetProofCoin), eq.vOverdueBillID,
-                           nEquityMg, strReason))
-            return state.DoS(strReason == "duplicate-bill" ? 100 : 0, false, REJECT_INVALID, "bad-house-equity-" + strReason);
-        if (nEquityMg >= 0)
-            return state.DoS(0, false, REJECT_INVALID, "bad-house-equity-positive");
-        house.nEquityNegativeHeight = (uint32_t)nHeight;
         houseOut = house;
         return true;
     }
 
-    if (tx.nHouseOp == HOUSE_OP_TILL) {
-        // Gram-notes release: gold into or out of the till vault. The moves themselves are checked against the
-        // vaults by CheckHouseVaultMoves; here, the approvers. The house record doesn't change.
-        HouseTill till;
-        if (!DecodeHousePayload(tx.vchHousePayload, till))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-payload");
+    if (tx.nHouseOp == HOUSE_OP_RATE) {
+        // Gold B (D-2026-11-07-1): the house's own rate. A live house posts it (its notes pay at the bid while it is
+        // Stressed or Deferred too); SETKEY is approved here by the M-of-N. POST's rate-key signature, the spread, the
+        // rise cap and the records are ConnectIssuedTx's (the key and the rate live in the units DB). The house record
+        // doesn't change.
+        HouseRate rate;
+        if (!DecodeHousePayload(tx.vchHousePayload, rate))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-payload");
         CHouse house;
-        if (!fnGetHouse(till.nHouseID, house))
+        if (!fnGetHouse(rate.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
-        if (!VerifyHouseApprovers(house, till.vApproverIndex, till.vApproverSig, HouseTillSigHash(house.houseID, tx),
-                house.nThresholdM, state, "bad-house-till-approver"))
+        const char chEffStatus = HouseEffectiveStatus(house, nHeight);
+        if (chEffStatus != HOUSE_STATUS_OPEN && chEffStatus != HOUSE_STATUS_STRESSED &&
+                chEffStatus != HOUSE_STATUS_DEFERRED)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-closed");
+        if (rate.nKind == HOUSE_RATE_SETKEY &&
+                !VerifyHouseApprovers(house, rate.vApproverIndex, rate.vApproverSig,
+                                      HouseRateSigHash(rate.nHouseID, tx, rate), house.nThresholdM, state,
+                                      "bad-house-rate-approver"))
             return false;
         houseOut = house;
         return true;
@@ -5263,6 +5150,229 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
     fHouseChanged = false;
     const uint256 hashOutputs = BillHashOutputs(tx);
 
+    // Gold B (D-2026-11-07-1; GOLD_B.md §4): the swap. Checked here against the units check scope (the block so far or the
+    // mempool's); ConnectIssuedTx writes the swap records. Times are the chain clock's (active time for the deadline).
+    if (IsNoteSwapOp(tx.nNoteOp)) {
+        CChainClock clock;
+        if (!ChainClockForChecks(clock))
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-noclock");
+        const Consensus::GramParams& gpSwap = Params().GetConsensus().GramAt(nHeight);
+        if (tx.nNoteOp == NOTE_OP_SWAP) {
+            NoteSwap sw;
+            if (!DecodeNotePayload(tx.vchNotePayload, sw))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
+            CHouse house;
+            if (!fnGetHouse(sw.nHouseID, house))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+            const char chEff = HouseEffectiveStatus(house, nHeight);
+            if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED && chEff != HOUSE_STATUS_DEFERRED)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-house-closed");
+            if (sw.nUnits != nNoteUnitsIn || house.nMintedUnits < sw.nUnits)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-units");
+            if (!CPubKey(sw.vchHolderPubKey).VerifyStrict(NoteSwapSigHash(sw, tx), sw.vchHolderSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-sig");
+            CCharterToken token;
+            if (!HouseCharterTokenForChecks(sw.nHouseID, sw.nChainID, sw.vchContract, clock.nMonoTime, token))
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-token");
+            CSwapRecord existing;
+            if (SwapRecordForChecks(sw.hashLock, existing))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-hash-used");
+            uint64_t nBid = 0;
+            if (!BoundHouseRate(sw.nHouseID, sw.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap", nBid))
+                return false;
+            const CScript scriptPayout(sw.vchPayoutScript.begin(), sw.vchPayoutScript.end());
+            if (scriptPayout == HouseEscrowScript(house.houseID) || IsGoldUnpayableScript(scriptPayout))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payout-script");
+            // The notes leave circulation now; until DONE or PAID they are the house's pending-swap liability.
+            house.nMintedUnits -= sw.nUnits;
+            houseOut = house;
+            fHouseChanged = true;
+            return true;
+        }
+        if (tx.nNoteOp == NOTE_OP_SWAP_DONE) {
+            NoteSwapDone d;
+            if (!DecodeNotePayload(tx.vchNotePayload, d))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-done-payload");
+            CSwapRecord r;
+            if (!SwapRecordForChecks(d.hashLock, r) || r.nHouseID != d.nHouseID)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-unknown");
+            if (!r.Open())
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-settled");
+            uint256 hashCheck;
+            CSHA256().Write(d.vchPreimage.data(), d.vchPreimage.size()).Finalize(hashCheck.begin());
+            if (hashCheck != d.hashLock)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-preimage");
+            if (clock.nActiveTime >= r.nDeadlineActive)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-late");
+            return true;
+        }
+        if (tx.nNoteOp == NOTE_OP_SWAP_PAY) {
+            NoteSwapPay p;
+            if (!DecodeNotePayload(tx.vchNotePayload, p))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-pay-payload");
+            CSwapRecord r;
+            if (!SwapRecordForChecks(p.hashLock, r) || r.nHouseID != p.nHouseID)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-unknown");
+            if (!r.Open())
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-settled");
+            if ((p.fWasProtested != 0) != (r.nStatus == SWAP_PROTESTED))
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-pay-protest-flag");
+            {
+                // A failed house's swaps are claimed from its escrow (SWAP_CLAIM), never paid outside the waterfall: a
+                // payment then would also prune the shortfall ledger the snapshot reads (review 2026-11-07).
+                CHouse hPay;
+                if (fnGetHouse(p.nHouseID, hPay) && HouseEffectiveStatus(hPay, nHeight) == HOUSE_STATUS_INSOLVENT)
+                    return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-pay-insolvent");
+            }
+            uint64_t nBidNow = 0;
+            if (!BoundHouseRate(p.nHouseID, p.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap-pay", nBidNow))
+                return false;
+            const uint64_t nRate = SwapPayRate(r, SwapBidAtDeadlineForChecks(r), clock.nActiveTime);
+            const CAmount amountOwed = MgToSats(r.nUnits, nRate);
+            const CScript scriptPayout(r.vchPayoutScript.begin(), r.vchPayoutScript.end());
+            CAmount amountPaid = 0;
+            for (const CTxOut& o : tx.vout)
+                if (o.scriptPubKey == scriptPayout)
+                    amountPaid += o.nValue;
+            if (amountPaid < amountOwed)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-pay-amount");
+            if (!p.fWasProtested)
+                return true;
+            // A protested swap that is paid lifts its protest (as discharging a protested demand does).
+            CHouse house;
+            if (!fnGetHouse(p.nHouseID, house) || house.nProtestOpen == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-pay-house");
+            house.nProtestOpen--;
+            houseOut = house;
+            fHouseChanged = true;
+            return true;
+        }
+        if (tx.nNoteOp == NOTE_OP_SWAP_CLAIM) {
+            // The waterfall (GOLD_B.md §6): a failed house's pending swap, or a shortfall it paid within the lapse before
+            // it failed, claims at the noteholders' rank - exactly its pro-rata entitlement, from the escrow pot, to the
+            // swap's payout script. Anyone may post it: the amount is fixed, so nobody can claim it short.
+            NoteSwapClaim c;
+            if (!DecodeNotePayload(tx.vchNotePayload, c))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-payload");
+            CHouse house;
+            if (!fnGetHouse(c.nHouseID, house))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+            if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-not-insolvent");
+            if (HouseClosed(house))
+                return state.DoS(10, false, REJECT_INVALID, "bad-note-swap-claim-house-closed");
+            if (!HouseCollectionDone(house, nHeight))
+                return state.DoS(10, false, REJECT_INVALID, "bad-note-swap-claim-collecting");
+            CSwapRecord r;
+            if (!SwapRecordForChecks(c.hashLock, r) || r.nHouseID != c.nHouseID)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-unknown");
+            const uint32_t nE = HouseInsolventSince(house, nHeight);
+            uint64_t nUnits = 0;
+            if (r.Open()) {
+                // Only once its deadline has passed: before it the house's lock on Ethereum may still be claimed with s,
+                // and the holder would take the gold and the claim (review 2026-11-07).
+                if (clock.nActiveTime < r.nDeadlineActive)
+                    return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-early");
+                nUnits = r.nUnits;
+            } else if (r.nStatus == SWAP_PAID && r.nShortfallMg > 0) {
+                const int64_t nClockE = ClockAtHeight(nE ? (int)nE : nHeight);
+                const int64_t nLapse = (int64_t)gpSwap.nShortfallLapseSecs / 600;
+                if (r.nSettleClock > nClockE || r.nSettleClock + nLapse < nClockE)
+                    return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-lapsed");
+                nUnits = r.nShortfallMg;
+            } else {
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-settled");
+            }
+            if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetCoin))
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-no-price");
+            CAmount amountEscrowIn = 0;
+            for (const CTxIn& in : tx.vin) {
+                Coin coin;
+                if (fnGetCoin(in.prevout, coin) && !coin.IsSpent() && coin.fHouseEscrow)
+                    amountEscrowIn += coin.out.nValue;
+            }
+            CAmount amountEscrowChange = 0;
+            if (c.fEscrowChange) {
+                if (tx.vout[1].scriptPubKey != HouseEscrowScript(house.houseID))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-escrow-script");
+                amountEscrowChange = tx.vout[1].nValue;
+            }
+            for (size_t o = 0; o < tx.vout.size(); o++)
+                if ((o != 1 || !c.fEscrowChange) && tx.vout[o].scriptPubKey == HouseEscrowScript(house.houseID))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-stray-escrow");
+            const CAmount amountEntitlement = ClaimSatsEntitlement(nUnits, 0, house.amountInsolventPot,
+                                                                   house.nInsolventUnits, house.nInsolventSatsPerGram);
+            if (amountEscrowChange > amountEscrowIn || amountEscrowIn - amountEscrowChange != amountEntitlement)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-amount");
+            const CScript scriptPayout(r.vchPayoutScript.begin(), r.vchPayoutScript.end());
+            if (tx.vout[0].scriptPubKey != scriptPayout || tx.vout[0].nValue < amountEntitlement)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-payout");
+            // The escrow change list, as a note CLAIM keeps it (live change only, sorted).
+            std::set<COutPoint> setSpentIn;
+            for (const CTxIn& in : tx.vin)
+                setSpentIn.insert(in.prevout);
+            std::vector<COutPoint> vKeep;
+            for (const COutPoint& out : house.vOutEscrowChange)
+                if (!setSpentIn.count(out))
+                    vKeep.push_back(out);
+            if (c.fEscrowChange)
+                vKeep.push_back(COutPoint(tx.GetHash(), 1));
+            std::sort(vKeep.begin(), vKeep.end());
+            house.vOutEscrowChange = vKeep;
+            houseOut = house;
+            fHouseChanged = true;
+            return true;
+        }
+        if (tx.nNoteOp == NOTE_OP_SWAP_EXPIRE) {
+            // At or after the deadline: fix the swap's bid at T_f (design 2026-11-07), the house's bid in effect now.
+            NoteSwapExpire e;
+            if (!DecodeNotePayload(tx.vchNotePayload, e))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-expire-payload");
+            CSwapRecord r;
+            if (!SwapRecordForChecks(e.hashLock, r) || r.nHouseID != e.nHouseID)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-unknown");
+            if (!r.Open() || r.nBidT != 0)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-expired");
+            if (clock.nActiveTime < r.nDeadlineActive)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-expire-early");
+            uint64_t nBidNow = 0;
+            return BoundHouseRate(e.nHouseID, e.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap-expire",
+                                  nBidNow);
+        }
+        // NOTE_OP_SWAP_PROTEST: undelivered and unpaid a day after its deadline - an unpaid formal demand, the stress
+        // cascade (house.cpp's protest origin). An honest house can always pay sECX, so this can't be griefed.
+        NoteSwapProtest pro;
+        if (!DecodeNotePayload(tx.vchNotePayload, pro))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-protest-payload");
+        CSwapRecord r;
+        if (!SwapRecordForChecks(pro.hashLock, r) || r.nHouseID != pro.nHouseID)
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-unknown");
+        if (r.nStatus != SWAP_PENDING)
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-not-pending");
+        if (clock.nActiveTime < r.nDeadlineActive + (int64_t)gpSwap.nSwapPayWindowSecs)
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-protest-early");
+        CHouse house;
+        if (!fnGetHouse(pro.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
+        const char chEff = HouseEffectiveStatus(house, nHeight);
+        if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-protest-status");
+        if (pro.nPrevProtestOpen != house.nProtestOpen || pro.nPrevProtestHeight != house.nProtestHeight ||
+                pro.nPrevProtestDemandHeight != house.nProtestDemandHeight)
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-protest-priors");
+        const bool fFreshEpisode = house.nProtestOpen == 0;
+        if (fFreshEpisode)
+            HouseProtestEpisodeStart(house, (uint32_t)nHeight);   // one cure per 180 days (D-2026-11-07-3)
+        house.nProtestOpen += 1;
+        if (fFreshEpisode || (uint32_t)nHeight < house.nProtestHeight)
+            house.nProtestHeight = (uint32_t)nHeight;
+        if (fFreshEpisode || r.nDemandHeight < house.nProtestDemandHeight)
+            house.nProtestDemandHeight = r.nDemandHeight;
+        houseOut = house;
+        fHouseChanged = true;
+        return true;
+    }
+
     if (tx.nNoteOp == NOTE_OP_MINT) {
         NoteMint mint;
         if (!DecodeNotePayload(tx.vchNotePayload, mint))
@@ -5290,9 +5400,12 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // so live deposits shrink mint headroom (and vice-versa - ORIGINATE reads
         // live nMintedUnits). All terms are money-range (<= MAX_MONEY), so
         // N + D + total <= 3*MAX_MONEY fits u64 and lambdaX10*E <= 30*2.1e15 fits.
+        // Gold B (GOLD_B.md §1): issuing needs a rate posted within GramParams::nRateRefreshSecs (review 2026-11-07).
+        if (!HouseRateFreshForChecks(house.nHouseID, (int64_t)Params().GetConsensus().GramAt(nHeight).nRateRefreshSecs))
+            return state.DoS(0, false, REJECT_INVALID, "bad-note-mint-rate-stale");
         if (house.nMintedUnits > (uint64_t)MAX_MONEY - total ||
                 house.nMintedUnits + total > (uint64_t)MAX_MONEY - house.nDepositUnits ||
-                house.nMintedUnits + total + house.nDepositUnits > GoldCapitalCapUnits(house, nHeight))
+                house.nMintedUnits + total + house.nDepositUnits > CapitalCapUnits(house, nHeight))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-over-cap");
 
         // RESERVE cap (Phase 3.5 D2 - "the rho-at-mint gate"): issuance is ALSO
@@ -5308,9 +5421,14 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // it alive: base-native, rho-gated, it survives every modelled panic
         // with no fee at all; lambda-only, it dies at all of them.
         //
-        // Gram-notes release: the till is the house's gold till vault, counted - exact on-chain, so the old
-        // attestation-cadence and reserve-proof gates (R-i7) have nothing left to guard for gold.
-        const uint64_t reserveCap = GoldTillCapUnits(house, nHeight);
+        // Gold B (GOLD_B.md §5; design 2026-11-07): the till is the sECX this mint itself proves unspent (R-i7's proof
+        // primitive), not a stored attestation the house could have spent since. No proofs: a till of 0.
+        CAmount amountTill = 0;
+        if (!mint.vReserveProofs.empty() &&
+                !VerifyReserveProofs(house.houseID, mint.nAsOfHeight, mint.vReserveProofs, tx.vin, nHeight, fnGetProofCoin,
+                                     fnGetBlockHash, amountTill, state, "bad-note-mint-reserve", fMempool))
+            return false;
+        const uint64_t reserveCap = TillCapUnits(house, nHeight, amountTill);
         if (house.nMintedUnits + total > reserveCap)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-under-reserved");
 
@@ -5408,117 +5526,32 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-sig");
         }
 
-        // Gram-notes release (GOLD_USD_SCOPE.md step 6): what values the sECX paid, and gold paid from the till.
-        // The price is the payout price at a height the payload binds (at most nPriceBackBlocks back, so a price
-        // move after signing can't invalidate it); none means only gold counts. Gold from the till vault needs the
-        // house's M-of-N.
-        const Consensus::GramParams& gpRedeem = Params().GetConsensus().GramAt(nHeight);
-        uint64_t nRedeemPrice = 0;   // sats per gram; 0 = no price
-        if (g_nPayoutPriceTestOverride && redeem.nPriceHeight == 0)
-            nRedeemPrice = g_nPayoutPriceTestOverride;   // unit tests only (see issued.h)
-        if (redeem.nPriceHeight != 0) {
-            if ((int64_t)redeem.nPriceHeight >= (int64_t)nHeight ||
-                    (int64_t)nHeight - (int64_t)redeem.nPriceHeight > (int64_t)gpRedeem.nPriceBackBlocks)
-                return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-note-redeem-price-height");
-            if (!PayoutPriceForChecks((int)redeem.nPriceHeight, nRedeemPrice) || nRedeemPrice == 0)
-                return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-note-redeem-no-price");
-        }
-        if (!tx.vVaultMove.empty()) {
-            std::map<uint256, uint64_t> mapCapitalDraw;
-            std::map<uint256, std::map<uint32_t, uint64_t>> mapCapitalByPartner;
-            for (const CVaultMove& m : tx.vVaultMove) {
-                if (m.nHouseID != redeem.nHouseID || m.nDelta >= 0 || (m.nKind != VAULT_TILL && m.nKind != VAULT_CAPITAL))
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-vault-move");
-                if (m.nKind == VAULT_CAPITAL) {
-                    mapCapitalDraw[m.tokenID] += (uint64_t)(-m.nDelta);
-                    mapCapitalByPartner[m.tokenID][m.nPartner] = (uint64_t)(-m.nDelta);
-                }
+        // Gold B (D-2026-11-07-1): the sECX paid is valued at the house's own bid in effect, which the payload names
+        // (none named: a holder-signed redemption, whose signature over the outputs alone protects the holder).
+        uint64_t nRedeemPrice = 0;   // sats per gram; 0 = none named
+        if (redeem.fPreAuthDischarge) {
+            // The house pays alone: at least the bid recorded at the demand (GOLD_B §3; review 2026-11-07).
+            uint32_t nTagD = 0;
+            for (const CTxIn& in : tx.vin) {
+                Coin coin;
+                if (fnGetCoin(in.prevout, coin) && coin.fNote && coin.nDemandHeight != 0) { nTagD = coin.nDemandHeight; break; }
             }
-            // Review round 1 (G2): the gold a redeem draws from the house's vaults reaches its recipient - the
-            // pre-authorised script for a discharge, else the holder's - token for token: at least as much of each
-            // drawn token is paid to that script as the vaults give up. (Gold paid from elsewhere may top it up.)
-            {
-                const CScript scriptRecipient = redeem.fPreAuthDischarge
-                    ? CScript(redeem.vchPayoutScript.begin(), redeem.vchPayoutScript.end())
-                    : NoteScriptForPubKey(redeem.vchHolderPubKey);
-                std::map<uint256, uint64_t> mapDrawn, mapToRecipient;
-                for (const CVaultMove& m : tx.vVaultMove)
-                    mapDrawn[m.tokenID] += (uint64_t)(-m.nDelta);
-                for (const CIssuedOut& a : tx.vIssuedOut)
-                    if (a.nOut < tx.vout.size() && tx.vout[a.nOut].scriptPubKey == scriptRecipient)
-                        mapToRecipient[a.tokenID] += a.nUnits - std::min(a.nUnits, a.nFrozen);
-                for (const std::pair<const uint256, uint64_t>& d : mapDrawn)
-                    if (mapToRecipient[d.first] < d.second)
-                        return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-vault-not-to-recipient");
-            }
-            if (!mapCapitalDraw.empty()) {
-                // R3-12 (design draft 9): a suspended house may pay its queue from its partners' capital while its
-                // equity stays positive - the oldest demands first (R2-fix-9: none queued at an earlier height), each
-                // draw split over the partners holding the token pro rata (R2-int-2: CapitalDrawSplit, exactly).
-                if (!fDeferredHouse)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-capital-not-suspended");
-                uint32_t nTag = 0;
-                bool fTagSet = false;
-                for (const CTxIn& in : tx.vin) {
-                    Coin coin;
-                    if (fnGetCoin(in.prevout, coin) && coin.fNote) {
-                        if (fTagSet && coin.nDemandHeight != nTag)
-                            return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-capital-mixed");
-                        nTag = coin.nDemandHeight;
-                        fTagSet = true;
-                    }
-                }
-                // Any demand may be paid from capital (review round 1, G9: B3 formal demands included - they are
-                // often the oldest, the ones whose protest stressed the house).
-                if (nTag == 0)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-capital-not-queued");
-                if (HouseQueueUnitsBeforeForChecks(house.nHouseID, NoteDemandHeightOf(nTag)) > 0)
-                    return state.DoS(0, false, REJECT_INVALID, "bad-note-redeem-capital-not-oldest");
-                // G2: capital pays at most what is due - the units plus their interest (the till may add more).
-                {
-                    uint64_t nCapitalTotal = 0;
-                    for (const std::pair<const uint256, uint64_t>& d : mapCapitalDraw)
-                        nCapitalTotal += d.second;
-                    const CAmount amountDueCap = (CAmount)nNoteUnitsIn +
-                        NoteDemandInterest(house, nTag, nNoteUnitsIn, (uint32_t)nHeight, Params().GetConsensus());
-                    if ((CAmount)nCapitalTotal > amountDueCap)
-                        return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-capital-over-due");
-                }
-                if (nRedeemPrice == 0)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-capital-no-price");
-                int64_t nEquityMg = 0;
-                std::string strEquity;
-                const std::vector<uint32_t> vOverdueCap = HouseOverdueBills(house, nHeight);
-                if (vOverdueCap.size() >= MAX_EQUITY_OVERDUE_BILLS)   // G3h: the list may be cut short - fail closed
-                    return state.DoS(0, false, REJECT_INVALID, "bad-note-redeem-capital-equity");
-                if (!HouseEquityMg(house, nHeight, nRedeemPrice, HouseLiveEscrowPot(house, fnGetCoin),
-                                   vOverdueCap, nEquityMg, strEquity) || nEquityMg <= 0)
-                    return state.DoS(0, false, REJECT_INVALID, "bad-note-redeem-capital-equity");
-                std::map<uint256, std::vector<std::pair<uint32_t, uint64_t>>> mapEntries;
-                for (const CVaultEntry& e : HouseVaultEntriesForChecks(house.nHouseID))
-                    if (e.nKind == VAULT_CAPITAL)
-                        mapEntries[e.tokenID].push_back(std::make_pair(e.nPartner, e.nUnits));
-                for (const std::pair<const uint256, uint64_t>& d : mapCapitalDraw)
-                    if (CapitalDrawSplit(d.second, mapEntries[d.first]) != mapCapitalByPartner[d.first])
-                        return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-capital-split");
-            }
-            if (!VerifyHouseApprovers(house, redeem.vApproverIndex, redeem.vApproverSig,
-                    NoteRedeemVaultSigHash(house.houseID, tx), house.nThresholdM, state, "bad-note-redeem-vault-approver"))
+            if (!BoundDischargeRate(redeem.nHouseID, redeem.nRateNamed, nHeight, NoteDemandHeightOf(nTagD), state,
+                                    "bad-note-redeem", nRedeemPrice))
+                return false;
+        } else if (redeem.nRateNamed != 0 || g_nHouseRateTestOverride) {
+            if (!BoundHouseRate(redeem.nHouseID, redeem.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-redeem",
+                                nRedeemPrice))
                 return false;
         }
-        // The value paid to a script, in mg: gold units (annex) mg for mg, sats at the price. Review round 1 (G1b): only
-        // unfrozen units of a trusted gold token count - a self-made token, or frozen units, pay nothing.
+        // The value paid to a script, in mg: sECX at the house's bid (Gold B: no gold on FreeBank, so issued-token
+        // outputs pay nothing).
         const auto fnPaidMg = [&](const CScript& script) {
             unsigned __int128 nMg = 0;
             for (size_t o = 0; o < tx.vout.size(); o++) {
-                if (tx.vout[o].scriptPubKey != script)
+                if (tx.vout[o].scriptPubKey != script || FindIssuedOut(tx, (uint32_t)o))
                     continue;
-                const CIssuedOut* p = FindIssuedOut(tx, (uint32_t)o);
-                if (p) {
-                    if (IssuedTokenTrustedForChecks(p->tokenID))
-                        nMg += p->nUnits - std::min(p->nUnits, p->nFrozen);
-                }
-                else if (nRedeemPrice)
+                if (nRedeemPrice)
                     nMg += (unsigned __int128)tx.vout[o].nValue * 1000 / nRedeemPrice;
             }
             return (CAmount)std::min<unsigned __int128>(nMg, (unsigned __int128)MAX_MONEY);
@@ -5529,13 +5562,9 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // runner bears the spread - sheet delta-2: a floor of U + interest
         // with no spread deduction would make demand-then-redeem the
         // universal brassage bypass below rho).
-        // v1.1.0 (D-2026-11-05-1): no spread at an Open house; otherwise the curve on the counted gold till against the
-        // 2% till floor (not the last attested ECX ratio, which compared sats with mg and charged the full 4% at a gold
-        // house that never attests). The spread is paid in sECX at the bound price into the escrow pot. A redemption
-        // that binds no price (gold in kind) can't pay it that way, and redemption never stops, so it owes no sECX
-        // spread - instead the gold it draws from the house's vaults is capped at what the holder is owed less the spread
-        // (below, after the interest): the spread stays in the house for the holders who stay, and the house can't waive
-        // it for whomever it pays in kind (design, 11-05).
+        // v1.1.0 (D-2026-11-05-1): no spread at an Open house; otherwise the curve on the till (attested sECX at A30,
+        // Gold B) against the 2% till floor. The spread is paid in sECX at the house's bid into the escrow pot; a
+        // redemption that names no rate pays none (the holder's signature over the outputs protects it).
         const uint32_t nSpreadBpsOwed = GoldBrassageBps(house, nHeight);
         const uint32_t nBrassageBps = nRedeemPrice ? nSpreadBpsOwed : 0;
         const CAmount amountBrassageSpread = HouseBrassageAmount(nNoteUnitsIn, nBrassageBps);   // the sECX output
@@ -5656,20 +5685,6 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 // values (sticky-earliest, from protests whose coins were
                 // burned in EARLIER txs) beyond any undo data this tx has.
             }
-        }
-
-        // v1.1.0 (D-2026-11-05-1, design 11-05): with no price bound, the spread is kept in kind. The gold this
-        // redemption draws from the house's vaults may not exceed the notes burned plus their interest, less the spread,
-        // mg for mg. (With a price bound, the spread is the sECX output checked below.)
-        if (!nRedeemPrice && nSpreadBpsOwed > 0 && !tx.vVaultMove.empty()) {
-            unsigned __int128 nDrawMg = 0;
-            for (const CVaultMove& m : tx.vVaultMove)
-                nDrawMg += (unsigned __int128)((uint64_t)0 - (uint64_t)m.nDelta);   // all draws (checked above: nDelta < 0)
-            const unsigned __int128 nCapMg = (unsigned __int128)nNoteUnitsIn + (uint64_t)amountInterestOwed -
-                                             std::min<unsigned __int128>((uint64_t)amountSpreadBorne,
-                                                                         (unsigned __int128)nNoteUnitsIn + (uint64_t)amountInterestOwed);
-            if (nDrawMg > nCapMg)
-                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-brassage-inkind");
         }
 
         // DYNAMIC BRASSAGE (3.5 D1/D10; v1.1.0 D-2026-11-05-1). A redemption from a
@@ -5874,7 +5889,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                     nWindowStart = (uint32_t)coin.nHeight;
             }
         }
-        if (PricedHeightSince(nWindowStart, nHeight) < (int64_t)nWindowStart + (int64_t)Params().GetConsensus().nDemandWindow)
+        if ((uint32_t)nHeight < ClockDeadlineHeight(nWindowStart, Params().GetConsensus().nDemandWindow, nHeight))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-early");
 
         // Undo contract (the nPrevLastActivation idiom): the payload's priors
@@ -5908,6 +5923,8 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // resets without a real recovery).
         const uint32_t nNewMarks = (uint32_t)pro.vUnits.size();
         const bool fFreshEpisode = house.nProtestOpen == 0;
+        if (fFreshEpisode)
+            HouseProtestEpisodeStart(house, (uint32_t)nHeight);   // one cure per 180 days (D-2026-11-07-3)
         house.nProtestOpen += nNewMarks;   // bounded: <= MAX_NOTE_OUTPUTS per op, one op per house per block
         if (fFreshEpisode || (uint32_t)nHeight < house.nProtestHeight)
             house.nProtestHeight = (uint32_t)nHeight;
@@ -5974,33 +5991,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (amountEscrowChange > amountEscrowIn)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-escrow-inflation");
 
-        // Gram-notes release (5b): the house's gold, in kind. A claim takes each token pro rata to what is left in the
-        // house's vaults - its units over the units still outstanding, which keeps the ratio and so the order of
-        // claims irrelevant - and never more than par in gold (R2-int-10's "in kind, pro rata in each asset").
-        uint64_t nClaimGoldMg = 0;
-        if (!tx.vVaultMove.empty()) {
-            const std::map<uint256, uint64_t> mapPot = HouseVaultFreeTotalsForChecks(house.nHouseID, nHeight);
-            std::map<uint256, uint64_t> mapOut;
-            uint64_t nGoldOut = 0;
-            for (const CVaultMove& m : tx.vVaultMove) {
-                if (m.nHouseID != house.nHouseID || m.nDelta >= 0)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-vault-move");
-                mapOut[m.tokenID] += (uint64_t)(-m.nDelta);
-                nGoldOut += (uint64_t)(-m.nDelta);
-            }
-            if (house.nMintedUnits == 0)
-                return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-underflow");
-            for (const std::pair<const uint256, uint64_t>& o : mapOut) {
-                const auto it = mapPot.find(o.first);
-                const uint64_t nPot = it == mapPot.end() ? 0 : it->second;
-                const uint64_t nShare = (uint64_t)((unsigned __int128)nNoteUnitsIn * nPot / house.nMintedUnits);
-                if (o.second > nShare)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-gold-over-share");
-            }
-            if (nGoldOut > nNoteUnitsIn)
-                return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-gold-over-par");
-            nClaimGoldMg = nGoldOut;
-        }
+        const uint64_t nClaimGoldMg = 0;   // Gold B: no gold on FreeBank; claims are paid in sECX only
 
         // Pro-rata bound (D5): the fixed snapshot denominator makes claims
         // order-independent - no front-running in the terminal state. Gram-notes release: and no more than par still
@@ -6236,7 +6227,7 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
         const uint32_t nE = HouseInsolventSince(house, nHeight);
         if (nE == 0)
             return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-not-insolvent");
-        if ((uint64_t)nHeight >= (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
+        if ((uint32_t)nHeight >= ClockDeadlineHeight(nE, Params().GetConsensus().nTokenClaimWindow, nHeight))
             return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-window-closed");
 
         // Record checks first, the elliptic-curve work last (a bad claim costs little).
@@ -6314,7 +6305,7 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
         const uint32_t nE = HouseInsolventSince(house, nHeight);
         if (nE == 0)
             return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-not-insolvent");
-        if ((uint64_t)nHeight < (uint64_t)nE + Params().GetConsensus().nTokenClaimWindow)
+        if ((uint32_t)nHeight < ClockDeadlineHeight(nE, Params().GetConsensus().nTokenClaimWindow, nHeight))
             return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-window-open");
         // v0.2.28 (B, E): as the note claim.
         if (HouseClosed(house))
@@ -6332,24 +6323,6 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             house.nTokenBaseHeight = (uint32_t)nHeight;
         }
         const uint64_t nBase = house.nTokenBase, nClaimed = house.nTokenClaimed;
-        // Gram-notes release (5b, decisions log 22): each claim's gold in kind, as a note's (what is left over the units
-        // outstanding). Required, not optional: whoever relays the collect can't leave it out.
-        // D-2026-11-04-1 (3e): the shares come from the house as the block found it - the committed vaults and units
-        // outstanding, before any op in this block - so an earlier note or deposit claim in the same block (whose
-        // floored shares raise the ratio a little) can't make a collect built at the tip miss its exact shares.
-        // Covered: every earlier op in the block took at most its share, so the ratio left only rises, and a share at
-        // the starting ratio never exceeds what the vault still holds (the vault-move check below draws it).
-        std::map<uint256, uint64_t> mapGoldPot;
-        {
-            UnitsCheckScope scopeStart(nullptr);   // no check view: the committed units DB, the block's starting state
-            mapGoldPot = HouseVaultFreeTotalsForChecks(house.nHouseID, nHeight);
-        }
-        uint64_t nGoldOutstanding = house.nMintedUnits;
-        CHouse houseStart;
-        if (phousetree && phousetree->GetHouse(house.nHouseID, houseStart))
-            nGoldOutstanding = houseStart.nMintedUnits;
-        std::map<uint256, uint64_t> mapGoldDue;
-
         size_t o = col.fEscrowChange ? 1 : 0;
         uint64_t nUnitsPaid = 0;
         CAmount amountDue = 0;
@@ -6363,13 +6336,9 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             if (c.nCollectHeight != 0)
                 return state.DoS(10, false, REJECT_INVALID, "bad-token-collect-collected");
             const uint64_t u = TokenClaimUnits(c.nAmount, nBase, nClaimed);
-            // The same share a note gets (keep note holders whole): its gold, then the snapshot pot over the snapshot
-            // units, no more than par still owes after the gold.
-            const std::vector<std::pair<uint256, uint64_t>> vGoldShare = GoldClaimShares(u, mapGoldPot, nGoldOutstanding);
-            uint64_t nGoldU = 0;
-            for (const std::pair<uint256, uint64_t>& g : vGoldShare)
-                nGoldU += g.second;
-            const CAmount amountEnt = ClaimSatsEntitlement(u, nGoldU, house.amountInsolventPot, house.nInsolventUnits,
+            // The same share a note gets (keep note holders whole): the snapshot pot over the snapshot units, no more
+            // than par at the snapshot rate (Gold B: no gold on FreeBank).
+            const CAmount amountEnt = ClaimSatsEntitlement(u, 0, house.amountInsolventPot, house.nInsolventUnits,
                                                            house.nInsolventSatsPerGram);
             const CAmount amountFee = TokenRelayerFee(amountEnt, c.nFeeBps);
             const CAmount amountPay = amountEnt - amountFee;
@@ -6383,20 +6352,6 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                 const CScript scriptFee(c.vchRelayerScript.begin(), c.vchRelayerScript.end());
                 if (o >= tx.vout.size() || tx.vout[o].scriptPubKey != scriptFee || tx.vout[o].nValue != amountFee)
                     return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-fee");
-                o++;
-            }
-            // Then one output per token of gold, at the claim's payout script, carrying exactly its share.
-            for (const std::pair<uint256, uint64_t>& g : vGoldShare) {
-                const CScript scriptPay(c.vchPayoutScript.begin(), c.vchPayoutScript.end());
-                if (o >= tx.vout.size() || tx.vout[o].scriptPubKey != scriptPay || tx.vout[o].nValue != ISSUED_COIN_VALUE)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-gold");
-                bool fAssigned = false;
-                for (const CIssuedOut& a : tx.vIssuedOut)
-                    if (a.nOut == o)
-                        fAssigned = a.tokenID == g.first && a.nUnits == g.second && a.nFrozen == 0;
-                if (!fAssigned)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-gold");
-                mapGoldDue[g.first] += g.second;
                 o++;
             }
             nUnitsPaid += u;
@@ -6430,18 +6385,6 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-escrow-inflation");
         if (amountEscrowIn - amountEscrowChange > amountDue)
             return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-over-entitlement");
-        // The vault side: exactly the gold due, out of this house's vaults (the flow check ties it to the outputs).
-        {
-            std::map<uint256, uint64_t> mapMoved;
-            for (const CVaultMove& m : tx.vVaultMove) {
-                if (m.nHouseID != house.nHouseID || m.nDelta >= 0)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-vault-move");
-                mapMoved[m.tokenID] += (uint64_t)(-m.nDelta);
-            }
-            if (mapMoved != mapGoldDue)
-                return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-gold-moved");
-        }
-
         if (house.nTokenUnits < nUnitsPaid || house.nMintedUnits < nUnitsPaid)
             return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-underflow");
         house.nTokenUnits -= nUnitsPaid;
@@ -6482,7 +6425,7 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
 static bool IsLockedScriptFamily(const CScript& script)
 {
     return IsHouseEscrowScript(script) || IsBillEscrowScript(script) || IsMutualFundScript(script) ||
-           IsNotePreAuthScript(script) || IsPoolEscrowScript(script) || IsOracleBondScript(script);
+           IsNotePreAuthScript(script) || IsPoolEscrowScript(script);
 }
 
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
@@ -6528,9 +6471,12 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // LIVE nMintedUnits (notes and deposits share the one leverage ceiling).
         // Deposits are OUTSIDE rho - NO reserve proof, NO rho gate: a term-locked,
         // non-redeemable claim cannot run, so it is not backed against liquidity.
+        // Gold B (GOLD_B.md §1): issuing needs a rate posted within GramParams::nRateRefreshSecs (review 2026-11-07).
+        if (!HouseRateFreshForChecks(house.nHouseID, (int64_t)Params().GetConsensus().GramAt(nHeight).nRateRefreshSecs))
+            return state.DoS(0, false, REJECT_INVALID, "bad-deposit-originate-rate-stale");
         if (house.nDepositUnits > (uint64_t)MAX_MONEY - total ||
                 house.nMintedUnits > (uint64_t)MAX_MONEY - (house.nDepositUnits + total) ||
-                house.nMintedUnits + house.nDepositUnits + total > GoldCapitalCapUnits(house, nHeight))
+                house.nMintedUnits + house.nDepositUnits + total > CapitalCapUnits(house, nHeight))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-originate-over-cap");
 
         // House M-of-N authorizes the exact batch (house_id + terms + inputs +
@@ -6629,20 +6575,20 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-withdraw-no-receipt");
         // Term-locked: no early withdrawal from the house (early liquidity is a
         // market sale of the receipt - TRANSFER).
-        if (nHeight < 0 || (uint32_t)nHeight < receipt.nDepositMaturityHeight)
-            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-not-matured");
+        if (nHeight < 0 || (uint32_t)nHeight < TermDeadlineHeight(receipt.nDepositOriginationHeight,
+                                                                  receipt.nDepositMaturityHeight, 0, nHeight))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-not-matured");   // the term in clock time
 
         // CONSENSUS interest FLOOR (unlike note par-redemption's free-choice
         // payout): the holder must be paid >= principal + accrued, at the RECEIPT'S
         // OWN rate on ONE CONTINUOUS clock from origination (a deposit paid late
         // simply earns more). A matured saver has no leverage and must not be able
         // to be shortchanged of accrued.
-        const uint32_t nBlocks = (uint32_t)nHeight > receipt.nDepositOriginationHeight
-                               ? (uint32_t)nHeight - receipt.nDepositOriginationHeight : 0;
+        const uint32_t nBlocks = (uint32_t)ClockSince(receipt.nDepositOriginationHeight, nHeight);   // clock blocks (GOLD_B §6)
         const CAmount amountInterest = DepositMaturityInterest(receipt.nDepositPrincipal, nBlocks, receipt.nDepositRateBps);
         // Gram-notes release: principal and interest are mg; paid in sECX at the bound payout price.
         uint64_t nPrice = 0;
-        if (!BoundPayoutPrice(wd.nPriceHeight, nHeight, true /* chain-relative: never a ban */, state, "bad-deposit-withdraw", nPrice))
+        if (!BoundHouseRate(wd.nHouseID, wd.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-deposit-withdraw", nPrice))
             return false;
         const CAmount amountDue = MgToSats((uint64_t)receipt.nDepositPrincipal + (uint64_t)amountInterest, nPrice);
         const CScript scriptHolder = DepositScriptForPubKey(wd.vchHolderPubKey);
@@ -6688,8 +6634,8 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         const char chEff = HouseEffectiveStatus(house, nHeight);
         if (chEff != HOUSE_STATUS_OPEN && chEff != HOUSE_STATUS_STRESSED)
             return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-house-status");
-        if (nHeight < 0 || (uint32_t)nHeight < d.nMaturityHeight)
-            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-early");
+        if (nHeight < 0 || (uint32_t)nHeight < TermDeadlineHeight(d.nOriginationHeight, d.nMaturityHeight, 0, nHeight))
+            return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-early");   // the term in clock time
         // The payout must be a real destination, never one of the consensus-locked script families.
         if (IsLockedScriptFamily(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payout-script");
@@ -6724,7 +6670,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         if (nDemandH == 0)
             return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-no-demand-height");
         const uint32_t nWindowStart = std::max(nDemandH, house.nDeferEndedHeight);
-        if (PricedHeightSince(nWindowStart, nHeight) < (int64_t)nWindowStart + (int64_t)Params().GetConsensus().nDemandWindow)
+        if ((uint32_t)nHeight < ClockDeadlineHeight(nWindowStart, Params().GetConsensus().nDemandWindow, nHeight))
             return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-early");
         if (pr.nPrevProtestOpen != house.nProtestOpen || pr.nPrevProtestHeight != house.nProtestHeight ||
                 pr.nPrevProtestDemandHeight != house.nProtestDemandHeight)
@@ -6744,6 +6690,8 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-custody-script");
         // Effects: exactly a note protest's (one marked coin) - the house is Stressed from here (HouseStressOrigin).
         const bool fFreshEpisode = house.nProtestOpen == 0;
+        if (fFreshEpisode)
+            HouseProtestEpisodeStart(house, (uint32_t)nHeight);   // one cure per 180 days (D-2026-11-07-3)
         house.nProtestOpen += 1;
         if (fFreshEpisode || (uint32_t)nHeight < house.nProtestHeight)
             house.nProtestHeight = (uint32_t)nHeight;
@@ -6782,10 +6730,10 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
                                       dc.vchPayoutScript), dc.vchPreAuthSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-preauth-sig");
         // WITHDRAW's floor: principal + interest at the receipt's own rate on one continuous clock from origination.
-        const uint32_t nBlocks = (uint32_t)nHeight > receipt.nDepositOriginationHeight
-                               ? (uint32_t)nHeight - receipt.nDepositOriginationHeight : 0;
+        const uint32_t nBlocks = (uint32_t)ClockSince(receipt.nDepositOriginationHeight, nHeight);   // clock blocks (GOLD_B §6)
         uint64_t nPrice = 0;   // gram-notes release: mg owed, sECX paid at the bound price
-        if (!BoundPayoutPrice(dc.nPriceHeight, nHeight, true /* chain-relative: never a ban */, state, "bad-deposit-discharge", nPrice))
+        if (!BoundDischargeRate(dc.nHouseID, dc.nRateNamed, nHeight, NoteDemandHeightOf(receipt.nDemandHeight), state,
+                                "bad-deposit-discharge", nPrice))   // at least the bid at the demand (GOLD_B §3)
             return false;
         const CAmount amountDue = MgToSats((uint64_t)receipt.nDepositPrincipal +
                 (uint64_t)DepositMaturityInterest(receipt.nDepositPrincipal, nBlocks, receipt.nDepositRateBps), nPrice);
@@ -6871,33 +6819,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-escrow-inflation");
 
 
-        // Gram-notes release (5b): deposits are junior - they take only the gold beyond what the notes still outstanding
-        // can take at par (review round 1, G3f; decision 22 made them wait for the last note, which one lost note
-        // blocked for good), each token pro rata (principal over the principal outstanding), at most the principal.
-        uint64_t nClaimGoldMg = 0;
-        if (!tx.vVaultMove.empty()) {
-            if (house.nDepositUnits == 0)
-                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-underflow");
-            const std::map<uint256, uint64_t> mapPot =
-                DepositGoldPot(HouseVaultFreeTotalsForChecks(house.nHouseID, nHeight), house.nMintedUnits);
-            std::map<uint256, uint64_t> mapOut;
-            uint64_t nGoldOut = 0;
-            for (const CVaultMove& m : tx.vVaultMove) {
-                if (m.nHouseID != house.nHouseID || m.nDelta >= 0)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-vault-move");
-                mapOut[m.tokenID] += (uint64_t)(-m.nDelta);
-                nGoldOut += (uint64_t)(-m.nDelta);
-            }
-            for (const std::pair<const uint256, uint64_t>& o : mapOut) {
-                const auto it = mapPot.find(o.first);
-                const uint64_t nPot = it == mapPot.end() ? 0 : it->second;
-                if (o.second > (uint64_t)((unsigned __int128)receipt.nDepositPrincipal * nPot / house.nDepositUnits))
-                    return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-gold-over-share");
-            }
-            if (nGoldOut > (uint64_t)receipt.nDepositPrincipal)
-                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-gold-over-par");
-            nClaimGoldMg = nGoldOut;
-        }
+        const uint64_t nClaimGoldMg = 0;   // Gold B: no gold on FreeBank
 
         // JUNIOR deposit tranche = what the pot has left AFTER notes take their par
         // (nInsolventUnits). Capped at principal (accrued interest does not survive
@@ -6966,9 +6888,10 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
 {
     fHouseChanged = false;
     fPoolRetired = false;
-    // Gram-notes release (D-2026-10-31-8 item 9): house note pools are closed until a later release sets the
-    // height (a second, unconnected bidder). Every op: with no CREATE no pool exists, and the rule stays plain.
-    if (nHeight < Params().GetConsensus().nNotePoolHeight)
+    // Gram-notes release (D-2026-10-31-8 item 9): house note pools are closed while one producer is the only one; no
+    // forks (D-2026-11-05-3): they open by themselves at nNotePoolTime. Every op: with no CREATE no pool exists, and
+    // the rule stays plain.
+    if (!LaterRuleOn(Params().GetConsensus().nNotePoolTime, nHeight))
         return state.DoS(100, false, REJECT_INVALID, "bad-pool-closed");
     const uint256 hashOutputs = BillHashOutputs(tx);
     const uint256 hashPrevouts = PoolHashPrevouts(tx);
@@ -7236,13 +7159,14 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-unknown-house");
     if (!GoldParEligible(houseA, nHeight) || !GoldParEligible(houseB, nHeight))
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-house-ineligible");
-    // Gram-notes release: a residual (mode 1) is sECX within the par band at the bound payout price.
+    // Gold B (GOLD_B.md §3): a residual (mode 1) is sECX between the lower bid and the higher ask of the two houses. A
+    // rate posted after signing can move the band: no ban.
     if (x.nMode == 1) {
-        uint64_t nPrice = 0;
-        if (!BoundPayoutPrice(x.nPriceHeight, nHeight, fMempool, state, "bad-settle", nPrice))
-            return false;
-        if (!SettleResidualInBand(x.nUnitsANotes, x.nUnitsBNotes, x.nMode, x.amountResidual, nPrice))
-            return state.DoS(100, false, REJECT_INVALID, "bad-settle-band");
+        uint64_t nLo = 0, nHi = 0;
+        if (!SettleBandForChecks({x.nHouseA, x.nHouseB}, nHeight, nLo, nHi))
+            return state.DoS(0, false, REJECT_INVALID, "bad-settle-no-rate");
+        if (!SettleResidualInBand(x.nUnitsANotes, x.nUnitsBNotes, x.nMode, x.amountResidual, nLo, nHi))
+            return state.DoS(0, false, REJECT_INVALID, "bad-settle-band");
     }
 
     // (9) Per-house cadence: an eligibility comparison, never a sweep. Also
@@ -7340,19 +7264,19 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
     if (nHeight < 0)
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-net-not-attested");
 
-    // Gram-notes release: each net creditor's receipt is sECX within the par band of its net (mg) at the bound
-    // payout price.
+    // Gold B (GOLD_B.md §3): each net creditor's receipt is sECX between the lowest bid and the highest ask of the
+    // round's houses, times its net (mg).
     {
-        uint64_t nPrice = 0;
-        if (!BoundPayoutPrice(n.nPriceHeight, nHeight, fMempool, state, "bad-settle-net", nPrice))
-            return false;
+        uint64_t nLo = 0, nHi = 0;
+        if (!SettleBandForChecks(n.vHouseID, nHeight, nLo, nHi))
+            return state.DoS(0, false, REJECT_INVALID, "bad-settle-net-no-rate");
         std::vector<int64_t> vNet;
         std::vector<uint64_t> vBurn;
         if (!SettleNetPositions(n, vNet, vBurn))
             return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-range");
         for (size_t i = 0; i < vNet.size() && i < n.vReceive.size(); i++)
-            if (vNet[i] > 0 && !SettleResidualInBand((uint64_t)vNet[i], 0, 1, n.vReceive[i], nPrice))
-                return state.DoS(100, false, REJECT_INVALID, "bad-settle-band");
+            if (vNet[i] > 0 && !SettleResidualInBand((uint64_t)vNet[i], 0, 1, n.vReceive[i], nLo, nHi))
+                return state.DoS(0, false, REJECT_INVALID, "bad-settle-band");
     }
 
     std::vector<CHouse> vHouse(n.vHouseID.size());
@@ -7422,178 +7346,6 @@ static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int n
     if (!CheckSettleOperation(tx, state, nHeight, fnGetHouse, houseA, houseB, fMempool))
         return false;
     vHousesOut = {houseA, houseB};
-    return true;
-}
-
-/** Gold oracle contextual checks (Phase G-1, spec v2 s2-s3). Per-tx only -
- * the quorum + median are the CALLER's post-loop business. External linkage
- * for the unit gates (the CheckSettleOperation pattern). */
-/** Is nHeight inside the op's validity window? nTargetHeight is the FIRST
- * height at which the op may connect; it stays valid for nOracleOpWindow
- * heights in total. k=1 (the pre-2026-07-28 rule) is the degenerate case, and
- * it starved the oracle: under BMM the candidate for H+1 is templated in the
- * same call that connects H, so an op signed against tip H could never reach
- * it. Window signed off in ORACLE_WINDOW_PROPOSAL.md. */
-static bool OracleHeightInWindow(uint32_t nTargetHeight, int nHeight, uint32_t nWindow)
-{
-    if (nHeight < 0 || (uint32_t)nHeight < nTargetHeight)
-        return false;
-    return (uint32_t)nHeight - nTargetHeight < nWindow;
-}
-
-bool CheckOracleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
-                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHashAt,
-                          const std::function<bool(uint32_t, COracleSubmitter&)>& fnGetSubmitter,
-                          const std::function<bool(const std::vector<unsigned char>&)>& fnHaveKey,
-                          uint32_t nNextSubmitterID,
-                          COracleSubmitter& subOut, bool& fFreshBondOut, std::vector<COracleObs>& vObsOut,
-                          bool fMempool)
-{
-    fFreshBondOut = false;
-    vObsOut.clear();
-    if (!CheckOracleTransactionShape(tx, state))
-        return false;
-
-    // CHAIN-STATE-RELATIVE rejects score 0 in the mempool and 100 at connect
-    // [proposal row 7]. A peer relaying an op that expired in flight, or that
-    // anchors to a block we just reorged away from, or whose priors a fix
-    // overtook, is behaving honestly against a tip that differs from ours -
-    // and at DoS(100) a single such tx bans it outright (DEFAULT_BANSCORE
-    // is 100), partitioning a small signet exactly when the oracle needs relay
-    // most. Under the window, late arrival is a NORMAL event, not an attack.
-    // INTRINSIC rejects (bad sig, wrong key, malformed payload) keep 100 on
-    // every path - those are never honest.
-    const int nStateDoS = fMempool ? 0 : 100;
-    const uint32_t nWindow = Params().GetConsensus().nOracleOpWindow;
-    const uint256 hashPrevouts = OracleHashPrevouts(tx);
-    const uint256 hashOutputs = BillHashOutputs(tx);
-
-    if (tx.nOracleOp == ORACLE_OP_SUBMIT) {
-        OracleSubmit x;
-        DecodeOraclePayload(tx.vchOraclePayload, x);   // shape guaranteed decode
-
-        // (1) height window + branch binding. The op may connect anywhere in
-        // [nTargetHeight, nTargetHeight + k), and hashPrevBlockBind must be the
-        // block at nTargetHeight-1 ON THE CONNECTING BRANCH - so a fork below
-        // the signing tip still rejects it, preserving the C-5 cross-branch
-        // closure that the old parent-hash equality provided [C-5/F-4fid].
-        if (!OracleHeightInWindow(x.nTargetHeight, nHeight, nWindow))
-            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-height");
-        uint256 hashAnchor;
-        if (!fnGetBlockHashAt(x.nTargetHeight - 1, hashAnchor) || hashAnchor != x.hashPrevBlockBind)
-            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-branch");
-
-        // (2) known submitter, bonded in a PRIOR block [E-2].
-        COracleSubmitter sub;
-        if (!fnGetSubmitter(x.nSubmitterID, sub))
-            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-unknown-submitter");
-        if (sub.nBondHeight == 0 || sub.nBondHeight >= (uint32_t)nHeight)
-            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-bond-height");
-
-        // (3) own liveness stamp byte-exact (the fix priors went with the gram-notes release: the units DB undoes
-        // the observations).
-        if (x.nPrevOwnLastSubmitHeight != sub.nLastSubmitHeight)
-            return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-priors-mismatch");
-
-        // (4) the submitter's signature over the shared digest.
-        CPubKey pubkey(sub.vchPubKey);
-        if (!pubkey.IsFullyValid() ||
-                !pubkey.VerifyStrict(OracleSubmitSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
-
-        subOut = sub;
-        subOut.nLastSubmitHeight = (uint32_t)nHeight;   // credit even sub-quorum [A-3]
-        vObsOut = x.vObs;
-        return true;
-    }
-
-    OracleBond x;
-    DecodeOraclePayload(tx.vchOraclePayload, x);
-
-    // Same window as SUBMIT (BOND was the observed starvation casualty too).
-    // No branch bind on BOND, unchanged: its funding inputs give cross-branch
-    // exclusivity through the UTXO set, and a returning id additionally binds
-    // the record it overwrites byte-exact.
-    if (!OracleHeightInWindow(x.nTargetHeight, nHeight, nWindow))
-        return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-height");
-
-    // Bond escrow output pinned at vout[0]: the length-distinct escrow form
-    // carrying the registered key. The coin is tagged fOracleBond at AddCoins
-    // and spend-gated in CheckTxInputs (T-o3): only a same-key BOND may
-    // consolidate it - the record-tracked outpoint plus the tag close the
-    // anyone-can-spend exposure.
-    if (tx.vout.empty() || tx.vout[0].nValue <= 0 ||
-            !IsOracleBondScript(tx.vout[0].scriptPubKey))
-        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-out");
-    // The escrow must carry THIS submitter's registered key, not merely the
-    // right SHAPE. Shape alone let the key that signs prices diverge from the
-    // key that owns the bond: the spend gate pins consolidation to the script's
-    // embedded key, so a mismatched escrow is unspendable by its own submitter
-    // (silently burned), and at promotion the bond would not be the stake of
-    // the party being slashed.
-    if (tx.vout[0].scriptPubKey != OracleBondScript(x.vchSubmitterPubKey))
-        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-out-key");
-    // Gram-notes release: a bond below the schedule's minimum registers nobody (the bond is the reporter's stake).
-    if (tx.vout[0].nValue < Params().GetConsensus().GramAt(nHeight).nOracleBondMin)
-        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-min");
-
-    if (x.nSubmitterID == 0) {
-        // Fresh registration: the key must be new; the dense id is assigned
-        // here (house-charter precedent). One per block via the caller's
-        // fresh-bond slot.
-        if (fnHaveKey(x.vchSubmitterPubKey))
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-dup-key");
-        if (nNextSubmitterID == 0)
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-id-seed");
-        CPubKey pubkey(x.vchSubmitterPubKey);
-        if (!pubkey.IsFullyValid() ||
-                !pubkey.VerifyStrict(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
-        subOut = COracleSubmitter();
-        subOut.nSubmitterID = nNextSubmitterID;
-        subOut.vchPubKey = x.vchSubmitterPubKey;
-        subOut.bondOutpoint = COutPoint(tx.GetHash(), 0);
-        subOut.nBondHeight = (uint32_t)nHeight;
-        fFreshBondOut = true;
-        return true;
-    }
-
-    // Returning id: record must exist, key must match, priors byte-exact
-    // against the record being overwritten [C-3].
-    COracleSubmitter sub;
-    if (!fnGetSubmitter(x.nSubmitterID, sub))
-        return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-unknown-submitter");
-    if (sub.vchPubKey != x.vchSubmitterPubKey)
-        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-key-mismatch");
-    if (x.nPrevBondHeight != sub.nBondHeight ||
-            x.nPrevLastSubmitHeight != sub.nLastSubmitHeight ||
-            x.nPrevUnbondRequestHeight != sub.nUnbondRequestHeight ||
-            x.outPrevBond != sub.bondOutpoint)
-        return state.DoS(nStateDoS, false, REJECT_INVALID, "bad-oracle-priors-mismatch");
-    // A returning bond MUST consume the record's current bond coin. Without
-    // this the value ratchet in CheckTxInputs is opt-in: that ratchet only
-    // fires on bond coins actually spent, so a re-bond could simply ABANDON the
-    // old escrow, post a 1-satoshi vout[0], and repoint the record at it - a
-    // penalty-free unbond, in a design whose stated rule is that a bond leaves
-    // escrow only into another bond. Requiring the spend makes the ratchet
-    // unconditional for returning bonds. (Null outpoint = the record's coin was
-    // already consumed on a branch we since left; nothing to require.)
-    if (!sub.bondOutpoint.IsNull()) {
-        bool fSpendsOwnBond = false;
-        for (const CTxIn& in : tx.vin) {
-            if (in.prevout == sub.bondOutpoint) { fSpendsOwnBond = true; break; }
-        }
-        if (!fSpendsOwnBond)
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-not-consolidated");
-    }
-    CPubKey pubkey(x.vchSubmitterPubKey);
-    if (!pubkey.IsFullyValid() ||
-            !pubkey.VerifyStrict(OracleBondSigHash(x, hashPrevouts, hashOutputs), x.vchSig))
-        return state.DoS(100, false, REJECT_INVALID, "bad-oracle-sig-invalid");
-    subOut = sub;
-    subOut.bondOutpoint = COutPoint(tx.GetHash(), 0);
-    subOut.nBondHeight = (uint32_t)nHeight;
-    subOut.nUnbondRequestHeight = 0;   // a re-bond cancels a pending unbond
     return true;
 }
 
@@ -8367,6 +8119,15 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
                 HousePartner& partner = house.vPartner[topup.nPartnerIndex];
                 partner.amountPledge -= tx.vout[0].nValue;
+                // The ramp tranche it added, by value (the last match; idempotent under a repeated disconnect).
+                for (size_t t = house.vEscrowTranche.size(); t-- > 0;) {
+                    const CEscrowTranche& tr = house.vEscrowTranche[t];
+                    if (tr.nPartner == topup.nPartnerIndex && tr.amount == tx.vout[0].nValue &&
+                            tr.nStartHeight == (uint32_t)pindex->nHeight) {
+                        house.vEscrowTranche.erase(house.vEscrowTranche.begin() + t);
+                        break;
+                    }
+                }
                 const COutPoint added(hash, 0);
                 for (size_t j2 = 0; j2 < partner.vOutPledge.size(); j2++) {
                     if (partner.vOutPledge[j2] == added) {
@@ -8390,6 +8151,11 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     return DISCONNECT_FAILED;
                 }
                 house.vPartner.pop_back();
+                // The admitted partner's ramp tranche goes with it.
+                const uint32_t nRemoved = (uint32_t)house.vPartner.size();
+                house.vEscrowTranche.erase(std::remove_if(house.vEscrowTranche.begin(), house.vEscrowTranche.end(),
+                                                          [&](const CEscrowTranche& tr) { return tr.nPartner == nRemoved; }),
+                                           house.vEscrowTranche.end());
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write house admit undo!");
                     return DISCONNECT_FAILED;
@@ -8561,6 +8327,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nDeferRenewals = att.nPrevDeferRenewals;
                 house.nDeferCumBlocks = att.nPrevDeferCumBlocks;
                 house.nDeferEndedHeight = att.nPrevDeferEndedHeight;
+                house.nCureLeft = att.nPrevCureLeft;   // Gold B: the continued cure's time left
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write house attest undo!");
                     return DISCONNECT_FAILED;
@@ -8594,22 +8361,6 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 }
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write house defer undo!");
-                    return DISCONNECT_FAILED;
-                }
-            }
-            else if (tx.nHouseOp == HOUSE_OP_EQUITY) {
-                // Connect stamped nEquityNegativeHeight = this height (the op takes the house's slot, so nothing else
-                // touched the house in this block): the inverse clears it.
-                HouseEquity eq;
-                CHouse house;
-                if (!DecodeHousePayload(tx.vchHousePayload, eq) || !phousetree->GetHouse(eq.nHouseID, house) ||
-                        house.nEquityNegativeHeight != (uint32_t)pindex->nHeight) {
-                    error("DisconnectBlock(): Failed to undo house equity!");
-                    return DISCONNECT_FAILED;
-                }
-                house.nEquityNegativeHeight = 0;
-                if (!phousetree->WriteHouse(house)) {
-                    error("DisconnectBlock(): Failed to write house equity undo!");
                     return DISCONNECT_FAILED;
                 }
             }
@@ -8732,6 +8483,8 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nProtestOpen = pr.nPrevProtestOpen;
                 house.nProtestHeight = pr.nPrevProtestHeight;
                 house.nProtestDemandHeight = pr.nPrevProtestDemandHeight;
+                if (house.nNoCureHeight == (uint32_t)pindex->nHeight)
+                    house.nNoCureHeight = 0;   // only this op (it holds the house's slot) can have set it here
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write deposit protest undo!");
                     return DISCONNECT_FAILED;
@@ -9237,8 +8990,82 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nProtestOpen = pro.nPrevProtestOpen;
                 house.nProtestHeight = pro.nPrevProtestHeight;
                 house.nProtestDemandHeight = pro.nPrevProtestDemandHeight;
+                if (house.nNoCureHeight == (uint32_t)pindex->nHeight)
+                    house.nNoCureHeight = 0;   // only this op (it holds the house's slot) can have set it here
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write note protest undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nNoteOp == NOTE_OP_SWAP_CLAIM) {
+                // Gold B waterfall: the escrow change list back as before the claim, and the snapshot reverted if this
+                // claim took it (the note CLAIM's undo). The swap record reverts with the units DB's block undo.
+                NoteSwapClaim c;
+                CHouse house;
+                if (!DecodeNotePayload(tx.vchNotePayload, c) || !phousetree->GetHouse(c.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo a swap claim!");
+                    return DISCONNECT_FAILED;
+                }
+                house.vOutEscrowChange = EscrowChangeBeforeOp(house, tx, i > 0 ? &blockUndo.vtxundo[i - 1] : nullptr, 1);
+                if (house.nInsolventHeight == (uint32_t)pindex->nHeight) {
+                    house.status = HOUSE_STATUS_OPEN;
+                    house.nInsolventHeight = 0;
+                    house.nInsolventUnits = 0;
+                    house.amountInsolventPot = 0;
+                    house.nInsolventDepositPrincipal = 0;
+                    house.nInsolventSatsPerGram = 0;
+                    house.nInsolventGoldMg = 0;
+                    for (HousePartner& p : house.vPartner)
+                        p.amountInsolventPledge = 0;
+                }
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write a swap claim undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nNoteOp == NOTE_OP_SWAP || tx.nNoteOp == NOTE_OP_SWAP_PAY || tx.nNoteOp == NOTE_OP_SWAP_PROTEST) {
+                // Gold B: the swap ops that changed the house record (the swap records themselves revert with the
+                // units DB's block undo). SWAP took its units out of nMintedUnits; a PAY of a protested swap lifted
+                // one protest; SWAP_PROTEST restores its priors from the payload.
+                CHouse house;
+                bool fWrite = false;
+                if (tx.nNoteOp == NOTE_OP_SWAP) {
+                    NoteSwap sw;
+                    if (!DecodeNotePayload(tx.vchNotePayload, sw) || !phousetree->GetHouse(sw.nHouseID, house)) {
+                        error("DisconnectBlock(): Failed to undo a note swap!");
+                        return DISCONNECT_FAILED;
+                    }
+                    house.nMintedUnits += sw.nUnits;
+                    fWrite = true;
+                } else if (tx.nNoteOp == NOTE_OP_SWAP_PAY) {
+                    NoteSwapPay p;
+                    if (!DecodeNotePayload(tx.vchNotePayload, p)) {
+                        error("DisconnectBlock(): Failed to undo a swap payment!");
+                        return DISCONNECT_FAILED;
+                    }
+                    if (p.fWasProtested) {
+                        if (!phousetree->GetHouse(p.nHouseID, house)) {
+                            error("DisconnectBlock(): Failed to undo a swap payment!");
+                            return DISCONNECT_FAILED;
+                        }
+                        house.nProtestOpen++;
+                        fWrite = true;
+                    }
+                } else {
+                    NoteSwapProtest pro;
+                    if (!DecodeNotePayload(tx.vchNotePayload, pro) || !phousetree->GetHouse(pro.nHouseID, house)) {
+                        error("DisconnectBlock(): Failed to undo a swap protest!");
+                        return DISCONNECT_FAILED;
+                    }
+                    house.nProtestOpen = pro.nPrevProtestOpen;
+                    house.nProtestHeight = pro.nPrevProtestHeight;
+                    house.nProtestDemandHeight = pro.nPrevProtestDemandHeight;
+                    if (house.nNoCureHeight == (uint32_t)pindex->nHeight)
+                        house.nNoCureHeight = 0;   // only this op (it holds the house's slot) can have set it here
+                    fWrite = true;
+                }
+                if (fWrite && !phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write a swap undo!");
                     return DISCONNECT_FAILED;
                 }
             }
@@ -9302,88 +9129,6 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write settle undo house %u!", side.nID);
                     return DISCONNECT_FAILED;
-                }
-            }
-        }
-
-        // Gold oracle undo (Phase G-1, spec s3): priors ride in every SUBMIT
-        // payload; the fix skip-guard discriminator is nFixHeight == this
-        // height ("not yet undone" - at most one fix lands per block, so the
-        // stored height strictly increases across accept-blocks). Submitter
-        // stamps restore per-tx with their own skip-if-prior.
-        if (fHouseUndo && tx.nVersion == TRANSACTION_ORACLE_VERSION) {
-            if (tx.nOracleOp == ORACLE_OP_SUBMIT) {
-                OracleSubmit ox;
-                if (!DecodeOraclePayload(tx.vchOraclePayload, ox)) {
-                    error("DisconnectBlock(): Failed to decode oracle submit payload!");
-                    return DISCONNECT_FAILED;
-                }
-                // Gram-notes release: the observations and fixes live in the units DB, undone with its block record.
-                COracleSubmitter sub;
-                if (!phousetree->GetOracleSubmitter(ox.nSubmitterID, sub)) {
-                    error("DisconnectBlock(): Failed to read oracle submitter %u!", ox.nSubmitterID);
-                    return DISCONNECT_FAILED;
-                }
-                if (sub.nLastSubmitHeight != ox.nPrevOwnLastSubmitHeight) {
-                    if (sub.nLastSubmitHeight != (uint32_t)pindex->nHeight) {
-                        error("DisconnectBlock(): Oracle submit undo stamp mismatch submitter %u!", ox.nSubmitterID);
-                        return DISCONNECT_FAILED;
-                    }
-                    sub.nLastSubmitHeight = ox.nPrevOwnLastSubmitHeight;
-                    if (!phousetree->WriteOracleSubmitter(sub)) {
-                        error("DisconnectBlock(): Failed to write oracle submitter undo %u!", ox.nSubmitterID);
-                        return DISCONNECT_FAILED;
-                    }
-                }
-            } else if (tx.nOracleOp == ORACLE_OP_BOND) {
-                OracleBond ob;
-                if (!DecodeOraclePayload(tx.vchOraclePayload, ob)) {
-                    error("DisconnectBlock(): Failed to decode oracle bond payload!");
-                    return DISCONNECT_FAILED;
-                }
-                if (ob.nSubmitterID == 0) {
-                    // Fresh bond: the id was assigned at connect - find it by
-                    // key. Absent = already undone (crash-resume). Fresh ids
-                    // are LIFO across disconnects, so it must be the last.
-                    uint32_t nID = 0;
-                    if (phousetree->GetOracleSubmitterIDByKey(ob.vchSubmitterPubKey, nID)) {
-                        uint32_t nLast = 0;
-                        phousetree->GetLastOracleSubmitterID(nLast);
-                        if (nID != nLast) {
-                            error("DisconnectBlock(): Fresh oracle bond undo out of order (%u != %u)!", nID, nLast);
-                            return DISCONNECT_FAILED;
-                        }
-                        if (!phousetree->RemoveOracleSubmitter(nID) ||
-                                !phousetree->WriteLastOracleSubmitterID(nID - 1)) {
-                            error("DisconnectBlock(): Failed to remove fresh oracle bond %u!", nID);
-                            return DISCONNECT_FAILED;
-                        }
-                    }
-                } else {
-                    COracleSubmitter sub;
-                    if (!phousetree->GetOracleSubmitter(ob.nSubmitterID, sub)) {
-                        error("DisconnectBlock(): Failed to read oracle submitter %u!", ob.nSubmitterID);
-                        return DISCONNECT_FAILED;
-                    }
-                    if (sub.nBondHeight != ob.nPrevBondHeight) {   // skip-if-prior
-                        if (sub.nBondHeight != (uint32_t)pindex->nHeight) {
-                            error("DisconnectBlock(): Oracle bond undo stamp mismatch submitter %u!", ob.nSubmitterID);
-                            return DISCONNECT_FAILED;
-                        }
-                        sub.nBondHeight = ob.nPrevBondHeight;
-                        sub.nLastSubmitHeight = ob.nPrevLastSubmitHeight;
-                        sub.nUnbondRequestHeight = ob.nPrevUnbondRequestHeight;
-                        // The outpoint is mutated at connect like the stamps,
-                        // so it must be restored like them - otherwise the
-                        // record points at this disconnected tx's vout[0],
-                        // which no longer exists, orphaning the prior bond and
-                        // diverging from a node that synced the same branch.
-                        sub.bondOutpoint = ob.outPrevBond;
-                        if (!phousetree->WriteOracleSubmitter(sub)) {
-                            error("DisconnectBlock(): Failed to write oracle bond undo %u!", ob.nSubmitterID);
-                            return DISCONNECT_FAILED;
-                        }
-                    }
                 }
             }
         }
@@ -10218,15 +9963,6 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     std::vector<uint32_t> vPoolRemove;          // pools RETIREd (deleted) this block
     std::set<uint32_t> setPoolTouched;          // ONE pool op per pool per block (decision 3)
 
-    // Oracle submitter staging (rides the HouseDB batch + marker, so fHouseDBReplay covers it). Gram-notes release:
-    // the observations and fixes go to the units DB (pricefeed.h); the fixes are computed post-loop from the
-    // submitter records as they stand after this block.
-    std::set<uint32_t> setOracleSubTouched;             // ONE oracle op per submitter per block
-    std::map<uint32_t, COracleSubmitter> mapOracleSubUpdate;
-    std::vector<COracleSubmitter> vOracleSubNew;        // fresh bonds this block
-    bool fOracleFreshBondThisBlock = false;             // the id-0 guard slot
-    uint32_t nOracleSubIDNext = 0;                      // lazily seeded
-
     // Side-DB lifecycle (3.4 review): HouseDB/BillDB carry a best-block
     // marker written ATOMICALLY with each block's effects. Normally the
     // marker sits at the parent; if it is at THIS block or a descendant, the
@@ -10303,6 +10039,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                           __func__, pindex->GetBlockHash().ToString());
         }
     }
+
+    // Gold B (D-2026-11-07-1): the chain clock advances AFTER this block's transactions (below), so they are judged on the
+    // parent's clock - known to the mempool, the template check and connect alike (review 2026-11-07: a block's own time
+    // is fixed only after its contents are bid, so a window judged on it could make a mined block invalid).
 
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
@@ -10936,15 +10676,6 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 if (!CheckHouseOperation(tx, state, pindex->nHeight, fnGetHouse, fnHaveHouseHash, fnHaveClassID, fnGetProofCoin, fnGetBlockHash, houseResult))
                     return error("ConnectBlock(): CheckHouseOperation on %s failed with %s",
                         tx.GetHash().ToString(), FormatStateMessage(state));
-                // Gram-notes release: the op's gold vault moves, against the house as it stood before the op.
-                if ((!tx.vVaultMove.empty() || tx.nHouseOp == HOUSE_OP_CLOSE || tx.nHouseOp == HOUSE_OP_RECLAIM ||
-                 tx.nHouseOp == HOUSE_OP_WINDDOWN) && !IsHouseRegisterOp(tx.nHouseOp)) {
-                    CHouse houseBefore;
-                    if (!fnGetHouse(houseResult.nHouseID, houseBefore) ||
-                            !CheckHouseVaultMoves(tx, houseBefore, pindex->nHeight, unitsView, state))
-                        return error("ConnectBlock(): CheckHouseVaultMoves on %s failed with %s",
-                            tx.GetHash().ToString(), FormatStateMessage(state));
-                }
 
                 if (IsHouseRegisterOp(tx.nHouseOp)) {
                     if (nHouseIDNext == 0) {
@@ -11260,88 +10991,6 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             }
         }
 
-        // Gold oracle ops (Phase G-1, consensus-INERT: this maintains the fix
-        // + submitter records; NOTHING reads them). Rides the HouseDB batch,
-        // so fHouseDBReplay skips it like every sibling family.
-        if (!fHouseDBReplay && tx.nVersion == TRANSACTION_ORACLE_VERSION) {
-            if (nOracleSubIDNext == 0) {
-                uint32_t nLastSub = 0;
-                phousetree->GetLastOracleSubmitterID(nLastSub);
-                nOracleSubIDNext = nLastSub + 1;
-            }
-            auto fnGetSubmitter = [&](uint32_t nID, COracleSubmitter& sub) {
-                std::map<uint32_t, COracleSubmitter>::const_iterator it = mapOracleSubUpdate.find(nID);
-                if (it != mapOracleSubUpdate.end()) { sub = it->second; return true; }
-                for (const COracleSubmitter& s2 : vOracleSubNew)
-                    if (s2.nSubmitterID == nID) { sub = s2; return true; }
-                return phousetree->GetOracleSubmitter(nID, sub);
-            };
-            auto fnHaveKey = [&](const std::vector<unsigned char>& vchKey) {
-                for (const std::pair<const uint32_t, COracleSubmitter>& kv : mapOracleSubUpdate)
-                    if (kv.second.vchPubKey == vchKey) return true;
-                for (const COracleSubmitter& s2 : vOracleSubNew)
-                    if (s2.vchPubKey == vchKey) return true;
-                uint32_t nDummy;
-                return phousetree->GetOracleSubmitterIDByKey(vchKey, nDummy);
-            };
-            COracleSubmitter subResult;
-            bool fFreshBond = false;
-            std::vector<COracleObs> vObs;
-            // The window anchor MUST be resolved from pindex, never chainActive:
-            // a reorg connect runs on a side branch where chainActive[] is the
-            // wrong chain entirely. GetAncestor walks THIS block's ancestry, so
-            // an op signed on a competing branch fails the bind - which is the
-            // cross-branch closure the old parent-hash equality gave us, and
-            // pindex->pprev was literally its k=1 case.
-            auto fnGetAnchor = [pindex](uint32_t nH, uint256& hashOut) {
-                // STRICTLY prior heights only. Under TestBlockValidity pindex is
-                // a temporary index whose phashBlock is null, so answering for
-                // nH == pindex->nHeight would null-deref in GetBlockHash. The
-                // resolver is only ever asked for nTargetHeight-1 <= nHeight-1.
-                if ((int64_t)nH >= (int64_t)pindex->nHeight)
-                    return false;
-                const CBlockIndex* p = pindex->GetAncestor((int)nH);
-                if (!p || !p->phashBlock)
-                    return false;
-                hashOut = p->GetBlockHash();
-                return true;
-            };
-            if (!CheckOracleOperation(tx, state, pindex->nHeight, fnGetAnchor,
-                    fnGetSubmitter, fnHaveKey, nOracleSubIDNext,
-                    subResult, fFreshBond, vObs))
-                return error("ConnectBlock(): CheckOracleOperation on %s failed with %s",
-                    tx.GetHash().ToString(), FormatStateMessage(state));
-            // One oracle op per submitter per block - CONSENSUS, not an ATMP
-            // nicety: the BMM sequencer bypasses its own mempool [A-1].
-            if (setOracleSubTouched.count(subResult.nSubmitterID))
-                return state.DoS(100, error("ConnectBlock(): second oracle op for submitter %u this block",
-                    subResult.nSubmitterID), REJECT_INVALID, "bad-oracle-multiple-ops");
-            setOracleSubTouched.insert(subResult.nSubmitterID);
-            if (tx.nOracleOp == ORACLE_OP_SUBMIT) {
-                mapOracleSubUpdate[subResult.nSubmitterID] = subResult;
-            } else if (fFreshBond) {
-                if (fOracleFreshBondThisBlock)
-                    return state.DoS(100, error("ConnectBlock(): second fresh oracle bond this block"),
-                        REJECT_INVALID, "bad-oracle-multiple-ops");
-                fOracleFreshBondThisBlock = true;
-                vOracleSubNew.push_back(subResult);
-                nOracleSubIDNext++;
-            } else {
-                mapOracleSubUpdate[subResult.nSubmitterID] = subResult;
-            }
-        }
-
-        // Gram-notes release: a submission's observations become its reporter's latest in the units DB (decoded here,
-        // not taken from the house section, so a block whose house effects are already in the HouseDB still records
-        // them; the house section checks the op).
-        if (!fUnitsDBReplay && tx.nVersion == TRANSACTION_ORACLE_VERSION && tx.nOracleOp == ORACLE_OP_SUBMIT) {
-            OracleSubmit ox;
-            if (!DecodeOraclePayload(tx.vchOraclePayload, ox))
-                return state.DoS(100, error("ConnectBlock(): undecodable oracle submit %s", tx.GetHash().ToString()),
-                                 REJECT_INVALID, "bad-oracle-payload");
-            PriceFeedRecord(unitsView, ox.nSubmitterID, ox.vObs, pindex->nHeight);
-        }
-
         // Gram-notes release: issued tokens against the units state (frozen units follow the annex; a v18 op's
         // keys, token and effects). Before UpdateCoins, while the inputs are still in the view; skipped with the rest
         // of the units sections when this block's units effects are already in the DB.
@@ -11414,7 +11063,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     // B5: the refunded withdrawals' status (WITHDRAWAL_SPENT) is written in
     // the sidechain section below, after every check on the block.
 
-    CAmount blockReward = nFees + nDepositPayout + nRefundPayout;
+    CAmount blockReward = nFees + nDepositPayout + nRefundPayout;   // Gold B: every block's fees go to its producer
     if (block.vtx[0]->GetValueOut() > blockReward)
         return state.DoS(100,
                          error("ConnectBlock(): coinbase pays too much (actual=%d vs limit=%d)",
@@ -11876,75 +11525,17 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
             vHouseWrite.push_back(p.second);
         const uint32_t nLastHouseID = nHouseIDNext - 1;
 
-        // Submitter liveness credit was staged per-tx [A-3]; the fixes are the units DB's (below).
-        std::vector<COracleSubmitter> vOracleSubWrite = vOracleSubNew;
-        for (const std::pair<const uint32_t, COracleSubmitter>& p : mapOracleSubUpdate)
-            vOracleSubWrite.push_back(p.second);
-        const uint32_t nLastOracleSubID = nOracleSubIDNext ? nOracleSubIDNext - 1 : 0;
-
         if (!phousetree->WriteBlockEffects(vHouseWrite, vHouseNew.size() ? &nLastHouseID : nullptr, pindex->GetBlockHash(),
-                nullptr, false,
-                vOracleSubWrite.empty() ? nullptr : &vOracleSubWrite, nullptr,
-                vOracleSubNew.size() ? &nLastOracleSubID : nullptr,
                 memberEffects.empty() ? nullptr : &memberEffects,
                 tokenEffects.empty() ? nullptr : &tokenEffects))
             return state.Error("Failed to write house index!");
     }
 
     if (!fUnitsDBReplay) {
-        // The price feed's end of block, from the submitter records as they stand after this block: the HouseDB's
-        // with this block's staged updates (none when the HouseDB already holds them).
-        std::map<uint32_t, COracleSubmitter> mapReporter;
-        for (const COracleSubmitter& r : phousetree->GetOracleSubmitters())
-            mapReporter[r.nSubmitterID] = r;
-        for (const COracleSubmitter& r : vOracleSubNew)
-            mapReporter[r.nSubmitterID] = r;
-        for (const std::pair<const uint32_t, COracleSubmitter>& p : mapOracleSubUpdate)
-            mapReporter[p.first] = p.second;
-        const Consensus::GramParams& gp = chainparams.GetConsensus().GramAt(pindex->nHeight);
-        // A reporter's observations count while it is bonded and not unbonding; each stream's quorum base is the
-        // reporters that observed it recently (PriceFeedActiveOn; review round 1, G7a).
-        const auto fnCounts = [&](uint32_t nID) {
-            std::map<uint32_t, COracleSubmitter>::const_iterator it = mapReporter.find(nID);
-            return it != mapReporter.end() && it->second.nBondHeight != 0 && it->second.nUnbondRequestHeight == 0;
-        };
-        uint32_t nActive = 0;
-        for (const std::pair<const uint32_t, COracleSubmitter>& p : mapReporter)
-            if (fnCounts(p.first))
-                nActive++;
-        PriceFeedEndBlock(unitsView, pindex->nHeight, gp, nActive, fnCounts);
-        PriceFeedExitEndBlock(unitsView, pindex->nHeight, gp);   // the exit's step (dormant until 730 daily medians)
-        // Token pools' samples, then issuer bonds and the k ladder (k climbs only while the token's pool is deep).
-        TokenPoolsEndBlock(unitsView, pindex->nHeight, gp);
-        IssuedTokensEndBlock(unitsView, pindex->nHeight, gp,
-            [&](const CIssuedToken& token) {
-                uint64_t nView = 0;
-                bool fDeep = false;
-                return TokenPoolView(unitsView, token.tokenID, pindex->nHeight, gp, nView, fDeep) && fDeep;
-            },
-            [&](const CIssuedToken& token) {
-                CPriceFix fix;
-                int nFixHeight = 0;
-                // The backing stream's quorum base: the larger of the reporters that reported this token's backing
-                // within its window and the reporters active on the gold price (review round 1b: three reporters of
-                // a self-made token's backing alone would otherwise make it trusted).
-                const uint32_t nQuorum = PriceFeedQuorum(std::max(
-                    PriceFeedActiveOn(unitsView, ORACLE_STREAM_BACKING, token.tokenID, pindex->nHeight, gp.nBackingWindow, fnCounts),
-                    PriceFeedActiveOn(unitsView, ORACLE_STREAM_GOLD_ECX, uint256(), pindex->nHeight,
-                                      gp.nOracleWindow * gp.nOracleActiveWindows, fnCounts)), gp);
-                // D-2026-11-04-1 (3d, R2-ops-7): and burns not left unpaid past nBurnPayBlocks beyond the threshold.
-                return PriceFeedBackingAt(unitsView, token.tokenID, pindex->nHeight, gp, nQuorum, fnCounts, fix, nFixHeight) &&
-                       pindex->nHeight - nFixHeight <= (int)gp.nBackingStaleBlocks && fix.nValue >= token.nSupply &&
-                       !IssuedBurnOverdue(unitsView, token, fix.nAux2, pindex->nHeight, gp);
-            });
-
-        // The no-price path: record this block if it ends with no payout price (after the pools' samples).
-        {
-            uint64_t nPayoutNow = 0;
-            PriceFeedNoPriceEndBlock(unitsView, pindex->nHeight,
-                                     PayoutPrice(unitsView, pindex->nHeight, gp, nPayoutNow) && nPayoutNow != 0);
-        }
-
+        // The chain clock steps to this block: by its median time past (review 2026-11-07: one forward-dated L1 header
+        // can't move it; moving it takes most of the last 11 blocks), made monotone, the active time capped per step.
+        AdvanceChainClock(unitsView, (uint32_t)pindex->nHeight, pindex->GetMedianTimePast(),
+                          chainparams.GetConsensus().GramAt(pindex->nHeight));
         std::map<UnitsKey, UnitsSlot> mapUnitsChange, mapUnitsBefore;
         unitsView.GetChanges(mapUnitsChange, mapUnitsBefore);
         if (!punitsdb->WriteBlock(mapUnitsChange, mapUnitsBefore, pindex->GetBlockHash()))
@@ -13048,6 +12639,17 @@ static bool CheckBlockBMMTime(const CBlockHeader& block, CValidationState& state
                          strprintf("block time %u is not the time %u of its L1 block %s", block.nTime, nTimeMain,
                                    block.hashMainchainBlock.ToString()));
     return true;
+}
+
+bool LaterRuleOn(int64_t nSwitchTime, int nHeight)
+{
+    if (nSwitchTime <= 0)
+        return true;
+    if (nSwitchTime == Consensus::LATER_RULE_NEVER)
+        return false;
+    AssertLockHeld(cs_main);
+    const CBlockIndex* pprev = nHeight >= 1 ? chainActive[nHeight - 1] : nullptr;
+    return pprev != nullptr && pprev->GetMedianTimePast() >= nSwitchTime;
 }
 
 bool CheckBlockBMM(const CBlock& block, CValidationState& state)

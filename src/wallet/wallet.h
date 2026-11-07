@@ -706,10 +706,8 @@ private:
 
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
 struct IssuedCreate;
-struct COracleObs;
 
 /** One of the wallet's issued-token coins (gram-notes release, issued.h). */
-struct CVaultFreezeTarget;   // issued.h (5b: a freeze on a house vault)
 struct CIssuedWalletCoin
 {
     COutPoint outpoint;
@@ -1069,7 +1067,7 @@ public:
     bool FundSignCommitAssetTx(CMutableTransaction& mtx, const std::vector<std::pair<COutPoint, CTxOut>>& vAssetIn,
                                const CAmount& nFee, std::string& strFail, uint256& txidOut);
 
-    bool IssueBill(CTransactionRef& tx, std::string& strFail, const std::vector<unsigned char>& vchBody, const CAmount& nAmount, const CAmount& nAmountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const CAmount& nFee);
+    bool IssueBill(CTransactionRef& tx, std::string& strFail, const std::vector<unsigned char>& vchBody, const CAmount& nAmount, const CAmount& nAmountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const CAmount& nFee, uint32_t nRefHouseID);
     bool EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const std::vector<unsigned char>& vchToPubKey, const CAmount& nFee);
     /** RETIRE / CLAIM auto-dispatch to their HOUSE-HELD twins (ops 7/8) when the
      * bill sits in a loan book. The drawee retiring its own acceptance should not
@@ -1180,6 +1178,22 @@ public:
      *  without the house's keys would burn its paper and pay itself (v0.2.26, the app's 2026-10-11 find). */
     bool HoldsHouseKey(const CHouse& house) const;
     bool RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    /** Gold B (GOLD_B.md §4): demand nUnits of the house's notes in a charter token by hash lock (NOTE_OP_SWAP). One
+     *  holder's plain coins that sum to exactly nUnits are handed in; the payout script receives an sECX payment if the
+     *  swap is paid instead of delivered. */
+    bool SwapNotesInKind(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, uint64_t nChainID,
+                         const std::vector<unsigned char>& vchContract, const std::vector<unsigned char>& vchEthAddress,
+                         const uint256& hashLock, const CScript& scriptPayout, const CAmount& nFee);
+    /** The swap's later ops, anyone's: DONE (the preimage), PAY (the sECX owed, from this wallet), PROTEST, EXPIRE. */
+    bool SwapDone(std::string& strFail, uint256& txidOut, const uint256& hashLock, const std::vector<unsigned char>& vchPreimage,
+                  const CAmount& nFee);
+    bool SwapPay(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee, CAmount& amountPaidOut);
+    bool SwapProtest(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee);
+    bool SwapExpire(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee);
+    /** The waterfall (GOLD_B §6): claim a failed house's pending swap or live shortfall - its exact entitlement from the
+     *  escrow pot to the swap's payout script. Anyone may; this wallet pays the fee. */
+    bool SwapClaimFromEscrow(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee,
+                             CAmount& amountPaidOut);
     /** DEMAND, one op two modes keyed on house status (B3):
      * - Deferred: the 3.5 option-clause demand (plain; interest from demand).
      * - Open/Stressed: the B3 formal demand - coins move onto the consensus-
@@ -1329,25 +1343,6 @@ public:
      * been lifted (3.5 D11). */
     bool ReleaseReserves(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
 
-    /** Gold oracle (Phase G-1, T-o4). BondOracleSubmitter: register a fresh
-     * submitter key (nSubmitterID 0, dense id assigned at connect and reported
-     * via nAssignedIDOut) or re-bond/top-up a returning one, CONSOLIDATING its
-     * existing bond coin - only a same-key BOND may spend it, so leaving it
-     * behind would orphan the value from the record. SubmitOraclePrice: one
-     * price valid from the next height for nOracleOpWindow blocks (v17 binds a
-     * target height + its signing-tip anchor), so it tolerates missing a
-     * template; it is still re-signed every block by design, and a re-sign
-     * displaces its own pooled predecessor.
-     * Price unit is milligrams of gold per 1000 ECX - the chain's convention;
-     * callers holding grams/ECX must convert (x 1e6). */
-    bool BondOracleSubmitter(std::string& strFail, uint256& txidOut, uint32_t& nAssignedIDOut,
-                             uint32_t nSubmitterID, const CAmount& amountBond, const CAmount& nFee);
-    bool SubmitOraclePrice(std::string& strFail, uint256& txidOut,
-                           uint32_t nSubmitterID, uint64_t nPriceMilligrams, const CAmount& nFee);
-    /** Gram-notes release: one submission of any observations (oracle.h streams: prices, backing reports, claims). */
-    bool SubmitOracleObs(std::string& strFail, uint256& txidOut, uint32_t nSubmitterID, std::vector<COracleObs> vObs,
-                         const CAmount& nFee);
-
     /** Gram-notes release: issued tokens (wallet/issued_wallet.cpp). CreateIssuedToken takes a new issuer key (and a
      *  freeze key if asked) from the keypool and fills them into `create`. Each op funds its outputs and fee from
      *  plain ECX, puts plain change after the annex's outputs, signs the token key's payload signature once inputs and
@@ -1362,7 +1357,7 @@ public:
                     const std::vector<unsigned char>& vchEthDest, const CAmount& nFee);
     bool FreezeIssued(std::string& strFail, uint256& txidOut, const uint256& tokenID,
                       const std::vector<COutPoint>& vOutpoint, const std::vector<uint64_t>& vFrozen, bool fFreeze,
-                      const CAmount& nFee, const std::vector<CVaultFreezeTarget>& vVault = {});
+                      const CAmount& nFee);
     bool CommitIssuedTx(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx,
                         const std::vector<CIssuedWalletCoin>& vTokenIn, const CAmount& nFee,
                         const std::function<bool(const CTransaction&)>& fnPayload,
@@ -1377,22 +1372,6 @@ public:
                               const CAmount& nFee);
     bool SwapToken(std::string& strFail, uint256& txidOut, const uint256& tokenID, bool fSell, uint64_t nAmountIn,
                    const CAmount& nFee, uint64_t nMinOut = 0);
-    bool BondIssuer(std::string& strFail, uint256& txidOut, const uint256& tokenID, const CAmount& nAmount,
-                    const CAmount& nFee);
-    /** Gold vaults (step 5): a partner pledges gold into the house's capital (a TOPUP); the house moves gold into or
-     *  out of its till (TILL, approved by the partners whose keys this wallet holds). */
-    bool PledgeGold(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint32_t nPartnerIndex,
-                    const uint256& tokenID, uint64_t nUnits, const CAmount& nFee);
-    /** D-2026-11-04-1 (3a): take the partner's whole capital entry of a dust token (the house holds at most
-     *  HOUSE_DUST_SLOT_MG of it) out to this wallet, adding nAddUnits (>= the units taken) of a token the house holds. */
-    bool ClearDustSlot(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint32_t nPartnerIndex,
-                       const uint256& tokenClear, const uint256& tokenAdd, uint64_t nAddUnits, const CAmount& nFee);
-    bool MoveTill(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const uint256& tokenID, int64_t nDelta,
-                  const CAmount& nFee);
-    /** Equity proof (R3-1): prove a house's equity negative at the tip's payout price, listing its overdue bills;
-     *  opens claims. Refuses (equity in nEquityOut) when it isn't negative. */
-    bool ProveEquity(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const CAmount& nFee, int64_t& nEquityOut,
-                     std::vector<uint32_t>& vOverdueOut);
 
     void ListAccountCreditDebit(const std::string& strAccount, std::list<CAccountingEntry>& entries);
     bool AddAccountingEntry(const CAccountingEntry&);

@@ -23,11 +23,11 @@
 //! On-disk record format version for BOTH Coin (chainstate/) and
 //! TxInUndoSerializer (blocks/rev*.dat). Neither record carries a length or a
 //! version of its own - they are flat positional field concatenations, and
-//! FreeBank has only ever APPENDED (deposit terms, pool/LP tags, fOracleBond).
+//! FreeBank has only ever APPENDED (deposit terms, pool/LP tags, fCustody).
 //! So a binary cannot read a record written by a binary with a different field
 //! set, and the failure is not always loud: reading a NEWER record with an
 //! OLDER build succeeds, ignores the trailing bytes, and silently clears the
-//! custody tags. fOracleBond cleared leaves an anyone-can-spend bond coin with
+//! custody tags. fCustody cleared leaves an anyone-can-spend bond coin with
 //! nothing protecting it (tx_verify.cpp's bond guard IS its whole protection),
 //! and diverges that node from a fresh sync.
 //!
@@ -130,7 +130,7 @@ public:
     //! Is this a gold-oracle submitter bond escrow output (Phase G-1)? The
     //! coin carries no id - the registered pubkey is IN the bond script, so
     //! the spend gate pins ownership by script comparison, never a lookup.
-    bool fOracleBond;
+    bool fCustody;
 
     //! Gram-notes release (issued.h): does this coin carry issued-token units?
     //! assetID then holds the token's id (its CREATE txid), so IsAssetColoured()
@@ -143,8 +143,8 @@ public:
     uint64_t nIssuedFrozen;
 
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fCustody(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fBitAssetIn, bool fBitAssetControlIn, const uint256& assetIDIn) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), fBitAsset(fBitAssetIn), fBitAssetControl(fBitAssetControlIn), assetID(assetIDIn), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fCustody(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) {}
 
     void SetBill(bool fEscrowIn, uint32_t nBillIDIn) {
         fBill = !fEscrowIn;
@@ -185,8 +185,8 @@ public:
         nLpUnits = nUnitsIn;
     }
 
-    void SetOracleBond() {
-        fOracleBond = true;
+    void SetCustody() {
+        fCustody = true;
     }
 
     void SetIssued(const uint256& tokenID, uint64_t nUnits, uint64_t nFrozen) {
@@ -219,14 +219,14 @@ public:
         fPoolEscrow = false;
         fLpShare = false;
         nLpUnits = 0;
-        fOracleBond = false;
+        fCustody = false;
         fIssued = false;
         nIssuedUnits = 0;
         nIssuedFrozen = 0;
     }
 
     //! empty constructor
-    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), assetID(), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fOracleBond(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) { }
+    Coin() : fCoinBase(false), nHeight(0), fBitAsset(false), fBitAssetControl(false), assetID(), fBill(false), fBillEscrow(false), nBillID(0), fHouseEscrow(false), nHouseID(0), fNote(false), nNoteUnits(0), nDemandHeight(0), fDeposit(false), nDepositPrincipal(0), nDepositRateBps(0), nDepositMaturityHeight(0), nDepositOriginationHeight(0), fPoolEscrow(false), fLpShare(false), nLpUnits(0), fCustody(false), fIssued(false), nIssuedUnits(0), nIssuedFrozen(0) { }
 
     bool IsCoinBase() const {
         return fCoinBase;
@@ -285,7 +285,7 @@ public:
         // Appended last (the fPoolEscrow precedent). Any append here is a disk
         // format break: bump FREEBANK_DISK_FORMAT_VERSION so the startup gate
         // demands the reindex, instead of leaving it to whoever notices.
-        ::Serialize(s, fOracleBond);
+        ::Serialize(s, fCustody);
         // v4 (gram-notes release): the issued-token units; assetID holds the token id.
         ::Serialize(s, fIssued);
         if (fIssued) {
@@ -324,7 +324,7 @@ public:
         ::Unserialize(s, fPoolEscrow);
         ::Unserialize(s, fLpShare);
         ::Unserialize(s, nLpUnits);
-        ::Unserialize(s, fOracleBond);
+        ::Unserialize(s, fCustody);
         ::Unserialize(s, fIssued);
         nIssuedUnits = 0;
         nIssuedFrozen = 0;

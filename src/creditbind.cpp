@@ -10,7 +10,6 @@
 #include <house.h>
 #include <issued.h>
 #include <note.h>
-#include <oracle.h>
 #include <pool.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
@@ -108,12 +107,18 @@ void Strip(HouseRenew& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseRelease& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseMemberOp& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseClose&) {}
-void Strip(HouseTill& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
-void Strip(HouseEquity&) {}
+void Strip(HouseRate& p) { p.vchRateSig.clear(); p.vApproverIndex.clear(); p.vApproverSig.clear(); }
+void Strip(HouseCharter& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 
 void Strip(NoteMint& p) { ClearProofSigs(p.vReserveProofs); p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(NoteTransfer& p) { p.vchSenderSig.clear(); }
-void Strip(NoteRedeem& p) { p.vchHolderSig.clear(); p.vchPreAuthSig.clear(); p.vApproverIndex.clear(); p.vApproverSig.clear(); }
+void Strip(NoteRedeem& p) { p.vchHolderSig.clear(); p.vchPreAuthSig.clear(); }
+void Strip(NoteSwap& p) { p.vchHolderSig.clear(); }
+void Strip(NoteSwapDone&) {}
+void Strip(NoteSwapPay&) {}
+void Strip(NoteSwapProtest&) {}
+void Strip(NoteSwapExpire&) {}
+void Strip(NoteSwapClaim&) {}
 void Strip(NoteLock& p) { p.vchHolderSig.clear(); p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(NoteUnlock& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(NoteClaim& p) { p.vchHolderSig.clear(); }
@@ -153,15 +158,11 @@ void Strip(SettleExchange& p)
 }
 void Strip(SettleNet& p) { p.vPresentSig.clear(); p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 
-void Strip(OracleBond& p) { p.vchSig.clear(); }
-void Strip(OracleSubmit& p) { p.vchSig.clear(); }
 
 void Strip(IssuedCreate& p) { p.vchIssuerSig.clear(); }
 void Strip(IssuedMint& p) { p.vchIssuerSig.clear(); }
 void Strip(IssuedBurn&) {}
 void Strip(IssuedFreeze& p) { p.vchFreezeSig.clear(); }
-void Strip(IssuedBond& p) { p.vchIssuerSig.clear(); }
-void Strip(IssuedUnbond& p) { p.vchIssuerSig.clear(); }
 void Strip(IssuedPoolCreate&) {}
 void Strip(IssuedPoolAdd&) {}
 void Strip(IssuedPoolRemove&) {}
@@ -225,8 +226,8 @@ void BindHouse(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& v
     case HOUSE_OP_MEMBER_REMOVE:
     case HOUSE_OP_MEMBER_PURGE: Bind<HouseMemberOp>(ss, vch); break;
     case HOUSE_OP_CLOSE: Bind<HouseClose>(ss, vch); break;
-    case HOUSE_OP_TILL: Bind<HouseTill>(ss, vch); break;
-    case HOUSE_OP_EQUITY: Bind<HouseEquity>(ss, vch); break;
+    case HOUSE_OP_RATE: Bind<HouseRate>(ss, vch); break;
+    case HOUSE_OP_CHARTER: Bind<HouseCharter>(ss, vch); break;
     default: BindRaw(ss, vch);
     }
 }
@@ -246,6 +247,12 @@ void BindNote(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& vc
     case NOTE_OP_TOKEN_POST: Bind<NoteTokenPost>(ss, vch); break;
     case NOTE_OP_TOKEN_CLAIM: Bind<NoteTokenClaim>(ss, vch); break;
     case NOTE_OP_TOKEN_COLLECT: Bind<NoteTokenCollect>(ss, vch); break;
+    case NOTE_OP_SWAP: Bind<NoteSwap>(ss, vch); break;
+    case NOTE_OP_SWAP_DONE: Bind<NoteSwapDone>(ss, vch); break;
+    case NOTE_OP_SWAP_PAY: Bind<NoteSwapPay>(ss, vch); break;
+    case NOTE_OP_SWAP_PROTEST: Bind<NoteSwapProtest>(ss, vch); break;
+    case NOTE_OP_SWAP_EXPIRE: Bind<NoteSwapExpire>(ss, vch); break;
+    case NOTE_OP_SWAP_CLAIM: Bind<NoteSwapClaim>(ss, vch); break;
     default: BindRaw(ss, vch);
     }
 }
@@ -285,15 +292,6 @@ void BindSettle(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& 
     }
 }
 
-void BindOracle(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& vch)
-{
-    switch (nOp) {
-    case ORACLE_OP_BOND: Bind<OracleBond>(ss, vch); break;
-    case ORACLE_OP_SUBMIT: Bind<OracleSubmit>(ss, vch); break;
-    default: BindRaw(ss, vch);
-    }
-}
-
 void BindIssued(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& vch)
 {
     switch (nOp) {
@@ -302,8 +300,6 @@ void BindIssued(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& 
     case ISSUED_OP_BURN: Bind<IssuedBurn>(ss, vch); break;
     case ISSUED_OP_FREEZE:
     case ISSUED_OP_UNFREEZE: Bind<IssuedFreeze>(ss, vch); break;
-    case ISSUED_OP_BOND: Bind<IssuedBond>(ss, vch); break;
-    case ISSUED_OP_UNBOND: Bind<IssuedUnbond>(ss, vch); break;
     case ISSUED_OP_POOL_CREATE: Bind<IssuedPoolCreate>(ss, vch); break;
     case ISSUED_OP_POOL_ADD: Bind<IssuedPoolAdd>(ss, vch); break;
     case ISSUED_OP_POOL_REMOVE: Bind<IssuedPoolRemove>(ss, vch); break;
@@ -329,14 +325,12 @@ uint256 CreditBindingHash(const CTransaction& tx)
     case TRANSACTION_DEPOSIT_VERSION: ss << tx.nDepositOp; BindDeposit(ss, tx.nDepositOp, tx.vchDepositPayload); break;
     case TRANSACTION_POOL_VERSION: ss << tx.nPoolOp; BindPool(ss, tx.nPoolOp, tx.vchPoolPayload); break;
     case TRANSACTION_SETTLE_VERSION: ss << tx.nSettleOp; BindSettle(ss, tx.nSettleOp, tx.vchSettlePayload); break;
-    case TRANSACTION_ORACLE_VERSION: ss << tx.nOracleOp; BindOracle(ss, tx.nOracleOp, tx.vchOraclePayload); break;
     case TRANSACTION_TOKEN_VERSION: ss << tx.nIssuedOp; BindIssued(ss, tx.nIssuedOp, tx.vchIssuedPayload); break;
     default: break;
     }
     // Gram-notes release: which outputs carry which issued units is the annex's alone, so it is bound whole.
     if (HasIssuedAnnex(tx.nVersion)) {
         ss << tx.vIssuedOut;
-        ss << tx.vVaultMove;   // and every move into or out of a house's gold vault
     }
     return ss.GetHash();
 }

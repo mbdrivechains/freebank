@@ -119,9 +119,8 @@ struct SettleExchange {
     std::vector<uint32_t> vApproverIndexB;
     std::vector<std::vector<unsigned char>> vApproverSigB;
 
-    // Gram-notes release: notes are mg; the residual is sECX, in the par band at this height's payout price (at most
-    // nPriceBackBlocks back; 0 when no residual is paid, mode 0).
-    uint32_t nPriceHeight = 0;
+    // Gold B (D-2026-11-07-1; GOLD_B.md §3): notes are mg; the residual is sECX between the lower bid and the higher ask of
+    // the two houses' rates in effect (no price field: the band is read from the chain).
 
     SettleExchange() : nHouseA(0), nHouseB(0), nMode(0), nUnitsANotes(0), nUnitsBNotes(0),
                        nCountANotes(0), nCountBNotes(0), amountResidual(0),
@@ -153,7 +152,6 @@ struct SettleExchange {
         READWRITE(vApproverSigA);
         READWRITE(vApproverIndexB);
         READWRITE(vApproverSigB);
-        READWRITE(nPriceHeight);
     }
 };
 
@@ -177,7 +175,7 @@ uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevou
  * shape-checked units <= SETTLE_MAX_UNITS and amountResidual in [0, MAX_MONEY]
  * first; the helper additionally hard-bounds both). */
 bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
-                          uint8_t nMode, CAmount amountResidual, uint64_t nSatsPerGram);
+                          uint8_t nMode, CAmount amountResidual, uint64_t nLoSatsPerGram, uint64_t nHiSatsPerGram);
 
 /** One bundle of a NET round: nUnits of nIssuer's notes handed in by nPresenter (both in the round, never the same
  * house), spent as nCount consecutive inputs on the presenter's key. */
@@ -225,7 +223,6 @@ struct SettleNet {
     std::vector<std::vector<uint32_t>> vApproverIndex;               // per house (excluded from digest)
     std::vector<std::vector<std::vector<unsigned char>>> vApproverSig;
 
-    uint32_t nPriceHeight = 0;   // gram-notes release: as SettleExchange
 
     SettleNet() : nExpiryHeight(0) {}
 
@@ -243,7 +240,6 @@ struct SettleNet {
         READWRITE(vPresentSig);
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
-        READWRITE(nPriceHeight);
     }
 };
 
@@ -356,9 +352,10 @@ struct SettleNetRoundV1 {
     CAmount nFee;
     std::vector<SettleNetRoundPart> vPart;        // ascending house id, one per house that has joined
     std::vector<unsigned char> vchTx;             // the transaction being signed (empty before the first signature)
-    uint32_t nPriceHeight;                        // review round 1 (G8b): the one payout-price height every house builds with
+    uint64_t nRoundRate;                          // Gold B: the one rate (sats per gram) every house builds with - the
+                                                  // midpoint of the round's band when it started
 
-    SettleNetRoundV1() : nVersion(1), nStarter(0), nExpiryHeight(0), nFee(0), nPriceHeight(0) {}
+    SettleNetRoundV1() : nVersion(1), nStarter(0), nExpiryHeight(0), nFee(0), nRoundRate(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -371,7 +368,7 @@ struct SettleNetRoundV1 {
         READWRITE(nFee);
         READWRITE(vPart);
         READWRITE(vchTx);
-        READWRITE(nPriceHeight);
+        READWRITE(nRoundRate);
     }
 };
 

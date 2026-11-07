@@ -49,10 +49,11 @@ static CMutableTransaction MakeIssueTx(BillIssue& issueOut, CKey& keyDrawer, CKe
     issue.vchAcceptorPubKey = std::vector<unsigned char>(pubAcceptor.begin(), pubAcceptor.end());
     issue.vchHolderPubKey = std::vector<unsigned char>(pubHolder.begin(), pubHolder.end());
 
+    issue.nRefHouseID = 1;   // Gold B: the reference house (the fixtures' house 1)
     const uint256 billID = BillIDFromBody(issue.vchEncryptedBody);
     const uint256 sighash = BillIssueSigHash(billID, issue.amount, TEST_BILL_ESCROW,
             issue.nMaturityHeight, issue.nGraceBlocks, issue.vchDrawerPubKey,
-            issue.vchAcceptorPubKey, issue.vchHolderPubKey);
+            issue.vchAcceptorPubKey, issue.vchHolderPubKey, issue.nRefHouseID);
     BOOST_REQUIRE(keyDrawer.Sign(sighash, issue.vchDrawerSig));
     BOOST_REQUIRE(keyAcceptor.Sign(sighash, issue.vchAcceptorSig));
 
@@ -179,20 +180,20 @@ BOOST_AUTO_TEST_CASE(bill_issue_sig_binding)
     const CAmount escrow = 75 * COIN / 10;
 
     const uint256 sighash = BillIssueSigHash(billID, amount, escrow, 500,
-            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub);
+            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1);
     std::vector<unsigned char> vchSig;
     BOOST_REQUIRE(keyDrawer.Sign(sighash, vchSig));
     BOOST_CHECK(pub.Verify(sighash, vchSig));
 
     // Front-run with a token escrow bond -> different sighash -> sig invalid
     const uint256 sighashCheapBond = BillIssueSigHash(billID, amount, 1, 500,
-            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub);
+            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1);
     BOOST_CHECK(sighash != sighashCheapBond);
     BOOST_CHECK(!pub.Verify(sighashCheapBond, vchSig));
 
     // Tampered face amount -> sig invalid
     BOOST_CHECK(!pub.Verify(BillIssueSigHash(billID, amount + 1, escrow, 500,
-            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub), vchSig));
+            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1), vchSig));
 }
 
 BOOST_AUTO_TEST_CASE(bill_issue_shape_rejections)
@@ -1331,7 +1332,7 @@ BOOST_AUTO_TEST_CASE(bill_b1_colored_input_classes)
         { COL_DEPOSIT, "bad-txns-spend-deposit-coin" },
         { COL_POOL,    "bad-txns-spend-pool-coin" },
         { COL_LP,      "bad-txns-spend-lp-coin" },
-        { COL_BOND,    "bad-txns-spend-oracle-bond" },
+        { COL_BOND,    "bad-txns-spend-custody" },
         { COL_ASSET,   "bad-bill-asset-input" },
     };
 
@@ -1346,7 +1347,7 @@ BOOST_AUTO_TEST_CASE(bill_b1_colored_input_classes)
             case COL_DEPOSIT: coin.SetDeposit(3, 1000, 500, 120000, 50); break;
             case COL_POOL:    coin.SetPoolEscrow(3); break;
             case COL_LP:      coin.SetLpShare(3, 1000); break;
-            case COL_BOND:    coin.SetOracleBond(); break;
+            case COL_BOND:    coin.SetCustody(); break;
             case COL_ASSET:   break;   // nAssetID set through the constructor
             }
             const COutPoint tainted(uint256S("ee"), 0);

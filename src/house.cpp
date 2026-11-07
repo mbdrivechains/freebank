@@ -4,6 +4,8 @@
 
 #include <house.h>
 
+#include <algorithm>
+
 #include <bill.h>
 #include <chainparams.h>
 #include <consensus/validation.h>
@@ -210,18 +212,37 @@ uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const 
     return ss.GetHash();
 }
 
-uint256 HouseTillSigHash(const uint256& houseID, const CTransaction& tx)
+uint256 HouseRateSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseRate& rate)
 {
     CHashWriter hPrevouts(SER_GETHASH, 0);
     for (const CTxIn& in : tx.vin)
         hPrevouts << in.prevout;
     CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/till");
-    ss << houseID;
+    ss << std::string("FreeBankHouse/rate");
+    ss << nHouseID;
+    ss << rate.nKind;
+    ss << rate.nBid;
+    ss << rate.nAsk;
+    ss << rate.vchRatePubKey;
     ss << hPrevouts.GetHash();
     ss << BillHashOutputs(tx);
-    ss << tx.vIssuedOut;
-    ss << tx.vVaultMove;
+    return ss.GetHash();
+}
+
+uint256 HouseCharterSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseCharter& charter)
+{
+    CHashWriter hPrevouts(SER_GETHASH, 0);
+    for (const CTxIn& in : tx.vin)
+        hPrevouts << in.prevout;
+    HouseCharter unsigned_ = charter;
+    unsigned_.vApproverIndex.clear();
+    unsigned_.vApproverSig.clear();
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankHouse/charter");
+    ss << nHouseID;
+    ss << unsigned_;
+    ss << hPrevouts.GetHash();
+    ss << BillHashOutputs(tx);
     return ss.GetHash();
 }
 
@@ -365,8 +386,9 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
 {
     if (house.status == HOUSE_STATUS_WOUNDDOWN) return HOUSE_STATUS_WOUNDDOWN;
     if (house.status == HOUSE_STATUS_INSOLVENT) return HOUSE_STATUS_INSOLVENT; // materialized
-    // Gram-notes release (R3-1): equity proven negative - claims open from that block, for good.
-    if (house.nEquityNegativeHeight != 0 && nHeight >= 0 && (uint32_t)nHeight >= house.nEquityNegativeHeight)
+    // Gold B (D-2026-11-07-2/-3): an unpaid demand protested within 180 days of the last cure's start finds no cure -
+    // insolvent from that block (HouseProtestEpisodeStart). A protest with a cure available is a stress origin instead.
+    if (house.nNoCureHeight != 0 && nHeight >= 0 && (uint32_t)nHeight >= house.nNoCureHeight)
         return HOUSE_STATUS_INSOLVENT;
 
     // Option clause (3.5): an invoked deferral REPLACES the ordinary stress
@@ -380,7 +402,7 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
     // no suspension outlasts nSuspensionCap - HouseDeferInsolventHeight is the
     // earlier of the two.
     if (house.nDeferInvokedHeight != 0) {
-        if (nHeight >= 0 && (uint32_t)nHeight >= HouseDeferInsolventHeight(house))
+        if (nHeight >= 0 && (uint32_t)nHeight >= HouseDeferInsolventHeight(house, nHeight))
             return HOUSE_STATUS_INSOLVENT;   // went silent, or ran out its 12 months, while suspended
         return HOUSE_STATUS_DEFERRED;
     }
@@ -388,36 +410,87 @@ char HouseEffectiveStatus(const CHouse& house, int nHeight)
     // Stored status is 'o' and no deferral - the 3.4 derivation
     const uint32_t nStress = HouseStressOrigin(house, nHeight);
     if (nStress == 0) return HOUSE_STATUS_OPEN;
-    if ((uint32_t)nHeight >= nStress + HOUSE_STRESSED_WINDOW)
-        return HOUSE_STATUS_INSOLVENT;                          // window expiry
+    if (nHeight >= 0 && (uint32_t)nHeight >= ClockDeadlineHeight(nStress, HouseCureWindow(house, nStress), nHeight))
+        return HOUSE_STATUS_INSOLVENT;                          // window expiry (clock time, GOLD_B §6)
     return HOUSE_STATUS_STRESSED;
 }
 
-uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house)
+uint64_t HouseCureWindow(const CHouse& house, uint32_t nStress)
 {
-    if (house.nDeferInvokedHeight == 0)
-        return 0;
-    // 64-bit sum, saturated: every operand is a u32 and a pathological
-    // regtest cadence must not wrap the deadline into the past.
-    const uint64_t n = (uint64_t)house.nLastAttestHeight
-                     + (uint64_t)HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1
-                     + (uint64_t)Params().GetConsensus().nDeferSilenceWindow;
-    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+    // A protest re-armed by a recovery continues its cure with the time it had left (design 2026-11-08).
+    if (house.nCureLeft != 0 && house.ProtestLive() && house.nDeferEndedHeight != 0 && nStress == house.nDeferEndedHeight)
+        return house.nCureLeft;
+    return HOUSE_STRESSED_WINDOW;
 }
 
-uint32_t HouseDeferCapInsolventHeight(const CHouse& house)
+ClockAtFn g_fnClockAt = nullptr;
+
+int64_t ClockAtHeight(int nHeight)
 {
-    if (house.nDeferInvokedHeight == 0)
+    if (nHeight <= 0)
         return 0;
-    const uint64_t n = (uint64_t)house.nDeferInvokedHeight + (uint64_t)Params().GetConsensus().nSuspensionCap;
-    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+    return g_fnClockAt ? g_fnClockAt(nHeight) : nHeight;
 }
 
-uint32_t HouseDeferInsolventHeight(const CHouse& house)
+int64_t ClockSince(uint32_t nStart, int nNow)
+{
+    if (nNow <= (int64_t)nStart)
+        return 0;
+    const int64_t n = ClockAtHeight(nNow) - ClockAtHeight((int)nStart);
+    return n > 0 ? n : 0;
+}
+
+uint32_t ClockDeadlineHeight(uint32_t nStart, uint64_t nSpan, int nNow)
+{
+    const int64_t nFrom = nStart;
+    const int64_t nTo = nNow < nFrom ? nFrom : nNow;
+    const int64_t c0 = ClockAtHeight((int)nFrom);
+    const int64_t nElapsed = ClockAtHeight((int)nTo) - c0;
+    if (nElapsed < 0 || (uint64_t)nElapsed < nSpan) {
+        // Not run yet by nTo: the clock blocks still to run, one per block from here (exact when the clock is the height).
+        const uint64_t n = (uint64_t)nTo + (nSpan - (uint64_t)std::max<int64_t>(nElapsed, 0));
+        return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+    }
+    // Run by nTo: the first height in [nFrom, nTo] where it had (the clock never goes backwards).
+    int64_t lo = nFrom, hi = nTo;
+    while (lo < hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if ((uint64_t)std::max<int64_t>(ClockAtHeight((int)mid) - c0, 0) >= nSpan)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return (uint32_t)lo;
+}
+
+uint32_t TermDeadlineHeight(uint32_t nStart, uint32_t nTarget, uint64_t nAfter, int nNow)
+{
+    const uint32_t nFrom = (nStart != 0 && nStart <= nTarget) ? nStart : nTarget;
+    return ClockDeadlineHeight(nFrom, (uint64_t)(nTarget - nFrom) + nAfter, nNow);
+}
+
+uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house, int nNow)
 {
     if (house.nDeferInvokedHeight == 0)
         return 0;
-    return std::min(HouseDeferSilenceInsolventHeight(house), HouseDeferCapInsolventHeight(house));
+    // The span after the last attestation, in clock blocks (GOLD_B §6); 64-bit, saturated in ClockDeadlineHeight.
+    const uint64_t nSpan = (uint64_t)HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1 +
+                           (uint64_t)Params().GetConsensus().nDeferSilenceWindow;
+    return ClockDeadlineHeight(house.nLastAttestHeight, nSpan, nNow);
+}
+
+uint32_t HouseDeferCapInsolventHeight(const CHouse& house, int nNow)
+{
+    if (house.nDeferInvokedHeight == 0)
+        return 0;
+    return ClockDeadlineHeight(house.nDeferInvokedHeight, Params().GetConsensus().nSuspensionCap, nNow);
+}
+
+uint32_t HouseDeferInsolventHeight(const CHouse& house, int nNow)
+{
+    if (house.nDeferInvokedHeight == 0)
+        return 0;
+    return std::min(HouseDeferSilenceInsolventHeight(house, nNow), HouseDeferCapInsolventHeight(house, nNow));
 }
 
 // E for the v0.2.28 windows: HouseInsolventSince, or - for a materialized house whose derivation inputs no longer
@@ -437,7 +510,7 @@ bool HouseCollectionDone(const CHouse& house, int nHeight)
         return false;
     if (house.nLoanBookFace == 0)
         return true;
-    return nHeight >= 0 && (uint64_t)nHeight >= (uint64_t)nE + Params().GetConsensus().nCollectWindow;
+    return nHeight >= 0 && (uint32_t)nHeight >= ClockDeadlineHeight(nE, Params().GetConsensus().nCollectWindow, nHeight);
 }
 
 uint32_t HouseClaimWindowCloses(const CHouse& house, int nHeight)
@@ -445,8 +518,7 @@ uint32_t HouseClaimWindowCloses(const CHouse& house, int nHeight)
     const uint32_t nE = HouseWindowE(house, nHeight);
     if (nE == 0)
         return 0;
-    const uint64_t n = (uint64_t)nE + Params().GetConsensus().nInsolventClaimWindow;
-    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+    return ClockDeadlineHeight(nE, Params().GetConsensus().nInsolventClaimWindow, nHeight);
 }
 
 bool HouseClosed(const CHouse& house)
@@ -463,18 +535,31 @@ uint32_t HouseInsolventSince(const CHouse& house, int nHeight)
 {
     if (house.status == HOUSE_STATUS_WOUNDDOWN || HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
         return 0;
-    // An EQUITY op is refused once a house is insolvent by any route, so its height is the first.
-    if (house.nEquityNegativeHeight != 0)
-        return house.nEquityNegativeHeight;
+    // Every protest is refused once a house is insolvent by any route, so a no-cure protest's height is the first. (A
+    // protest with a cure is a stress origin: insolvent at the window's end, below.)
+    if (house.nNoCureHeight != 0)
+        return house.nNoCureHeight;
     if (house.nDeferInvokedHeight != 0)
-        return HouseDeferInsolventHeight(house);
-    // The ordinary stress path: insolvent at the stress origin + the window (HouseEffectiveStatus). The origin is
-    // stable for heights past the attestation deadline, which an insolvent house is.
+        return HouseDeferInsolventHeight(house, nHeight);
+    // The ordinary stress path: insolvent once the window has run from the stress origin (HouseEffectiveStatus), in
+    // clock time (GOLD_B §6). The origin is stable for heights past the attestation deadline, which an insolvent house is.
     const uint32_t nStress = HouseStressOrigin(house, nHeight);
     if (nStress == 0)
         return 0;   // unreachable for an insolvent house
-    const uint64_t n = (uint64_t)nStress + HOUSE_STRESSED_WINDOW;
-    return n > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)n;
+    return ClockDeadlineHeight(nStress, HouseCureWindow(house, nStress), nHeight);
+}
+
+void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight)
+{
+    // Gold B (D-2026-11-07-2/-3): one cure per 180 days. A cure is a protest episode; nProtestHeight still holds the last
+    // episode's start (only protests write it, sticky-earliest within an episode, never cleared by a discharge). Called
+    // by every protest op before it overwrites the heights, only when the episode is fresh (nProtestOpen was 0). The
+    // undo needs no prior: a protest is refused at an insolvent house, so nNoCureHeight was 0 before it.
+    // Counted from the END of the last episode (design 2026-11-08): its start, or the recovery that ended a suspension
+    // (under B a suspension only starts while a protest stresses the house; an episode without one lasts the cure).
+    const uint32_t nRef = std::max(house.nProtestHeight, house.nDeferEndedHeight);
+    if (nRef != 0 && nHeight >= nRef && ClockSince(nRef, (int)nHeight) < (int64_t)HOUSE_CURE_SPACING_BLOCKS)
+        house.nNoCureHeight = nHeight;
 }
 
 uint64_t HouseCapitalCapUnits(const CHouse& house)
@@ -673,6 +758,8 @@ template bool DecodeHousePayload<HouseRenew>(const std::vector<unsigned char>&, 
 template bool DecodeHousePayload<HouseRelease>(const std::vector<unsigned char>&, HouseRelease&);
 template bool DecodeHousePayload<HouseRegisterMO>(const std::vector<unsigned char>&, HouseRegisterMO&);
 template bool DecodeHousePayload<HouseMemberOp>(const std::vector<unsigned char>&, HouseMemberOp&);
+template bool DecodeHousePayload<HouseRate>(const std::vector<unsigned char>&, HouseRate&);
+template bool DecodeHousePayload<HouseCharter>(const std::vector<unsigned char>&, HouseCharter&);
 
 static bool IsValidHousePubKey(const std::vector<unsigned char>& vch)
 {
@@ -763,8 +850,12 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-house-coinbase");
 
-    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_EQUITY)
+    if (tx.nHouseOp < HOUSE_OP_REGISTER || tx.nHouseOp > HOUSE_OP_MAX)
         return state.DoS(100, false, REJECT_INVALID, "bad-house-op");
+    if (tx.nHouseOp == HOUSE_OP_RETIRED_TILL || tx.nHouseOp == HOUSE_OP_RETIRED_TILL_DECLARE)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-op-retired");   // Gold B: no gold vaults
+    if (tx.nHouseOp == HOUSE_OP_RETIRED_EQUITY)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-op-retired");   // D-2026-11-07-3: no closure on losses
 
     // Register: 64 partners x (33B key + 72B sig + amount) + declaration
     if (tx.vchHousePayload.size() > 16384)
@@ -837,21 +928,51 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payload");
     }
     else
-    if (tx.nHouseOp == HOUSE_OP_EQUITY) {
-        HouseEquity eq;
-        if (!DecodeHousePayload(tx.vchHousePayload, eq) || eq.nHouseID == 0 ||
-                eq.vOverdueBillID.size() > MAX_EQUITY_OVERDUE_BILLS)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-equity-payload");
+    if (tx.nHouseOp == HOUSE_OP_RATE) {
+        HouseRate rate;
+        if (!DecodeHousePayload(tx.vchHousePayload, rate) || rate.nHouseID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-payload");
+        if (rate.nKind == HOUSE_RATE_POST) {
+            if (rate.nBid == 0 || rate.nAsk < rate.nBid || !rate.vchRatePubKey.empty() ||
+                    rate.vchRateSig.empty() || rate.vchRateSig.size() > 73 ||
+                    !rate.vApproverIndex.empty() || !rate.vApproverSig.empty())
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-post");
+        } else if (rate.nKind == HOUSE_RATE_SETKEY) {
+            const CPubKey key(rate.vchRatePubKey);
+            if (rate.nBid != 0 || rate.nAsk != 0 || !rate.vchRateSig.empty() ||
+                    rate.vchRatePubKey.size() != CPubKey::COMPRESSED_PUBLIC_KEY_SIZE || !key.IsFullyValid())
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-setkey");
+            if (!CheckApproverShape(rate.vApproverIndex, rate.vApproverSig) || rate.vApproverIndex.empty())
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-approvers");
+        } else {
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-kind");
+        }
+        if (!tx.vIssuedOut.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-units");
     }
     else
-    if (tx.nHouseOp == HOUSE_OP_TILL) {
-        HouseTill till;
-        if (!DecodeHousePayload(tx.vchHousePayload, till) || till.nHouseID == 0)
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-payload");
-        if (!CheckApproverShape(till.vApproverIndex, till.vApproverSig) || till.vApproverIndex.empty())
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-approvers");
-        if (tx.vVaultMove.empty())
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-till-empty");
+    if (tx.nHouseOp == HOUSE_OP_CHARTER) {
+        HouseCharter ch;
+        if (!DecodeHousePayload(tx.vchHousePayload, ch) || ch.nHouseID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-payload");
+        if (ch.nKind == HOUSE_CHARTER_ADD) {
+            const bool fZeroContract = std::all_of(ch.vchContract.begin(), ch.vchContract.end(),
+                                                   [](unsigned char c) { return c == 0; });
+            if (ch.nChainID == 0 || ch.vchContract.size() != 20 || fZeroContract || ch.nDecimals > 36 ||
+                    ch.nGramsNum == 0 || ch.nGramsDen == 0 || ch.nRelated > HOUSE_RELATED_YES || ch.nIndex != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-add");
+        } else if (ch.nKind == HOUSE_CHARTER_REMOVE || ch.nKind == HOUSE_CHARTER_RELATED) {
+            if (ch.nChainID != 0 || !ch.vchContract.empty() || ch.nDecimals != 0 || ch.nGramsNum != 0 ||
+                    ch.nGramsDen != 0 || ch.nRelated > HOUSE_RELATED_YES ||
+                    (ch.nKind == HOUSE_CHARTER_REMOVE && ch.nRelated != 0))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-index-op");
+        } else {
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-kind");
+        }
+        if (!CheckApproverShape(ch.vApproverIndex, ch.vApproverSig) || ch.vApproverIndex.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-approvers");
+        if (!tx.vIssuedOut.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-units");
     }
     else
     if (tx.nHouseOp == HOUSE_OP_RECLAIM) {

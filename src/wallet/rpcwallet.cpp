@@ -37,8 +37,10 @@
 #include <util.h>
 #include <utilmoneystr.h>
 #include <utilstrencodings.h>
+#include <houserate.h>
 #include <units.h>     // v1.1.1: signdiscount's loss figures at the payout price
 #include <issued.h>
+#include <notices.h>
 #include <wallet/coincontrol.h>
 #include <wallet/feebumper.h>
 #include <wallet/rpcwallet.h>
@@ -4032,9 +4034,10 @@ UniValue issuebill(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 4 || request.params.size() > 6)
+    if (request.fHelp || request.params.size() < 4 || request.params.size() > 7)
         throw std::runtime_error(
             "issuebill\n"
+            HELP_ROLE_BILL
             "\nArguments:\n"
             "1. \"body\"            (string, required) hex of the encrypted bill body\n"
             "2. \"face_mg\"         (numeric, required) the face in mg of gold, a whole number (v1.1.1; v1.1.0 read\n"
@@ -4043,6 +4046,9 @@ UniValue issuebill(const JSONRPCRequest& request)
             "4. \"maturityheight\"  (numeric, required) sidechain height the bill matures at\n"
             "5. \"graceblocks\"     (numeric, optional) grace period, default 1008\n"
             "6. \"fee\"             (numeric or string, optional) default 0.001\n"
+            "7. \"ref_house\"       (numeric, required for now as the last argument) the reference house: while the\n"
+            "                     bill is privately held, the drawee repays in sECX at this house's highest ask of\n"
+            "                     the last 30 days (Gold B). It must have posted a rate.\n"
             "\nIssue (draw + accept) a bill of exchange. v1 single-wallet handshake:\n"
             "this wallet plays drawer, acceptor and initial holder with fresh keys.\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -4071,6 +4077,9 @@ UniValue issuebill(const JSONRPCRequest& request)
     CAmount nFee = 100000;
     if (request.params.size() >= 6)
         nFee = AmountFromValue(request.params[5]);
+    if (request.params.size() < 7 || request.params[6].get_int() <= 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "ref_house is required: the house whose 30-day highest ask the bill repays at (Gold B)");
+    const uint32_t nRefHouseID = (uint32_t)request.params[6].get_int();
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -4079,7 +4088,7 @@ UniValue issuebill(const JSONRPCRequest& request)
 
     CTransactionRef tx;
     std::string strFail = "";
-    if (!pwallet->IssueBill(tx, strFail, vchBody, nAmount, nEscrow, nMaturityHeight, nGraceBlocks, nFee)) {
+    if (!pwallet->IssueBill(tx, strFail, vchBody, nAmount, nEscrow, nMaturityHeight, nGraceBlocks, nFee, nRefHouseID)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -4152,14 +4161,16 @@ UniValue mintnote(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "mintnote\n"
+            HELP_ROLE_HOUSE
             "\nArguments:\n"
             "1. \"id\"     (numeric, required) the house ID number\n"
-            "2. \"units\"  (numeric, required) note units to mint (base-native, 1 unit redeems 1 sat)\n"
+            "2. \"units\"  (numeric, required) note units to mint, mg of gold (1 unit = 1 mg)\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
             "4. \"address\" (string, optional) the holder's FreeBank P2PKH address (a member, for a members-only\n"
             "               house); default a fresh key of this wallet, or a members-only house's own redemption key\n"
-            "\nMint house notes to a fresh holder key. House M-of-N authorized;\n"
-            "capped by the escrow (N + minted <= lambda * active escrow).\n"
+            "\nMint house notes to a fresh holder key. House M-of-N authorized. Needs a rate posted within 24 h; notes plus\n"
+            "deposits stay within the ramped escrow capacity and notes within the till cap, both less the notes owed by\n"
+            "open swaps (gethousecapital: capital_cap_mg, till_cap_mg, pending_swaps_mg).\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("mintnote", "1 100000")
@@ -4813,7 +4824,7 @@ UniValue redeemnote(const JSONRPCRequest& request)
             "1. \"id\"     (numeric, required) the house ID number\n"
             "2. \"units\"  (numeric, required) note units to redeem (a holder's coins must sum exactly to this)\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
-            "\nBurn notes and receive base-coin 1:1 from the house reserves.\n"
+            "\nBurn notes and receive sECX at the house's bid (mg x bid in sats per gram), less any brassage.\n"
             "The payout comes from this wallet's coins (the house's reserves in this version), so the wallet\n"
             "must hold one of the house's active partner keys; from v0.2.26 it refuses otherwise. A holder\n"
             "without the keys lodges a demand (demandnote) and the house pays it.\n"
@@ -4871,7 +4882,8 @@ UniValue demandnote(const JSONRPCRequest& request)
             "- OPEN/STRESSED: the B3 formal demand - notes move onto the consensus\n"
             "  custody script with a STANDING payout authorisation, so the house\n"
             "  can (and must) discharge unilaterally within the demand window;\n"
-            "  in-window discharge pays par exactly. Custody notes cannot\n"
+            "  an in-window discharge pays sECX at no less than the bid at the demand\n"
+            "  (or demand gold tokens in kind: swapnotes). Custody notes cannot\n"
             "  transfer; if the window lapses, protestnote starts the teeth.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
@@ -4974,11 +4986,12 @@ UniValue protestnote(const JSONRPCRequest& request)
             "1. \"id\"     (numeric, required) the house ID number\n"
             "2. \"fee\"    (numeric or string, optional) default 0.001\n"
             "\nProtest this wallet's OLDEST pre-auth demand whose window the house\n"
-            "let lapse (B3). The marked coins start (or join) the house's ONE\n"
-            "continuous insolvency clock: the house is effectively Stressed until\n"
-            "it discharges every protested claim, and expiry without discharge is\n"
-            "the waterfall. Reserves are not redemption - an attestation cannot\n"
-            "clear a protest.\n"
+            "let lapse (B3). The marked coins start (or join) the house's cure: it\n"
+            "is Stressed for 7 days and insolvent at the end unless it discharges\n"
+            "every protested claim. One cure per 180 days: a protest within 180 days\n"
+            "of the last episode's end makes the house insolvent at once (gethouse\n"
+            "shows next_cure_height). Reserves are not redemption - an attestation\n"
+            "cannot clear a protest.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("protestnote", "1")
@@ -5017,12 +5030,11 @@ UniValue dischargedemands(const JSONRPCRequest& request)
             "\nArguments:\n"
             "1. \"id\"     (numeric, required) the house ID number (this wallet must fund its payouts)\n"
             "2. \"fee\"    (numeric or string, optional) default 0.001\n"
-            "3. fromcapital (boolean, optional, default false) gram-notes release (R3-12): a suspended house pays the\n"
-            "               demand in gold from its partners' capital, split pro rata, oldest demands first, while its\n"
-            "               equity is positive (this wallet must hold M partner keys)\n"
+            "3. fromcapital (boolean, optional, default false) removed in v1.2.0 (no gold capital): refused if true\n"
             "\nDischarge the OLDEST outstanding pre-auth demand against the house\n"
-            "(B3): pay the pre-authorised script the consensus floor - par inside\n"
-            "the window, par + the chain rate (10%/yr) after it: from window lapse for a B3\n"
+            "(B3): pay the pre-authorised script the consensus floor in sECX - the units at the\n"
+            "higher of the bid at the demand and the bid now, plus the chain rate (10%/yr) after\n"
+            "the window: from window lapse for a B3\n"
             "demand, from the demand for a queue demand filed while suspended - using the\n"
             "holder's standing authorisation; no holder action is needed. One\n"
             "discharge per call (it takes the house slot); call again next block\n"
@@ -5076,7 +5088,8 @@ UniValue claimnote(const JSONRPCRequest& request)
             "2. \"units\"  (numeric, required) note units to claim (a holder's coins must sum exactly to this)\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
             "\nInsolvency waterfall: burn notes of an INSOLVENT house and take\n"
-            "the pro-rata entitlement min(U, U*pot/units) from its escrow pot.\n"
+            "the pro-rata entitlement from its escrow pot: each mg valued at the house's highest\n"
+            "bid of the 90 days before it failed, scaled down pro rata if the pot is short.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("claimnote", "1 25000")
@@ -5152,7 +5165,7 @@ UniValue listmynotes(const JSONRPCRequest& request)
             "listmynotes\n"
             "\nList this wallet's note holdings, one row per house, with the house's\n"
             "current (effective) status and whether par redemption / demand is open.\n"
-            "Units are base-native (1 unit redeems 1 sat).\n"
+            "Units are mg of gold, paid in sECX at the house's bid.\n"
             "\nResult:\n"
             "[\n"
             "  {\n"
@@ -5318,16 +5331,18 @@ UniValue originatedeposit(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 4 || request.params.size() > 6)
         throw std::runtime_error(
             "originatedeposit\n"
+            HELP_ROLE_HOUSE
             "\nArguments:\n"
             "1. \"id\"        (numeric, required) the house ID number\n"
-            "2. \"principal\" (numeric, required) deposit principal in sats (base-native 1:1)\n"
+            "2. \"principal\" (numeric, required) deposit principal, mg of gold\n"
             "3. \"ratebps\"   (numeric, required) annual rate in basis points (house-set)\n"
             "4. \"maturity\"  (numeric, required) absolute sidechain height the term ends at\n"
             "5. \"fee\"       (numeric or string, optional) default 0.001\n"
             "6. \"address\"   (string, optional) the saver's FreeBank P2PKH address (a member, for a members-only\n"
             "                 house; required there); default a fresh key of this wallet\n"
             "\nHouse issues a term-deposit receipt to a fresh holder key. House M-of-N\n"
-            "authorized; capped by capital (N + D + principal <= lambda * active escrow).\n"
+            "authorized; notes plus deposits stay within the ramped escrow capacity less the notes owed by\n"
+            "open swaps (gethousecapital capital_cap_mg).\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("originatedeposit", "1 1000000 500 5000")
@@ -5430,7 +5445,7 @@ UniValue demanddeposit(const JSONRPCRequest& request)
             "While the house is open or stressed only.\n"
             "\nArguments:\n"
             "1. id         (numeric, required) the house\n"
-            "2. principal  (numeric, required) the receipt's principal, in sats\n"
+            "2. principal  (numeric, required) the receipt's principal, in mg\n"
             "3. address    (string, optional) where the house must pay; default: the receipt's own key\n"
             "4. fee        (numeric, optional) default 0.001\n"
             "\nResult: { \"txid\": \"hex\" }   (keep it: protestdeposit / dischargedeposit take it)\n"
@@ -5469,7 +5484,8 @@ UniValue protestdeposit(const JSONRPCRequest& request)
         throw std::runtime_error(
             "protestdeposit \"txid\" ( fee )\n"
             "\nProtest an unpaid deposit demand (v0.2.29), from nDemandWindow blocks after it: the house becomes\n"
-            "stressed, and insolvent after the stress window unless it pays or suspends.\n"
+            "stressed for its 7-day cure, and insolvent at the end unless it pays or suspends. One cure per 180 days:\n"
+            "within 180 days of the last episode's end the house is insolvent at once.\n"
             "\nArguments:\n"
             "1. txid  (string, required) the demanddeposit transaction\n"
             "2. fee   (numeric, optional) default 0.001\n"
@@ -5550,7 +5566,7 @@ UniValue listdepositdemands(const JSONRPCRequest& request)
         if (pcursor->GetKey(key) && pcursor->GetValue(coin) && !coin.IsSpent() && coin.fDeposit &&
                 coin.nHouseID == nHouseID && NoteDemandIsPreAuth(coin.nDemandHeight) && !mempool.isSpent(key)) {
             const uint32_t nDemandH = NoteDemandHeightOf(coin.nDemandHeight);
-            const uint32_t nBlocks = nNext > coin.nDepositOriginationHeight ? nNext - coin.nDepositOriginationHeight : 0;
+            const uint32_t nBlocks = (uint32_t)ClockSince(coin.nDepositOriginationHeight, nNext);   // clock blocks
             UniValue o(UniValue::VOBJ);
             o.pushKV("txid", key.hash.GetHex());
             o.pushKV("vout", (int)key.n);
@@ -5559,8 +5575,8 @@ UniValue listdepositdemands(const JSONRPCRequest& request)
             o.pushKV("maturity", (uint64_t)coin.nDepositMaturityHeight);
             o.pushKV("demand_height", (uint64_t)nDemandH);
             o.pushKV("protested", NoteDemandIsProtested(coin.nDemandHeight));
-            o.pushKV("protest_opens_at", (uint64_t)(std::max(nDemandH, house.nDeferEndedHeight) +
-                                                    Params().GetConsensus().nDemandWindow));
+            o.pushKV("protest_opens_at", (uint64_t)ClockDeadlineHeight(std::max(nDemandH, house.nDeferEndedHeight),
+                                                                       Params().GetConsensus().nDemandWindow, nNext));
             o.pushKV("due_now_mg", (uint64_t)coin.nDepositPrincipal +   // v1.1.1: whole mg (v1.1.0: "due_now", x1e-8)
                      (uint64_t)DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps));
             arr.push_back(o);
@@ -5665,6 +5681,7 @@ UniValue createpool(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 5)
         throw std::runtime_error(
             "createpool\n"
+            HELP_ROLE_POOL
             "\nArguments:\n"
             "1. \"id\"        (numeric, required) the house ID (== the pool ID; one pool per house)\n"
             "2. \"noteunits\" (numeric, required) note units seeding the note side\n"
@@ -5693,9 +5710,9 @@ UniValue createpool(const JSONRPCRequest& request)
     pwallet->BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    if (chainActive.Height() + 1 < Params().GetConsensus().nNotePoolHeight)
-        throw JSONRPCError(RPC_MISC_ERROR, "House note pools are closed on this network until a later release opens "
-                                           "them (getblockchaininfo note_pools_open); gold-token pools are open");
+    if (!LaterRuleOn(Params().GetConsensus().nNotePoolTime, chainActive.Height() + 1))
+        throw JSONRPCError(RPC_MISC_ERROR, "House note pools are closed on this network until its later-rules time "
+                                           "(getblockchaininfo note_pools_open, later_rules_time); dollar-token pools open at dollar_pools_open");
 
     uint256 txid;
     std::string strFail = "";
@@ -5717,6 +5734,7 @@ UniValue addpoolliquidity(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
             "addpoolliquidity\n"
+            HELP_ROLE_POOL
             "\nArguments:\n"
             "1. \"id\"        (numeric, required) the pool ID (== the house ID)\n"
             "2. \"noteunits\" (numeric, required) note units to add\n"
@@ -5959,7 +5977,8 @@ UniValue signsettle(const JSONRPCRequest& request)
             "1. \"proposal\" (string, required) the hex blob from the counterparty's proposesettle\n"
             "2. \"fee\"      (numeric or string, optional) default 0.001\n"
             "\nRound 2: the responder (who must be the DEBTOR, or a pure swap) presents its\n"
-            "own paper, assembles + funds the final transaction (residual at exact par to\n"
+            "own paper, assembles + funds the final transaction (residual in sECX, at a rate inside\n"
+            "the two houses' lowest-bid / highest-ask band, to\n"
             "the creditor's redemption key), signs its quorum + presenter + inputs, and\n"
             "returns the part-signed tx for the initiator's completesettle.\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -6047,7 +6066,7 @@ UniValue createnetting(const JSONRPCRequest& request)
         throw std::runtime_error(
             "createnetting ownid [houses,...] ( expiryblocks fee )\n"
             "\nStarts a netting round (the Edinburgh exchange): every house in it hands in the other houses' notes\n"
-            "it holds, all are burned, and only net positions are paid, at par. Every house signs. This house joins\n"
+            "it holds, all are burned, and only net positions are paid, in sECX at a rate inside the houses' bid/ask band. Every house signs. This house joins\n"
             "at once and pays the transaction fee. Pass the returned round to each other house's joinnetting, then\n"
             "fundnetting, then signnetting; the last signature sends it.\n"
             "\nArguments:\n"
@@ -6148,7 +6167,7 @@ UniValue fundnetting(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 2)
         throw std::runtime_error(
             "fundnetting ownid \"round\"\n"
-            "\nOnce every house has joined: adds the confirmed coins paying this house's net debt at par (and the fee,\n"
+            "\nOnce every house has joined: adds the confirmed coins paying this house's net debt in sECX at the round's rate (and the fee,\n"
             "for the house that started the round), with change back to this wallet. A house that owes nothing still\n"
             "runs it, to mark its part funded.\n"
             "\nArguments:\n"
@@ -6474,6 +6493,7 @@ UniValue registerhouse(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 5 || request.params.size() > 7)
         throw std::runtime_error(
             "registerhouse\n"
+            HELP_ROLE_HOUSE
             "\nArguments:\n"
             "1. \"tier\"      (numeric, required) liability tier 0-3\n"
             "2. \"threshold\" (numeric, required) approvals M for threshold ops (1 for solo)\n"
@@ -6813,8 +6833,10 @@ UniValue attesthouse(const JSONRPCRequest& request)
             "3. \"allowzero\"  (boolean, optional) default false: attest zero reserves on purpose. Without it the\n"
             "                 wallet refuses an attestation that would prove zero while the house last proved more\n"
             "\nPublish a reserve attestation: proves this wallet's plain\n"
-            "confirmed coins as the house's liquid till. Below the\n"
-            "10% floor the house turns Stressed; recovery needs 15%.\n"
+            "confirmed coins as the house's liquid till (sECX, counted in grams at its\n"
+            "30-day highest ask). An attestation never stresses a house: a till below 2%\n"
+            "of notes only stops issuing. For a suspended house, a till back at 2% of\n"
+            "notes lifts the suspension.\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
             + HelpExampleCli("attesthouse", "1")
@@ -6847,132 +6869,6 @@ UniValue attesthouse(const JSONRPCRequest& request)
     return response;
 }
 
-UniValue bondoraclesubmitter(const JSONRPCRequest& request)
-{
-    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
-        return NullUniValue;
-    }
-
-    if (request.fHelp || request.params.size() > 3)
-        throw std::runtime_error(
-            "bondoraclesubmitter\n"
-            "\nArguments:\n"
-            "1. \"id\"     (numeric, optional) submitter ID to re-bond / top up.\n"
-            "              Omit or 0 to register a NEW submitter key.\n"
-            "2. \"bond\"   (numeric or string, optional) bond to escrow, default 1.0\n"
-            "3. \"fee\"    (numeric or string, optional) default 0.001\n"
-            "\nEscrow a bond and register (or re-bond) a gold-price submitter.\n"
-            "A fresh registration takes a new wallet key and is assigned a dense\n"
-            "ID by consensus when it confirms - one fresh registration per block.\n"
-            "Re-bonding an existing ID CONSOLIDATES its current bond coin into\n"
-            "the new one (only a same-key bond may spend it) and cancels any\n"
-            "pending unbond request.\n"
-            "\nThe price feed is live from v1.1.0: its fixes set the payout price and\n"
-            "token backing (getgoldfix). While there is one block producer no bond\n"
-            "is forfeited (D-2026-11-04-1); a later release sets the height from\n"
-            "which forfeits apply.\n"
-            + HelpRequiringPassphrase(pwallet) +
-            "\nExamples:\n"
-            + HelpExampleCli("bondoraclesubmitter", "")
-            + HelpExampleCli("bondoraclesubmitter", "2 5.0")
-            + HelpExampleRpc("bondoraclesubmitter", "2, 5.0")
-        );
-
-    ObserveSafeMode();
-
-    uint32_t nSubmitterID = 0;
-    if (request.params.size() >= 1 && !request.params[0].isNull())
-        nSubmitterID = request.params[0].get_int();
-
-    CAmount amountBond = COIN;
-    if (request.params.size() >= 2 && !request.params[1].isNull())
-        amountBond = AmountFromValue(request.params[1]);
-
-    CAmount nFee = 100000;
-    if (request.params.size() >= 3 && !request.params[2].isNull())
-        nFee = AmountFromValue(request.params[2]);
-
-    EnsureWalletIsUnlocked(pwallet);
-    pwallet->BlockUntilSyncedToCurrentChain();
-
-    LOCK2(cs_main, pwallet->cs_wallet);
-
-    uint256 txid;
-    uint32_t nAssignedID = 0;
-    std::string strFail = "";
-    if (!pwallet->BondOracleSubmitter(strFail, txid, nAssignedID, nSubmitterID, amountBond, nFee)) {
-        LogPrintf("%s: %s\n", __func__, strFail);
-        throw JSONRPCError(RPC_MISC_ERROR, strFail);
-    }
-
-    UniValue response(UniValue::VOBJ);
-    response.pushKV("txid", txid.ToString());
-    response.pushKV("submitterid", (uint64_t)nAssignedID);
-    if (nSubmitterID == 0)
-        response.pushKV("note", "ID is assigned by consensus at confirmation - "
-                                "re-read it from listoraclesubmitters once this confirms");
-    return response;
-}
-
-UniValue submitoracleprice(const JSONRPCRequest& request)
-{
-    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
-        return NullUniValue;
-    }
-
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
-        throw std::runtime_error(
-            "submitoracleprice\n"
-            "\nArguments:\n"
-            "1. \"id\"     (numeric, required) this wallet's submitter ID\n"
-            "2. \"price\"  (numeric, required) the gold price in SATS OF sECX PER GRAM of gold (gram-notes release)\n"
-            "3. \"fee\"    (numeric or string, optional) default 0.0001\n"
-            "\nSubmit one gold price observation (stream 1, the same as submitoracleobs id\n"
-            "[{\"stream\":1,\"value\":price}]). It counts toward a fix while it is your latest observation within the\n"
-            "price window; a fix forms once a quorum of the stream's recent reporters have one in the window, and\n"
-            "the payout price follows the 144-block median of fixes (with the deep trusted pools).\n"
-            "\nUNITS: sats per gram. If ECX trades at E dollars and gold at G dollars a gram, the price is\n"
-            "G / E x 1e8. (Before the gram-notes release this RPC took milligrams of gold per 1000 ECX - an old\n"
-            "driver sending that unit would report a price wildly off; values outside 1 .. 1e15 are refused.)\n"
-            + HelpRequiringPassphrase(pwallet) +
-            "\nExamples:\n"
-            + HelpExampleCli("submitoracleprice", "1 110000")
-            + HelpExampleRpc("submitoracleprice", "1, 110000")
-        );
-
-    ObserveSafeMode();
-
-    const uint32_t nSubmitterID = request.params[0].get_int();
-    const int64_t nPriceSigned = request.params[1].get_int64();
-    if (nPriceSigned <= 0 || nPriceSigned > 1000000000000000LL)
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Price must be 1 .. 1e15 sats per gram!");
-    const uint64_t nPrice = (uint64_t)nPriceSigned;
-
-    CAmount nFee = 10000;
-    if (request.params.size() >= 3 && !request.params[2].isNull())
-        nFee = AmountFromValue(request.params[2]);
-
-    EnsureWalletIsUnlocked(pwallet);
-    pwallet->BlockUntilSyncedToCurrentChain();
-
-    LOCK2(cs_main, pwallet->cs_wallet);
-
-    uint256 txid;
-    std::string strFail = "";
-    if (!pwallet->SubmitOraclePrice(strFail, txid, nSubmitterID, nPrice, nFee)) {
-        LogPrintf("%s: %s\n", __func__, strFail);
-        throw JSONRPCError(RPC_MISC_ERROR, strFail);
-    }
-
-    UniValue response(UniValue::VOBJ);
-    response.pushKV("txid", txid.ToString());
-    response.pushKV("targetheight", (uint64_t)(chainActive.Height() + 1));
-    return response;
-}
-
-// DEFER / RENEW: identical RPC shape, so one implementation with a flag.
 static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -6987,13 +6883,13 @@ static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
             "1. \"id\"   (numeric, required) the house ID number\n"
             "2. \"fee\"  (numeric or string, optional) default 0.001\n"
             + (fRenew
-                ? "\nRETIRED in v0.2.18: a suspension has no end date, so there is nothing\n"
+                ? "\nRETIRED in v0.2.18: a suspension can't be extended, so there is nothing\n"
                   "to renew. Always returns an error.\n"
                 : "\nInvoke the option clause (ARCH s7 Option (c)): a STRESSED house\n"
-                  "suspends par redemption, with no end date. Holders queue (demandnote)\n"
+                  "suspends payment for at most 12 months, then becomes Insolvent. Holders queue (demandnote)\n"
                   "and earn the scheduled rate (gethouse defer_interest_bps) from the date\n"
                   "of demand; the house may pay demanded notes while suspended. Recovery\n"
-                  "(an attestation at floor+buffer) lifts it. A suspended house that\n"
+                  "(an attestation proving a till of 2% of notes) lifts it. A suspended house that\n"
                   "misses 2 attestation cadences and then stays silent until\n"
                   "defer_silence_insolvent_height becomes Insolvent. Refused at Open\n"
                   "(nothing to defer) and at Insolvent (resolution, never suspension).\n"
@@ -7007,9 +6903,9 @@ static UniValue DeferOrRenewRPC(const JSONRPCRequest& request, bool fRenew)
     // v0.2.18 (operator Q4): the op is invalid from block 0. Say so plainly,
     // before touching the wallet, rather than "Method not found".
     if (fRenew)
-        throw JSONRPCError(RPC_MISC_ERROR, "renewdeferral is retired (v0.2.18): a suspension has no end date, "
+        throw JSONRPCError(RPC_MISC_ERROR, "renewdeferral is retired (v0.2.18): a suspension can't be extended, "
                                            "so there is nothing to renew. Keep attesting on cadence; a recovery "
-                                           "attestation at floor + buffer reopens the house.");
+                                           "attestation proving a till of 2% of notes reopens the house.");
 
     ObserveSafeMode();
     const uint32_t nHouseID = request.params[0].get_int();
@@ -7187,8 +7083,8 @@ UniValue retirebill(const JSONRPCRequest& request)
             "2. \"fee\"    (numeric or string, optional) default 0.001\n"
             "3. \"notes\"  (numeric, optional) default 0. A bill a discount house holds\n"
             "             only: pay up to this many units of the house's OWN notes,\n"
-            "             burned at par (1 unit = 1 sat of face); the rest is paid in\n"
-            "             sECX. Whole plain (undemanded) note coins are burned, the\n"
+            "             burned at par (1 unit = 1 mg of face); the rest is paid in\n"
+            "             sECX at the 30-day highest ask of the house (or reference house). Whole plain (undemanded) note coins are burned, the\n"
             "             largest that still fit, never more than face.\n"
             "\nRetire a bill: the drawee (acceptor) pays face to the current\n"
             "holder and reclaims the escrow bond.\n"
@@ -7316,6 +7212,7 @@ UniValue proposediscount(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
             "proposediscount\n"
+            HELP_ROLE_BILL
             "\nArguments:\n"
             "1. \"id\"           (numeric, required) the bill to sell\n"
             "2. \"houseid\"      (numeric, required) the house asked to buy it\n"
@@ -7366,13 +7263,14 @@ UniValue signdiscount(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
         throw std::runtime_error(
             "signdiscount\n"
+            HELP_ROLE_HOUSE
             "\nArguments:\n"
             "1. \"proposal\" (string, required) the hex blob from the seller's proposediscount\n"
             "2. \"fee\"      (numeric or string, optional) default 0.001; must clear the\n"
             "                endorsement fee floor for the bill's chain length\n"
             "\nRound 2, from the BUYING HOUSE's wallet: assemble and fund the whole\n"
-            "transaction, mint the priced note leg to the seller, prove live reserves\n"
-            "(rho-at-mint), and sign the house quorum plus the house's own inputs.\n"
+            "transaction, mint the priced note leg to the seller, prove a till of 2% of\n"
+            "notes (sECX at the house's 30-day highest ask), and sign the house quorum plus the house's own inputs.\n"
             "Returns the part-signed transaction for the seller's completediscount.\n"
             "\nEvery claim in the proposal is re-derived from the chain here; only the\n"
             "price and the expiry are the seller's to set.\n"
@@ -7382,7 +7280,7 @@ UniValue signdiscount(const JSONRPCRequest& request)
             "  \"face_mg\": n,           (numeric) what the drawee owes at maturity, mg of gold\n"
             "  \"price_mg\": n,          (numeric) what the house pays now (new notes to the seller), mg of gold\n"
             "  \"bond\": x.xxx,          (numeric) the seller's bond in escrow, sECX\n"
-            "  \"payout_price\": n,      (numeric) sats per gram the two figures below use (null: no price yet)\n"
+            "  \"repay_rate\": n,        (numeric) sats per gram the bill repays at, the two figures below use (null: no rate)\n"
             "  \"max_deficiency\": x.xxx, (numeric) face not covered by the bond, sECX at that price\n"
             "  \"max_loss\": x.xxx       (numeric) price minus bond, sECX at that price: the most the house loses if the drawee pays\n"
             "                            nothing. Recourse to the seller is CAPPED at the bond, not added to it\n"
@@ -7423,8 +7321,9 @@ UniValue signdiscount(const JSONRPCRequest& request)
         if (!pbilltree->GetBill(prop.nBillID, bill))
             return response;
     }
-    // v1.1.1: the face and price are mg of gold, the bond sECX; the two loss figures compare them at the payout price
-    // (v1.1.0 subtracted sECX from mg).
+    // v1.1.1: the face and price are mg of gold, the bond sECX; the two loss figures compare them at the rate the bill
+    // repays at once discounted: the BUYING house's highest ask of the last 30 days (a bill a house holds repays at its
+    // own ask; security stage A W3: the reference house's ask could show a loss of 0).
     response.pushKV("face_mg", (uint64_t)bill.amount);
     response.pushKV("price_mg", (uint64_t)prop.amountPrice);
     response.pushKV("bond", ValueFromAmount(bill.amountEscrow));
@@ -7432,18 +7331,19 @@ UniValue signdiscount(const JSONRPCRequest& request)
     bool fPrice;
     {
         LOCK(cs_main);
-        CUnitsView units(punitsdb.get());
-        fPrice = PayoutPrice(units, chainActive.Height(), Params().GetConsensus().GramAt(chainActive.Height()), nPrice);
+        uint64_t nBidUnused = 0;
+        const uint32_t nRepayHouse = prop.nHouseID;
+        fPrice = HouseRateMaxForChecks(nRepayHouse, chainActive.Height() + 1, 30, nBidUnused, nPrice) && nPrice > 0;
     }
     if (fPrice) {
         auto toSats = [nPrice](uint64_t nMg) {
             return (CAmount)std::min<unsigned __int128>(((unsigned __int128)nMg * nPrice + 999) / 1000, (unsigned __int128)MAX_MONEY);
         };
-        response.pushKV("payout_price", nPrice);
+        response.pushKV("repay_rate", nPrice);
         response.pushKV("max_deficiency", ValueFromAmount(std::max<CAmount>(0, toSats((uint64_t)bill.amount) - bill.amountEscrow)));
         response.pushKV("max_loss", ValueFromAmount(std::max<CAmount>(0, toSats((uint64_t)prop.amountPrice) - bill.amountEscrow)));
     } else {
-        response.pushKV("payout_price", NullUniValue);
+        response.pushKV("repay_rate", NullUniValue);
         response.pushKV("max_deficiency", NullUniValue);
         response.pushKV("max_loss", NullUniValue);
     }
@@ -7608,6 +7508,7 @@ UniValue listmybills(const JSONRPCRequest& request)
         obj.pushKV("status", std::string(1, bill.status));
         obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
         obj.pushKV("grace_blocks", (uint64_t)bill.nGraceBlocks);
+        obj.pushKV("ref_house_id", (uint64_t)bill.nRefHouseID);   // Gold B: the house whose 30-day highest ask it repays at
 
         UniValue roles(UniValue::VARR);
         if (fHolder) roles.push_back("holder");
@@ -8240,7 +8141,7 @@ static const CRPCCommand commands[] =
     { "BitAssets",          "transferasset",                    &transferasset,                 {"asset_id", "address", "units", "fee"} },
     { "BitAssets",          "transferassetcontrol",             &transferassetcontrol,          {"asset_id", "address", "fee"} },
 
-    { "bills",              "issuebill",                        &issuebill,                     {"body", "face_mg", "escrow", "maturityheight", "graceblocks", "fee"} },
+    { "bills",              "issuebill",                        &issuebill,                     {"body", "face_mg", "escrow", "maturityheight", "graceblocks", "fee", "ref_house"} },
     { "bills",              "endorsebill",                      &endorsebill,                   {"id", "topubkey", "fee"} },
     { "bills",              "retirebill",                       &retirebill,                    {"id", "fee", "notes"} },
     { "bills",              "claimbillescrow",                  &claimbillescrow,               {"id", "fee"} },
@@ -8310,8 +8211,6 @@ static const CRPCCommand commands[] =
     { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee"} },
     { "houses",             "closehouse",                       &closehouse,                    {"id", "fee"} },
 
-    { "oracle",             "bondoraclesubmitter",              &bondoraclesubmitter,           {"id", "bond", "fee"} },
-    { "oracle",             "submitoracleprice",                &submitoracleprice,             {"id", "price", "fee"} },
 };
 
 void RegisterIssuedRPCCommands(CRPCTable& t);   // wallet/issued_wallet.cpp (gram-notes release)

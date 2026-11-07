@@ -79,13 +79,7 @@ static const char DB_TOKEN_CLAIM = 'L';
 // side DBs to the chainstate lifecycle; see HouseDB::WriteBlockEffects).
 static const char DB_SIDE_BEST_BLOCK = 'Z';
 
-// Gold oracle (Phase G-1) - rides the HouseDB batch + marker (spec F-6a: no
-// new side-DB, no new replay family). READ access is oracle-module + RPC
-// only (the inertness tripwire); these keys are batch plumbing.
-static const char DB_ORACLE_FIX = 'g';
-static const char DB_ORACLE_SUB = 'q';
-static const char DB_ORACLE_SUB_KEY = 'k';
-static const char DB_ORACLE_SUB_LAST_ID = 'j';
+// HouseDB keys 'g', 'q', 'k' and 'j' held the retired gold oracle (Gold B); never reuse them.
 
 namespace {
 
@@ -893,10 +887,6 @@ bool HouseDB::WriteHouse(const CHouse& house)
 }
 
 bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock,
-                                const CGoldFix* pFix, bool fEraseFix,
-                                const std::vector<COracleSubmitter>* pvSubmitter,
-                                const std::vector<uint32_t>* pvSubmitterRemove,
-                                const uint32_t* pnLastSubmitterID,
                                 const HouseMemberEffects* pMembers,
                                 const TokenEffects* pTokens)
 {
@@ -908,28 +898,6 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
     }
     if (pnLastID)
         batch.Write(DB_HOUSE_LAST_ID, *pnLastID);
-    // Oracle effects (Phase G-1) share the atomic batch + marker: one crash
-    // window for the whole side-state family.
-    if (pFix)
-        batch.Write(DB_ORACLE_FIX, *pFix);
-    if (fEraseFix)
-        batch.Erase(DB_ORACLE_FIX);
-    if (pvSubmitter) {
-        for (const COracleSubmitter& sub : *pvSubmitter) {
-            batch.Write(std::make_pair(DB_ORACLE_SUB, sub.nSubmitterID), sub);
-            batch.Write(std::make_pair(DB_ORACLE_SUB_KEY, sub.vchPubKey), sub.nSubmitterID);
-        }
-    }
-    if (pvSubmitterRemove) {
-        for (const uint32_t nID : *pvSubmitterRemove) {
-            COracleSubmitter sub;
-            if (Read(std::make_pair(DB_ORACLE_SUB, nID), sub))
-                batch.Erase(std::make_pair(DB_ORACLE_SUB_KEY, sub.vchPubKey));
-            batch.Erase(std::make_pair(DB_ORACLE_SUB, nID));
-        }
-    }
-    if (pnLastSubmitterID)
-        batch.Write(DB_ORACLE_SUB_LAST_ID, *pnLastSubmitterID);
     if (pMembers) {
         for (const auto& kv : pMembers->mapRecord) {
             const auto key = std::make_pair(DB_HOUSE_MEMBER, kv.first);
@@ -1077,74 +1045,6 @@ std::vector<std::pair<uint160, CHouseMember>> HouseDB::ListHouseMembers(uint32_t
         pcursor->Next();
     }
     return v;
-}
-
-bool HouseDB::WriteGoldFix(const CGoldFix& fix)
-{
-    return Write(DB_ORACLE_FIX, fix, true);
-}
-
-bool HouseDB::EraseGoldFix()
-{
-    return Erase(DB_ORACLE_FIX, true);
-}
-
-bool HouseDB::WriteOracleSubmitter(const COracleSubmitter& sub)
-{
-    CDBBatch batch(*this);
-    batch.Write(std::make_pair(DB_ORACLE_SUB, sub.nSubmitterID), sub);
-    batch.Write(std::make_pair(DB_ORACLE_SUB_KEY, sub.vchPubKey), sub.nSubmitterID);
-    return WriteBatch(batch, true);
-}
-
-bool HouseDB::RemoveOracleSubmitter(const uint32_t nID)
-{
-    COracleSubmitter sub;
-    if (!Read(std::make_pair(DB_ORACLE_SUB, nID), sub))
-        return true;    // already gone (crash-resume idempotency)
-    CDBBatch batch(*this);
-    batch.Erase(std::make_pair(DB_ORACLE_SUB_KEY, sub.vchPubKey));
-    batch.Erase(std::make_pair(DB_ORACLE_SUB, nID));
-    return WriteBatch(batch, true);
-}
-
-bool HouseDB::WriteLastOracleSubmitterID(const uint32_t nID)
-{
-    return Write(DB_ORACLE_SUB_LAST_ID, nID, true);
-}
-
-bool HouseDB::GetGoldFix(CGoldFix& fix)
-{
-    return Read(DB_ORACLE_FIX, fix);
-}
-
-bool HouseDB::GetOracleSubmitter(const uint32_t nID, COracleSubmitter& sub)
-{
-    return Read(std::make_pair(DB_ORACLE_SUB, nID), sub);
-}
-
-bool HouseDB::GetOracleSubmitterIDByKey(const std::vector<unsigned char>& vchPubKey, uint32_t& nID)
-{
-    return Read(std::make_pair(DB_ORACLE_SUB_KEY, vchPubKey), nID);
-}
-
-bool HouseDB::GetLastOracleSubmitterID(uint32_t& nID)
-{
-    return Read(DB_ORACLE_SUB_LAST_ID, nID);
-}
-
-std::vector<COracleSubmitter> HouseDB::GetOracleSubmitters()
-{
-    std::vector<COracleSubmitter> vSub;
-    uint32_t nLast = 0;
-    if (!GetLastOracleSubmitterID(nLast))
-        return vSub;
-    for (uint32_t i = 1; i <= nLast; i++) {
-        COracleSubmitter sub;
-        if (GetOracleSubmitter(i, sub))
-            vSub.push_back(sub);
-    }
-    return vSub;
 }
 
 bool HouseDB::GetBestBlock(uint256& hashBlock)

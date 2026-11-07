@@ -85,21 +85,6 @@ uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint25
     return ss.GetHash();
 }
 
-uint256 NoteRedeemVaultSigHash(const uint256& houseID, const CTransaction& tx)
-{
-    CHashWriter hPrevouts(SER_GETHASH, 0);
-    for (const CTxIn& in : tx.vin)
-        hPrevouts << in.prevout;
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/redeem-vault");
-    ss << houseID;
-    ss << hPrevouts.GetHash();
-    ss << BillHashOutputs(tx);
-    ss << tx.vIssuedOut;
-    ss << tx.vVaultMove;
-    return ss.GetHash();
-}
-
 uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
@@ -107,6 +92,33 @@ uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256
     ss << nHouseID;
     ss << nUnitsBurned;
     ss << hashOutputs;   // binds payout + escrow change exactly
+    return ss.GetHash();
+}
+
+bool NoteSwapOpHashLock(const CTransaction& tx, uint256& hashLock)
+{
+    if (tx.nVersion != TRANSACTION_NOTE_VERSION || !IsNoteSwapOp(tx.nNoteOp))
+        return false;
+    switch (tx.nNoteOp) {
+    case NOTE_OP_SWAP: { NoteSwap p; if (!DecodeNotePayload(tx.vchNotePayload, p)) return false; hashLock = p.hashLock; return true; }
+    case NOTE_OP_SWAP_DONE: { NoteSwapDone p; if (!DecodeNotePayload(tx.vchNotePayload, p)) return false; hashLock = p.hashLock; return true; }
+    case NOTE_OP_SWAP_PAY: { NoteSwapPay p; if (!DecodeNotePayload(tx.vchNotePayload, p)) return false; hashLock = p.hashLock; return true; }
+    case NOTE_OP_SWAP_PROTEST: { NoteSwapProtest p; if (!DecodeNotePayload(tx.vchNotePayload, p)) return false; hashLock = p.hashLock; return true; }
+    case NOTE_OP_SWAP_EXPIRE: { NoteSwapExpire p; if (!DecodeNotePayload(tx.vchNotePayload, p)) return false; hashLock = p.hashLock; return true; }
+    case NOTE_OP_SWAP_CLAIM: { NoteSwapClaim p; if (!DecodeNotePayload(tx.vchNotePayload, p)) return false; hashLock = p.hashLock; return true; }
+    }
+    return false;
+}
+
+uint256 NoteSwapSigHash(const NoteSwap& swap, const CTransaction& tx)
+{
+    NoteSwap unsigned_ = swap;
+    unsigned_.vchHolderSig.clear();
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/swap");
+    ss << unsigned_;
+    ss << NoteHashPrevouts(tx);
+    ss << BillHashOutputs(tx);
     return ss.GetHash();
 }
 
@@ -253,11 +265,25 @@ void NoteDemandAccrualWindow(const CHouse& house, uint32_t nDemandTag, uint32_t 
     nEndOut = nEnd;
 }
 
-CAmount NoteDemandInterest(const CHouse& house, uint32_t nDemandTag, uint64_t nUnits,
-                           uint32_t nPayHeight, const Consensus::Params& consensus)
+CAmount NoteDemandInterest(const CHouse& houseIn, uint32_t nDemandTagIn, uint64_t nUnits,
+                           uint32_t nPayHeightIn, const Consensus::Params& consensus)
 {
-    if (NoteDemandHeightOf(nDemandTag) == 0)
+    if (NoteDemandHeightOf(nDemandTagIn) == 0)
         return 0;
+    // Gold B clocks in time (GOLD_B.md §6): the heights below - the demand, the reopen E, the re-suspension I and the
+    // payment - are read as clock blocks (600 s of chain active time each), so interest accrues by time, not by how many
+    // blocks the chain happened to make. The window logic is unchanged; only its inputs are mapped (monotone, so every
+    // order between them holds). Identity when the clock is the height (regtest, unit tests).
+    auto fnClock = [](uint32_t h) -> uint32_t {
+        const int64_t c = ClockAtHeight((int)h);
+        return c <= 0 ? 0 : c >= (int64_t)NOTE_DEMAND_QUEUE_BIT ? NOTE_DEMAND_QUEUE_BIT - 1 : (uint32_t)c;
+    };
+    CHouse house = houseIn;
+    if (house.nDeferEndedHeight != 0) house.nDeferEndedHeight = std::max<uint32_t>(fnClock(house.nDeferEndedHeight), 1);
+    if (house.nDeferInvokedHeight != 0) house.nDeferInvokedHeight = std::max<uint32_t>(fnClock(house.nDeferInvokedHeight), 1);
+    const uint32_t nDemandTag = (nDemandTagIn & NOTE_DEMAND_TAG_BITS) |
+                                std::max<uint32_t>(fnClock(NoteDemandHeightOf(nDemandTagIn)), 1);
+    const uint32_t nPayHeight = fnClock(nPayHeightIn);
     uint32_t nStart = 0, nEnd = 0;
     NoteDemandAccrualWindow(house, nDemandTag, nPayHeight, consensus.nDemandWindow, nStart, nEnd);
     // A QUEUE demand from an earlier episode, paid while the house is suspended
@@ -360,6 +386,11 @@ template bool DecodeNotePayload<NoteTokenKeyset>(const std::vector<unsigned char
 template bool DecodeNotePayload<NoteTokenPost>(const std::vector<unsigned char>&, NoteTokenPost&);
 template bool DecodeNotePayload<NoteTokenClaim>(const std::vector<unsigned char>&, NoteTokenClaim&);
 template bool DecodeNotePayload<NoteTokenCollect>(const std::vector<unsigned char>&, NoteTokenCollect&);
+template bool DecodeNotePayload<NoteSwap>(const std::vector<unsigned char>&, NoteSwap&);
+template bool DecodeNotePayload<NoteSwapDone>(const std::vector<unsigned char>&, NoteSwapDone&);
+template bool DecodeNotePayload<NoteSwapPay>(const std::vector<unsigned char>&, NoteSwapPay&);
+template bool DecodeNotePayload<NoteSwapProtest>(const std::vector<unsigned char>&, NoteSwapProtest&);
+template bool DecodeNotePayload<NoteSwapExpire>(const std::vector<unsigned char>&, NoteSwapExpire&);
 
 void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight)
 {
@@ -425,6 +456,11 @@ void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fCon
         NoteClaim c;
         if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange)
             coin.SetHouseEscrow(fConnected ? c.nHouseID : 0);
+    } else if (tx.nNoteOp == NOTE_OP_SWAP_CLAIM && n == 1) {
+        // Gold B: a swap claim may return escrow change at vout[1]; the contextual check pinned its script.
+        NoteSwapClaim c;
+        if (DecodeNotePayload(tx.vchNotePayload, c) && c.fEscrowChange)
+            coin.SetHouseEscrow(fConnected ? c.nHouseID : 0);
     } else if (tx.nNoteOp == NOTE_OP_TOKEN_COLLECT && n == 0) {
         // v0.2.21: a token collect may return escrow change at vout[0]; the contextual check pinned its script.
         NoteTokenCollect c;
@@ -486,8 +522,47 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
     // v0.2.20: LOCK (4) and UNLOCK (5), reserved inert since v1, are live (the
     // token mint and burn record, D-2026-10-08-1).
     // v0.2.21: 9-12 are the token holders' claim at a failed house (token.h).
-    if (tx.nNoteOp < NOTE_OP_MINT || (tx.nNoteOp > NOTE_OP_PROTEST && !IsTokenClaimOp(tx.nNoteOp)))
+    if (tx.nNoteOp < NOTE_OP_MINT || (tx.nNoteOp > NOTE_OP_PROTEST && !IsTokenClaimOp(tx.nNoteOp) && !IsNoteSwapOp(tx.nNoteOp)))
         return state.DoS(100, false, REJECT_INVALID, "bad-note-op");
+
+    // Gold B (GOLD_B.md §4): the swap ops' shapes. A SWAP hands notes in (no note outputs); the others carry no notes.
+    if (IsNoteSwapOp(tx.nNoteOp)) {
+        if (!tx.vIssuedOut.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-units");
+        if (tx.nNoteOp == NOTE_OP_SWAP) {
+            NoteSwap sw;
+            if (!DecodeNotePayload(tx.vchNotePayload, sw) || sw.nHouseID == 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
+            const bool fZeroAddr = std::all_of(sw.vchEthAddress.begin(), sw.vchEthAddress.end(), [](unsigned char c) { return c == 0; });
+            if (sw.nUnits < NOTE_SWAP_MIN_MG || sw.nUnits > (uint64_t)MAX_MONEY || sw.nChainID == 0 ||
+                    sw.vchContract.size() != 20 || sw.vchEthAddress.size() != 20 || fZeroAddr || sw.hashLock.IsNull() ||
+                    sw.vchHolderPubKey.size() != CPubKey::COMPRESSED_PUBLIC_KEY_SIZE || sw.vchHolderSig.empty() ||
+                    sw.vchHolderSig.size() > 80 || sw.vchPayoutScript.empty() || sw.vchPayoutScript.size() > 128)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
+        } else if (tx.nNoteOp == NOTE_OP_SWAP_DONE) {
+            NoteSwapDone d;
+            if (!DecodeNotePayload(tx.vchNotePayload, d) || d.nHouseID == 0 || d.hashLock.IsNull() || d.vchPreimage.size() != 32)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-done-payload");
+        } else if (tx.nNoteOp == NOTE_OP_SWAP_PAY) {
+            NoteSwapPay p;
+            if (!DecodeNotePayload(tx.vchNotePayload, p) || p.nHouseID == 0 || p.hashLock.IsNull() || p.fWasProtested > 1)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-pay-payload");
+        } else if (tx.nNoteOp == NOTE_OP_SWAP_EXPIRE) {
+            NoteSwapExpire p;
+            if (!DecodeNotePayload(tx.vchNotePayload, p) || p.nHouseID == 0 || p.hashLock.IsNull())
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-expire-payload");
+        } else if (tx.nNoteOp == NOTE_OP_SWAP_CLAIM) {
+            NoteSwapClaim c;
+            if (!DecodeNotePayload(tx.vchNotePayload, c) || c.nHouseID == 0 || c.hashLock.IsNull() || c.fEscrowChange > 1 ||
+                    tx.vout.empty() || (c.fEscrowChange && tx.vout.size() < 2))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-payload");
+        } else {
+            NoteSwapProtest p;
+            if (!DecodeNotePayload(tx.vchNotePayload, p) || p.nHouseID == 0 || p.hashLock.IsNull())
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-protest-payload");
+        }
+        return true;
+    }
 
     // 100 outputs x u64 + M approver sigs + (MINT, R-i7) up to 64 reserve proofs
     // (~145 B each); bounded well above the worst case.

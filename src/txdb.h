@@ -250,7 +250,6 @@ public:
 };
 
 /** Access to the house database (blocks/Houses/) */
-#include <oracle.h>
 #include <house.h>   // v0.2.19: CHouseMember, HouseMemberPrior, HouseMemberEffects
 #include <token.h>   // v0.2.21: the token claim records
 
@@ -267,10 +266,6 @@ public:
      * aborts on divergence instead of double-applying (which the ATTEST
      * priors check would turn into a permanent canonical-chain rejection). */
     bool WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock,
-                           const CGoldFix* pFix = nullptr, bool fEraseFix = false,
-                           const std::vector<COracleSubmitter>* pvSubmitter = nullptr,
-                           const std::vector<uint32_t>* pvSubmitterRemove = nullptr,
-                           const uint32_t* pnLastSubmitterID = nullptr,
                            const HouseMemberEffects* pMembers = nullptr,
                            const TokenEffects* pTokens = nullptr);
 
@@ -297,19 +292,6 @@ public:
     /** Up to nMax records of one house from keyid start (inclusive), in key order. */
     std::vector<std::pair<uint160, CHouseMember>> ListHouseMembers(uint32_t nHouseID, const uint160& start, size_t nMax);
 
-    /** Gold oracle (Phase G-1, consensus-INERT). Readers: oracle module +
-     * RPC only - consult the inertness tripwire in oracle.h before adding a
-     * call site; promotion is a signed design phase, not a call site. */
-    bool GetGoldFix(CGoldFix& fix);
-    bool WriteGoldFix(const CGoldFix& fix);
-    bool EraseGoldFix();
-    bool WriteOracleSubmitter(const COracleSubmitter& sub);
-    bool RemoveOracleSubmitter(const uint32_t nID);
-    bool WriteLastOracleSubmitterID(const uint32_t nID);
-    bool GetOracleSubmitter(const uint32_t nID, COracleSubmitter& sub);
-    bool GetOracleSubmitterIDByKey(const std::vector<unsigned char>& vchPubKey, uint32_t& nID);
-    bool GetLastOracleSubmitterID(uint32_t& nID);
-    std::vector<COracleSubmitter> GetOracleSubmitters();
     bool GetBestBlock(uint256& hashBlock);
     bool WriteBestBlock(const uint256& hashBlock);
 

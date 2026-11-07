@@ -13,7 +13,6 @@
 #include <token.h>
 #include <house.h>
 #include <note.h>
-#include <oracle.h>   // IsOracleBondScript
 #include <pool.h>
 #include <pubkey.h>
 #include <script/script.h>
@@ -44,8 +43,6 @@ template bool DecodeIssuedPayload<IssuedCreate>(const std::vector<unsigned char>
 template bool DecodeIssuedPayload<IssuedMint>(const std::vector<unsigned char>&, IssuedMint&);
 template bool DecodeIssuedPayload<IssuedBurn>(const std::vector<unsigned char>&, IssuedBurn&);
 template bool DecodeIssuedPayload<IssuedFreeze>(const std::vector<unsigned char>&, IssuedFreeze&);
-template bool DecodeIssuedPayload<IssuedBond>(const std::vector<unsigned char>&, IssuedBond&);
-template bool DecodeIssuedPayload<IssuedUnbond>(const std::vector<unsigned char>&, IssuedUnbond&);
 template bool DecodeIssuedPayload<IssuedPoolCreate>(const std::vector<unsigned char>&, IssuedPoolCreate&);
 template bool DecodeIssuedPayload<IssuedPoolAdd>(const std::vector<unsigned char>&, IssuedPoolAdd&);
 template bool DecodeIssuedPayload<IssuedPoolRemove>(const std::vector<unsigned char>&, IssuedPoolRemove&);
@@ -65,11 +62,6 @@ CScript CreationBurnScript()
     return CScript() << OP_RETURN << std::vector<unsigned char>{'F', 'B', 'C', 'F'};
 }
 
-CAmount CreationBurnSats(uint64_t nSatsPerGram, uint64_t nCreateFeeMg)
-{
-    const unsigned __int128 n = ((unsigned __int128)nCreateFeeMg * nSatsPerGram + 999) / 1000;
-    return n > (unsigned __int128)MAX_MONEY ? MAX_MONEY : (CAmount)n;
-}
 
 bool IsTokenPoolScript(const CScript& script, uint256* pTokenID)
 {
@@ -100,27 +92,6 @@ uint256 IssuedPoolOpToken(const CTransaction& tx)
     case ISSUED_OP_POOL_SWAP: { IssuedPoolSwap x; return DecodeIssuedPayload(tx.vchIssuedPayload, x) ? x.tokenID : uint256(); }
     }
     return uint256();
-}
-
-static const unsigned char ISSUED_BOND_TAG[4] = {'F', 'B', 'I', 'B'};
-
-CScript IssuedBondScript(const uint256& tokenID)
-{
-    std::vector<unsigned char> v(ISSUED_BOND_TAG, ISSUED_BOND_TAG + 4);
-    v.insert(v.end(), tokenID.begin(), tokenID.end());
-    return CScript() << v << OP_DROP << OP_TRUE;
-}
-
-bool IsIssuedBondScript(const CScript& script, uint256* pTokenID)
-{
-    // 0x24 <36 bytes> OP_DROP OP_TRUE
-    if (script.size() != 39 || script[0] != 0x24 || script[37] != OP_DROP || script[38] != OP_TRUE)
-        return false;
-    if (!std::equal(ISSUED_BOND_TAG, ISSUED_BOND_TAG + 4, script.begin() + 1))
-        return false;
-    if (pTokenID)
-        std::copy(script.begin() + 5, script.begin() + 37, pTokenID->begin());
-    return true;
 }
 
 namespace {
@@ -165,20 +136,6 @@ std::vector<unsigned char> IssuedPayloadSigForm(const CTransaction& tx)
         IssuedFreeze x;
         if (!DecodeIssuedPayload(tx.vchIssuedPayload, x)) return tx.vchIssuedPayload;
         x.vchFreezeSig.clear();
-        ss << x;
-        break;
-    }
-    case ISSUED_OP_BOND: {
-        IssuedBond x;
-        if (!DecodeIssuedPayload(tx.vchIssuedPayload, x)) return tx.vchIssuedPayload;
-        x.vchIssuerSig.clear();
-        ss << x;
-        break;
-    }
-    case ISSUED_OP_UNBOND: {
-        IssuedUnbond x;
-        if (!DecodeIssuedPayload(tx.vchIssuedPayload, x)) return tx.vchIssuedPayload;
-        x.vchIssuerSig.clear();
         ss << x;
         break;
     }
@@ -275,52 +232,16 @@ static bool CheckPoolLpOut(const CTransaction& tx, const uint256& token, uint64_
     return true;
 }
 
-/** Which transactions may move gold into or out of house vaults (step 5): a partner's TOPUP (in) and RECLAIM (out),
- *  the house's TILL (both). The house section checks each move against the op (CheckHouseVaultMoves). */
-static bool VaultMovesAllowed(const CTransaction& tx)
-{
-    return (tx.nVersion == TRANSACTION_HOUSE_VERSION &&
-            (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_RECLAIM || tx.nHouseOp == HOUSE_OP_TILL)) ||
-           // step 6: a redemption paid in gold from the till (the REDEEM check holds it to the house's till, out)
-           (tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_REDEEM) ||
-           // 5b: a failed house's gold paid out in kind - note claims, and CLOSE sending the rest to the fund
-           (tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_CLAIM) ||
-           (tx.nVersion == TRANSACTION_DEPOSIT_VERSION && tx.nDepositOp == DEPOSIT_OP_CLAIM) ||
-           (tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_COLLECT) ||
-           (tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_CLOSE);
-}
-
 bool CheckIssuedShape(const CTransaction& tx, std::string& strReason)
 {
     if (!HasIssuedAnnex(tx.nVersion))
         return true;
-    // Review round 1 (G5): a coinbase never carries an annex or vault moves - it skips the input-side checks, so it
-    // would create units from nothing.
+    // Review round 1 (G5): a coinbase never carries an annex - it skips the input-side checks, so it would create units
+    // from nothing.
     if (tx.IsCoinBase()) { strReason = "bad-issued-coinbase"; return false; }
 
-    if (!tx.vVaultMove.empty()) {
-        if (!VaultMovesAllowed(tx)) { strReason = "bad-vault-move-op"; return false; }
-        if (tx.vVaultMove.size() > MAX_ISSUED_OUTS) { strReason = "bad-vault-move-size"; return false; }
-        std::set<uint256> setToken;
-        for (size_t k = 0; k < tx.vVaultMove.size(); k++) {
-            const CVaultMove& m = tx.vVaultMove[k];
-            if (m.nHouseID == 0 || m.nKind > VAULT_TILL || (m.nKind == VAULT_TILL && m.nPartner != 0) ||
-                    m.tokenID.IsNull() || m.nDelta == 0 || m.nDelta > MAX_MONEY || m.nDelta < -MAX_MONEY) {
-                strReason = "bad-vault-move"; return false;
-            }
-            if (k > 0) {
-                const CVaultMove& p = tx.vVaultMove[k - 1];
-                const auto a = std::make_tuple(p.nHouseID, p.nKind, p.nPartner, p.tokenID);
-                const auto b = std::make_tuple(m.nHouseID, m.nKind, m.nPartner, m.tokenID);
-                if (!(a < b)) { strReason = "bad-vault-move-order"; return false; }
-            }
-            setToken.insert(m.tokenID);
-        }
-        if (setToken.size() > MAX_ISSUED_TOKENS_PER_TX) { strReason = "bad-vault-move-tokens"; return false; }
-    }
-
     if (!tx.vIssuedOut.empty()) {
-        if (!IssuedAnnexAllowed(tx) && !VaultMovesAllowed(tx)) { strReason = "bad-issued-annex-op"; return false; }
+        if (!IssuedAnnexAllowed(tx)) { strReason = "bad-issued-annex-op"; return false; }
         if (tx.vIssuedOut.size() > MAX_ISSUED_OUTS) { strReason = "bad-issued-annex-size"; return false; }
         std::set<uint256> setToken;
         for (size_t k = 0; k < tx.vIssuedOut.size(); k++) {
@@ -353,7 +274,8 @@ bool CheckIssuedShape(const CTransaction& tx, std::string& strReason)
     case ISSUED_OP_CREATE: {
         IssuedCreate x;
         if (!DecodeIssuedPayload(tx.vchIssuedPayload, x)) { strReason = "bad-issued-create-payload"; return false; }
-        if (x.nKind != ISSUED_KIND_GOLD_MG && x.nKind != ISSUED_KIND_USD_CENTS) { strReason = "bad-issued-create-kind"; return false; }
+        // Gold B (D-2026-11-07-1): gold tokens live on Ethereum, in each house's own custody; no gold kind on FreeBank.
+        if (x.nKind != ISSUED_KIND_USD_CENTS) { strReason = "bad-issued-create-kind"; return false; }
         if (!IsValidAssetTicker(x.strTicker)) { strReason = "bad-issued-create-ticker"; return false; }
         if (!IsCompressedKey(x.vchIssuerKey)) { strReason = "bad-issued-create-issuer-key"; return false; }
         if (!x.vchFreezeKey.empty() && !IsCompressedKey(x.vchFreezeKey)) { strReason = "bad-issued-create-freeze-key"; return false; }
@@ -393,29 +315,14 @@ bool CheckIssuedShape(const CTransaction& tx, std::string& strReason)
     case ISSUED_OP_UNFREEZE: {
         IssuedFreeze x;
         if (!DecodeIssuedPayload(tx.vchIssuedPayload, x)) { strReason = "bad-issued-freeze-payload"; return false; }
-        if (x.tokenID.IsNull() || (x.vOutpoint.empty() && x.vVault.empty()) ||
-                x.vOutpoint.size() + x.vVault.size() > MAX_ISSUED_FREEZE_OUTPOINTS || x.vFrozen.size() != x.vOutpoint.size()) {
+        if (x.tokenID.IsNull() || x.vOutpoint.empty() ||
+                x.vOutpoint.size() > MAX_ISSUED_FREEZE_OUTPOINTS || x.vFrozen.size() != x.vOutpoint.size()) {
             strReason = "bad-issued-freeze-shape"; return false;
         }
         std::set<COutPoint> setSeen;
         for (const COutPoint& o : x.vOutpoint)
             if (!setSeen.insert(o).second) { strReason = "bad-issued-freeze-duplicate"; return false; }
-        std::set<uint32_t> setHouse;
-        for (const CVaultFreezeTarget& v : x.vVault)
-            if (v.nHouseID == 0 || !setHouse.insert(v.nHouseID).second) { strReason = "bad-issued-freeze-duplicate"; return false; }
         if (!tx.vIssuedOut.empty()) { strReason = "bad-issued-annex-op"; return false; }
-        break;
-    }
-    case ISSUED_OP_BOND: {
-        IssuedBond x;
-        if (!DecodeIssuedPayload(tx.vchIssuedPayload, x) || x.tokenID.IsNull()) { strReason = "bad-issued-bond-payload"; return false; }
-        if (!tx.vIssuedOut.empty()) { strReason = "bad-issued-annex-op"; return false; }
-        if (tx.vout.empty() || tx.vout[0].nValue <= 0 || tx.vout[0].scriptPubKey != IssuedBondScript(x.tokenID)) {
-            strReason = "bad-issued-bond-out"; return false;
-        }
-        // Only vout[0] carries the bond script: any other would enter the UTXO set untagged and anyone-can-spend.
-        for (size_t o = 1; o < tx.vout.size(); o++)
-            if (IsIssuedBondScript(tx.vout[o].scriptPubKey)) { strReason = "bad-issued-bond-stray"; return false; }
         break;
     }
     case ISSUED_OP_POOL_CREATE: {
@@ -464,16 +371,6 @@ bool CheckIssuedShape(const CTransaction& tx, std::string& strReason)
             return false;
         break;
     }
-    case ISSUED_OP_UNBOND: {
-        IssuedUnbond x;
-        if (!DecodeIssuedPayload(tx.vchIssuedPayload, x) || x.tokenID.IsNull() || x.fWithdraw > 1) {
-            strReason = "bad-issued-unbond-payload"; return false;
-        }
-        if (!tx.vIssuedOut.empty()) { strReason = "bad-issued-annex-op"; return false; }
-        for (const CTxOut& out : tx.vout)
-            if (IsIssuedBondScript(out.scriptPubKey)) { strReason = "bad-issued-bond-stray"; return false; }
-        break;
-    }
     default:
         strReason = "bad-issued-op";
         return false;
@@ -489,7 +386,7 @@ bool CheckIssuedFlow(const CTransaction& tx, const std::vector<const Coin*>& vSp
     for (const Coin* coin : vSpent) {
         if (!coin || !coin->fIssued)
             continue;
-        if (!HasIssuedAnnex(tx.nVersion) || (!IssuedAnnexAllowed(tx) && !VaultMovesAllowed(tx))) {
+        if (!HasIssuedAnnex(tx.nVersion) || !IssuedAnnexAllowed(tx)) {
             strReason = "bad-issued-input-op"; return false;
         }
         uint64_t& n = mapIn[coin->assetID];
@@ -535,14 +432,6 @@ bool CheckIssuedFlow(const CTransaction& tx, const std::vector<const Coin*>& vSp
         nBurned = x.nBurnLp;
     }
 
-    // Vault moves: units into a vault leave the outputs' side, units out of one join the inputs' side.
-    for (const CVaultMove& m : tx.vVaultMove) {
-        uint64_t& n = m.nDelta > 0 ? mapOut[m.tokenID] : mapIn[m.tokenID];
-        const uint64_t nAbs = m.nDelta > 0 ? (uint64_t)m.nDelta : (uint64_t)(-m.nDelta);
-        if (n > (uint64_t)MAX_MONEY - nAbs) { strReason = "bad-vault-move-units"; return false; }
-        n += nAbs;
-    }
-
     std::set<uint256> setToken;
     for (const auto& p : mapIn) setToken.insert(p.first);
     for (const auto& p : mapOut) setToken.insert(p.first);
@@ -567,13 +456,12 @@ uint256 CreditHashOutputs(const CTransaction& tx)
     ss << std::string("FreeBank/credit-outputs");
     ss << BillHashOutputs(tx);
     ss << tx.vIssuedOut;
-    ss << tx.vVaultMove;
     return ss.GetHash();
 }
 
 bool IsGoldUnpayableScript(const CScript& script)
 {
     return script.IsUnspendable() || IsHouseEscrowScript(script) || IsBillEscrowScript(script) ||
-           IsPoolEscrowScript(script) || IsIssuedBondScript(script) || IsOracleBondScript(script) ||
+           IsPoolEscrowScript(script) ||
            IsNotePreAuthScript(script) || IsTokenPoolScript(script);
 }

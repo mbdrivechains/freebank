@@ -70,7 +70,7 @@ public:
         // tag IS the coin's entire protection. Omitting it here let a reorg over
         // any bond consolidation restore the coin UNTAGGED - free to sweep, and
         // a consensus split between reorged and freshly-synced nodes.
-        ::Serialize(s, txout->fOracleBond);
+        ::Serialize(s, txout->fCustody);
         // v4 (gram-notes release): the issued-token units, as Coin::Serialize.
         ::Serialize(s, txout->fIssued);
         if (txout->fIssued) {
@@ -124,7 +124,7 @@ public:
         ::Unserialize(s, txout->fPoolEscrow);
         ::Unserialize(s, txout->fLpShare);
         ::Unserialize(s, txout->nLpUnits);
-        ::Unserialize(s, txout->fOracleBond);
+        ::Unserialize(s, txout->fCustody);
         ::Unserialize(s, txout->fIssued);
         txout->nIssuedUnits = 0;
         txout->nIssuedFrozen = 0;

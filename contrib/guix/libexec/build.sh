@@ -278,14 +278,14 @@ mkdir -p "$DISTSRC"
     mkdir -p "$OUTDIR"
 
     # The release layout BitWindow downloads (docs-local/release-linux.sh): freebank/bin/{freebankd,freebank-cli,
-    # freebank-tx} stripped, COPYING, README.md; asset freebank-<version>-x86_64-linux-gnu.tar.gz.
+    # freebank-tx} stripped, COPYING, README.md, NOTICE.md; asset freebank-<version>-x86_64-linux-gnu.tar.gz.
     # The easynet build: freebank-easynet/ with the same files plus EASYNET.md; asset freebank-easynet-<version>-<host>.
     STAGE="${PWD}/installed/${PKG}"
     mkdir -p "${STAGE}/bin"
     for b in $BINS; do
         "${HOST}-strip" --strip-all -o "${STAGE}/bin/$(basename "$b")" "$b"
     done
-    cp COPYING README.md "${STAGE}/"
+    cp COPYING README.md NOTICE.md "${STAGE}/"
     if [ -n "${EASYNET:-}" ]; then
         bash contrib/easynet-readme.sh "${DISTNAME##*-}" > "${STAGE}/EASYNET.md"
     fi

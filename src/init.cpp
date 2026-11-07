@@ -8,6 +8,7 @@
 #endif
 
 #include <init.h>
+#include <notices.h>
 
 #include <addrman.h>
 #include <amount.h>
@@ -555,7 +556,8 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-limitdescendantsize=<n>", strprintf("Do not accept transactions if any ancestor would have more than <n> kilobytes of in-mempool descendants (default: %u).", DEFAULT_DESCENDANT_SIZE_LIMIT));
         strUsage += HelpMessageOpt("-vbparams=deployment:start:end", "Use given start/end times for specified version bits deployment (regtest-only)");
         strUsage += HelpMessageOpt("-depositstartheight=<n>", "Credit only slot-130 treasury changes in L1 blocks at or above this L1 height, as a chain restarted on an L1 with a treasury history does (regtest-only; default: 0, all)");
-        strUsage += HelpMessageOpt("-housepoolheight=<n>", "Height from which house note pools are open (regtest-only; default: never, as on every public network)");
+        strUsage += HelpMessageOpt("-housepooltime=<t>", "Median time from which house note pools are open (regtest-only; 0 = from genesis; default: never)");
+        strUsage += HelpMessageOpt("-dollarpooltime=<t>", "Median time from which dollar-token pools are open (regtest-only; 0 = from genesis; default: never)");
         strUsage += HelpMessageOpt("-dormant=<0|1>", "Run the chain dormant (no block after genesis), as FreeBank mainnet ships (regtest-only)");
         strUsage += HelpMessageOpt("-memberopguard=0", "Let a second member op for a house into the mempool, to test the block rule (regtest-only)");
     }
@@ -649,8 +651,8 @@ std::string HelpMessage(HelpMessageMode mode)
 
 std::string LicenseInfo()
 {
-    const std::string URL_SOURCE_CODE = "<https://github.com/bitcoin/bitcoin>";
-    const std::string URL_WEBSITE = "<https://bitcoincore.org>";
+    const std::string URL_SOURCE_CODE = "<https://github.com/mbdrivechains/freebank>";
+    const std::string URL_WEBSITE = "<https://github.com/mbdrivechains/freebank>";
 
     return CopyrightHolders(strprintf(_("Copyright (C) %i-%i"), 2009, COPYRIGHT_YEAR) + " ") + "\n" +
            "\n" +
@@ -662,7 +664,7 @@ std::string LicenseInfo()
                URL_SOURCE_CODE) +
            "\n" +
            "\n" +
-           _("This is experimental software.") + "\n" +
+           FREEBANK_NOTICE_SHORT +
            strprintf(_("Distributed under the MIT software license, see the accompanying file %s or %s"), "COPYING", "<https://opensource.org/licenses/MIT>") + "\n" +
            "\n" +
            strprintf(_("This product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit %s and cryptographic software written by Eric Young and UPnP software written by Thomas Bernard."), "<https://www.openssl.org>") +
@@ -1256,8 +1258,8 @@ bool AppInitParameterInteraction()
     // its regtest knob is refused loudly rather than silently ignored - a gate
     // that still passes it is testing a rule that no longer exists.
     if (gArgs.IsArgSet("-deferwindow"))
-        return InitError(_("-deferwindow is retired (v0.2.18: a suspension has no end date; a suspended "
-                           "house becomes insolvent only by silence, see nDeferSilenceWindow)."));
+        return InitError(_("-deferwindow is retired (v0.2.18: a suspension can't be extended; a suspended house becomes "
+                           "insolvent by silence (nDeferSilenceWindow) or after nSuspensionCap, 12 months)."));
     if ((gArgs.IsArgSet("-attestcadence") || gArgs.IsArgSet("-stressedwindow")) &&
             chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-attestcadence / -stressedwindow are regtest-only test "
@@ -1505,16 +1507,26 @@ bool AppInitParameterInteraction()
         LogPrintf("Deposits count from L1 height %d (regtest)\n", (int)n);
     }
 
-    if (gArgs.IsArgSet("-housepoolheight")) {
-        // Gram-notes release: house note pools stay closed until a later release sets the height (D-2026-10-31-8
-        // item 9). Regtest may open them so the pool gates keep exercising the code.
+    if (gArgs.IsArgSet("-housepoolheight"))
+        return InitError("-housepoolheight is replaced by -housepooltime (no forks: the later rules switch on by time).");
+    if (gArgs.IsArgSet("-oracleunbonddelay") || gArgs.IsArgSet("-fullforfeittime"))
+        return InitError("-oracleunbonddelay and -fullforfeittime are gone with the gold oracle (Gold B).");
+    if (gArgs.IsArgSet("-housepooltime") || gArgs.IsArgSet("-dollarpooltime")) {
+        // No forks (D-2026-11-05-3): every public network switches the later rules on at one time. Regtest may set
+        // each alone so the gates exercise the code before and after.
         if (!chainparams.MineBlocksOnDemand())
-            return InitError("-housepoolheight may only be set on regtest.");
-        const int64_t n = gArgs.GetArg("-housepoolheight", (int64_t)std::numeric_limits<int>::max());
-        if (n < 0 || n > std::numeric_limits<int>::max())
-            return InitError("-housepoolheight out of range");
-        UpdateNotePoolHeight((int)n);
-        LogPrintf("House note pools open from height %d (regtest)\n", (int)n);
+            return InitError("-housepooltime and -dollarpooltime may only be set on regtest.");
+        const Consensus::Params& cp = chainparams.GetConsensus();
+        int64_t v[2] = {cp.nNotePoolTime, cp.nDollarPoolTime};
+        const char* names[2] = {"-housepooltime", "-dollarpooltime"};
+        for (int i = 0; i < 2; i++) {
+            if (!gArgs.IsArgSet(names[i])) continue;
+            v[i] = gArgs.GetArg(names[i], Consensus::LATER_RULE_NEVER);
+            if (v[i] < 0)
+                return InitError(strprintf("%s out of range", names[i]));
+            LogPrintf("%s=%d (regtest)\n", names[i], v[i]);
+        }
+        UpdateLaterRuleTimes(v[0], v[1]);
     }
 
     if (gArgs.IsArgSet("-vbparams")) {
@@ -1619,6 +1631,19 @@ bool AppInitMain()
         LogPrintf("Startup time: %s\n", DateTimeStrFormat("%Y-%m-%d %H:%M:%S", GetTime()));
     LogPrintf("Default data directory %s\n", GetDefaultDataDir().string());
     LogPrintf("Using data directory %s\n", GetDataDir().string());
+    // The user notice, once per data directory (legal's N; freebankd.cpp prints it to the terminal before -daemon
+    // forks). NOTICE.txt marks it shown and keeps a copy beside the data.
+    {
+        const fs::path pathNotice = GetDataDir() / "NOTICE.txt";
+        if (!fs::exists(pathNotice)) {
+            LogPrintf("%s", FREEBANK_NOTICE_STANDARD);
+            FILE* file = fsbridge::fopen(pathNotice, "w");
+            if (file) {
+                fputs(FREEBANK_NOTICE_STANDARD, file);
+                fclose(file);
+            }
+        }
+    }
     LogPrintf("Using config file %s\n", GetConfigFile(gArgs.GetArg("-conf", BITCOIN_CONF_FILENAME)).string());
     LogPrintf("Using at most %i automatic connections (%i file descriptors available)\n", nMaxConnections, nFD);
 
@@ -1966,7 +1991,7 @@ bool AppInitMain()
                 // Same positional-record hazard on the chainstate side, where
                 // the DOWNGRADE direction is the silent one: an older build
                 // reads fewer fields, ignores the trailing bytes and reports
-                // nothing at all, having quietly dropped fOracleBond and the
+                // nothing at all, having quietly dropped fCustody and the
                 // rest. Skipped only when the chainstate holds nothing yet
                 // (fresh, or just wiped by -reindex / -reindex-chainstate). A
                 // half-flushed chainstate still has head blocks, and

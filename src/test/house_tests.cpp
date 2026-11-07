@@ -696,7 +696,7 @@ BOOST_AUTO_TEST_CASE(gold_brassage_schedule)
     // (here Stressed) owes the spread on the counted gold till / notes against the 2% till floor - par at or above it,
     // the full 4% at a quarter of it, the same quadratic curve between. Nothing about the attested ECX reserves enters.
     uint64_t nTill = 0;
-    g_fnGoldForChecksTestOverride = [&nTill](const CHouse&, int, CGoldCount& count) { count.nTillMg = nTill; };
+    g_fnCapitalForChecksTestOverride = [&nTill](const CHouse&, int, CHouseCapital& cap) { cap.nTillMg = nTill; };
     const int H = 100;
     CHouse house;
     house.nMintedUnits = 1000000000;           // 1 tonne of notes, in mg
@@ -730,7 +730,7 @@ BOOST_AUTO_TEST_CASE(gold_brassage_schedule)
     BOOST_CHECK_EQUAL(GoldBrassageBps(house, H), HOUSE_BRASSAGE_MAX_BPS);
     nTill = 19900000;                          // a whisker under the floor: almost nothing
     BOOST_CHECK(GoldBrassageBps(house, H) < 5);
-    g_fnGoldForChecksTestOverride = nullptr;
+    g_fnCapitalForChecksTestOverride = nullptr;
 }
 
 BOOST_AUTO_TEST_CASE(house_brassage_schedule)
@@ -1586,8 +1586,9 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
     // BOTH this pin and the addendum arithmetic together, or the synthesis
     // silently builds a malformed record and the migration it claims to prove
     // proves nothing.
-    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 13);   // fired again at v9 -> v10 (members-only flags, 1 byte),
-                                                // v10 -> v11 (token backing, 1 u64) and v12 -> v13 (gram snapshot)
+    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 14);   // fired again at v9 -> v10 (members-only flags, 1 byte),
+                                                // v10 -> v11 (token backing, 1 u64), v12 -> v13 (gram snapshot)
+                                                // and v13 -> v14 (Gold B no-cure height u32 + tranche list)
 
     CHouse back;
     CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
@@ -1626,7 +1627,9 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
         static const size_t V11_ADDENDUM = sizeof(uint64_t);
         static const size_t V12_ADDENDUM = 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t);   // the token claim totals
         static const size_t V13_ADDENDUM = 2 * sizeof(uint64_t) + sizeof(uint32_t);       // the gram snapshot + equity
-        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM + V12_ADDENDUM + V13_ADDENDUM));
+        static const size_t V14_ADDENDUM = sizeof(uint32_t) + 1 + sizeof(uint32_t);   // no-cure height, tranches, cure left
+        b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM + V12_ADDENDUM + V13_ADDENDUM +
+                             V14_ADDENDUM));
         CDataStream ssV7(b, SER_NETWORK, PROTOCOL_VERSION);
         CHouse h7;
         ssV7 >> h7;                                   // must not throw
@@ -1794,45 +1797,207 @@ BOOST_AUTO_TEST_CASE(mutual_fund_output_is_locked)
     BOOST_CHECK(!IsHouseEscrowScript(MutualFundScript()));
 }
 
-// Gram-notes release (R3-1): anyone proves a house's equity negative and claims open; a bill unpaid 432 blocks past
-// maturity counts zero, but only when listed and really overdue.
-BOOST_AUTO_TEST_CASE(house_equity_proof)
+// Gold B (D-2026-11-07-2/-3): a house closes only when it doesn't pay a demand. A protest starts a cure (Stressed for
+// the window, then insolvent unless the demand is paid); one cure per 180 days - a fresh protest episode within
+// HOUSE_CURE_SPACING_BLOCKS of the last one's start finds none, and the house is insolvent from that block.
+BOOST_AUTO_TEST_CASE(house_one_cure_per_180_days)
+{
+    CHouse house = MakeGuardHouse();
+    const uint32_t nH1 = 2000;
+    // The first protest episode is a cure.
+    HouseProtestEpisodeStart(house, nH1);
+    BOOST_CHECK_EQUAL(house.nNoCureHeight, 0u);
+    house.nProtestOpen = 1;              // what the protest op writes after the call
+    house.nProtestHeight = nH1;
+    house.nProtestDemandHeight = nH1 - 100;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1), HOUSE_STATUS_STRESSED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1 + HOUSE_STRESSED_WINDOW - 1), HOUSE_STATUS_STRESSED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_INSOLVENT);
+    BOOST_CHECK_EQUAL(HouseInsolventSince(house, nH1 + HOUSE_STRESSED_WINDOW + 5), nH1 + HOUSE_STRESSED_WINDOW);
+    // Cured: the demand paid takes the counter to zero; the heights stay as inert leftovers.
+    house.nProtestOpen = 0;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_OPEN);
+
+    // A second unpaid demand protested within 180 days of the cure's start: no cure, insolvent from that block.
+    {
+        CHouse h = house;
+        const uint32_t nH2 = nH1 + HOUSE_CURE_SPACING_BLOCKS - 1;
+        HouseProtestEpisodeStart(h, nH2);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, nH2);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2 - 1), HOUSE_STATUS_OPEN);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2), HOUSE_STATUS_INSOLVENT);
+        BOOST_CHECK_EQUAL(HouseInsolventSince(h, nH2 + 10), nH2);
+    }
+    // 180 days after the cure's start, a protest is a fresh cure.
+    {
+        CHouse h = house;
+        HouseProtestEpisodeStart(h, nH1 + HOUSE_CURE_SPACING_BLOCKS);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, 0u);
+    }
+
+    // The v14 field round-trips.
+    {
+        CHouse h = house;
+        h.nNoCureHeight = 4242;
+        CDataStream ss(SER_DISK, CLIENT_VERSION);
+        ss << h;
+        CHouse back;
+        ss >> back;
+        BOOST_CHECK_EQUAL(back.nNoCureHeight, 4242u);
+    }
+
+    // The EQUITY op (17) is retired: bad loans never close a house, since a house can repay a bill for its borrower.
+    {
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+        mtx.nHouseOp = HOUSE_OP_RETIRED_EQUITY;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
+        mtx.vchHousePayload = {0x01, 0x00, 0x00, 0x00};
+        CValidationState state;
+        BOOST_CHECK(!CheckHouseTransactionShape(CTransaction(mtx), state));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-op-retired");
+    }
+}
+
+// Gold B clocks in time (GOLD_B.md §6): windows count clock blocks (600 s of chain active time), so a chain that makes a
+// block every 30 minutes (three clock blocks each) runs its windows in a third of the blocks.
+static int64_t SparseClock(int nHeight) { return nHeight <= 0 ? 0 : 3 * (int64_t)nHeight; }
+
+BOOST_AUTO_TEST_CASE(clock_windows_count_time)
+{
+    const ClockAtFn fnPrev = g_fnClockAt;
+    g_fnClockAt = &SparseClock;
+
+    BOOST_CHECK_EQUAL(ClockSince(100, 110), 30);
+    BOOST_CHECK_EQUAL(ClockSince(110, 100), 0);
+    // 1008 clock blocks from block 1000 have run at the first h with 3h - 3000 >= 1008: 1336.
+    BOOST_CHECK_EQUAL(ClockDeadlineHeight(1000, 1008, 5000), 1336u);
+    // Not yet run by 1100 (300 of 1008): estimated 708 blocks on.
+    BOOST_CHECK_EQUAL(ClockDeadlineHeight(1000, 1008, 1100), 1808u);
+    // A bill issued at 1000 naming maturity 2000 (a 1000-clock-block term) matures at 1334 (3 x 334 = 1002 >= 1000).
+    BOOST_CHECK_EQUAL(TermDeadlineHeight(1000, 2000, 0, 5000), 1334u);
+    BOOST_CHECK_EQUAL(TermDeadlineHeight(0, 2000, 0, 5000), 2000u);   // no start: counts from the target
+
+    // The cure: a protest at 2000 runs out at 2000 + 1008/3 = 2336.
+    CHouse house = MakeGuardHouse();
+    house.nProtestOpen = 1;
+    house.nProtestHeight = 2000;
+    house.nProtestDemandHeight = 1900;
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 2335), HOUSE_STATUS_STRESSED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, 2336), HOUSE_STATUS_INSOLVENT);
+    BOOST_CHECK_EQUAL(HouseInsolventSince(house, 2400), 2336u);
+    BOOST_CHECK_EQUAL(HouseInsolventSince(house, 9999), 2336u);   // E never moves
+
+    // One cure per 180 days counts time: 25920 clock blocks = 8640 of these blocks.
+    house.nProtestOpen = 0;
+    {
+        CHouse h = house;
+        HouseProtestEpisodeStart(h, 2000 + 8639);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, 2000u + 8639);
+    }
+    {
+        CHouse h = house;
+        HouseProtestEpisodeStart(h, 2000 + 8640);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, 0u);
+    }
+
+    // Interest accrues by time: a plain demand at 1000 paid at 1100 owes 300 clock blocks of interest, not 100.
+    {
+        CHouse h = MakeGuardHouse();
+        const Consensus::Params& cp = Params().GetConsensus();
+        const uint64_t nUnits = 52560000;
+        BOOST_CHECK_EQUAL(NoteDemandInterest(h, 1000, nUnits, 1100, cp),
+                          NoteDeferralInterest(nUnits, 3000, 3300, cp.vDeferInterestSchedule));
+        g_fnClockAt = nullptr;   // the height clock: 100 blocks
+        BOOST_CHECK_EQUAL(NoteDemandInterest(h, 1000, nUnits, 1100, cp),
+                          NoteDeferralInterest(nUnits, 1000, 1100, cp.vDeferInterestSchedule));
+    }
+
+    g_fnClockAt = fnPrev;
+}
+
+// Gold B ramp (GOLD_B.md §5): each escrow tranche counts 1x, doubling per clean period (180 days of clock blocks) up to
+// the 10% floor's 10x; new escrow starts at 1x; a protest resets every tranche.
+BOOST_AUTO_TEST_CASE(escrow_ramp)
+{
+    const auto fnPrevCap = g_fnCapitalForChecksTestOverride;
+    g_fnCapitalForChecksTestOverride = nullptr;   // the real count (the fixture's rate: 1000 sats per gram, so sats = mg)
+    const uint32_t P = Params().GetConsensus().GramAt(1).nRampPeriodBlocks;
+    CHouse h;
+    h.nHouseID = 9;
+    h.nRegisteredHeight = 100;
+    HousePartner p;
+    p.amountPledge = 1000000;
+    p.status = HOUSE_PARTNER_ACTIVE;
+    h.vPartner.push_back(p);
+    h.vEscrowTranche.emplace_back(0, 1000000, 100);
+    auto fnCap = [&](const CHouse& house, int nHeight) {
+        CHouseCapital cap;
+        BOOST_REQUIRE(HouseCapitalForChecks(house, nHeight, 0, cap));
+        return cap.nCapacityMg;
+    };
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + P - 1), 1000000u);       // 1x
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + P), 2000000u);           // a clean period: 2x
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + 3 * P), 8000000u);       // 8x
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + 4 * P), 10000000u);      // capped at the floor's 10x
+    // A top-up arrives at 1x.
+    h.vPartner[0].amountPledge += 1000000;
+    h.vEscrowTranche.emplace_back(0, 1000000, 100 + 4 * P);
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + 4 * P), 11000000u);
+    // A protest resets every tranche to 1x.
+    h.nProtestHeight = 100 + 4 * P + 10;
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + 4 * P + 10), 2000000u);
+    BOOST_CHECK_EQUAL(fnCap(h, 100 + 5 * P + 10), 4000000u);
+    // ...and so does the end of a suspension (security stage A V1): the time suspended is not clean.
+    CHouse susp = h;
+    susp.nDeferEndedHeight = 100 + 7 * P + 10;
+    BOOST_CHECK_EQUAL(fnCap(susp, 100 + 7 * P + 10), 2000000u);   // back to 1x at the recovery, not 10x
+    BOOST_CHECK_EQUAL(fnCap(susp, 100 + 8 * P + 10), 4000000u);
+    // An exited partner's escrow doesn't count; a record without tranches counts from registration.
+    CHouse legacy = h;
+    legacy.vEscrowTranche.clear();
+    legacy.nProtestHeight = 0;
+    BOOST_CHECK_EQUAL(fnCap(legacy, 100 + P), 4000000u);      // 2,000,000 at 2x
+    legacy.vPartner[0].status = HOUSE_PARTNER_TAIL;
+    BOOST_CHECK_EQUAL(fnCap(legacy, 100 + P), 0u);
+    g_fnCapitalForChecksTestOverride = fnPrevCap;
+}
+
+// Design 2026-11-08: a suspension's recovery that re-arms a live protest CONTINUES its cure with the time left
+// (CHouse::nCureLeft), and the 180-day spacing counts from the end of the last episode (the recovery).
+BOOST_AUTO_TEST_CASE(cure_continues_after_recovery)
+{
+    CHouse h = MakeGuardHouse();
+    h.nProtestOpen = 1;
+    h.nProtestHeight = 100;
+    h.nDeferEndedHeight = 300;   // the recovery that re-armed the protest
+    h.nCureLeft = 50;
+    BOOST_CHECK_EQUAL(HouseCureWindow(h, 300), 50u);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, 349), HOUSE_STATUS_STRESSED);
+    BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, 350), HOUSE_STATUS_INSOLVENT);
+    BOOST_CHECK_EQUAL(HouseInsolventSince(h, 400), 350u);
+    // A fresh protest (no re-arm) gets the whole window.
+    CHouse f = h;
+    f.nDeferEndedHeight = 0;
+    BOOST_CHECK_EQUAL(HouseCureWindow(f, 100), (uint64_t)HOUSE_STRESSED_WINDOW);
+    // The spacing counts from the recovery (the episode's end), not the protest's start.
+    CHouse g = h;
+    g.nProtestOpen = 0;
+    HouseProtestEpisodeStart(g, 300 + HOUSE_CURE_SPACING_BLOCKS - 1);
+    BOOST_CHECK_EQUAL(g.nNoCureHeight, 300u + HOUSE_CURE_SPACING_BLOCKS - 1);
+    CHouse g2 = h;
+    g2.nProtestOpen = 0;
+    HouseProtestEpisodeStart(g2, 300 + HOUSE_CURE_SPACING_BLOCKS);
+    BOOST_CHECK_EQUAL(g2.nNoCureHeight, 0u);
+}
+
+// The overdue bills the chain sees (information for the RPCs and the explorer; no rule reads it, D-2026-11-07-3):
+// this house's bills unpaid nBillOverdueBlocks past maturity.
+BOOST_AUTO_TEST_CASE(house_overdue_bills_seen)
 {
     sidechain_test::SideDBScope sideDBs;
     CHouse house = MakeGuardHouse();
-    house.nMintedUnits = 3000;
-    const int nH = 2000;
-    auto run = [&](const CHouse& h, int nHeight, const HouseEquity& eq, CHouse& out) {
-        auto fnGetHouse = [&](uint32_t id, CHouse& o) { if (id == h.nHouseID) { o = h; return true; } return false; };
-        auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
-            if (o == COutPoint(uint256S("a0"), 0) || o == COutPoint(uint256S("a1"), 0)) {
-                c = GuardEscrowCoin(h.nHouseID, 1000);
-                return true;
-            }
-            return false;
-        };
-        CMutableTransaction mtx;
-        mtx.nVersion = TRANSACTION_HOUSE_VERSION;
-        mtx.nHouseOp = HOUSE_OP_EQUITY;
-        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-        ss << eq;
-        mtx.vchHousePayload.assign(ss.begin(), ss.end());
-        CValidationState state;
-        const bool f = CheckHouseOperation(CTransaction(mtx), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
-                                           fnGetCoin, GuardNoBlock, out);
-        return f ? std::string("OK") : state.GetRejectReason();
-    };
-    HouseEquity eq;
-    eq.nHouseID = house.nHouseID;
-    eq.nPriceHeight = 0;   // the unit-test price (1 mg = 1 sat) at the block before
-    CHouse out;
-
-    // Escrow 2,000 sats = 2,000 mg against 1,500 mg of notes: positive, refused.
-    CHouse rich = house;
-    rich.nMintedUnits = 1500;
-    BOOST_CHECK_EQUAL(run(rich, nH, eq, out), "bad-house-equity-positive");
-
-    // A performing bill of 5,000 in the book: 2,000 + 5,000 - 3,000 > 0, refused...
     CBill bill;
     bill.nBillID = 1;
     bill.billID = uint256S("b1");
@@ -1844,31 +2009,8 @@ BOOST_AUTO_TEST_CASE(house_equity_proof)
     other.billID = uint256S("b2");
     other.nOwnerHouseID = house.nHouseID + 1;
     BOOST_REQUIRE(pbilltree->WriteBills({bill, other}));
-    CHouse book = house;
-    book.nLoanBookFace = 5000;
-    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "bad-house-equity-positive");
-    // ...listed overdue (unpaid past maturity + 432) it counts zero: 2,000 - 3,000 < 0, accepted.
-    eq.vOverdueBillID = {1};
-    BOOST_CHECK_EQUAL(run(book, 1432, eq, out), "bad-house-equity-bill-not-overdue");   // not yet overdue
-    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "OK");
-    BOOST_CHECK_EQUAL(out.nEquityNegativeHeight, (uint32_t)nH);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(out, nH), HOUSE_STATUS_INSOLVENT);
-    BOOST_CHECK_EQUAL(HouseEffectiveStatus(out, nH - 1), HOUSE_STATUS_OPEN);
-    BOOST_CHECK_EQUAL(HouseInsolventSince(out, nH + 10), (uint32_t)nH);
-    // Once insolvent, no second proof.
-    BOOST_CHECK_EQUAL(run(out, nH + 1, eq, out), "bad-house-equity-not-open");
-    // Another house's bill, or the same bill twice, can't be listed.
-    eq.vOverdueBillID = {2};
-    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "bad-house-equity-bill-not-overdue");
-    eq.vOverdueBillID = {1, 1};
-    BOOST_CHECK_EQUAL(run(book, nH, eq, out), "bad-house-equity-duplicate-bill");
-    // The wallet's list: this house's overdue bills only.
-    BOOST_CHECK(HouseOverdueBills(book, nH) == std::vector<uint32_t>{1});
-    BOOST_CHECK(HouseOverdueBills(book, 1432).empty());
-
-    // No bills, no gold, escrow below the notes: negative outright.
-    eq.vOverdueBillID.clear();
-    BOOST_CHECK_EQUAL(run(house, nH, eq, out), "OK");
+    BOOST_CHECK(HouseOverdueBills(house, 2000) == std::vector<uint32_t>{1});
+    BOOST_CHECK(HouseOverdueBills(house, 1432).empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

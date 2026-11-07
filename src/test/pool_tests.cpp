@@ -3,7 +3,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <pool.h>
-#include <chainparams.h>  // UpdateNotePoolHeight
+#include <chainparams.h>  // UpdateLaterRuleTimes
+#include <validation.h>   // LaterRuleOn, chainActive, cs_main
 #include <limits>
 
 #include <bill.h>           // BillHashOutputs
@@ -31,12 +32,17 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                         CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired);
 
-// Gram-notes release: house note pools are closed on every network until a later release sets nNotePoolHeight
-// (D-2026-10-31-8 item 9). These tests exercise the pool rules, so they open the pools; pool_closed_until_height
-// checks the closure itself.
+// Gram-notes release: house note pools are closed while one producer is the only one (D-2026-10-31-8 item 9); no
+// forks (D-2026-11-05-3): they open by themselves at nNotePoolTime. These tests exercise the pool rules, so they open
+// the pools; pool_closed_until_time and later_rule_on_median_time check the closure itself.
+static void SetNotePoolTime(int64_t t)
+{
+    const Consensus::Params& cp = Params().GetConsensus();
+    UpdateLaterRuleTimes(t, cp.nDollarPoolTime);
+}
 struct NotePoolsOpenSetup : public BasicTestingSetup {
-    NotePoolsOpenSetup() { UpdateNotePoolHeight(0); }
-    ~NotePoolsOpenSetup() { UpdateNotePoolHeight(std::numeric_limits<int>::max()); }
+    NotePoolsOpenSetup() { SetNotePoolTime(0); }
+    ~NotePoolsOpenSetup() { SetNotePoolTime(Consensus::LATER_RULE_NEVER); }
 };
 
 BOOST_FIXTURE_TEST_SUITE(pool_tests, NotePoolsOpenSetup)
@@ -1378,9 +1384,9 @@ static std::string PoolCtxRetire(const CMutableTransaction& mtx, int nHeight,
     return state.GetRejectReason();
 }
 
-BOOST_AUTO_TEST_CASE(pool_closed_until_height)
+BOOST_AUTO_TEST_CASE(pool_closed_until_time)
 {
-    // Every house note pool op is refused below nNotePoolHeight, before any payload or DB check.
+    // Every house note pool op is refused before nNotePoolTime, before any payload or DB check.
     const auto fnNoPool = [](uint32_t, CPool&) { return false; };
     const auto fnNoHouse = [](uint32_t, CHouse&) { return false; };
     for (uint8_t op : {POOL_OP_CREATE, POOL_OP_ADD_LIQ, POOL_OP_REMOVE_LIQ, POOL_OP_SWAP, POOL_OP_RETIRE}) {
@@ -1388,13 +1394,11 @@ BOOST_AUTO_TEST_CASE(pool_closed_until_height)
         mtx.nVersion = TRANSACTION_POOL_VERSION;
         mtx.nPoolOp = op;
         CPool poolOut;
-        UpdateNotePoolHeight(500);
-        BOOST_CHECK_EQUAL(PoolCtxReject(mtx, 499, fnNoPool, fnNoHouse, poolOut), "bad-pool-closed");
-        // At the height the closure no longer applies: the op fails on its own checks instead.
-        BOOST_CHECK(PoolCtxReject(mtx, 500, fnNoPool, fnNoHouse, poolOut) != "bad-pool-closed");
-        UpdateNotePoolHeight(std::numeric_limits<int>::max());
+        SetNotePoolTime(Consensus::LATER_RULE_NEVER);
         BOOST_CHECK_EQUAL(PoolCtxReject(mtx, 1000000, fnNoPool, fnNoHouse, poolOut), "bad-pool-closed");
-        UpdateNotePoolHeight(0);
+        // Open: the closure no longer applies, and the op fails on its own checks instead.
+        SetNotePoolTime(0);
+        BOOST_CHECK(PoolCtxReject(mtx, 1, fnNoPool, fnNoHouse, poolOut) != "bad-pool-closed");
     }
 }
 
@@ -1822,6 +1826,22 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
         auto fnSettled = [&](uint32_t nID, CHouse& hh){ if (nID != 7) return false; hh = h; return true; };
         BOOST_CHECK_EQUAL(PoolCtxRetire(spTx, 1100, fnGetPool, fnSettled, houseOut, fRetired), "bad-pool-retire-trigger-settled");
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(later_rule_on_median_time, TestingSetup)
+{
+    // No forks (D-2026-11-05-3): a later rule is on for the block at nHeight once its parent's median time past has
+    // reached the switch time. TestingSetup's active chain is the genesis block alone.
+    LOCK(cs_main);
+    const int64_t nMtp = chainActive[0]->GetMedianTimePast();
+    BOOST_CHECK(LaterRuleOn(nMtp, 1));                         // at the time: on
+    BOOST_CHECK(LaterRuleOn(nMtp - 1, 1));                     // after it: on
+    BOOST_CHECK(!LaterRuleOn(nMtp + 1, 1));                    // before it: off
+    BOOST_CHECK(!LaterRuleOn(nMtp, 2));                        // no parent on the active chain: off
+    BOOST_CHECK(LaterRuleOn(0, 1000000));                      // 0: from genesis, any height
+    BOOST_CHECK(!LaterRuleOn(Consensus::LATER_RULE_NEVER, 1)); // never
+    // Main's time is the end of Michael's bidding.
+    BOOST_CHECK_EQUAL(Consensus::LATER_RULES_TIME_MAIN, 1824940800);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

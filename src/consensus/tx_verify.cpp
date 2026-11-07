@@ -12,7 +12,6 @@
 #include <note.h>
 #include <token.h>
 #include <deposit.h>
-#include <oracle.h>
 #include <pool.h>
 #include <settle.h>
 #include <consensus/consensus.h>
@@ -238,11 +237,10 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
             return false;
     }
 
-    // Oracle transactions (Phase G-1): context-free shape checks
-    if (tx.nVersion == TRANSACTION_ORACLE_VERSION) {
-        if (!CheckOracleTransactionShape(tx, state))
-            return false;
-    }
+    // Gold B (D-2026-11-07-1): the gold oracle is gone. Version 17 is retired: no rule but this one rejects an unknown
+    // version (policy does, consensus doesn't), and HasIssuedAnnex would otherwise parse it with an annex.
+    if (tx.nVersion == TRANSACTION_ORACLE_VERSION)
+        return state.DoS(100, false, REJECT_INVALID, "bad-txns-version-retired");
 
     // Check for negative or overflow output values
     // C6-A (A1): the BitAsset-genesis skip is gone (v10 rejected above), so
@@ -320,6 +318,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
             NoteDemand d;
             if (DecodeNotePayload(tx.vchNotePayload, d)) vchNoteKey = d.vchHolderPubKey;
+        } else if (tx.nNoteOp == NOTE_OP_SWAP) {
+            NoteSwap s;
+            if (DecodeNotePayload(tx.vchNotePayload, s)) vchNoteKey = s.vchHolderPubKey;
         } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
             // The protest's standing IS this pin: only the demand's holder may
             // protest, and with the coins in custody the scriptSig proves
@@ -452,35 +453,6 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     unsigned int nHRetireNoteIn = 0;
     uint64_t nHRetireUnitsIn = 0;
 
-    // For an oracle BOND (v17, Phase G-1), any spent bond escrow coin must
-    // carry THIS submitter's bond script - the registered pubkey is in the
-    // script, so re-bond/top-up consolidation is key-pinned by script
-    // comparison and a cross-submitter sweep fails here, never a db lookup.
-    // Decode once up front; a failed decode leaves the flag false and the
-    // bond guard below rejects any bond-coin spend fail-closed.
-    CScript expectedOracleBondScript;
-    bool fHaveOracleBond = false;
-    CAmount nOracleBondIn = 0;
-    // Gram-notes release: an issuer bond coin (IssuedBondScript) is spent only by its own token's BOND (consolidating
-    // into the new bond) or UNBOND withdrawal; ConnectIssuedTx checks the value and the delay.
-    CScript expectedIssuedBondScript;
-    if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_BOND) {
-        IssuedBond ib;
-        if (DecodeIssuedPayload(tx.vchIssuedPayload, ib))
-            expectedIssuedBondScript = IssuedBondScript(ib.tokenID);
-    } else if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_UNBOND) {
-        IssuedUnbond iu;
-        if (DecodeIssuedPayload(tx.vchIssuedPayload, iu) && iu.fWithdraw)
-            expectedIssuedBondScript = IssuedBondScript(iu.tokenID);
-    }
-    if (tx.nVersion == TRANSACTION_ORACLE_VERSION && tx.nOracleOp == ORACLE_OP_BOND) {
-        OracleBond ob;
-        if (DecodeOraclePayload(tx.vchOraclePayload, ob)) {
-            expectedOracleBondScript = OracleBondScript(ob.vchSubmitterPubKey);
-            fHaveOracleBond = true;
-        }
-    }
-
     std::vector<const Coin*> vSpentCoins;    // for ComputeAssetTags, in vin order
     vSpentCoins.reserve(tx.vin.size());
     CAmount nValueIn = 0;
@@ -535,7 +507,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 const bool fSideA = i < settle.nCountANotes;
                 if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
                         coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
-                        coin.fOracleBond)
+                        coin.fCustody)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
                 if (coin.nHouseID != (fSideA ? settle.nHouseA : settle.nHouseB))
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-issuer");
@@ -550,7 +522,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             } else {
                 if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
                         coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
-                        coin.fOracleBond)
+                        coin.fCustody)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
             }
         }
@@ -562,7 +534,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 const size_t k = vNetBundleOfInput[i];
                 if (!coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
                         coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
-                        coin.fOracleBond)
+                        coin.fCustody)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
                 if (coin.nHouseID != settleNet.vBundle[k].nIssuer)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-bundle-issuer");
@@ -576,7 +548,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             } else {
                 if (coin.fNote || coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow ||
                         coin.fBill || coin.fBillEscrow || coin.fDeposit || coin.IsAssetColoured() ||
-                        coin.fOracleBond)
+                        coin.fCustody)
                     return state.DoS(100, false, REJECT_INVALID, "bad-settle-tagged-input");
             }
         }
@@ -587,7 +559,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         // in a demand), and its units are burned: a bill transaction makes no note outputs.
         if (fHaveHRetireNotes && coin.fNote) {
             if (coin.fPoolEscrow || coin.fLpShare || coin.fHouseEscrow || coin.fBill || coin.fBillEscrow ||
-                    coin.fDeposit || coin.IsAssetColoured() || coin.fOracleBond)
+                    coin.fDeposit || coin.IsAssetColoured() || coin.fCustody)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-tagged-input");
             if (coin.nHouseID != hretireNotes.nOwnerHouseID)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-issuer");
@@ -637,7 +609,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             const bool fRelease = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RELEASE;
             // v0.2.21: a token COLLECT pays token holders from the same pot.
             const bool fClaim = tx.nVersion == TRANSACTION_NOTE_VERSION &&
-                    (tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT);
+                    (tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT ||
+                     tx.nNoteOp == NOTE_OP_SWAP_CLAIM);   // Gold B: a pending swap / shortfall claims from the same pot
             // A deposit CLAIM (v14) pays the subordinated tranche FROM the escrow
             // pot too, so it may spend house escrow (like the note CLAIM).
             const bool fDepClaim = tx.nVersion == TRANSACTION_DEPOSIT_VERSION && tx.nDepositOp == DEPOSIT_OP_CLAIM;
@@ -699,20 +672,10 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             nLpUnitsIn += coin.nLpUnits;
         }
 
-        // Oracle bond guard (Phase G-1, T-o3): a bond escrow coin sits on an
-        // anyone-can-spend script, so this tag gate IS its whole protection -
-        // a plain tx sweeping it is a bond drain and rejected. The only
-        // sanctioned spender is a v17 BOND whose payload key matches the
-        // coin's script (re-bond / top-up consolidation by the SAME
-        // submitter); a SUBMIT eroding its own bond is rejected with the
-        // rest. No unbond-withdraw op exists in the scaffold - deliberate,
-        // the delay is decorative while inert (spec s2) - so until promotion
-        // a bond leaves escrow only by consolidating into a new bond.
+        // Custody guard: a custody-tagged coin sits on an anyone-can-spend script, so the tag is its whole protection.
+        // Since Gold B the only custody coins are token pools' pairs.
         uint256 poolToken;
-        if (coin.fOracleBond && IsIssuedBondScript(coin.out.scriptPubKey)) {
-            if (expectedIssuedBondScript.empty() || coin.out.scriptPubKey != expectedIssuedBondScript)
-                return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-issuer-bond");
-        } else if (coin.fOracleBond && IsTokenPoolScript(coin.out.scriptPubKey, &poolToken)) {
+        if (coin.fCustody && IsTokenPoolScript(coin.out.scriptPubKey, &poolToken)) {
             // Gram-notes release: a token pool's custody pair is spent only by that pool's ADD / REMOVE / SWAP, the
             // token side at vin[0] and the sats side at vin[1].
             const bool fPoolOp = tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) &&
@@ -721,30 +684,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-pool-custody");
             if ((coin.fIssued && i != 0) || (!coin.fIssued && i != 1))
                 return state.DoS(100, false, REJECT_INVALID, "bad-issued-pool-custody-position");
-        } else if (coin.fOracleBond) {
-            if (!fHaveOracleBond)
-                return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-oracle-bond");
-            if (coin.out.scriptPubKey != expectedOracleBondScript)
-                return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-input-key");
-            // Sum what is being consolidated: the new escrow may not be worth
-            // LESS (checked after the loop). Without that, "consolidation" is a
-            // penalty-free unbond - re-bond spending a 1 BTX coin, re-post
-            // vout[0] at one satoshi, take the rest as plain change - and the
-            // scaffold's claim that a bond can only leave escrow into another
-            // bond becomes false. Overflow-safe: MoneyRange holds per coin.
-            if (nOracleBondIn > MAX_MONEY - coin.out.nValue)
-                return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-value-overflow");
-            nOracleBondIn += coin.out.nValue;
+        } else if (coin.fCustody) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-spend-custody");
         }
-
-        // Oracle txs cannot spend any OTHER colored coin: submissions and
-        // bonds are funded from plain value only (mirrors every family's
-        // colored-input rule; keeps oracle-awareness out of the instrument
-        // guards above - the s8.7 multi-tag lesson).
-        if (tx.nVersion == TRANSACTION_ORACLE_VERSION &&
-                (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow || coin.fHouseEscrow ||
-                 coin.fNote || coin.fDeposit || coin.fPoolEscrow || coin.fLpShare))
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-colored-input");
 
         // Note guard: a note coin is locked to its house's v13 TRANSFER /
         // REDEEM / CLAIM (its base value is dust; the claim amount is
@@ -767,7 +709,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             const bool fNoteOpOK = tx.nVersion == TRANSACTION_NOTE_VERSION &&
                     (tx.nNoteOp == NOTE_OP_TRANSFER || tx.nNoteOp == NOTE_OP_REDEEM ||
                      tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_DEMAND ||
-                     tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_LOCK);
+                     tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_LOCK || tx.nNoteOp == NOTE_OP_SWAP);
             const bool fPoolOpOK = tx.nVersion == TRANSACTION_POOL_VERSION &&
                     (tx.nPoolOp == POOL_OP_CREATE || tx.nPoolOp == POOL_OP_ADD_LIQ ||
                      tx.nPoolOp == POOL_OP_SWAP);
@@ -823,7 +765,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         }
         else if (tx.nVersion == TRANSACTION_NOTE_VERSION &&
                 (coin.IsAssetColoured() || coin.fBill || coin.fBillEscrow ||
-                 (coin.fHouseEscrow && tx.nNoteOp != NOTE_OP_CLAIM && tx.nNoteOp != NOTE_OP_TOKEN_COLLECT))) {
+                 (coin.fHouseEscrow && tx.nNoteOp != NOTE_OP_CLAIM && tx.nNoteOp != NOTE_OP_TOKEN_COLLECT &&
+                  tx.nNoteOp != NOTE_OP_SWAP_CLAIM))) {
             return state.DoS(100, false, REJECT_INVALID, "bad-note-colored-input");
         }
 
@@ -882,17 +825,6 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                  (coin.fHouseEscrow && tx.nDepositOp != DEPOSIT_OP_CLAIM))) {
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-colored-input");
         }
-    }
-
-    // Oracle bond conservation: a BOND that consolidates existing bond coins
-    // must re-escrow at least what it took in. The shape gate already pins
-    // vout[0] as the bond output with nValue > 0, so this is the ratchet that
-    // makes "a bond leaves escrow only into another bond" true rather than
-    // aspirational - otherwise a re-bond is an instant, penalty-free unbond.
-    // Topping UP is always allowed; only shrinking is refused.
-    if (nOracleBondIn > 0) {
-        if (tx.vout.empty() || tx.vout[0].nValue < nOracleBondIn)
-            return state.DoS(100, false, REJECT_INVALID, "bad-oracle-bond-value-decrease");
     }
 
     if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -1170,6 +1102,31 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // way a later discharge can know it is retiring this protest.
             if (pro.nDemandTag != (nDemandHeightIn | NOTE_DEMAND_PROTESTED_BIT))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-tag-mismatch");
+        }
+        else if (tx.nNoteOp == NOTE_OP_SWAP) {
+            // Gold B (GOLD_B.md §4): the holder hands in undemanded notes of one house, all of them (no note outputs),
+            // exactly the payload's units; they become the house's pending-swap liability.
+            NoteSwap s;
+            if (!DecodeNotePayload(tx.vchNotePayload, s))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
+            if (nNoteIn == 0 || s.nHouseID != nNoteHouseIn || nNoteUnitsIn != s.nUnits)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-inputs");
+            if (nDemandHeightIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-demanded");
+            if (nHouseEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-spends-escrow");
+        }
+        else if (tx.nNoteOp == NOTE_OP_SWAP_DONE || tx.nNoteOp == NOTE_OP_SWAP_PAY || tx.nNoteOp == NOTE_OP_SWAP_PROTEST) {
+            if (nNoteIn != 0 || nHouseEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-inputs");
+        }
+        else if (tx.nNoteOp == NOTE_OP_SWAP_CLAIM) {
+            // Gold B waterfall: no notes in; escrow of the claimed house only (the entitlement bound is contextual).
+            NoteSwapClaim c;
+            if (!DecodeNotePayload(tx.vchNotePayload, c))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-payload");
+            if (nNoteIn != 0 || nHouseEscrowIn == 0 || nHouseIDIn != c.nHouseID)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-claim-inputs");
         }
         else if (tx.nNoteOp == NOTE_OP_REDEEM) {
             NoteRedeem r;

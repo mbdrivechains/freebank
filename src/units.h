@@ -75,45 +75,38 @@ typedef boost::optional<UnitsValue> UnitsSlot;   // none = no such key
 /** Key prefixes. The DB is new in the gram-notes release; give every record kind its own byte. */
 static const unsigned char UNITS_BEST_BLOCK = 'Z';
 static const unsigned char UNITS_DB_VERSION = 'v';      // -> uint32 the layout version (review 11-04)
-/** The units DB's layout version. 2 = v1.1.0 (the demanded-notes index, burns' cumulative units). A DB with blocks in
- *  it and another (or no) version was written by an earlier build: the node asks for -reindex. */
-static const uint32_t UNITS_DB_VERSION_CURRENT = 2;
+/** The units DB's layout version. 2 = v1.1.0, 3 = no forks (D-2026-11-05-3). 4 = Gold B (D-2026-11-07-1): the oracle,
+ *  vault, bond, exit and reporter records are gone, and the chain clock and house rates are new. A DB with blocks in it
+ *  and another (or no) version was written by an earlier build: the node asks for -reindex. */
+static const uint32_t UNITS_DB_VERSION_CURRENT = 5;   // 5: Gold B clock records per height (H), demand bids (B), shortfall ledger (M)
 static const unsigned char UNITS_BLOCK_UNDO = 'u';
 static const unsigned char UNITS_TEST = '~';     // unit tests only
 static const unsigned char UNITS_ISSUED_TOKEN = 'T';    // + token id -> CIssuedToken (issued.h)
 static const unsigned char UNITS_ISSUED_FROZEN = 'F';   // + outpoint -> uint64 frozen units, set by FREEZE / UNFREEZE
 static const unsigned char UNITS_ISSUED_BURN = 'R';     // + token id + sequence -> CIssuedBurn
 
-static const unsigned char UNITS_VAULT = 'V';          // + house + kind + partner + token -> uint64 units (a gold vault)
-static const unsigned char UNITS_VAULT_TOTAL = 'A';    // + token -> uint64 units of the token in every house's vaults
 static const unsigned char UNITS_TOKEN_POOL = 'L';     // + token id -> CTokenPool (issued.h)
-static const unsigned char UNITS_POOL_SAMPLE = 'Y';    // + token id + height -> CPoolSample
-static const unsigned char UNITS_ORACLE_OBS = 'P';     // + stream + subject + submitter -> COracleObsRec (pricefeed.h)
-static const unsigned char UNITS_ORACLE_FIX = 'X';     // + stream + subject + height -> CPriceFix
-static const unsigned char UNITS_ORACLE_DAY = 'D';     // + day (height / 144) -> uint64 median sats per gram that day
-static const unsigned char UNITS_VAULT_FROZEN = 'G';   // + house + token -> CVaultFrozen (an issuer's freeze on vault gold)
-static const unsigned char UNITS_QUEUE = 'Q';           // + house + demand height -> uint64 units of queued demands (R3-12)
 static const unsigned char UNITS_DEMANDED = 'q';        // + house + demand tag -> uint64 units of demanded notes (3c)
-static const unsigned char UNITS_EXIT = 'E';           // -> CExitState (the exit's step; one record)
-static const unsigned char UNITS_NOPRICE = 'N';        // + start height -> uint32 end height: a run of blocks with no payout price
-static const unsigned char UNITS_NOPRICE_LAST = 'n';   // -> uint32 start of the latest no-price run
-static const unsigned char UNITS_BACKING_ADDRESS = 'b';  // + backing address -> token id (one token per address)
+// Retired with Gold B (never reuse): V A Y P X D G Q E N n b f r k h y w p j.
+// Gold B (D-2026-11-07-1; houserate.h): the chain clock and each house's own rate.
+static const unsigned char UNITS_CHAIN_CLOCK = 'c';      // -> CChainClock (one record: the last connected block's clock)
+static const unsigned char UNITS_CLOCK_AT = 'H';         // + height -> CClockAt the chain's active and monotone time at that block
+static const unsigned char UNITS_SHORTFALL = 'M';        // + house -> CShortfallLedger (failed-swap shortfalls within the lapse)
+static const unsigned char UNITS_DEMAND_BID = 'B';       // + house + demand height -> uint64 the bid in effect at that demand
+static const unsigned char UNITS_HOUSE_RATE = 'o';       // + house -> CHouseRate (its current and previous posted rate)
+static const unsigned char UNITS_RATE_DAY = 'd';         // + house + day -> CRateDay (the highest bid and ask in effect that day)
+static const unsigned char UNITS_RATE_KEY = 'K';         // + house -> the rate key's public key (set by the partners)
+static const unsigned char UNITS_CHARTER = 'C';          // + house -> CHouseCharter (the gold tokens it pays in kind)
+static const unsigned char UNITS_SWAP = 'S';             // + hash lock -> CSwapRecord (every swap ever: H is used once)
+static const unsigned char UNITS_SWAP_PENDING = 'W';     // + house -> uint64 mg of its swaps not yet done or paid
 
 inline UnitsKey IssuedTokenKey(const uint256& tokenID) { return UnitsKey(UNITS_ISSUED_TOKEN).Hash(tokenID); }
 inline UnitsKey IssuedFrozenKey(const uint256& txid, uint32_t n) { return UnitsKey(UNITS_ISSUED_FROZEN).Hash(txid).U32(n); }
 inline UnitsKey IssuedBurnKey(const uint256& tokenID, uint64_t nSeq) { return UnitsKey(UNITS_ISSUED_BURN).Hash(tokenID).U64(nSeq); }
-inline UnitsKey VaultKey(uint32_t nHouseID, uint8_t nKind, uint32_t nPartner, const uint256& tokenID)
-{
-    return UnitsKey(UNITS_VAULT).U32(nHouseID).U8(nKind).U32(nPartner).Hash(tokenID);
-}
-inline UnitsKey VaultTotalKey(const uint256& tokenID) { return UnitsKey(UNITS_VAULT_TOTAL).Hash(tokenID); }
-inline UnitsKey VaultFrozenKey(uint32_t nHouseID, const uint256& tokenID) { return UnitsKey(UNITS_VAULT_FROZEN).U32(nHouseID).Hash(tokenID); }
-inline UnitsKey QueueKey(uint32_t nHouseID, uint32_t nDemandHeight) { return UnitsKey(UNITS_QUEUE).U32(nHouseID).U32(nDemandHeight); }
 /** D-2026-11-04-1 (3c): every demanded note's units by house and full demand tag (the tag fixes how its interest runs),
- *  so a house's equity counts the interest its demands have accrued. */
+ *  so the waterfall counts the interest its demands have accrued. */
 inline UnitsKey DemandedKey(uint32_t nHouseID, uint32_t nDemandTag) { return UnitsKey(UNITS_DEMANDED).U32(nHouseID).U32(nDemandTag); }
 inline UnitsKey TokenPoolKey(const uint256& tokenID) { return UnitsKey(UNITS_TOKEN_POOL).Hash(tokenID); }
-inline UnitsKey PoolSampleKey(const uint256& tokenID, uint32_t nHeight) { return UnitsKey(UNITS_POOL_SAMPLE).Hash(tokenID).U32(nHeight); }
 
 /** One block's undo: the value every key it touched had before it. */
 struct CUnitsBlockUndo

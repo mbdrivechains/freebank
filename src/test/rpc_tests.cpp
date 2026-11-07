@@ -16,7 +16,6 @@
 #include <house.h>
 #include <netbase.h>
 #include <note.h>
-#include <oracle.h>
 #include <pool.h>
 #include <rpc/blockchain.h>
 #include <settle.h>
@@ -502,7 +501,6 @@ BOOST_AUTO_TEST_CASE(rpc_txtouniv_weight_and_credit)
     BOOST_CHECK(CreditFamilyName(3) == nullptr);
     BOOST_CHECK(CreditFamilyName(TRANSACTION_BITASSET_CREATE_VERSION) == nullptr);
     BOOST_CHECK_EQUAL(CreditFamilyName(TRANSACTION_BILL_VERSION), std::string("bill"));
-    BOOST_CHECK_EQUAL(CreditFamilyName(TRANSACTION_ORACLE_VERSION), std::string("oracle"));
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM), "hclaim");
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_NOTES), "hretire_notes");
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_HOUSE_VERSION, HOUSE_OP_RELEASE), "release");
@@ -511,15 +509,21 @@ BOOST_AUTO_TEST_CASE(rpc_txtouniv_weight_and_credit)
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_POOL_VERSION, POOL_OP_ADD_LIQ), "add_liq");
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE), "exchange");
     BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_SETTLE_VERSION, 2), "op_2"); // PRESENT is reserved
-    BOOST_CHECK_EQUAL(CreditOpName(TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT), "submit");
     const std::vector<std::pair<int, int>> vLastOp = {
-        {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW}, {TRANSACTION_HOUSE_VERSION, HOUSE_OP_EQUITY},
+        {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW}, {TRANSACTION_HOUSE_VERSION, HOUSE_OP_MAX},
         {TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST}, {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DISCHARGE},
         {TRANSACTION_POOL_VERSION, POOL_OP_RETIRE}, {TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE},
-        {TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT}, {TRANSACTION_TOKEN_VERSION, ISSUED_OP_POOL_SWAP}};
+        {TRANSACTION_TOKEN_VERSION, ISSUED_OP_POOL_SWAP}};
+    // Gold B retired house ops 16 (TILL), 17 (EQUITY, D-2026-11-07-3) and 18 (TILL_DECLARE) and token ops 7-8 (issuer
+    // BOND / UNBOND): no names.
+    const auto fnRetired = [](int nVersion, int nOp) {
+        return (nVersion == TRANSACTION_HOUSE_VERSION && (nOp == HOUSE_OP_RETIRED_TILL || nOp == HOUSE_OP_RETIRED_EQUITY ||
+                                                          nOp == HOUSE_OP_RETIRED_TILL_DECLARE)) ||
+               (nVersion == TRANSACTION_TOKEN_VERSION && (nOp == ISSUED_OP_RETIRED_BOND || nOp == ISSUED_OP_RETIRED_UNBOND));
+    };
     for (const auto& fam : vLastOp) {
         for (int op = 1; op <= fam.second; op++)
-            BOOST_CHECK_MESSAGE(CreditOpName(fam.first, op).compare(0, 3, "op_") != 0,
+            BOOST_CHECK_MESSAGE(fnRetired(fam.first, op) || CreditOpName(fam.first, op).compare(0, 3, "op_") != 0,
                 strprintf("v%d op %d has no name", fam.first, op));
         BOOST_CHECK_EQUAL(CreditOpName(fam.first, fam.second + 1).compare(0, 3, "op_"), 0);
     }

@@ -21,6 +21,7 @@
 #include <deposit.h>
 #include <hash.h>
 #include <house.h>
+#include <issued.h>
 #include <l1client.h>
 #include <validation.h>
 #include <net.h>
@@ -34,6 +35,7 @@
 #include <sidechainclient.h>
 #include <timedata.h>
 #include <txdb.h>
+#include <units.h>
 #include <util.h>
 #include <utilmoneystr.h>
 #include <validation.h>
@@ -500,6 +502,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
     if (!vDepositSorted.empty() && !psidechaintree->GetLastDepositID(hashLastDepositID))
         LogPrintf("%s: first deposit for this sidechain: %s (mainchain txid)\n", __func__, vDepositSorted.front().dtx.GetHash().ToString());
 
+
     // Create deposit payout output(s)
     //
     // Make sure we don't add too many deposit outputs
@@ -575,7 +578,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
     coinbaseTx.vout[0].nValue = nFees;
 
     if (nFeesOut)
-        *nFeesOut = nFees;
+        *nFeesOut = coinbaseTx.vout[0].nValue;   // what the producer keeps (it bids from this)
 
     // Signal the most recent Withdrawal Bundle created by this sidechain
     if (!hashCurrentWithdrawalBundle.IsNull())
@@ -772,7 +775,8 @@ bool IsClockTx(const CTransaction& tx)
     if (tx.nVersion == TRANSACTION_NOTE_VERSION)
         return tx.nNoteOp == NOTE_OP_REDEEM || tx.nNoteOp == NOTE_OP_DEMAND ||
                tx.nNoteOp == NOTE_OP_PROTEST || tx.nNoteOp == NOTE_OP_CLAIM ||
-               tx.nNoteOp == NOTE_OP_TOKEN_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT;   // v0.2.21: token holders' turn
+               tx.nNoteOp == NOTE_OP_TOKEN_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT ||   // v0.2.21: token holders' turn
+               IsNoteSwapOp(tx.nNoteOp);   // Gold B: the swap's deadline, pay window and claim run on the clock
     if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION)
         return tx.nDepositOp == DEPOSIT_OP_WITHDRAW || tx.nDepositOp == DEPOSIT_OP_CLAIM ||
                tx.nDepositOp == DEPOSIT_OP_DEMAND || tx.nDepositOp == DEPOSIT_OP_PROTEST ||   // v0.2.29
@@ -1223,17 +1227,6 @@ void InclusionLogTemplate(int nHeight, const std::vector<uint256>& vIncluded,
         out.push_back(o);
     }
     e.pushKV("left_out", out);
-    InclusionLogWrite(e);
-}
-
-void InclusionLogDisplace(uint32_t nSubmitter, const uint256& txidOld, const uint256& txidNew)
-{
-    UniValue e(UniValue::VOBJ);
-    e.pushKV("kind", "oracle-displace");
-    e.pushKV("submitter", (uint64_t)nSubmitter);
-    e.pushKV("displaced", txidOld.GetHex());
-    e.pushKV("by", txidNew.GetHex());
-    e.pushKV("rule", "the latest valid submission received wins");
     InclusionLogWrite(e);
 }
 

@@ -129,7 +129,7 @@ UniValue getrawtransaction(const JSONRPCRequest& request)
             "     ,...\n"
             "  ],\n"
             "  \"credit\" : {            (json object, only for credit tx versions 11-17) the op trailer after nLockTime\n"
-            "     \"family\" : \"str\",      (string) bill, house, note, deposit (term deposit), pool, settle or oracle\n"
+            "     \"family\" : \"str\",      (string) bill, house, note, deposit (term deposit), pool, settle or token\n"
             "     \"op\" : n,              (numeric) the op byte\n"
             "     \"op_name\" : \"str\",     (string) the op's name, e.g. issue, attest, mint; op_<n> if unknown\n"
             "     \"payload_hex\" : \"hex\"  (string) the op payload, hex\n"

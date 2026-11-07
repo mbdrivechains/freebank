@@ -18,12 +18,14 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > into it. FreeBank is not a bank. Nothing on it is insured or guaranteed by any government or by its developers.
 >
 > Houses are run by independent operators, not by FreeBank's developers. A house can suspend payment or fail, and its
-> notes may not be paid in full. Notes are denominated in grams of gold and paid in sECX (ECX held on FreeBank) at an
-> on-chain price. Moving sECX back to eCash is slow and needs eCash miners' approval, and sECX can trade below ECX.
+> notes may not be paid in full. Notes are denominated in grams of gold and paid in sECX (ECX held on FreeBank) at a
+> rate each house sets itself, or in gold tokens on Ethereum if the house delivers them. FreeBank checks only a house's
+> sECX, never its gold tokens, and shows whether the house pays. Moving sECX back to eCash is slow and needs eCash miners' approval,
+> and sECX can trade below ECX.
 >
-> Running a house, issuing tokens, reporting prices or lending to consumers may need a licence where you do it.
-> Nothing here is an offer of a financial product, or financial, legal or tax advice. FreeBank is not offered where
-> using it would be unlawful. You are responsible for the laws and taxes that apply to you.
+> Running a house, issuing tokens or lending to consumers may need a licence where you do it. Nothing here is an
+> offer of a financial product, or financial, legal or tax advice. FreeBank is not offered where using it would be
+> unlawful. You are responsible for the laws and taxes that apply to you.
 >
 > The full notice: [NOTICE.md](NOTICE.md).
 
@@ -32,51 +34,61 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > and follows eCash, but no FreeBank block after genesis is valid until a later release switches the
 > chain on; deposits made meanwhile are credited, in order, then. v1.0.1 changes how deposits are
 > credited and v1.0.2 what a credit transaction's signatures cover (below); while mainnet is dormant,
-> both run it exactly as v1.0.0 does, and the mainnet M1 names v1.0.0. **v1.1.0, the gram-notes release, changes the
-> rules from genesis** (below): it runs mainnet, still dormant, and easynet, which restarts on it; every network on it
-> starts fresh. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
+> both run it exactly as v1.0.0 does, and the mainnet M1 names v1.0.0. **v1.1.0 (gram notes) and v1.2.0 (Gold B,
+> each house's own rate) each change the rules from genesis** (below): each runs mainnet, still dormant, and easynet,
+> which restarts on each; every network on them starts fresh. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
 
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,
 > gotchas, parameters, glossary) written so you can hand it to an AI assistant and be walked
 > through running your own FreeBank.
 
-## Gram notes (v1.1.0)
+## Gold B: each house's own rate (v1.2.0)
 
-From v1.1.0, notes, bills and deposits count **milligrams of gold**, and houses hold gold. The rules apply from genesis
-on every network the release runs.
+From v1.2.0 each house posts its own rate for the gram, and the chain has no gold price. Notes, bills and deposits
+still count milligrams of gold (v1.1.0). The rules apply from genesis on every network the release runs.
 
-- **Units and payouts.** Notes, bills, deposits and gold tokens count mg of gold (`getblockchaininfo` shows
-  `note_unit: "mg"`). Payouts are in sECX at the chain's payout price, in sats per gram; each payout binds a price
-  height at most 72 blocks back. With no price, issuing stops and payouts wait. Redemption never stops.
-- **Gold tokens.** A coin kind for tokens issued on FreeBank against gold held on Ethereum: create, mint, burn (to an
-  Ethereum address, at least 1,000 units), transfer, freeze, and issuer bonds. A token counts in a house only while it
-  is *trusted*:
-  - an issuer bond worth at least 1 kg;
-  - fresh backing reports covering its supply;
-  - its backing address its own;
-  - its burns paid, beyond a small threshold.
+- **The rate.** A house posts a bid and an ask in sats per gram (`posthouserate`), signed by a rate key it registers
+  (`sethouseratekey`) that can do nothing else. The ask is at most 2% above the bid. The bid may rise at most 25% in
+  24 hours and may fall any amount. A rate takes effect from the next block. To issue, a house must have posted
+  within the last 24 hours. `gethousecapital` shows the rate in effect, its 30-day highest ask, its 90-day highest
+  bid and whether it is fresh.
+- **Payments.** Every payment names the rate it accepts and is invalid on a mismatch.
+  - A holder who redeems is paid in sECX at the house's bid.
+  - A formal demand (`demandnote`, `demanddeposit`) is paid at no less than the bid when it was made; a later cut
+    doesn't reduce it.
+  - A bill repays in the house's notes at par, or in sECX at the house's highest ask of the last 30 days. A privately
+    held bill names a reference house whose ask it repays at.
+- **Gold tokens in kind.** A holder of 10 g or more may instead demand gold tokens on Ethereum by a hash-locked swap
+  (`swapnotes`), in a token the house lists in its charter (`addchartertoken`). The house delivers on Ethereum, and
+  revealing the secret on FreeBank completes the swap. If it isn't completed within 72 hours of active FreeBank time,
+  it is a failed swap: the house owes sECX at the lower of the demand's bid and its highest bid in the day before the
+  deadline, and a shortfall is kept as a claim in grams if the house fails within 90 days of paying it. FreeBank reads nothing
+  from Ethereum: checking the lock is the holder's app's job.
+- **Capital in sECX.** A house's escrow (its partners' pledges) and its till (sECX it proves it controls, by
+  attestation) count in grams at its 30-day highest ask. It can issue while its escrow is at least 10% of its notes
+  and deposits and its till at least 2% of its notes; notes still owed by open swaps count as notes. **The ramp:** each
+  escrow tranche counts 1x at first and doubles after each 180 clean days, up to 10x; a protest resets every tranche
+  to 1x. Falling below a floor only stops issuing.
+- **A house closes only when it doesn't pay a demand.** An unpaid demand can be protested. The house is then Stressed
+  for a 7-day cure, and Insolvent at its end unless it pays or suspends payment; a suspended house is Insolvent after
+  12 months, or sooner if it stops attesting. One cure per 180 days: a new protest episode within 180
+  days of the last one's end finds no cure, and the house is insolvent at once. `gethouse` shows the cure
+  (`cure_window`, `cure_insolvent_height`, `next_cure_height`). A failed swap is not a protest.
+- **Failed houses** pay without a price: the escrow and sECX go pro rata by grams to the most senior rank with open
+  claims, each claim reduced at the house's highest bid in the 90 days before it failed. Notes come first, with
+  pending swaps and shortfall claims; deposits after. The partners get nothing while any gram claim is open.
+- **Clocks run in time.** Cures, demand windows, maturities, the swap deadline and the 180-day spacing count active
+  time (600 s of eCash block time per step, each gap between blocks counted up to an hour), so a stall doesn't run
+  them out.
+- **Removed:** the price feed and its reporters, gold tokens on FreeBank (issuer bonds, vaults, backing reports),
+  equity proofs, and the dormant exit to ECX reserves. Issued tokens stay for other assets, and pools stay as markets,
+  never as a price.
+- `gethousecapital` also lists a house's overdue bills, which is never a complete measure of its loans: a house can
+  repay a bill for its borrower.
 
-  Creating a token or a pool burns 1 g of gold's worth of sECX.
-- **Price feed.** Bonded reporters post gold/ECX, gold/USD, token backing and backing-address claims. A fix needs a
-  quorum of the reporters active on that price, between 3 and 7. The payout price is the 144-block median, and no
-  more than 5% above a deep token pool's average.
-- **Houses hold gold.**
-  - Owners' capital of at least 10% of notes and deposits, and a till of at least 2% of notes, in gold-token vaults.
-  - No more than half from one company, contract or token.
-  - At most 8 tokens per house; a new one comes in only by the partners' agreement.
-  - An issuer's freeze on house gold counts zero after 30 days.
-  - Anyone can prove a house's equity negative (`proveequity`), which opens claims.
-  - Issuing needs no attestation, and a missed or low attestation no longer stresses a house: stress starts only with
-    a protested, unpaid demand. Attestations still count while a house is suspended, and before a house that has settled nets again.
-- **Failed houses** pay in value at a snapshot price: notes first, pro rata in gold then sECX; deposits after; what is
-  left goes to the noteholders' mutual fund.
-- **Token pools**, one per gold token, with swaps that chain within a block and LP shares. **House note pools are
-  closed** until a second, unconnected block producer appears (`getblockchaininfo` shows `note_pools_open`).
-- Also in v1.1.0:
-  - the block producer's inclusion log (`getinclusionlog`);
-  - a dormant exit to ECX reserves, which needs two years of daily prices first;
-  - a fix for a node that marked a good block invalid when its eCash node came back behind after a power cut.
+v1.1.0 (gram notes) made notes, bills and deposits count milligrams of gold, with a chain-wide price; v1.2.0 replaces
+that price with each house's own rate.
 
 Details: [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md), section 4.13.
 
@@ -87,18 +99,13 @@ others bid. Anyone may bid, and the highest bid wins. For that period:
 
 - His bid is a fixed **2,000 sats (0.00002 ECX) per eCash block**, paid as the fee of the bid transaction, published
   here, and is never raised to beat another bidder. The bidding stops on 31 October 2027.
-- His block producer includes every valid transaction it receives - price and backing reports and pool swaps
-  included - and publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder). Where a
-  reporter sends two reports for one block, the producer keeps the latest valid one it received, by a fixed rule, and
-  the log records the replacement.
-- He, any entity he controls, and anyone acting for him hold no gram notes, gold or dollar tokens, pool shares or stake
-  in any house.
+- His block producer includes every valid transaction it receives, house rate posts and pool swaps included, and
+  publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder).
+- He, any entity he controls, and anyone acting for him hold no gram notes, dollar tokens, pool shares or stake in any
+  house.
 
-The no-forfeit rule for price reporters ends at a height that a later release sets once a second, unconnected bidder
-is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
-
-These limits do not end with that period: he, any entity he controls, and anyone acting for him post no issuer bond and
-put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any issuer or house; and buy nothing to
+These limits do not end with that period: he, any entity he controls, and anyone acting for him put no liquidity in any
+pool; don't lend to, fund, guarantee or arrange for any issuer or house; and buy nothing to
 support a price and rescue no house.
 
 The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
@@ -125,8 +132,8 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   RPCs: `registerhouse`, `listhouses`, `attesthouse`, and friends.
 - **Credit notes**: per-house redeemable credit claims. Issuance is
   **reserve-gated at mint** — a mint must prove live reserves against the cap; notes
-  transfer person-to-person; the issuing house redeems at par from reserves. From v1.1.0 the caps count the
-  house's gold on the chain, with no reserve proof (Gram notes, above).
+  transfer person-to-person; the issuing house redeems at par from reserves. From v1.2.0 the caps count the
+  house's sECX escrow and attested till at its own rate (Gold B, above).
 - **Bearer redemption** (the holder's teeth): a note holder places a formal *demand* for
   par. Against an open house this **pre-authorises** the payout — the note coins move into
   a consensus-enforced custody script and the house **discharges** them unilaterally,
@@ -164,12 +171,12 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   from on-chain heights (inherently reorg-safe). Insolvency triggers a waterfall:
   noteholders claim pro-rata from the locked escrow pot, then a whole-house residual
   settlement. From v1.1.0 a missed cadence or a low attestation no longer stresses an open house (stress starts
-  only with a protested, unpaid demand), and a failed house pays as Gram notes, above, says.
+  only with a protested, unpaid demand); from v1.2.0 a failed house pays as Gold B, above, says.
 - **The option clause**, translated from the Scottish record: a stressed house may suspend
   redemption, paying interest at the protocol rate on demanded notes until it pays, with its till locked into the
-  claim pot. From v0.2.18 a suspension has no end date: it ends when the house reopens (an
-  attestation back above its floor; from v1.1.0, with its counted gold till back at 2% of its notes) or when its
-  silence makes it insolvent. Holders' demands
+  claim pot. A suspension lasts at most 12 months (from v0.2.28), then the house is Insolvent; it ends earlier
+  when the house reopens (an attestation back above its floor; from v1.2.0, with its attested sECX till back at 2%
+  of its notes) or when its silence makes it Insolvent. Holders' demands
   queue and the house may pay them alone. A consensus redemption spread (*brassage*) adds
   run-friction.
 - **Term deposits**: time-locked deposits with a consensus interest floor and transferable
@@ -188,7 +195,7 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   txid that created it; tickers are not unique, and a token is only as good as its issuer. RPCs:
   `createasset`, `transferasset`, `transferassetcontrol`, `listmyassets`, `listassets`.
 - **The unit up to v1.0.x is ECX.** v0.2.17 removed the gram display (`getgramrate` and the `*_grams` RPC
-  fields). From v1.1.0 notes count mg of gold (Gram notes, above).
+  fields). From v1.1.0 notes count mg of gold, paid from v1.2.0 at each house's own rate (Gold B, above).
 
 ## Robustness
 

@@ -270,36 +270,38 @@ BOOST_AUTO_TEST_CASE(settle_band_max_magnitude)
     // (MAX_MONEY): far below the band -> the helper must REJECT cleanly, and
     // the point of the vector is that the u128 arithmetic cannot overflow on
     // the way to that answer.
-    BOOST_CHECK(!SettleResidualInBand(U, 0, 1, MAX_MONEY, 1000));
+    BOOST_CHECK(!SettleResidualInBand(U, 0, 1, MAX_MONEY, 1000, 1000));
 
     // Max payable case: dU == MAX_MONEY, residual == MAX_MONEY (exact par).
-    BOOST_CHECK(SettleResidualInBand((uint64_t)MAX_MONEY, 0, 1, MAX_MONEY, 1000));
+    BOOST_CHECK(SettleResidualInBand((uint64_t)MAX_MONEY, 0, 1, MAX_MONEY, 1000, 1000));
 
     // Exact band edges at a clean magnitude: parValue = 10^12.
     const uint64_t par = 1000000000000ULL;
-    const CAmount lo = (CAmount)(par * (10000 - SETTLE_PAR_BAND_BPS) / 10000);   // 0.995 * par
-    const CAmount hi = (CAmount)(par * (10000 + SETTLE_PAR_BAND_BPS) / 10000);   // 1.005 * par
-    BOOST_CHECK(SettleResidualInBand(par, 0, 1, lo, 1000));         // exactly at the low edge
-    BOOST_CHECK(SettleResidualInBand(par, 0, 1, hi, 1000));         // exactly at the high edge
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, lo - 1, 1000));    // one sat below
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, hi + 1, 1000));    // one sat above
-    BOOST_CHECK(SettleResidualInBand(par, 0, 1, (CAmount)par, 1000)); // exact par
+    // Gold B: the band is [the lower bid, the higher ask] of the houses - here 995 and 1005 sats per gram.
+    const CAmount lo = (CAmount)(par * 995 / 1000);    // 0.995 * par
+    const CAmount hi = (CAmount)(par * 1005 / 1000);   // 1.005 * par
+    BOOST_CHECK(SettleResidualInBand(par, 0, 1, lo, 995, 1005));         // exactly at the low edge
+    BOOST_CHECK(SettleResidualInBand(par, 0, 1, hi, 995, 1005));         // exactly at the high edge
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, lo - 1, 995, 1005));    // one sat below
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, hi + 1, 995, 1005));    // one sat above
+    BOOST_CHECK(SettleResidualInBand(par, 0, 1, (CAmount)par, 995, 1005)); // exact par
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, (CAmount)par, 1005, 995)); // an inverted band is refused
 
     // Envelope violations reject cleanly (never overflow).
-    BOOST_CHECK(!SettleResidualInBand(U + 1, 0, 1, MAX_MONEY, 1000));
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, MAX_MONEY + 1, 1000));
-    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, -1, 1000));
+    BOOST_CHECK(!SettleResidualInBand(U + 1, 0, 1, MAX_MONEY, 1000, 1000));
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, MAX_MONEY + 1, 1000, 1000));
+    BOOST_CHECK(!SettleResidualInBand(par, 0, 1, -1, 1000, 1000));
 
     // Mode discipline.
-    BOOST_CHECK(SettleResidualInBand(50000, 50000, 0, 0, 1000));      // pure swap
-    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 0, 1, 1000));     // mode 0 with residual
-    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 1, 0, 1000));     // mode 1 with dU == 0
-    BOOST_CHECK(!SettleResidualInBand(60000, 45000, 0, 0, 1000));     // dU != 0 must be mode 1
+    BOOST_CHECK(SettleResidualInBand(50000, 50000, 0, 0, 1000, 1000));      // pure swap
+    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 0, 1, 1000, 1000));     // mode 0 with residual
+    BOOST_CHECK(!SettleResidualInBand(50000, 50000, 1, 0, 1000, 1000));     // mode 1 with dU == 0
+    BOOST_CHECK(!SettleResidualInBand(60000, 45000, 0, 0, 1000, 1000));     // dU != 0 must be mode 1
     // Min-residual floor: dU below SETTLE_MIN_RESIDUAL cannot be mode 1.
     BOOST_CHECK(!SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL - 1, 50000, 1,
-                                      SETTLE_MIN_RESIDUAL - 1, 1000));
+                                      SETTLE_MIN_RESIDUAL - 1, 1000, 1000));
     BOOST_CHECK(SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL, 50000, 1,
-                                     SETTLE_MIN_RESIDUAL, 1000));
+                                     SETTLE_MIN_RESIDUAL, 1000, 1000));
 }
 
 BOOST_AUTO_TEST_CASE(settle_tx_trailer_roundtrip)
@@ -796,15 +798,15 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
         mtx.vchSettlePayload = Encode(x);
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-presenter-sig-invalid");
     }
-    // Post-signing VALUE tamper: residual bumped 1 sat (still in band, dest and
-    // priors fine) - the shared digest moves, every signature dies. This is
-    // the atomic-mutual-consent property.
+    // Post-signing VALUE tamper: residual bumped 1 sat. Gold B: the fixture gives both houses bid = ask = 1000 sats per
+    // gram, so the band is exact and refuses the bump before the signatures are read (with a wider band the shared
+    // digest would move and every signature die - the atomic-mutual-consent property).
     {
         CMutableTransaction mtx = BuildSignedSettle(x, hA, hB, apprA, apprB, presA, presB, 1);
         x.amountResidual = 15001;
         mtx.vchSettlePayload = Encode(x);
         mtx.vout[0].nValue = 15001;
-        BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-approver");
+        BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-band");
     }
 }
 

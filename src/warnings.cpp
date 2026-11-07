@@ -7,6 +7,7 @@
 #include <clientversion.h>
 #include <util.h>
 #include <warnings.h>
+#include <notices.h>
 
 CCriticalSection cs_warnings;
 std::string strMiscWarning;
@@ -47,8 +48,8 @@ std::string GetWarnings(const std::string& strFor)
     LOCK(cs_warnings);
 
     if (!CLIENT_VERSION_IS_RELEASE) {
-        strStatusBar = "This is a pre-release test build - use at your own risk - do not use for mining or merchant applications";
-        strGUI = _("This is a pre-release test build - use at your own risk - do not use for mining or merchant applications");
+        strStatusBar = FREEBANK_NOTICE_PRERELEASE;
+        strGUI = _(FREEBANK_NOTICE_PRERELEASE);
     }
 
     if (gArgs.GetBoolArg("-testsafemode", DEFAULT_TESTSAFEMODE))

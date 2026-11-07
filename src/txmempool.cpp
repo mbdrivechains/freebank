@@ -10,7 +10,6 @@
 #include <issued.h>
 #include <note.h>
 #include <deposit.h>
-#include <oracle.h>
 #include <pool.h>
 
 #include <consensus/consensus.h>
@@ -1022,23 +1021,12 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
             // Issued-token units (gram-notes release): an unconfirmed coin carries its annex's units, so a child can
             // spend it with its units counted.
             ApplyIssuedCoinTags(*ptx, outpoint.n, coin);
-            // An unconfirmed issuer bond stays tagged: the bond script is anyone-can-spend, the tag its protection.
-            if (ptx->nVersion == TRANSACTION_TOKEN_VERSION && ptx->nIssuedOp == ISSUED_OP_BOND && outpoint.n == 0)
-                coin.SetOracleBond();
+            // A pool's unconfirmed custody pair stays tagged (the next swap can chain on it): the pool script is
+            // anyone-can-spend and the tag its only protection. Untagged here, a plain tx spending it would pass ATMP
+            // and then fail at ConnectBlock, bricking every later template (the DR-2 class). Payload-pure like
+            // AddCoins, so the mempool view and the connect view agree by construction.
             if (ptx->nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(ptx->nIssuedOp) && outpoint.n < 2)
-                coin.SetOracleBond();   // a pool's unconfirmed custody pair: the next swap can chain on it
-
-            // Oracle bond escrow (Phase G-1) stays tagged while unconfirmed for
-            // the sharpest version of the reason bills/houses do: the bond script
-            // is anyone-can-spend and this tag is its ONLY protection. Untagged
-            // here, a plain tx spending an unconfirmed bond passes ATMP (whose
-            // view is this one) and then fails at ConnectBlock, bricking every
-            // subsequent template - the DR-2 permanent-brick class, reachable by
-            // anyone at zero cost. Payload-pure like AddCoins (coins.cpp), so the
-            // mempool view and the connect view agree by construction.
-            if (ptx->nVersion == TRANSACTION_ORACLE_VERSION &&
-                    ptx->nOracleOp == ORACLE_OP_BOND && outpoint.n == 0)
-                coin.SetOracleBond();
+                coin.SetCustody();
 
             return true;
         } else {

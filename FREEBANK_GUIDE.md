@@ -6,12 +6,14 @@
 > into it. FreeBank is not a bank. Nothing on it is insured or guaranteed by any government or by its developers.
 >
 > Houses are run by independent operators, not by FreeBank's developers. A house can suspend payment or fail, and its
-> notes may not be paid in full. Notes are denominated in grams of gold and paid in sECX (ECX held on FreeBank) at an
-> on-chain price. Moving sECX back to eCash is slow and needs eCash miners' approval, and sECX can trade below ECX.
+> notes may not be paid in full. Notes are denominated in grams of gold and paid in sECX (ECX held on FreeBank) at a
+> rate each house sets itself, or in gold tokens on Ethereum if the house delivers them. FreeBank checks only a house's
+> sECX, never its gold tokens, and shows whether the house pays. Moving sECX back to eCash is slow and needs eCash miners' approval,
+> and sECX can trade below ECX.
 >
-> Running a house, issuing tokens, reporting prices or lending to consumers may need a licence where you do it.
-> Nothing here is an offer of a financial product, or financial, legal or tax advice. FreeBank is not offered where
-> using it would be unlawful. You are responsible for the laws and taxes that apply to you.
+> Running a house, issuing tokens or lending to consumers may need a licence where you do it. Nothing here is an
+> offer of a financial product, or financial, legal or tax advice. FreeBank is not offered where using it would be
+> unlawful. You are responsible for the laws and taxes that apply to you.
 >
 > The full notice: [NOTICE.md](NOTICE.md).
 
@@ -80,9 +82,10 @@ BitAssets sidechain chassis, itself Bitcoin Core lineage). It has **no coin of i
 no premine, no subsidy**: the only money inside it is mainchain coin that was deposited
 through the two-way peg. Everything a house issues is a liability paid in that pegged coin.
 
-From v1.1.0, notes, bills and deposits are denominated in grams of gold (counted in milligrams) and paid in sECX, ECX
-held on FreeBank, at the chain's gold price. Moving sECX back to eCash is slow and needs eCash miners' approval, and on
-FreeBank it can trade below ECX. A house holds its owners' capital and its till in gold tokens, counted on the chain.
+From v1.1.0, notes, bills and deposits are denominated in grams of gold (counted in milligrams). From v1.2.0 they are
+paid in sECX, ECX held on FreeBank, at the issuing house's own posted rate, or in gold tokens on Ethereum if the house
+delivers them. Moving sECX back to eCash is slow and needs eCash miners' approval, and on FreeBank it can trade below
+ECX. A house's capital and till are sECX, counted on the chain; the chain doesn't see any gold tokens a house holds.
 Releases before v1.1.0 count everything in ECX.
 
 ### The instruments, in one screen
@@ -90,16 +93,16 @@ Releases before v1.1.0 count everything in ECX.
 | Instrument | What it is | Built? |
 |---|---|---|
 | **Bill of exchange** | A unique, stateful IOU between a drawer (seller), a drawee/acceptor (buyer, who posts an escrow bond) and a holder (current owner). Matures at a block height; endorsable; defaulted bills pay the bond to the holder; liable parties can be pursued by recourse. | Yes |
-| **Discount house** | A registered, escrow-bonded, M-of-N-governed issuer of notes and term deposits. From v1.1.0 the chain counts its capital and till in gold tokens; it still attests on-chain to suspend, to reopen, and before netting again after a settlement (before v1.1.0 it proved its liquid reserves every ~144 blocks). Lifecycle: Open → Stressed → Suspended (`deferred` in the RPCs) → Insolvent / Wound-down. Open to anyone, or (v0.2.19) members-only or redeem-only, for co-ops. | Yes |
-| **Notes** | Per-house credit claims, transferred bearer-style. From v1.1.0, denominated in grams of gold (1 unit = 1 mg) and paid in sECX at the on-chain gold price, at par while the house is Open; before v1.1.0, in ECX (1 unit = 1 sat). Holders can formally demand payment; houses discharge demands unilaterally; a lapsed demand can be protested. | Yes |
+| **Discount house** | A registered, escrow-bonded, M-of-N-governed issuer of notes and term deposits. From v1.2.0 the chain counts its capital and till in sECX at its own posted rate (from v1.1.0 to v1.2.0, in gold tokens); it still attests on-chain to suspend, to reopen, and before netting again after a settlement (before v1.1.0 it proved its liquid reserves every ~144 blocks). Lifecycle: Open → Stressed → Suspended (`deferred` in the RPCs) → Insolvent / Wound-down. Open to anyone, or (v0.2.19) members-only or redeem-only, for co-ops. | Yes |
+| **Notes** | Per-house credit claims, transferred bearer-style. From v1.1.0, denominated in grams of gold (1 unit = 1 mg); from v1.2.0 paid in sECX at the house's own bid; before v1.1.0, in ECX (1 unit = 1 sat). Holders can formally demand payment; houses discharge demands unilaterally; a lapsed demand can be protested. | Yes |
 | **Discounting** | A house buys a bill from its holder, paying with notes minted in the same operation — the act of credit creation. Books the bill as a loan asset under a match-funding rule. | Yes |
 | **Term deposits** | Time-locked loans to a house at a per-receipt rate; transferable whole; junior to notes. | Yes |
-| **Clearing pool** | One constant-product AMM per house between its notes and the base coin — the secondary market that prices stressed paper. From v1.1.0 house note pools are closed until a second, unconnected block producer appears (`note_pools_open`); gold-token pools are open (4.13). | Yes |
-| **Settlement between houses** | Houses present each other's notes, the notes are burned, and only the net is paid at par in ECX. Two houses settle bilaterally (±0.5%); from v0.2.22 any number net in one round (the Edinburgh exchange). Every house signs. | Yes |
+| **Clearing pool** | One constant-product AMM per house between its notes and the base coin — the secondary market that prices stressed paper. House note pools are closed until 31 October 2027 (16 November 2026 on easynet), as are dollar-token pools (`note_pools_open`, `dollar_pools_open`). | Yes |
+| **Settlement between houses** | Houses present each other's notes, the notes are burned, and only the net is paid, in sECX, at a rate between the two houses' rates. Two houses settle bilaterally (±0.5%); from v0.2.22 any number net in one round (the Edinburgh exchange). Every house signs. | Yes |
 | **Token records** | A house may run a Chaumian mint (Cashu-style bearer tokens, off-chain). The chain records each mint (notes locked as backing) and each burn (backing released as notes), and from v0.2.21 token holders can claim at a failed house without its partners. The mint and the token wallet are separate software. | Yes (the on-chain records) |
 | **Assets** | Anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in the coins that carry it (v0.2.18). A token is only as good as its issuer; tickers are not unique. | Yes |
-| **Gold oracle** | Bonded submitters post a gold price; the fix is a braked lower median. **Consensus-inert**: nothing in consensus reads it. | Yes, inert |
-| Two-wallet bill issuance tooling, automatic clearing sweeps, gold notes, cash-credit lines | — | **Not built** (section 8 says which are designed) |
+| **House rate** | Each house posts its own bid and ask in sats per gram (v1.2.0); every payment names it. The gold oracle is removed. | Yes |
+| Two-wallet bill issuance tooling, automatic clearing sweeps, cash-credit lines | — | **Not built** (section 8 says which are designed) |
 
 ### Before you take on a role
 
@@ -108,9 +111,8 @@ Releases before v1.1.0 count everything in ECX.
 - gram notes may be financial products, such as derivatives;
 - lending to consumers needs a licence, buy-now-pay-later-style credit included;
 - holding tokens for others, or issuing your own against them, is custody and token issuance;
-- paying out sECX for notes may count as a crypto-asset service;
-- customer-check, sanctions and reporting laws apply to anyone serving the public;
-- knowingly false prices are an offence.
+- paying out sECX or gold tokens for notes may count as a crypto-asset service;
+- customer-check, sanctions and reporting laws apply to anyone serving the public.
 
 If you take on any of these roles, the law where you do it is your responsibility, not the developers'.
 
@@ -119,11 +121,10 @@ At the point where you take on each role:
 - **Running a house** (charter a house, mint notes, take term deposits, discount a bill): Running a house for others
   (issuing notes, lending them out, taking deposits or discounting bills) may be banking, deposit-taking or a
   financial service where you do it, and need a licence. Gram notes may count as financial products, such as
-  derivatives. That is your responsibility, not FreeBank's developers'.
-- **Issuing tokens** (create a token, mint, burn): Issuing tokens against gold or dollar tokens you hold for others is
-  custody and token issuance, which needs a licence in most countries.
-- **Reporting prices** (bond a submitter, submit prices): Your reports set what others are paid. Knowingly false or
-  manipulated prices are an offence in many countries.
+  derivatives, and paying out sECX or gold tokens for notes may count as a crypto-asset service. That is your
+  responsibility, not FreeBank's developers'.
+- **Issuing tokens** (create a token, mint, burn): Issuing tokens against dollar tokens you hold for others is custody
+  and token issuance, which needs a licence in most countries.
 - **Pools** (add to a pool, create a pool): Pool shares can lose value against what you put in. A token is only as
   good as its issuer.
 - **Bills** (issue a bill, sell it to a house): Bills are for trade between businesses. Credit to consumers,
@@ -451,37 +452,43 @@ bmm 3
 $FB listunspent 1 | grep -c '"amount"'    # several confirmed coins
 ```
 
-### 3.7 Your first house: register → attest → mint → redeem
+### 3.7 Your first house: register → rate → attest → mint → redeem
+
+From v1.2.0 a house posts its own rate for the gram before it issues (4.13). Amounts of notes are milligrams of gold
+(mg); the house pays them in sECX at its bid.
 
 ```bash
 # registerhouse <tier 0-3> <threshold M> "<classid, 1-16 chars [a-z0-9], unique>" <denommg> "<pledges, coin amounts>" <fee> [type]
-#   denommg: a recorded number, must be >0; nothing in consensus reads it - notes redeem 1 unit = 1 sat of ECX
+#   the pledges are the partners' sECX escrow (here one partner, 1 ECX); denommg is a recorded number, must be >0
 $FB registerhouse 0 1 "mybank" 1000 "[1.0]" 0.001      # prints {"txid": "..."}
 bmm 6
-$FB listhouses          # note the "id" of classid mybank; below it is $H
 H=$($FB listhouses | python3 -c "import json,sys; print([h['id'] for h in json.load(sys.stdin) if h['classid']=='mybank'][0])")
 
-$FB attesthouse $H 0.001       # prove this wallet's confirmed coins as the house's liquid till; prints {"txid": "..."}
+$FB sethouseratekey $H         # a key that can post the house's rate and nothing else (approved by the house's M-of-N)
+bmm 2
+$FB posthouserate $H 1000 1020 # bid 1,000 and ask 1,020 sats per gram (an example: 1 mg pays 1 sat), from the next block
+bmm 2
+$FB attesthouse $H 0.001       # prove this wallet's coins as the house's till (sECX it controls)
 bmm 4
-$FB gethouse $H                # effective_status: open; reservecapunits > 0 (about 3,998,000,000 here = the ~3.998-coin till / the 10% reserve floor)
+$FB gethousecapital $H         # bid, ask, rate_fresh: true, escrow_sats 100000000, till_attested_sats, capital_cap_mg, till_cap_mg
 
-$FB mintnote $H 40000000 0.001 # 40,000,000 units (1 unit = 1 sat) - within min(capital cap, reserve cap); prints {"txid": "..."}
+$FB mintnote $H 40000000 0.001 # 40,000,000 mg = 40 g of notes, within both caps; prints {"txid": "..."}
 bmm 6
 $FB listmynotes                # your notes, per house: units 40000000
 $FB gethouse $H                # mintedunits: 40000000
 
-$FB transfernote $H 10000000 0.001 "$($FB getnewaddress '' legacy)"   # bearer transfer (here to yourself); prints {"txid": "..."}
+$FB transfernote $H 10000000 0.001 "$($FB getnewaddress '' legacy)"   # bearer transfer (here to yourself)
 bmm 6
-$FB redeemnote $H 10000000 0.001                                        # the issuing house redeems at par; prints {"txid": "..."}
+$FB redeemnote $H 10000000 0.001                                        # paid at the house's bid: 10 g x 1,000 sats/g = 0.1 ECX
 bmm 6
 $FB gethouse $H                # mintedunits: 30000000
 ```
 
-You have registered a bank, proven its reserves, issued credit money, moved it, and
-redeemed it. Every step is a consensus-validated transaction on your sidechain.
+You have registered a house, given it a rate, proven its till, issued notes, moved them, and redeemed them. Every
+step is a consensus-validated transaction on your sidechain. (The maintainers' integration suite runs exactly these
+steps before each release.)
 
-*This is the v1.0.x recipe. On v1.1.0 amounts are mg, and the house needs gold capital and a gold till before it mints
-(4.13, step 3); minting no longer needs the attestation.*
+*On v1.0.x a note unit was a sat and there was no rate; on v1.1.0 the house needed gold tokens (both gone in v1.2.0).*
 
 ### 3.8 Peg out (optional)
 
@@ -633,7 +640,8 @@ $FB recoursebill "$ID2" 0.001; bmm 6
 **Units from v1.1.0.** A bill's face and a discount's price are whole mg of gold, as notes are: `issuebill` and
 `proposediscount` take them that way, and `getbill`, `listbills`, `listmybills` and `listloanbook` show `face_mg`.
 The escrow bond is sECX. `signdiscount` shows `face_mg`, `price_mg`, the bond, and `max_deficiency` / `max_loss` in
-sECX at the payout price. (Before v1.1.0 these were 8-decimal coin amounts.)
+sECX at the rate the bill repays at (`repay_rate`: the reference house's 30-day highest ask, from v1.2.0). (Before
+v1.1.0 these were 8-decimal coin amounts.)
 
 Bill status letters: `a` active, `r` retired, `d` defaulted. `issuebill` is still a
 *single-wallet handshake* (v0.2.25): the issuing wallet plays drawer, acceptor and initial holder
@@ -859,22 +867,10 @@ regtest) — the stamp lives on each house record, so a house that just settled 
 cannot settle with C until its window passes; an `attesthouse` on either house displaces
 a pooled settlement.
 
-### 4.9 Gold oracle (consensus-inert; replaced in v1.1.0)
+### 4.9 Gold oracle (removed in v1.2.0)
 
-*v1.1.0 replaces this with the price feed that payouts use: see 4.13. The commands below are the v1.0.x ones.*
-
-```bash
-$W1 bondoraclesubmitter 0 1.0 0.001              # [id, 0 = new] [bond coins] [fee]; one new registration per block; the id is assigned at confirmation
-bmm 1
-$FB listoraclesubmitters                         # re-read the id from here once the bond confirms
-SUB=$($FB listoraclesubmitters | python3 -c "import json,sys; print(json.load(sys.stdin)[-1]['id'])")
-$W1 submitoracleprice $SUB 800000000 0.001       # <submitter id> <milligrams of gold per 1000 ECX> <fee>; the number is an arbitrary example
-$FB getgoldfix                                   # {"raw": lower median, "braked", "fixheight", "ageblocks"}; prints nothing (JSON null) before the first fix
-```
-
-A fix forms only when a quorum of distinct submitter ids (3) submits in the same block.
-One wallet may bond several ids (one registration per block) and submit for all of them.
-Rises track immediately; falls are braked. Nothing in consensus reads the fix.
+v1.2.0 removed the gold oracle, its reporters and the chain-wide price: each house posts its own rate (4.13). The
+v1.0.x and v1.1.0 commands (`bondoraclesubmitter`, `submitoracleprice`, `submitoracleobs`, `getgoldfix`) are gone.
 
 ### 4.10 Withdrawal (peg-out)
 
@@ -938,72 +934,89 @@ Units can't be created after the genesis, only burned (sent to `OP_RETURN`), and
 be mixed in one transaction. Balances and coin selection never spend asset coins as ECX.
 `transferassetcontrol <asset_id> <address>` moves the control coin.
 
-### 4.13 Gram notes (v1.1.0)
+### 4.13 Gold B: each house's own rate (v1.2.0)
 
-From v1.1.0 notes, bills and deposits count milligrams of gold, houses hold gold tokens, and payouts are in sECX at the
-chain's payout price (sats per gram). The rules apply from genesis. The earlier recipes still work, with every amount
-of a note, bill or deposit in mg, but a house can issue only once it holds gold.
+From v1.2.0 each house posts its own rate for the gram and there is no chain-wide price. Notes, bills and deposits
+count mg of gold (since v1.1.0); a house pays them in sECX at its own bid, or in gold tokens on Ethereum if it delivers.
+The rules apply from genesis. The earlier recipes still work with every amount in mg, once the house has posted a rate.
 
-Issuing needs no attestation, and a missed or low attestation no longer stresses a house: stress starts only with a
-protested, unpaid demand (4.4). Attestations still count in three places: `deferhouse` needs one at most 144 blocks old;
-while a house is suspended, an attestation with its counted gold till back at 2% of its notes reopens it, and silence
-turns it Insolvent (4.5); and a house that has settled before must attest again before its next netting round (4.8).
-
-**1. The price.** Bonded reporters post observations, and a fix forms when a quorum of them report within six blocks.
+**1. The rate.** The house registers a rate key, then posts a bid and an ask in sats per gram.
 
 ```bash
-$W bondoraclesubmitter 0 1.0 0.001          # three or more reporters (one new id per block); re-read ids: listoraclesubmitters
-$W submitoracleobs <id> '[{"stream":1,"value":<sats per gram>}]'          # each reporter; fee defaults to 0.0001
-$FB getgoldfix                                # payout_view_sats_per_gram (the 144-block median; null = stale), last fixes
+$W sethouseratekey $H                 # [pubkey] [fee]; default a fresh key of this wallet; approved by the M-of-N
+$W posthouserate $H <bid> <ask>       # ask <= bid x 1.02; the bid may rise at most 25% in 24 h, and fall any amount
+$FB gethousecapital $H                # bid, ask (in effect for the next block), ask_30d_high, bid_90d_high,
+                                      # rate_fresh / rate_posted_time / rate_fresh_until (issuing needs a post within 24 h)
 ```
 
-**2. A gold token.** Creating one burns 1 g of gold's worth of sECX at the payout price, so the price must exist first.
+- Every payment names the rate it accepts and is invalid on a mismatch; the wallet fills it in from the chain. A
+  payment built just before the house posts a new rate can be refused: build it again.
+- A holder who redeems is paid at the bid. A formal demand (`demandnote`, `demanddeposit`) is paid at no less than the
+  bid when it was made, whatever the house posts afterwards.
+- A bill repays in the house's notes at par, or in sECX at its highest ask of the last 30 days. A bill held outside a
+  house names a reference house at issue (`issuebill`'s 7th argument, `ref_house_id` in the listings), and repays at
+  that house's ask.
+
+**2. Capital in sECX.** The escrow is the partners' pledges; the till is sECX the house proves it controls
+(`attesthouse`). Both count in grams at the house's 30-day highest ask.
+
+- Issuing needs escrow of at least 10% of notes plus deposits, and a till of at least 2% of notes. Notes owed by open
+  swaps count as notes. Below a floor the house only stops issuing; a floor never closes it.
+- The ramp: each escrow tranche counts 1x at first and doubles after each 180 clean days (no protest, no cure), up to
+  10x. A protest resets every tranche to 1x. New escrow starts at 1x.
+- `gethousecapital $H` shows `escrow_sats`/`escrow_mg`, `till_attested_sats`/`till_mg`, `capital_cap_mg` (on the
+  ramp), `capital_cap_at_full_ramp_mg`, `till_cap_mg`, `pending_swaps_mg`, `notes_mg`, `deposits_mg` and
+  `overdue_bill_ids`. The overdue list is never complete: a house can repay a bill for its borrower.
+
+**3. The charter: the gold tokens a house pays in kind.** FreeBank checks nothing on Ethereum; the charter is the
+house's statement, and the holder's app checks the token.
 
 ```bash
-$W createissuedtoken gold_mg GOLDA <backing contract 0x..> <backing address 0x..> <upstream company>   # id = the txid
-$W mintissued <token> 1000000000 "<address>"
-$W submitoracleobs <id> '[{"stream":1,"value":<sats/g>},{"stream":3,"subject":"<token>","value":<backing balance>,"aux":<eth block>,"aux2":<burn units paid>}]'
-$W issuerbond <token> 10                      # in sECX; it must be worth at least 1 kg at the price
-$FB getissuedtoken <token>                    # trusted, issuing_ok, supply, burns_queued, bond fields
-$W burnissued <token> 1000 <eth address>      # redeem to Ethereum: at least 1,000 units, never the zero address
+$W addchartertoken $H 1 <token contract> 18 311034768 10000000 undeclared
+                                      # chain id 1 (Ethereum); e.g. a token worth one troy ounce, 18 decimals: one token
+                                      # = 311034768/10000000 g; the partners' related-issuer declaration
+$W setcharterrelated $H 0 no          # the partners' declaration: yes, no or undeclared (the chain doesn't check it)
+$W removechartertoken $H 0            # takes effect 30 days after it is posted; a gold-note house keeps one entry
+$FB gethousecharter $H
 ```
 
-**3. A house holding gold.** A token new to the house comes in by the partners' agreement (the M-of-N till op); after
-that any partner may pledge it to capital. Issuing needs counted capital of at least 10% of notes and deposits, and a
-till of at least 2% of notes.
+**4. Gold tokens in kind: the swap.** A holder of at least 10 g demands tokens by a hash lock H = sha256(s). The house
+locks the tokens on Ethereum for the holder; the holder claims them there, which reveals s; anyone posts s on
+FreeBank to settle the swap.
 
 ```bash
-$W movetill $H <token> 10000000               # into the till (M-of-N); out with a negative amount while open or stressed
-$W pledgegold $H 0 <token> 100000000          # partner 0's capital
-$FB gethousegold $H                           # counted and raw capital and till, caps, vaults, frozen, equity_mg, demand_interest_mg
-$W cleardustslot $H 0 <dust token> <token held>   # a token the house holds at most 1,000 mg of: swap it out mg for mg
-$W proveequity $H                             # anyone; refused unless equity is negative, then claims open
+$W swapnotes $H 20000 1 <contract> <holder's eth address> <hash lock H> "<payout address>"   # notes leave circulation
+$FB getswap <H>                       # status, units_mg, bid_at_demand, deadline_active, active_now, bid_at_deadline, shortfall_mg
+$W swapdone <H> <s>                   # within 72 h of active time: the swap is done
+$W swappay <H>                        # the house pays sECX instead: before the deadline at the demand's bid
+$W swapexpire <H>                     # anyone, after the deadline: fixes the bid the failed swap pays at
+$W swapprotest <H>                    # anyone, a day after the deadline if still unpaid: a protest (5, below)
 ```
 
-**4. Token pools.** One per gold token; creating one also burns 1 g.
+- Unsettled at the deadline, it is a failed swap: the house owes sECX at the lower of the demand's bid and its highest
+  bid in the day before the deadline. A failed swap is not a protest and doesn't count against the ramp.
+- If that pays less than the demand's bid, the difference is kept as a claim in grams against the house. It counts
+  only if the house fails within 90 days of paying the swap (`swapclaim`, below).
+- Active time is the sum of the gaps between FreeBank blocks in eCash block time, each counted up to an hour, so a
+  stalled chain doesn't run the deadline out.
 
-```bash
-$W createtokenpool <token> 600000 66000000 30 # units, sats, fee bps
-$W swaptoken <token> sell 5000                # or buy; swaps chain within a block
-$FB listtokenpools                            # every pool, and the chain's payout price
-```
+**5. Protest, cure and failure.** A house closes only when it doesn't pay a demand.
 
-**Reporter notes.**
+- An unpaid demand past its window can be protested (`protestnote`, `protestdeposit`, `swapprotest`). The house is
+  Stressed for a 7-day cure and Insolvent at its end unless it pays or suspends payment (`deferhouse`, 4.5); a
+  suspended house is Insolvent after 12 months, or sooner if it stops attesting.
+- One cure per 180 days, counted from the end of the last episode: a protest within that finds no cure, and the house
+  is Insolvent at once. A suspension's recovery that finds the protest still unpaid continues the same cure with the
+  time it had left, at least a day.
+- `gethouse $H` shows `cure_window` (clock blocks of 10 minutes), `cure_insolvent_height`, `cure_left`,
+  `no_cure_height` and `next_cure_height`. Heights not reached yet are estimates.
+- At a failed house the escrow and sECX go pro rata by grams to the most senior rank with open claims, each claim
+  reduced at the house's highest bid in the 90 days before it failed. Notes first (`claimnote`), with pending swaps
+  and live shortfalls (`swapclaim <H>`); deposits after. The partners get nothing while any gram claim is open.
 
-- A report is signed for the next block and binds the current tip. It stays valid for 6 blocks (3 on regtest), so it
-  counts once a block producer includes it within that window; after that, or after a reorg below the tip it bound,
-  sign a new one. The producer keeps your latest valid report and logs any it replaced (`getinclusionlog`).
-- Streams: 1 gold/ECX in sats per gram; 2 gold/USD in cents per gram; 3 a token's backing; 4 a backing-address claim.
-- Backing (stream 3): `value` is the backing address's transferable balance in the token's units, as the minimum over
-  the window. `aux` is the Ethereum block cited. `aux2` is the units the backing address has sent to the burns'
-  Ethereum addresses, in total (units sent, before any transfer fee the token takes), and it includes units sent from
-  the backing address to `0x000000000000000000000000000000000000dEaD`. That
-  sink is how an issuer cures a burn it can't pay (an address the gold contract blacklists): it destroys the same
-  backing. A token whose burns older than 1,008 blocks are unpaid by more than max(10 g, 0.5% of supply) is
-  untrusted.
-- The quorum is max(3, half the reporters who reported that price in the last 24 blocks), capped at 7.
-- While there is one block producer, reporters forfeit nothing and are paid nothing. Both change at a height that a
-  later release sets once a second, unconnected bidder is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
+**What v1.2.0 removed:** the price feed and reporters, gold tokens on FreeBank (issuer bonds, gold vaults, backing
+reports, `movetill`, `pledgegold`, `gethousegold`), equity proofs (`proveequity`) and the dormant exit to ECX reserves.
+Issued tokens stay for other assets, and pools stay as markets, never as a price.
 
 ---
 
@@ -1314,18 +1327,13 @@ others bid. Anyone may bid, and the highest bid wins. For that period:
 
 - His bid is a fixed **2,000 sats (0.00002 ECX) per eCash block**, paid as the fee of the bid transaction, published
   here, and is never raised to beat another bidder. The bidding stops on 31 October 2027.
-- His block producer includes every valid transaction it receives - price and backing reports and pool swaps
-  included - and publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder). Where a
-  reporter sends two reports for one block, the producer keeps the latest valid one it received, by a fixed rule, and
-  the log records the replacement.
-- He, any entity he controls, and anyone acting for him hold no gram notes, gold or dollar tokens, pool shares or stake
-  in any house.
+- His block producer includes every valid transaction it receives, house rate posts and pool swaps included, and
+  publishes an inclusion log (`getinclusionlog`, and `inclusion.log` in the node's data folder).
+- He, any entity he controls, and anyone acting for him hold no gram notes, dollar tokens, pool shares or stake in any
+  house.
 
-The no-forfeit rule for price reporters ends at a height that a later release sets once a second, unconnected bidder
-is producing blocks (see the parameter schedule, `vGramSchedule` in `src/consensus/params.h`).
-
-These limits do not end with that period: he, any entity he controls, and anyone acting for him post no issuer bond and
-put no liquidity in any pool; don't lend to, fund, guarantee or arrange for any issuer or house; and buy nothing to
+These limits do not end with that period: he, any entity he controls, and anyone acting for him put no liquidity in any
+pool; don't lend to, fund, guarantee or arrange for any issuer or house; and buy nothing to
 support a price and rescue no house.
 
 The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
@@ -1985,21 +1993,24 @@ mempool and restart the enforcer on a bad read. *Following* the chain (5.2/5.3) 
 
 | Parameter | main | regtest |
 |---|---|---|
-| Attestation cadence | 144 blocks; Stressed after 2 missed (288) | 144 (override with `-attestcadence=<n>`, regtest only) |
+| Attestation cadence | 144 blocks; missed attestations don't stress an Open house (from v1.1.0), they count only while it is suspended | 144 (override with `-attestcadence=<n>`, regtest only) |
 | Attestation max age (as-of height) | 72 blocks | 72 |
 | Reserve floor / recovery | 10% / 15% | same |
 | Stressed → Insolvent window | 1008 blocks | 1008 (override `-stressedwindow=<n>`) |
-| Suspension | No end date; ends at a reopen (≥ 15%) or by silence: 2 missed cadences, then 4,032 blocks (~4 weeks) | silence 40 blocks |
+| Suspension | At most 12 months (52,560 blocks), then Insolvent; ends earlier at a reopen (an attestation proving a till of 2% of notes) or by silence: 2 missed cadences, then 4,032 blocks (~4 weeks) | silence 40 blocks |
 | Suspension and lapsed-demand interest | 10% per year from the demand (a lapsed demand: from the lapse); a height schedule, `defer_interest_bps` in `gethouse` | same |
 | Demand window | 1008 blocks | 12 |
 | Brassage | 0 while Open; up to 4% at a 2.5% attested ratio once impaired | same |
-| Issuance multiplier by tier | 1.0 / 1.5 / 2.0 / 3.0 × active escrow | same |
+| Issuing floors (v1.2.0) | escrow ≥ 10% of notes + deposits; attested till ≥ 2% of notes (sECX, in grams at the 30-day highest ask) | same |
+| The ramp (v1.2.0) | each escrow tranche 1x, doubling per 180 clean days, up to 10x | doubles every block |
+| House rate (v1.2.0) | ask ≤ bid + 2%; bid rise ≤ 25% per 24 h; post within 24 h to issue | same |
+| Swap (v1.2.0) | at least 10 g; deadline 72 h of active time; protestable 24 h after; bid at the deadline = highest in the day before | deadline 120 s, protestable 60 s after, bid window 30 s |
+| Cure (v1.2.0) | 7 days (1,008 clock blocks of 10 min); one per 180 days from the end of the last episode | `-stressedwindow`; clock = height |
 | Min pledge / max partners | 0.1 coin / 64 | same |
 | Partner tail lock after exit | 157,680 blocks (~3 years) | same |
 | Bill grace default / cap | 1008 / 52,560 blocks | same |
 | Settlement cadence per house | 144 blocks; residual band ±0.5% | 12 |
 | Pool fee | 1–100 bps, default 30; 1000 LP units locked | same |
-| Oracle quorum | 3 submitters in one block | 3 |
 | Token holders' claim window | 4,032 blocks (~4 weeks) from insolvency | 20 |
 | Netting round expiry | default 72 blocks, at most 144 | same |
 | Withdrawal bundle minimum | 10 (`-minwithdrawal`) | same |
@@ -2082,9 +2093,16 @@ arguments (default 0.001 coin). "Wallet" RPCs run in a wallet (`-rpcwallet=<name
 | `transferassetcontrol` | wallet | `asset_id address [fee]` | 4.12 |
 | `listmyassets` | wallet | `[asset_id]` | 4.12 |
 | `listassets` | node | `[from_asset_id] [count]` | 4.12 |
-| `bondoraclesubmitter` | wallet | `[id] [bond] [fee]` | 4.9 |
-| `submitoracleprice` | wallet | `submitterid price [fee]` | 4.9 |
-| `getgoldfix` · `listoraclesubmitters` | node | — | 4.9 |
+| `sethouseratekey` | wallet | `houseid [pubkey] [fee]` | 4.13 |
+| `posthouserate` | wallet | `houseid bid ask [fee]` | 4.13 |
+| `gethousecapital` | wallet | `houseid` | 4.13 |
+| `addchartertoken` | wallet | `houseid chain_id contract decimals grams_num grams_den related [fee]` | 4.13 |
+| `removechartertoken` · `setcharterrelated` | wallet | `houseid index [related] [fee]` | 4.13 |
+| `gethousecharter` | wallet | `houseid` | 4.13 |
+| `swapnotes` | wallet | `houseid units chain_id contract eth_address hash_lock payout_address [fee]` | 4.13 |
+| `swapdone` | wallet | `hash_lock preimage [fee]` | 4.13 |
+| `swappay` · `swapexpire` · `swapprotest` · `swapclaim` | wallet | `hash_lock [fee]` | 4.13 |
+| `getswap` | wallet | `hash_lock` | 4.13 |
 | `get_block_template` · `connect_block` · `get_bmm_inclusions` · `setcoinbasetag` | node | `connect_block block main_block_hash`; `get_bmm_inclusions critical_hash`; `setcoinbasetag name` | 7.4, 8 |
 | `getmainchaininfo` · `verifymainblockcache` · `updatemainblockcache` | node | — | — |
 

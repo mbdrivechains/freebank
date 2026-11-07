@@ -245,8 +245,8 @@ BOOST_AUTO_TEST_CASE(chouse_v9_reads_v8_and_rewrites_byte_identical)
     BOOST_REQUIRE(!v8.empty());
     BOOST_REQUIRE_EQUAL(v8[0], (unsigned char)HOUSE_SER_VERSION);   // version leads
     v8[0] = 8;
-    BOOST_REQUIRE(v8.size() >= 89);
-    v8.resize(v8.size() - 89);           // drop the v13 gram fields (20 bytes), the v12 claim totals (48 bytes), the v11
+    BOOST_REQUIRE(v8.size() >= 98);
+    v8.resize(v8.size() - 98);           // drop the v14 no-cure height, empty tranche list and cure left (9 bytes), the v13 gram fields (20 bytes), the v12 claim totals (48 bytes), the v11
                                          // token u64, the v10 flags byte and the three v9 uint32s
     CHouse fromV8;
     BOOST_REQUIRE(Deser(v8, fromV8));
@@ -398,14 +398,20 @@ BOOST_AUTO_TEST_CASE(shape_protest_is_in_range_and_reserved_ops_are_not)
         SetNotePayload(bad, p);
         BOOST_CHECK_EQUAL(ShapeReject(bad), op == NOTE_OP_LOCK ? "bad-note-lock-payload" : "bad-note-unlock-payload");
     }
-    // v0.2.21: 9-12 are the token claim ops (their own payload rejects); 13 is out of range - widening the ceiling
-    // must not widen it twice
+    // v0.2.21: 9-12 are the token claim ops (their own payload rejects); Gold B: 13-18 the swap ops (18 SWAP_CLAIM, the
+    // waterfall); 19 is out of range - widening the ceiling must not widen it twice
     CMutableTransaction nine = NoteTx(9);
     SetNotePayload(nine, p);
     BOOST_CHECK_EQUAL(ShapeReject(nine), "bad-token-keyset-payload");
-    CMutableTransaction thirteen = NoteTx(13);
+    CMutableTransaction thirteen = NoteTx(NOTE_OP_SWAP);
     SetNotePayload(thirteen, p);
-    BOOST_CHECK_EQUAL(ShapeReject(thirteen), "bad-note-op");
+    BOOST_CHECK_EQUAL(ShapeReject(thirteen), "bad-note-swap-payload");
+    CMutableTransaction claim = NoteTx(NOTE_OP_SWAP_CLAIM);
+    SetNotePayload(claim, p);
+    BOOST_CHECK_EQUAL(ShapeReject(claim), "bad-note-swap-claim-payload");
+    CMutableTransaction past = NoteTx(NOTE_OP_SWAP_CLAIM + 1);
+    SetNotePayload(past, p);
+    BOOST_CHECK_EQUAL(ShapeReject(past), "bad-note-op");
 }
 
 BOOST_AUTO_TEST_CASE(shape_preauth_fields_are_all_or_nothing)

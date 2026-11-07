@@ -59,6 +59,28 @@ static const uint8_t NOTE_OP_DEMAND   = 7;
 // Phase 3.5b / B3: a holder whose PRE-AUTHORISED demand has gone undischarged
 // for HOUSE_DEMAND_WINDOW protests, putting the house on the stress cascade.
 static const uint8_t NOTE_OP_PROTEST  = 8;
+// (9-12 are the token holders' claim, token.h.)
+// Gold B (D-2026-11-07-1; GOLD_B.md §4): the swap - a demand for gold tokens in kind, settled by a hash lock nobody judges.
+// SWAP: the holder hands in >= 10 g of a house's notes against hash H, naming a charter token and an Ethereum address;
+// the notes leave circulation and become the house's pending-swap liability. SWAP_DONE: anyone reveals s with
+// sha256(s) = H before the deadline (72 h of active time): the house delivered (the payee revealed s claiming the gold
+// tokens), the liability ends. SWAP_PAY: anyone pays it in sECX - before the deadline at the bid at the demand, after
+// it at the lower of that and the bid then (a shortfall in grams is recorded for the waterfall). SWAP_PROTEST: unpaid a
+// day after the deadline, anyone protests it, as an unpaid formal demand (the stress cascade). A failed swap is never a
+// protest by itself: the chain can't tell "never locked" from "never claimed".
+static const uint8_t NOTE_OP_SWAP          = 13;
+static const uint8_t NOTE_OP_SWAP_DONE     = 14;
+static const uint8_t NOTE_OP_SWAP_PAY      = 15;
+static const uint8_t NOTE_OP_SWAP_PROTEST  = 16;
+// SWAP_EXPIRE: at or after the deadline, anyone fixes the failed swap's rate - the house's bid then (design 2026-11-07:
+// fixed at T_f, so the house can't pick a lower bid by choosing when to pay). Any later swap op fixes it too if unset.
+static const uint8_t NOTE_OP_SWAP_EXPIRE   = 17;
+// SWAP_CLAIM (GOLD_B.md §6, the waterfall): at a failed house, a pending swap (its notes left circulation, the house still
+// owes them) or a shortfall paid within the lapse before failure claims at the noteholders' rank - exactly its pro-rata
+// entitlement, from the escrow pot, to the swap's payout script. Anyone may post it: the amount is fixed, so no grief.
+static const uint8_t NOTE_OP_SWAP_CLAIM    = 18;
+inline bool IsNoteSwapOp(uint8_t nOp) { return nOp >= NOTE_OP_SWAP && nOp <= NOTE_OP_SWAP_CLAIM; }
+static const uint64_t NOTE_SWAP_MIN_MG = 10000;   // the smallest swap: 10 g (an Ethereum delivery costs gas)
 
 // PRE-AUTH MARKER (B3 D-i, operator-signed 2026-08-04: the HIGH BIT of the
 // coin's nDemandHeight, NOT a new Coin field). A new bool would have changed
@@ -410,15 +432,11 @@ struct NoteRedeem {
     std::vector<unsigned char> vchPayoutScript;
     std::vector<unsigned char> vchPreAuthSig;
     // ---- Gram-notes release (GOLD_USD_SCOPE.md step 6) ---------------------
-    // nPriceHeight: the height whose payout price values the sECX paid (0 = none: a payout wholly in gold, or a
-    // holder-signed par redemption, which the holder's signature alone protects). At most nPriceBackBlocks back.
-    // Gold paid from the house's till vault (vault moves, TILL, out) counts mg for mg and needs the house's M-of-N
-    // over NoteRedeemVaultSigHash; it is how a house pays in kind when no price exists (R3-9).
-    uint32_t nPriceHeight;
-    std::vector<uint32_t> vApproverIndex;
-    std::vector<std::vector<unsigned char>> vApproverSig;
+    // nRateNamed (Gold B, D-2026-11-07-1): the house's bid in effect, which values the sECX paid (0 = none: a
+    // holder-signed redemption, which the holder's signature alone protects).
+    uint64_t nRateNamed;
 
-    NoteRedeem() : nHouseID(0), fBrassage(0), fPreAuthDischarge(0), nPriceHeight(0) {}
+    NoteRedeem() : nHouseID(0), fBrassage(0), fPreAuthDischarge(0), nRateNamed(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -432,14 +450,9 @@ struct NoteRedeem {
         READWRITE(vPreAuthUnits);
         READWRITE(vchPayoutScript);
         READWRITE(vchPreAuthSig);
-        READWRITE(nPriceHeight);
-        READWRITE(vApproverIndex);
-        READWRITE(vApproverSig);
+        READWRITE(nRateNamed);
     }
 };
-
-/** Gram-notes release: what the house's approvers sign for a redemption paid (partly) from its till vault. */
-uint256 NoteRedeemVaultSigHash(const uint256& houseID, const CTransaction& tx);
 
 /** CLAIM (Phase 3.4, ARCH s7 Option a-2): at effective-Insolvent, the holder
  * burns note coin(s) of the house (U units) and takes AT MOST the pro-rata
@@ -500,6 +513,131 @@ uint256 NoteMintSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, 
 uint256 NoteTransferSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
 uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs);
 uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs);
+/** NOTE_OP_SWAP payload (Gold B; leading nHouseID, the slot convention). The holder (vchHolderPubKey, owning every
+ *  note input) signs NoteSwapSigHash. nRateNamed: the house's bid in effect (the swap's bid at demand). */
+struct NoteSwap {
+    uint32_t nHouseID;
+    uint64_t nUnits;                          // mg handed in: the note inputs' sum, >= NOTE_SWAP_MIN_MG
+    std::vector<unsigned char> vchHolderPubKey;
+    std::vector<unsigned char> vchHolderSig;
+    uint64_t nChainID;                        // the charter token
+    std::vector<unsigned char> vchContract;   // 20 bytes
+    std::vector<unsigned char> vchEthAddress; // 20 bytes: where the gold tokens are to be locked for
+    uint256 hashLock;                         // H = sha256(s)
+    uint64_t nRateNamed;
+    std::vector<unsigned char> vchPayoutScript;   // where an sECX payment goes (SWAP_PAY)
+
+    NoteSwap() : nHouseID(0), nUnits(0), nChainID(0), nRateNamed(0) {}
+
+    ADD_SERIALIZE_METHODS
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nUnits);
+        READWRITE(vchHolderPubKey);
+        READWRITE(vchHolderSig);
+        READWRITE(nChainID);
+        READWRITE(vchContract);
+        READWRITE(vchEthAddress);
+        READWRITE(hashLock);
+        READWRITE(nRateNamed);
+        READWRITE(vchPayoutScript);
+    }
+};
+/** NOTE_OP_SWAP_DONE: the preimage (32 bytes). Anyone may post it. */
+struct NoteSwapDone {
+    uint32_t nHouseID;
+    uint256 hashLock;
+    std::vector<unsigned char> vchPreimage;
+
+    NoteSwapDone() : nHouseID(0) {}
+
+    ADD_SERIALIZE_METHODS
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(hashLock);
+        READWRITE(vchPreimage);
+    }
+};
+/** NOTE_OP_SWAP_PAY: the house's bid in effect named (the payment is at the lower of it and the swap's bid at demand once
+ *  the deadline has passed); fWasProtested restates whether the swap stood protested (connect checks it; the undo of the
+ *  protest count reads it). Anyone may pay. */
+struct NoteSwapPay {
+    uint32_t nHouseID;
+    uint256 hashLock;
+    uint64_t nRateNamed;
+    uint8_t fWasProtested;
+
+    NoteSwapPay() : nHouseID(0), nRateNamed(0), fWasProtested(0) {}
+
+    ADD_SERIALIZE_METHODS
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(hashLock);
+        READWRITE(nRateNamed);
+        READWRITE(fWasProtested);
+    }
+};
+/** NOTE_OP_SWAP_EXPIRE: the house's bid in effect named; it becomes the swap's bid at T_f. Anyone. */
+struct NoteSwapExpire {
+    uint32_t nHouseID;
+    uint256 hashLock;
+    uint64_t nRateNamed;
+
+    NoteSwapExpire() : nHouseID(0), nRateNamed(0) {}
+
+    ADD_SERIALIZE_METHODS
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(hashLock);
+        READWRITE(nRateNamed);
+    }
+};
+/** NOTE_OP_SWAP_PROTEST: the house's protest fields before it (undo priors, the NOTE_OP_PROTEST idiom). Anyone. */
+struct NoteSwapProtest {
+    uint32_t nHouseID;
+    uint256 hashLock;
+    uint32_t nPrevProtestOpen;
+    uint32_t nPrevProtestHeight;
+    uint32_t nPrevProtestDemandHeight;
+
+    NoteSwapProtest() : nHouseID(0), nPrevProtestOpen(0), nPrevProtestHeight(0), nPrevProtestDemandHeight(0) {}
+
+    ADD_SERIALIZE_METHODS
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(hashLock);
+        READWRITE(nPrevProtestOpen);
+        READWRITE(nPrevProtestHeight);
+        READWRITE(nPrevProtestDemandHeight);
+    }
+};
+/** NOTE_OP_SWAP_CLAIM: vout[0] pays the swap's payout script its entitlement; fEscrowChange: vout[1] is escrow change. */
+struct NoteSwapClaim {
+    uint32_t nHouseID;
+    uint256 hashLock;
+    uint8_t fEscrowChange;
+    NoteSwapClaim() : nHouseID(0), fEscrowChange(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(hashLock);
+        READWRITE(fEscrowChange);
+    }
+};
+/** What the holder signs for a SWAP: the payload without its signature, and the transaction's prevouts and outputs. */
+uint256 NoteSwapSigHash(const NoteSwap& swap, const CTransaction& tx);
+/** The hash lock a swap op (NOTE_OP_SWAP .. NOTE_OP_SWAP_CLAIM) names, or false if tx isn't one or its payload doesn't
+ *  decode. The mempool keeps at most one pooled swap op per hash lock (security stage A N1, 2026-11-08). */
+bool NoteSwapOpHashLock(const CTransaction& tx, uint256& hashLock);
+
 uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
 /** B3: the STANDING authorisation. Domain-separated from every other note
  * digest because it authorises a payout the holder will not be present to sign,

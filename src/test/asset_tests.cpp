@@ -220,8 +220,7 @@ BOOST_AUTO_TEST_CASE(asset_coloured_inputs_only_in_transfers_A5)
     AssetTags t;
     std::string r;
     for (int nVersion : {TRANSACTION_BILL_VERSION, TRANSACTION_HOUSE_VERSION, TRANSACTION_NOTE_VERSION,
-                         TRANSACTION_DEPOSIT_VERSION, TRANSACTION_POOL_VERSION, TRANSACTION_SETTLE_VERSION,
-                         TRANSACTION_ORACLE_VERSION}) {
+                         TRANSACTION_DEPOSIT_VERSION, TRANSACTION_POOL_VERSION, TRANSACTION_SETTLE_VERSION}) {
         BOOST_CHECK(!Tags(Spend(1, {5}, nVersion), {Units(5, id)}, t, r) && r == "bad-asset-input-op");
         BOOST_CHECK(!Tags(Spend(1, {5}, nVersion), {Control(id)}, t, r) && r == "bad-asset-input-op");
     }

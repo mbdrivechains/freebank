@@ -13,6 +13,7 @@
 #include <fs.h>
 #include <rpc/server.h>
 #include <init.h>
+#include <notices.h>
 #include <noui.h>
 #include <util.h>
 #include <httpserver.h>
@@ -76,6 +77,7 @@ bool AppInit(int argc, char* argv[])
         }
         else
         {
+            strUsage += "\n" + FormatParagraph(FREEBANK_NOTICE_SHORT) + "\n";
             strUsage += "\n" + _("Usage:") + "\n" +
                   "  freebankd [options]                     " + strprintf(_("Start %s Daemon"), _(PACKAGE_NAME)) + "\n";
 
@@ -135,6 +137,11 @@ bool AppInit(int argc, char* argv[])
         {
             // InitError will have been called with detailed error, which ends up on console
             return false;
+        }
+        // A data directory's first start shows the user notice once (AppInitMain logs it and writes NOTICE.txt).
+        // Printed here, before -daemon closes the terminal; with -printtoconsole the log line reaches it instead.
+        if (!gArgs.GetBoolArg("-printtoconsole", false) && !fs::exists(GetDataDir() / "NOTICE.txt")) {
+            fprintf(stdout, "%s\n", FREEBANK_NOTICE_STANDARD);
         }
         if (gArgs.GetBoolArg("-daemon", false))
         {

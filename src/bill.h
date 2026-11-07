@@ -127,7 +127,7 @@ static const uint64_t LOAN_BOOK_MAX_FACE = (uint64_t)MAX_MONEY;
 // STRICT byte compare (which is what catches u128 accumulator drift). Only a
 // house-held bill takes the versioned layout.
 static const uint32_t BILL_SER_SENTINEL = 0xFFFFFFFFU;
-static const uint8_t BILL_SER_VERSION = 2;
+static const uint8_t BILL_SER_VERSION = 3;   // 3 = Gold B: nRefHouseID
 
 /** One link of the endorsement chain (ARCH §4): signed over
  * (bill_id, to_pk, at_height) with a domain tag. */
@@ -173,10 +173,13 @@ struct CBill {
     // While nonzero the bill is in exactly one house's loan book and the plain
     // ops 2/3/4 refuse to touch it, so a single custody key can move nothing.
     uint32_t nOwnerHouseID;
+    // Gold B (D-2026-11-07-1; GOLD_B.md §3): the reference house named at ISSUE. While the bill is privately held, the
+    // drawee repays in sECX at this house's highest ask of the last 30 days; while a house holds it, at that house's.
+    uint32_t nRefHouseID;
 
     CBill() : nBillID(0), amount(0), amountEscrow(0), nIssuedHeight(0),
               nMaturityHeight(0), nGraceBlocks(0), status(BILL_STATUS_ACTIVE),
-              nOwnerHouseID(0) {}
+              nOwnerHouseID(0), nRefHouseID(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -201,7 +204,7 @@ struct CBill {
         } else {
             // Emit the legacy layout iff the record carries no post-legacy
             // state, so the on-disk bytes of an untouched bill never change.
-            if (nOwnerHouseID != 0) {
+            if (nOwnerHouseID != 0 || nRefHouseID != 0) {
                 uint32_t nSentinel = BILL_SER_SENTINEL;
                 nSerVersion = BILL_SER_VERSION;
                 READWRITE(nSentinel);
@@ -229,6 +232,11 @@ struct CBill {
         } else if (ser_action.ForRead()) {
             nOwnerHouseID = 0;
         }
+        if (nSerVersion >= 3) {
+            READWRITE(nRefHouseID);
+        } else if (ser_action.ForRead()) {
+            nRefHouseID = 0;
+        }
     }
 };
 
@@ -246,8 +254,9 @@ struct BillIssue {
     std::vector<unsigned char> vchHolderPubKey;
     std::vector<unsigned char> vchDrawerSig;      // over BillIssueSigHash
     std::vector<unsigned char> vchAcceptorSig;    // over BillIssueSigHash - this IS acceptance
+    uint32_t nRefHouseID;                         // Gold B: the reference house (see CBill::nRefHouseID)
 
-    BillIssue() : amount(0), nMaturityHeight(0), nGraceBlocks(0) {}
+    BillIssue() : amount(0), nMaturityHeight(0), nGraceBlocks(0), nRefHouseID(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -262,6 +271,7 @@ struct BillIssue {
         READWRITE(vchHolderPubKey);
         READWRITE(vchDrawerSig);
         READWRITE(vchAcceptorSig);
+        READWRITE(nRefHouseID);
     }
 };
 
@@ -286,7 +296,7 @@ struct BillRetire {
 
     // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
     // nPriceBackBlocks back; 0 when nothing is paid in sECX).
-    uint32_t nPriceHeight = 0;
+    uint64_t nRateNamed = 0;   // Gold B: the house rate it accepts (sats per gram)
 
     BillRetire() : nBillID(0) {}
 
@@ -296,7 +306,7 @@ struct BillRetire {
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nBillID);
         READWRITE(vchAcceptorSig);
-        READWRITE(nPriceHeight);
+        READWRITE(nRateNamed);
     }
 };
 
@@ -343,7 +353,7 @@ struct BillDiscount {
     std::vector<unsigned char> vchCustodyPubKey;          // 33B; == house.vchRedemptionDestPK
     uint32_t nExpiryHeight;                               // mandatory nonzero, bounded ahead
     uint32_t nAsOfHeight;                                 // rho-at-mint liveness (R-i7 / DR-1)
-    std::vector<AttestProof> vReserveProofs;              // 1..MAX_ATTEST_PROOFS, never empty
+    std::vector<AttestProof> vReserveProofs;              // <= MAX_ATTEST_PROOFS: the till this discount proves (Gold B)
     uint64_t nPrevMintedUnits;                            // undo priors, one per mutated field
     uint64_t nPrevLoanBookFace;
     uint64_t nPrevLoanWtMatHi;
@@ -404,7 +414,7 @@ struct BillRecourse {
 
     // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
     // nPriceBackBlocks back; 0 when nothing is paid in sECX).
-    uint32_t nPriceHeight = 0;
+    uint64_t nRateNamed = 0;   // Gold B: the house rate it accepts (sats per gram)
 
     BillRecourse() : nBillID(0) {}
 
@@ -416,7 +426,7 @@ struct BillRecourse {
         READWRITE(vchPayerPubKey);
         READWRITE(vchPrevHolderPubKey);
         READWRITE(vchPayerSig);
-        READWRITE(nPriceHeight);
+        READWRITE(nRateNamed);
     }
 };
 
@@ -437,7 +447,7 @@ struct BillHRetire {
 
     // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
     // nPriceBackBlocks back; 0 when nothing is paid in sECX).
-    uint32_t nPriceHeight = 0;
+    uint64_t nRateNamed = 0;   // Gold B: the house rate it accepts (sats per gram)
 
     BillHRetire() : nBillID(0), nOwnerHouseID(0), amountFace(0), nBillMaturityHeight(0),
                     nPrevLoanBookFace(0), nPrevLoanWtMatHi(0), nPrevLoanWtMatLo(0) {}
@@ -454,7 +464,7 @@ struct BillHRetire {
         READWRITE(nPrevLoanWtMatHi);
         READWRITE(nPrevLoanWtMatLo);
         READWRITE(vchAcceptorSig);
-        READWRITE(nPriceHeight);
+        READWRITE(nRateNamed);
     }
 };
 
@@ -481,7 +491,7 @@ struct BillHRetireNotes {
 
     // Gram-notes release: the height whose payout price values the sECX paid (the face is mg; at most
     // nPriceBackBlocks back; 0 when nothing is paid in sECX).
-    uint32_t nPriceHeight = 0;
+    uint64_t nRateNamed = 0;   // Gold B: the house rate it accepts (sats per gram)
 
     BillHRetireNotes() : nBillID(0), nOwnerHouseID(0), amountFace(0), nBillMaturityHeight(0), nUnitsBurned(0),
                          nPrevMintedUnits(0), nPrevLoanBookFace(0), nPrevLoanWtMatHi(0), nPrevLoanWtMatLo(0) {}
@@ -500,7 +510,7 @@ struct BillHRetireNotes {
         READWRITE(nPrevLoanWtMatHi);
         READWRITE(nPrevLoanWtMatLo);
         READWRITE(vchAcceptorSig);
-        READWRITE(nPriceHeight);
+        READWRITE(nRateNamed);
     }
 };
 
@@ -610,7 +620,7 @@ uint256 BillIDFromBody(const std::vector<unsigned char>& vchBody);
 // cover v11 trailer fields, so every payload field a party relies on MUST be
 // bound by one of these payload-level signatures.
 //
-uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey);
+uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID);
 uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned char>& vchTo, uint32_t nAtHeight);
 
 // Retire / claim spend the escrow coin with an EMPTY scriptSig, so nothing

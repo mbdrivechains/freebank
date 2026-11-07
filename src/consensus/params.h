@@ -14,6 +14,11 @@
 
 namespace Consensus {
 
+/** No forks (D-2026-11-05-3): 31 Oct 2027 00:00 UTC, the end of Michael's bidding (doc/PRODUCER_POLICY.md). */
+static constexpr int64_t LATER_RULES_TIME_MAIN = 1824940800;
+/** A later rule that never switches on (regtest's default). */
+static constexpr int64_t LATER_RULE_NEVER = std::numeric_limits<int64_t>::max();
+
 /** One step of the suspension-interest rate schedule (v0.2.18, operator sign-off
  *  2026-10-02, Q1-Q3): from block nHeight onward, demanded notes accrue at nBps
  *  basis points per year (simple, per block). */
@@ -27,44 +32,26 @@ struct DeferInterestStep {
  *  new entry of Params::vGramSchedule, never as a CLI knob. Fields are added step by step as the rules that read them
  *  land. */
 struct GramParams {
-    // The price feed (step 3; R3-10, D-2026-11-01-6 item 3).
-    uint32_t nOracleWindow = 6;           // blocks: a reporter's latest submission this recent counts toward a fix
-    uint32_t nOracleActiveWindows = 4;    // a bonded reporter counts toward a stream's quorum base if it observed that
-                                          //   stream within this many windows (review round 1, G7a: was 24, any stream)
-                                          //   this many windows (silent bonds can't raise the quorum, design 11-01)
-    uint32_t nOracleQuorumMin = 3;        // quorum = max(min, ceil(active / 2)), capped at max
-    uint32_t nOracleQuorumMax = 7;
-    uint32_t nPriceViewBlocks = 144;      // the payout view: the median of the last this-many blocks' raw fixes
-    uint32_t nPriceBackBlocks = 72;       // a payload's price height may be at most this far back (R2-ops-11, R2-int-7)
-    uint32_t nBackingWindow = 144;        // backing reports count within this window
-    uint32_t nBackingStaleBlocks = 288;   // a token whose last backing fix is older counts zero for issuing
-    uint32_t nBurnPayBlocks = 1008;       // D-2026-11-04-1 (3d, R2-ops-7; design agreed N = 7 days): burns this old
-                                          //   that the backing reports don't show paid, beyond the threshold below,
-                                          //   make the token untrusted (zero for issuing at once; equity and claims
-                                          //   after the 30-day grace, as any loss of trust)
-    uint64_t nBurnUnpaidMinMg = 10000;    //   the threshold: max(10 g, 0.5% of the token's supply) - so a burn to an
-    uint32_t nBurnUnpaidBps = 50;         //   address the issuer can't pay costs its sender real gold to matter
-    int64_t nOracleBondMin = 100000000;   // sats; provisional (to be sized against notes outstanding)
-    // Token pools and the payout price (step 4; R3-3, D-2026-11-01-6 item 4).
-    uint32_t nPoolViewBlocks = 144;       // a pool's price and depth are averaged over this many blocks
-    uint32_t nPoolDepthMinBps = 500;      // a pool counts while its average token reserve is >= 5% of the token's supply
-    uint32_t nPayoutCapBps = 500;         // while a pool counts, no payout price is more than 5% above the pool view
-    uint64_t nCreateFeeMg = 1000;         // D-2026-11-04-1 (3b): creating a token or a pool burns 1 g of gold's worth of
-                                          //   sECX at the payout price (no price, no creation)
-    // The house machine on gold (step 5; D-2026-11-01-1; the Monte Carlo's figures, proposals until agreed).
-    uint32_t nCapitalMinBps = 1000;       // issuing needs owners' capital (counted gold) >= 10% of notes and deposits
-    uint32_t nTillMinBps = 200;           // ... and a till (counted gold) >= 2% of notes
-    uint32_t nBillOverdueBlocks = 432;    // a bill unpaid this long past maturity counts zero in equity (R3-1)
-    uint64_t nIssuerBondMinMg = 1000000;  // review round 1b: a token is trusted only with an issuer bond worth >= 1 kg
-    uint32_t nFreezeGraceBlocks = 4320;   // frozen vault gold still counts for 30 days (decisions log 4)...
-    uint32_t nFreezeClearBlocks = 25920;  // ...and the grace restarts only after 180 days with nothing frozen
-    // The exit to ECX reserves (design draft 9; D-2026-11-01-1, -5): sigma = the annualised standard deviation of the
-    // daily log changes of the gold price over the trailing nExitDays; at or below nExitCalmBps the share of capital and
-    // till that may count in sECX rises one step (25%) per nExitStepBlocks, above nExitStormBps it falls one step.
-    uint32_t nExitDays = 730;
-    uint32_t nExitStepBlocks = 25920;
-    uint32_t nExitCalmBps = 4500;
-    uint32_t nExitStormBps = 6000;
+    int64_t nCreateFeeSats = 10000000;    // Gold B (GOLD_B.md §7; closes hole 4): creating a token or a pool burns this much
+                                          //   sECX (0.1 ECX; placeholder until the switch-on figures are set). D-2026-11-04-1 (3b)
+                                          //   made it 1 g at the payout price, which needed a price.
+    // The floors (D-2026-11-06-2, counted as D-2026-11-07-1 says: sECX in mg at the house's 30-day highest ask).
+    uint32_t nCapitalMinBps = 1000;       // issuing needs owners' capital (the sECX escrow) >= 10% of notes and deposits
+    uint32_t nTillMinBps = 200;           // ... and a till (attested sECX) >= 2% of notes
+    uint32_t nBillOverdueBlocks = 432;    // a bill unpaid this long past maturity is defaulted (R3-1; D-2026-11-07-2)
+    // Gold B (D-2026-11-07-1; GOLD_B.md §1, §4, §9): each house's own rate and the chain clock.
+    uint32_t nRateSpreadBps = 200;          // ask <= bid x (1 + 2%)
+    uint32_t nRateRiseBps = 2500;           // the bid may rise at most 25% ...
+    uint32_t nRateRiseWindowSecs = 86400;   // ... per 24 h (from the bid in effect when the window restarted); no fall cap
+    uint32_t nRateRefreshSecs = 86400;      // to issue, a house must have posted its rate within 24 h
+    uint32_t nActiveGapCapSecs = 3600;      // active time leaves out gaps over 1 h between blocks (the swap deadline)
+    uint32_t nCharterRemovalSecs = 2592000; // removing a charter token takes effect 30 days after it is posted
+    uint32_t nSwapDeadlineSecs = 259200;    // a swap's gold tokens are delivered (s revealed) within 72 h of active time
+    uint32_t nSwapPayWindowSecs = 86400;    // an undelivered swap unpaid this much active time after its deadline is protestable
+    uint32_t nShortfallLapseSecs = 7776000; // a failed swap's shortfall claim lapses 90 days after it is paid
+    uint32_t nSwapBidWindowSecs = 86400;    // a failed swap pays at most the highest bid in effect this long before T_f
+    uint32_t nRampPeriodBlocks = 25920;     // the ramp (GOLD_B §5): each escrow tranche's multiple doubles per 180 clean
+                                            //   days (clock blocks), from 1x up to the floor's limit
 };
 
 struct GramStep {
@@ -163,22 +150,6 @@ struct Params {
     uint32_t nSuspensionCap;
     uint32_t nCollectWindow;
     uint32_t nInsolventClaimWindow;
-    /** Gold oracle (Phase G-1, consensus-inert). Same never-a-CLI-knob rule.
-     *  Quorum = DISTINCT registered submitters required in one block for a
-     *  new fix; brake = max fall of the braked view, ppm per elapsed block,
-     *  elapsed capped; unbond delay is provisional (decorative while inert). */
-    uint32_t nOracleQuorumMin;
-    uint32_t nOracleBrakePpmPerBlock;
-    uint32_t nOracleBrakeElapsedCap;
-    uint32_t nOracleUnbondDelay;
-    /** How many heights a v17 op stays valid, counting its nTargetHeight as the
-     * first. MUST be >= 2: under BMM the candidate for the next block is
-     * templated in the same call that connects the current one, so an op signed
-     * against tip H can never reach the H+1 candidate - k=1 starves the oracle
-     * completely. See docs-local/ORACLE_WINDOW_PROPOSAL.md (operator-signed
-     * 2026-07-28). Every STORED height stays a connect height; only this
-     * validity predicate widened. */
-    uint32_t nOracleOpWindow;
     /** Withdrawal poison-row guard (v0.2.13, operator sign-off 2026-09-24:
      *  0 on main and regtest).
      *  From this sidechain height: (a) a withdrawal object is valid only if its
@@ -211,17 +182,19 @@ struct Params {
                 p = &s;
         return p->p;
     }
-    /** Gram-notes release, D-2026-11-01-6 item 3: while one block producer is the only one, reporters forfeit only
-     *  for equivocation and reporter pay is 0. From this height (set by a later release, once a second unconnected
-     *  bidder produces) the liveness and against-the-pool forfeits and the pay switch on. INT_MAX until then. */
-    int nFullForfeitHeight;
-    /** Gram-notes release, D-2026-11-01-6 item 1: no dollar-token pools at launch; a later release sets this height.
-     *  INT_MAX until then. */
-    int nDollarPoolHeight;
-    /** Gram-notes release, D-2026-10-31-8 item 9: house note pools (tx version TRANSACTION_POOL_VERSION, every op)
-     *  open once a second, unconnected BMM bidder produces; a later release sets this height. INT_MAX until then
-     *  (regtest: -housepoolheight). */
-    int nNotePoolHeight;
+    /** No forks (D-2026-11-05-3): the rules that waited on the sole-producer period switch on by themselves at one
+     *  time, the end of Michael's bidding (31 Oct 2027 00:00 UTC = LATER_RULES_TIME_MAIN on main), judged by the median
+     *  time past of a block's parent (LaterRuleOn, validation.h). No later release sets or moves them. Equal on every
+     *  public network, so regtest can switch each alone (-housepooltime, -dollarpooltime). LATER_RULE_NEVER = never;
+     *  0 = from genesis. (Gold B dropped nFullForfeitTime with the forfeits and reporter pay it switched on.)
+     *  - nDollarPoolTime: dollar-token pools (D-2026-11-01-6 item 1).
+     *  - nNotePoolTime: house note pools, tx version TRANSACTION_POOL_VERSION, every op (D-2026-10-31-8 item 9). */
+    int64_t nDollarPoolTime;
+    int64_t nNotePoolTime;
+    /** Gold B clocks in time (GOLD_B.md §6): the credit layer's windows count "clock blocks", 600 s each of chain active
+     *  time (CChainClock), so sparse blocks don't stretch them. Regtest counts plain heights instead (true), so gates
+     *  that mine N blocks keep working; the time path is covered by unit tests. */
+    bool fClockIsHeight = false;
     /** Gram-notes release (scope 7h): a chain started fresh on an L1 whose slot-130 treasury already has a history
      *  credits only treasury changes in L1 blocks at or above this L1 height; the older ones belong to the chain that
      *  ran before (a fresh chain would credit every deposit again after its withdrawals were paid). 0 = all; set on

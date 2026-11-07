@@ -452,6 +452,13 @@ bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
 
 /** Functions for validating blocks and updating the block tree */
 
+/** No forks (D-2026-11-05-3): is a later rule on for a block at nHeight on the active chain? True when the median time
+ *  past of its parent (chainActive[nHeight - 1]) is at or after nSwitchTime; 0 = from genesis, LATER_RULE_NEVER = never.
+ *  Median time past never falls along a chain, so once on, a rule stays on. Callers pass the height of the block being
+ *  connected (its parent is the active tip in ConnectTip, TestBlockValidity and VerifyDB) or tip + 1 (mempool, wallet,
+ *  RPC). Needs cs_main unless nSwitchTime is 0 or LATER_RULE_NEVER. */
+bool LaterRuleOn(int64_t nSwitchTime, int nHeight);
+
 /** Verify BMM for this block with the mainchain */
 /** v0.2.17 C1: the BMM check of a (non-genesis) block, with its coinbase's
  *  PrevBlockCommit. True, or false with state: invalid for a definite no,
@@ -573,16 +580,10 @@ extern std::unique_ptr<BitAssetDB> passettree;
 /** Global variable that points to the active bill tree (protected by cs_main) */
 extern std::unique_ptr<BillDB> pbilltree;
 
-/** Gram-notes release (R3-1): a house's equity in mg at a price - gold in its vaults + amountEscrow (its sECX escrow) at
- *  nSatsPerGram + its loan book at face less vOverdueBill - notes - deposits. Each listed bill must be in its book, not
- *  retired, and unpaid GramParams::nBillOverdueBlocks past maturity at nHeight (read from the bill DB). False with
- *  strReason ("no-price", "no-bills", "duplicate-bill", "bill-not-overdue") otherwise. */
-bool HouseEquityMg(const CHouse& house, int nHeight, uint64_t nSatsPerGram, const CAmount& amountEscrow,
-                   const std::vector<uint32_t>& vOverdueBill, int64_t& nEquityMg, std::string& strReason);
-/** The bills in a house's book overdue at nHeight (sorted, at most MAX_EQUITY_OVERDUE_BILLS). */
+/** The bills in a house's book unpaid GramParams::nBillOverdueBlocks past maturity at nHeight (sorted, at most
+ *  MAX_EQUITY_OVERDUE_BILLS). Information for the RPCs and the explorer only - never complete as a measure of loan
+ *  quality, since a house can repay a bill for its borrower (D-2026-11-07-3); no consensus rule reads it. */
 std::vector<uint32_t> HouseOverdueBills(const CHouse& house, int nHeight);
-/** A house's live sECX escrow pot (pledges, claim change, the deferral till) against a coin view. */
-CAmount HouseEscrowPotAtTip(const CHouse& house, const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin);
 extern std::unique_ptr<HouseDB> phousetree;
 extern std::unique_ptr<PoolDB> ppooltree;
 /** Global variable that points to the units DB (blocks/Units/, gram-notes release) */

@@ -115,7 +115,7 @@ jobs:
           mkdir -p "dist/$PKG/bin"
           cp src/freebankd src/freebank-cli src/freebank-tx "dist/$PKG/bin/"
           strip -S "dist/$PKG/bin/"*
-          cp COPYING README.md "dist/$PKG/"
+          cp COPYING README.md NOTICE.md "dist/$PKG/"
           [ "$PKG" = freebank ] || bash contrib/easynet-readme.sh "$VER" > "dist/$PKG/EASYNET.md"
           gtar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
             --mtime='2026-07-20 10:00' -cf "${PKG}-${VER}-${{ matrix.arch }}-apple-darwin.tar" "$PKG"

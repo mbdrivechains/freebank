@@ -6,7 +6,6 @@
 #include <base58.h>
 #include <bill.h>
 #include <house.h>
-#include <oracle.h>
 #include <pool.h>
 #include <note.h>
 #include <token.h>
@@ -33,9 +32,11 @@
 #include <sidechainclient.h>
 #include <timedata.h>
 #include <txdb.h>
+#include <issued.h>   // HouseCapitalForChecks
+#include <houserate.h>
+#include <units.h>
 #include <units.h>
 #include <issued.h>
-#include <pricefeed.h>
 #include <util.h>
 #include <validationinterface.h>
 #include <utilstrencodings.h>
@@ -1740,6 +1741,7 @@ static UniValue BillToJSON(const CBill& bill, bool fIncludeBody)
     obj.pushKV("issued_height", (uint64_t)bill.nIssuedHeight);
     obj.pushKV("maturity_height", (uint64_t)bill.nMaturityHeight);
     obj.pushKV("grace_blocks", (uint64_t)bill.nGraceBlocks);
+    obj.pushKV("ref_house_id", (uint64_t)bill.nRefHouseID);   // Gold B: the house whose 30-day highest ask it repays at
     obj.pushKV("drawer_pubkey", HexStr(bill.vchDrawerPubKey));
     obj.pushKV("acceptor_pubkey", HexStr(bill.vchAcceptorPubKey));
     obj.pushKV("holder_pubkey", HexStr(bill.vchHolderPubKey));
@@ -1901,7 +1903,6 @@ static UniValue HouseToJSON(const CHouse& house)
     obj.pushKV("threshold", (uint64_t)house.nThresholdM);
     obj.pushKV("classid", house.strClassID);
     obj.pushKV("denominationmggold", house.nDenomMgGold);
-    obj.pushKV("lambdax10", (uint64_t)HOUSE_LAMBDA_X10[house.nTier <= MAX_HOUSE_TIER ? house.nTier : 0]);
     obj.pushKV("activeescrow", ValueFromAmount(house.ActiveEscrow()));
     obj.pushKV("mintedunits", house.nMintedUnits);
     // v0.2.20: the part of mintedunits held as the backing of the house's Chaumian tokens (locked by the mint record,
@@ -1945,18 +1946,20 @@ static UniValue HouseToJSON(const CHouse& house)
     // The BINDING cap is the min of the two (3.5 D2): capital (lambda*escrow)
     // and reserve (attested till / rho). Publish all three - the market prices
     // which constraint is binding.
-    // Gram-notes release: a house issues against counted gold, so the caps are in mg from its gold (gethousegold has
-    // the detail): capital = counted capital / nCapitalMinBps less the deposits (the room for notes under it), reserve =
-    // counted till / nTillMinBps, mint = the lower. The binding cap is the mint cap.
+    // Gold B (D-2026-11-07-1): the caps are in mg from the house's sECX at its 30-day highest ask, as the issue checks
+    // count them: capital = the ramped escrow capacity (each tranche 1x doubling per 180 clean days to 10x) less the
+    // notes owed by open swaps, less the deposits (the room for notes under it); reserve = attested till / nTillMinBps
+    // less the open swaps; mint = the lower. The binding cap is the mint cap. No rate posted: every cap is 0.
     {
-        const int nTip = chainActive.Height();
-        const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nTip);
-        CUnitsView viewUnits(punitsdb.get());
-        CGoldCount gold;
-        HouseGoldCounted(viewUnits, house, nTip, gp, false, gold);
-        const uint64_t nCapitalCap = (uint64_t)((unsigned __int128)gold.nCapitalMg * 10000 / gp.nCapitalMinBps);
+        const int nNext = chainActive.Height() + 1;
+        const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nNext);
+        CHouseCapital cap;
+        const bool fCap = HouseCapitalForChecks(house, nNext, HouseAttestedTillSats(house, nNext), cap);
+        const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
+        const uint64_t nCapitalCap = fCap && cap.nCapacityMg > nPending ? cap.nCapacityMg - nPending : 0;
         const uint64_t nCapitalNotes = nCapitalCap > house.nDepositUnits ? nCapitalCap - house.nDepositUnits : 0;
-        const uint64_t nTillCap = (uint64_t)((unsigned __int128)gold.nTillMg * 10000 / gp.nTillMinBps);
+        const uint64_t nTillGross = fCap ? (uint64_t)((unsigned __int128)cap.nTillMg * 10000 / gp.nTillMinBps) : 0;
+        const uint64_t nTillCap = nTillGross > nPending ? nTillGross - nPending : 0;
         obj.pushKV("mintcapunits", std::min(nCapitalNotes, nTillCap));
         obj.pushKV("capitalcapunits", nCapitalNotes);
         obj.pushKV("reservecapunits", nTillCap);
@@ -1966,7 +1969,7 @@ static UniValue HouseToJSON(const CHouse& house)
     // deterrent depends on the fee being known ex ante.
     // v1.1.0: "attestedratiobps" dropped (attested ECX sats over notes in mg: no meaning under gram notes, and no
     // longer read by any rule).
-    // v1.1.0: the spread a redemption owes now reads the counted gold till against the 2% till floor
+    // The spread a redemption owes reads the till (attested sECX at A30, Gold B) against the 2% till floor
     obj.pushKV("tillratiobps", (uint64_t)GoldTillRatioBps(house, chainActive.Height() + 1));
     obj.pushKV("brassagebps", (uint64_t)GoldBrassageBps(house, chainActive.Height() + 1));
 
@@ -2000,6 +2003,25 @@ static UniValue HouseToJSON(const CHouse& house)
             obj.pushKV("protest_height", (uint64_t)house.nProtestHeight);
             obj.pushKV("protest_demand_height", (uint64_t)house.nProtestDemandHeight);
         }
+        // Gold B (D-2026-11-07-3): the cure a stressed house is running - its length in clock blocks (a fresh cure's
+        // 7 days, or the time a re-armed protest had left) and the first height it is insolvent unless it pays.
+        if (nStress != 0 && house.nDeferInvokedHeight == 0 && house.status != HOUSE_STATUS_INSOLVENT &&
+            house.nNoCureHeight == 0) {
+            const uint64_t nWindow = HouseCureWindow(house, nStress);
+            obj.pushKV("cure_window", nWindow);
+            obj.pushKV("cure_insolvent_height", (uint64_t)ClockDeadlineHeight(nStress, nWindow, nTipHeight + 1));
+        }
+        if (house.nCureLeft != 0)
+            obj.pushKV("cure_left", (uint64_t)house.nCureLeft);
+        if (house.nNoCureHeight != 0)
+            obj.pushKV("no_cure_height", (uint64_t)house.nNoCureHeight);
+        // One cure per 180 days, counted from the end of the last episode: the first height a new protest gets a cure.
+        {
+            const uint32_t nRef = std::max(house.nProtestHeight, house.nDeferEndedHeight);
+            if (nRef != 0)
+                obj.pushKV("next_cure_height",
+                           (uint64_t)ClockDeadlineHeight(nRef, HOUSE_CURE_SPACING_BLOCKS, nTipHeight + 1));
+        }
         obj.pushKV("attest_deadline", (uint64_t)nDeadline);
         obj.pushKV("lastattestheight", (uint64_t)house.nLastAttestHeight);
         obj.pushKV("lastattestreserves", ValueFromAmount(house.amountLastAttestReserves));
@@ -2025,10 +2047,10 @@ static UniValue HouseToJSON(const CHouse& house)
             // The silence deadline: the first height at which this suspended
             // house is Insolvent unless it attests before then (missed
             // MISS_N cadences + nDeferSilenceWindow). Moves on every attest.
-            obj.pushKV("defer_silence_insolvent_height", (uint64_t)HouseDeferSilenceInsolventHeight(house));
+            obj.pushKV("defer_silence_insolvent_height", (uint64_t)HouseDeferSilenceInsolventHeight(house, chainActive.Height() + 1));
             // v0.2.28: no suspension outlasts nSuspensionCap; the house is Insolvent at the earlier of the two.
-            obj.pushKV("defer_cap_insolvent_height", (uint64_t)HouseDeferCapInsolventHeight(house));
-            obj.pushKV("defer_insolvent_height", (uint64_t)HouseDeferInsolventHeight(house));
+            obj.pushKV("defer_cap_insolvent_height", (uint64_t)HouseDeferCapInsolventHeight(house, chainActive.Height() + 1));
+            obj.pushKV("defer_insolvent_height", (uint64_t)HouseDeferInsolventHeight(house, chainActive.Height() + 1));
         }
         obj.pushKV("defer_renewals", (uint64_t)house.nDeferRenewals);
         obj.pushKV("defer_activations", (uint64_t)house.nDeferActivations);
@@ -2103,6 +2125,14 @@ UniValue gethouse(const JSONRPCRequest& request)
             "\nArguments:\n"
             "1. id            (numeric, required) the house ID number\n"
             "\nGet one discount house (full record incl. partner set)\n"
+            "\nThe cure (Gold B; heights not yet reached are estimates at one clock block per block, exact once passed):\n"
+            "  \"cure_window\"            (numeric) a stressed house's cure in clock blocks (600 s each): 7 days, or the\n"
+            "                           time a protest re-armed by a recovery had left\n"
+            "  \"cure_insolvent_height\"  (numeric) the first height the stressed house is insolvent unless it pays\n"
+            "  \"cure_left\"              (numeric) the raw record: the clock blocks a re-armed cure continues with\n"
+            "  \"no_cure_height\"         (numeric) a protest found no cure (within 180 days): insolvent from here\n"
+            "  \"next_cure_height\"       (numeric) the first height a new protest gets a cure (180 days from the end of\n"
+            "                           the last episode, if it ended now)\n"
             "\nExamples:\n"
             + HelpExampleCli("gethouse", "1")
             + HelpExampleRpc("gethouse", "1")
@@ -2314,110 +2344,6 @@ UniValue getpool(const JSONRPCRequest& request)
     return PoolToJSON(pool);
 }
 
-UniValue getgoldfix(const JSONRPCRequest& request)
-{
-    if (request.fHelp || request.params.size() != 0)
-        throw std::runtime_error(
-            "getgoldfix\n"
-            "\nThe price feed (gram-notes release): the gold price's payout view in sats per gram and each\n"
-            "price stream's last fix. Prices come from bonded reporters' observations (pricefeed.h).\n"
-            "\nResult:\n"
-            "{\n"
-            "  \"payout_view_sats_per_gram\": n,  the median of the last 144 blocks' gold fixes (null = stale)\n"
-            "  \"stale\":       bool,\n"
-            "  \"gold_ecx_last_fix\": {\"value\", \"reporters\", \"fixheight\", \"ageblocks\"} or null,\n"
-            "  \"gold_usd_last_fix\": {...} or null (US cents per gram)\n"
-            "}\n"
-            "\nExamples:\n"
-            + HelpExampleCli("getgoldfix", "")
-            + HelpExampleRpc("getgoldfix", "")
-        );
-
-    LOCK(cs_main);
-
-    // Gram-notes release: the price feed in the units DB (pricefeed.h). No price yet is a normal state, not an error.
-    const int nTip = chainActive.Height();
-    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nTip);
-    CUnitsView units(punitsdb.get());
-    UniValue obj(UniValue::VOBJ);
-    uint64_t nView = 0;
-    const bool fView = PriceFeedPayoutView(units, nTip, gp, nView);
-    obj.pushKV("payout_view_sats_per_gram", fView ? UniValue((uint64_t)nView) : NullUniValue);
-    obj.pushKV("stale", !fView);
-    for (uint8_t nStream : {ORACLE_STREAM_GOLD_ECX, ORACLE_STREAM_GOLD_USD}) {
-        const std::vector<std::pair<UnitsKey, UnitsValue>> v = units.Scan(UnitsKey(UNITS_ORACLE_FIX).U8(nStream).Hash(uint256()), UnitsKey(), SIZE_MAX);
-        UniValue last(UniValue::VNULL);
-        if (!v.empty()) {
-            CPriceFix fix;
-            CDataStream ss(v.back().second, SER_DISK, CLIENT_VERSION);
-            ss >> fix;
-            const std::vector<unsigned char>& k = v.back().first.v;
-            const uint32_t nH = ((uint32_t)k[34] << 24) | ((uint32_t)k[35] << 16) | ((uint32_t)k[36] << 8) | (uint32_t)k[37];
-            last = UniValue(UniValue::VOBJ);
-            last.pushKV("value", (uint64_t)fix.nValue);
-            last.pushKV("reporters", (uint64_t)fix.nCount);
-            last.pushKV("fixheight", (uint64_t)nH);
-            if (nTip >= 0 && (uint32_t)nTip >= nH)
-                last.pushKV("ageblocks", (uint64_t)((uint32_t)nTip - nH));
-        }
-        obj.pushKV(nStream == ORACLE_STREAM_GOLD_ECX ? "gold_ecx_last_fix" : "gold_usd_last_fix", last);
-    }
-    return obj;
-}
-
-UniValue listoraclesubmitters(const JSONRPCRequest& request)
-{
-    if (request.fHelp || request.params.size() != 0)
-        throw std::runtime_error(
-            "listoraclesubmitters\n"
-            "\nList the bonded gold-price submitters, with liveness derived from\n"
-            "their stored heights (nothing about reliability is stored directly).\n"
-            "\nResult (array of):\n"
-            "{\n"
-            "  \"id\":                n,\n"
-            "  \"pubkey\":            \"hex\",\n"
-            "  \"bondtxid\":          \"hex\",  the bond escrow coin\n"
-            "  \"bondvout\":          n,\n"
-            "  \"bondheight\":        n,\n"
-            "  \"lastsubmitheight\":  n,   0 = has never submitted\n"
-            "  \"blockssincesubmit\": n,   derived; omitted if never\n"
-            "  \"unbondrequestheight\": n  0 = none pending\n"
-            "}\n"
-            "\nHONEST LIMIT: a gap in these heights does NOT prove a submitter was\n"
-            "absent. Consensus cannot distinguish \"did not submit\" from \"the block\n"
-            "producer did not include it\" - the sequencer authors these records.\n"
-            "Do not read this as a reliability score: nothing here is used to\n"
-            "forfeit a bond. While there is one block producer no reporter bond\n"
-            "is forfeited at all (D-2026-11-04-1); a later release sets the height\n"
-            "from which forfeits apply.\n"
-            "\nExamples:\n"
-            + HelpExampleCli("listoraclesubmitters", "")
-            + HelpExampleRpc("listoraclesubmitters", "")
-        );
-
-    LOCK(cs_main);
-
-    const int nTip = chainActive.Height();
-    UniValue ret(UniValue::VARR);
-    for (const COracleSubmitter& sub : phousetree->GetOracleSubmitters()) {
-        UniValue obj(UniValue::VOBJ);
-        obj.pushKV("id", (uint64_t)sub.nSubmitterID);
-        obj.pushKV("pubkey", HexStr(sub.vchPubKey));
-        // Separate txid/vout, not COutPoint::ToString() - that is a DEBUG form
-        // ("COutPoint(61dc76ef37, 0)"): abbreviated hash, unparseable, and
-        // useless to any caller wanting to look the coin up.
-        obj.pushKV("bondtxid", sub.bondOutpoint.hash.ToString());
-        obj.pushKV("bondvout", (uint64_t)sub.bondOutpoint.n);
-        obj.pushKV("bondheight", (uint64_t)sub.nBondHeight);
-        obj.pushKV("lastsubmitheight", (uint64_t)sub.nLastSubmitHeight);
-        if (sub.nLastSubmitHeight != 0 && nTip >= 0 && (uint32_t)nTip >= sub.nLastSubmitHeight)
-            obj.pushKV("blockssincesubmit", (uint64_t)((uint32_t)nTip - sub.nLastSubmitHeight));
-        obj.pushKV("unbondrequestheight", (uint64_t)sub.nUnbondRequestHeight);
-        ret.push_back(obj);
-    }
-    return ret;
-}
-
 static const CRPCCommand commands[] =
 { //  category              name                        actor (function)           argNames
   //  --------------------- ------------------------    -----------------------    ----------
@@ -2465,8 +2391,6 @@ static const CRPCCommand commands[] =
     { "pools",              "getpool",                      &getpool,                       {"id"}},
 
 
-    { "oracle",             "getgoldfix",                   &getgoldfix,                    {}},
-    { "oracle",             "listoraclesubmitters",         &listoraclesubmitters,          {}},
 
     /* BitAssets */
     { "BitAssets",          "listassets",                   &listassets,                    {"from_asset_id", "count"}},

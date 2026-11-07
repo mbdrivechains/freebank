@@ -5,6 +5,8 @@
 
 #include <rpc/blockchain.h>
 
+#include <house.h>   // ClockAtHeight (Gold B clocks in time)
+
 #include <amount.h>
 #include <chain.h>
 #include <chainparams.h>
@@ -25,6 +27,10 @@
 #include <util.h>
 #include <utilstrencodings.h>
 #include <hash.h>
+#include <base58.h>
+#include <issued.h>
+#include <script/standard.h>
+#include <units.h>
 #include <validationinterface.h>
 #include <warnings.h>
 
@@ -1216,7 +1222,13 @@ UniValue getblockchaininfo(const JSONRPCRequest& request)
             "  \"chain\": \"xxxx\",              (string) current network name (main, beta, regtest)\n"
             "  \"dormant\": true|false,        (boolean) v0.2.19: true while this network has no valid block after genesis\n"
             "                                  (FreeBank mainnet until a release switches it on)\n"
-            "  \"note_unit\": \"mg\",            (string) gram-notes release: what a note, bill, deposit or gold token unit counts (milligrams of gold, from genesis); absent on older builds (sats of sECX)\n"
+            "  \"note_unit\": \"mg\",            (string) gram-notes release: what a note, bill or deposit unit counts (milligrams of gold, from genesis); absent on older builds (sats of sECX)\n"
+            "  \"note_pools_open\": true|false, (boolean) house note pools are open for the next block\n"
+            "  \"dollar_pools_open\": true|false, (boolean) dollar-token pools are open for the next block\n"
+            "  \"later_rules_time\": n|null,     (numeric) when the two pool rules switch on by themselves (unix time, judged by the tip's median time;\n"
+            "                                  main: 1824940800 = 31 Oct 2027 00:00 UTC); null if never\n"
+            "  \"clock_blocks\": n,             (numeric) Gold B: the credit windows' clock at the tip, in clock blocks (600 s of chain\n"
+            "                                  active time each; equal to the height on regtest)\n"
             "  \"blocks\": xxxxxx,             (numeric) the current number of blocks processed in the server\n"
             "  \"headers\": xxxxxx,            (numeric) the current number of headers we have validated\n"
             "  \"bestblockhash\": \"...\",       (string) the hash of the currently best block\n"
@@ -1268,9 +1280,20 @@ UniValue getblockchaininfo(const JSONRPCRequest& request)
     // Gram-notes release: notes, bills, deposits and gold tokens count milligrams of gold, from genesis on every
     // network this build runs (older builds: absent, and their notes count sats of sECX).
     obj.pushKV("note_unit",             "mg");
-    // House note pools (createpool, swapnote, ...) open from a height a later release sets (D-2026-10-31-8 item 9);
-    // gold-token pools are open. Absent on older builds.
-    obj.pushKV("note_pools_open",       chainActive.Height() + 1 >= Params().GetConsensus().nNotePoolHeight);
+    // House note pools (createpool, swapnote, ...) are closed while one producer is the only one (D-2026-10-31-8 item
+    // 9); token pools are open. No forks (D-2026-11-05-3): the later rules switch on by themselves at one time,
+    // judged by the median time past of the next block's parent (the tip). Absent on older builds.
+    {
+        const Consensus::Params& cp = Params().GetConsensus();
+        const int nNext = chainActive.Height() + 1;
+        obj.pushKV("note_pools_open",   LaterRuleOn(cp.nNotePoolTime, nNext));
+        obj.pushKV("dollar_pools_open", LaterRuleOn(cp.nDollarPoolTime, nNext));
+        // The network's time (main: 31 Oct 2027 00:00 UTC); null when it never switches (regtest's default).
+        const int64_t nTime = cp.nNotePoolTime;
+        if (nTime == Consensus::LATER_RULE_NEVER) obj.pushKV("later_rules_time", NullUniValue);
+        else obj.pushKV("later_rules_time", nTime);
+        obj.pushKV("clock_blocks", ClockAtHeight(chainActive.Height()));   // GOLD_B §6
+    }
     obj.pushKV("blocks",                (int)chainActive.Height());
     obj.pushKV("headers",               pindexBestHeader ? pindexBestHeader->nHeight : -1);
     obj.pushKV("bestblockhash",         chainActive.Tip()->GetBlockHash().GetHex());

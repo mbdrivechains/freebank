@@ -9,7 +9,6 @@
 #include <deposit.h>
 #include <house.h>
 #include <note.h>
-#include <oracle.h>
 #include <issued.h>
 #include <pool.h>
 #include <settle.h>
@@ -171,7 +170,6 @@ const char* CreditFamilyName(int nVersion)
     case TRANSACTION_DEPOSIT_VERSION: return "deposit";
     case TRANSACTION_POOL_VERSION:    return "pool";
     case TRANSACTION_SETTLE_VERSION:  return "settle";
-    case TRANSACTION_ORACLE_VERSION:  return "oracle";
     case TRANSACTION_TOKEN_VERSION:   return "token";
     }
     return nullptr;
@@ -208,8 +206,8 @@ std::string CreditOpName(int nVersion, uint8_t nOp)
         {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_MEMBER_REMOVE}, "member_remove"},
         {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_MEMBER_PURGE}, "member_purge"},
         {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_CLOSE}, "close"},
-        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_TILL}, "till"},
-        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_EQUITY}, "equity"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_RATE}, "rate"},
+        {{TRANSACTION_HOUSE_VERSION, HOUSE_OP_CHARTER}, "charter"},
         {{TRANSACTION_NOTE_VERSION, NOTE_OP_MINT}, "mint"},
         {{TRANSACTION_NOTE_VERSION, NOTE_OP_TRANSFER}, "transfer"},
         {{TRANSACTION_NOTE_VERSION, NOTE_OP_REDEEM}, "redeem"},
@@ -218,6 +216,12 @@ std::string CreditOpName(int nVersion, uint8_t nOp)
         {{TRANSACTION_NOTE_VERSION, NOTE_OP_CLAIM}, "claim"},
         {{TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND}, "demand"},
         {{TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST}, "protest"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP}, "swap"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_DONE}, "swap_done"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PAY}, "swap_pay"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PROTEST}, "swap_protest"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_EXPIRE}, "swap_expire"},
+        {{TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_CLAIM}, "swap_claim"},
         {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE}, "originate"},
         {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_TRANSFER}, "transfer"},
         {{TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_WITHDRAW}, "withdraw"},
@@ -232,16 +236,12 @@ std::string CreditOpName(int nVersion, uint8_t nOp)
         {{TRANSACTION_POOL_VERSION, POOL_OP_RETIRE}, "retire"},
         {{TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE}, "exchange"},
         {{TRANSACTION_SETTLE_VERSION, SETTLE_OP_NET}, "net"},
-        {{TRANSACTION_ORACLE_VERSION, ORACLE_OP_BOND}, "bond"},
-        {{TRANSACTION_ORACLE_VERSION, ORACLE_OP_SUBMIT}, "submit"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_CREATE}, "create"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_MINT}, "mint"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_BURN}, "burn"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_TRANSFER}, "transfer"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_FREEZE}, "freeze"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_UNFREEZE}, "unfreeze"},
-        {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_BOND}, "bond"},
-        {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_UNBOND}, "unbond"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_POOL_CREATE}, "pool_create"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_POOL_ADD}, "pool_add"},
         {{TRANSACTION_TOKEN_VERSION, ISSUED_OP_POOL_REMOVE}, "pool_remove"},
@@ -266,7 +266,6 @@ static void CreditToUniv(const CTransaction& tx, UniValue& entry)
     case TRANSACTION_DEPOSIT_VERSION: nOp = tx.nDepositOp; payload = &tx.vchDepositPayload; break;
     case TRANSACTION_POOL_VERSION:    nOp = tx.nPoolOp;    payload = &tx.vchPoolPayload;    break;
     case TRANSACTION_SETTLE_VERSION:  nOp = tx.nSettleOp;  payload = &tx.vchSettlePayload;  break;
-    case TRANSACTION_ORACLE_VERSION:  nOp = tx.nOracleOp;  payload = &tx.vchOraclePayload;  break;
     case TRANSACTION_TOKEN_VERSION:   nOp = tx.nIssuedOp;  payload = &tx.vchIssuedPayload;  break;
     default: return;
     }

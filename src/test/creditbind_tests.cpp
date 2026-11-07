@@ -18,7 +18,6 @@
 #include <key.h>
 #include <miner.h>
 #include <note.h>
-#include <oracle.h>
 #include <issued.h>
 #include <policy/policy.h>
 #include <pool.h>
@@ -85,7 +84,6 @@ CMutableTransaction Credit(int32_t nVersion, uint8_t nOp, const std::vector<unsi
     case TRANSACTION_DEPOSIT_VERSION: m.nDepositOp = nOp; m.vchDepositPayload = vch; break;
     case TRANSACTION_POOL_VERSION: m.nPoolOp = nOp; m.vchPoolPayload = vch; break;
     case TRANSACTION_SETTLE_VERSION: m.nSettleOp = nOp; m.vchSettlePayload = vch; break;
-    case TRANSACTION_ORACLE_VERSION: m.nOracleOp = nOp; m.vchOraclePayload = vch; break;
     case TRANSACTION_TOKEN_VERSION: m.nIssuedOp = nOp; m.vchIssuedPayload = vch; break;
     }
     m.vin.push_back(CTxIn(COutPoint(uint256S("0a"), 0)));
@@ -106,7 +104,6 @@ uint256 Expected(uint8_t nOp, uint8_t nTag, const std::vector<unsigned char>& vc
     else
         ss << vchForm;
     ss << std::vector<CIssuedOut>();   // gram-notes release: every credit version binds its (here empty) annex
-    ss << std::vector<CVaultMove>();   // and its (here empty) vault moves
     return ss.GetHash();
 }
 
@@ -145,13 +142,12 @@ BOOST_FIXTURE_TEST_SUITE(creditbind_tests, BasicTestingSetup)
 BOOST_AUTO_TEST_CASE(binding_form_per_op)
 {
     const int B = TRANSACTION_BILL_VERSION, H = TRANSACTION_HOUSE_VERSION, N = TRANSACTION_NOTE_VERSION,
-              D = TRANSACTION_DEPOSIT_VERSION, P = TRANSACTION_POOL_VERSION, S = TRANSACTION_SETTLE_VERSION,
-              O = TRANSACTION_ORACLE_VERSION;
+              D = TRANSACTION_DEPOSIT_VERSION, P = TRANSACTION_POOL_VERSION, S = TRANSACTION_SETTLE_VERSION;
 
-    CheckOp<BillIssue>(B, BILL_OP_ISSUE, 28, [](BillIssue& p) { p.vchDrawerSig.clear(); p.vchAcceptorSig.clear(); }, "BILL ISSUE");
+    CheckOp<BillIssue>(B, BILL_OP_ISSUE, 32, [](BillIssue& p) { p.vchDrawerSig.clear(); p.vchAcceptorSig.clear(); }, "BILL ISSUE");
     // ENDORSE keeps its height bound: only the discount's link height is the seller's to set late.
     CheckOp<BillEndorse>(B, BILL_OP_ENDORSE, 14, [](BillEndorse& p) { p.endorsement.vchSig.clear(); }, "BILL ENDORSE");
-    CheckOp<BillRetire>(B, BILL_OP_RETIRE, 10, [](BillRetire& p) { p.vchAcceptorSig.clear(); }, "BILL RETIRE");
+    CheckOp<BillRetire>(B, BILL_OP_RETIRE, 14, [](BillRetire& p) { p.vchAcceptorSig.clear(); }, "BILL RETIRE");
     CheckOp<BillClaim>(B, BILL_OP_CLAIM, 6, [](BillClaim& p) { p.vchHolderSig.clear(); }, "BILL CLAIM");
     CheckOp<BillDiscount>(B, BILL_OP_DISCOUNT, 142, [](BillDiscount& p) {
         ClearProofs(p.vReserveProofs);
@@ -160,11 +156,11 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
         p.vchSellerSig.clear();
         ClearApprovers(p);
     }, "BILL DISCOUNT");
-    CheckOp<BillRecourse>(B, BILL_OP_RECOURSE, 14, [](BillRecourse& p) { p.vchPayerSig.clear(); }, "BILL RECOURSE");
-    CheckOp<BillHRetire>(B, BILL_OP_HRETIRE, 50, [](BillHRetire& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE");
+    CheckOp<BillRecourse>(B, BILL_OP_RECOURSE, 18, [](BillRecourse& p) { p.vchPayerSig.clear(); }, "BILL RECOURSE");
+    CheckOp<BillHRetire>(B, BILL_OP_HRETIRE, 54, [](BillHRetire& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE");
     CheckOp<BillHClaim>(B, BILL_OP_HCLAIM, 52, [](BillHClaim& p) { ClearApprovers(p); }, "BILL HCLAIM");
-    CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_NOTES, 66, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_NOTES");
-    CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_ESCROW, 66, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_ESCROW");
+    CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_NOTES, 70, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_NOTES");
+    CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_ESCROW, 70, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_ESCROW");
     CheckOp<BillHClaimEscrow>(B, BILL_OP_HCLAIM_ESCROW, 44, [](BillHClaimEscrow&) {}, "BILL HCLAIM_ESCROW");
 
     CheckOp<HouseRegister>(H, HOUSE_OP_REGISTER, 32, [](HouseRegister& p) { p.vPartnerSig.clear(); }, "HOUSE REGISTER");
@@ -173,7 +169,7 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
     CheckOp<HouseExit>(H, HOUSE_OP_EXIT, 18, [](HouseExit& p) { p.vchPartnerSig.clear(); ClearApprovers(p); }, "HOUSE EXIT");
     CheckOp<HouseWinddown>(H, HOUSE_OP_WINDDOWN, 12, [](HouseWinddown& p) { ClearApprovers(p); }, "HOUSE WINDDOWN");
     CheckOp<HouseReclaim>(H, HOUSE_OP_RECLAIM, 10, [](HouseReclaim& p) { p.vchSig.clear(); }, "HOUSE RECLAIM");
-    CheckOp<HouseAttest>(H, HOUSE_OP_ATTEST, 98, [](HouseAttest& p) { ClearProofs(p.vProofs); ClearApprovers(p); }, "HOUSE ATTEST");
+    CheckOp<HouseAttest>(H, HOUSE_OP_ATTEST, 102, [](HouseAttest& p) { ClearProofs(p.vProofs); ClearApprovers(p); }, "HOUSE ATTEST");
     CheckOp<HouseDefer>(H, HOUSE_OP_DEFER, 16, [](HouseDefer& p) { ClearApprovers(p); }, "HOUSE DEFER");
     CheckOp<HouseRenew>(H, HOUSE_OP_RENEW, 12, [](HouseRenew& p) { ClearApprovers(p); }, "HOUSE RENEW");
     CheckOp<HouseRelease>(H, HOUSE_OP_RELEASE, 12, [](HouseRelease& p) { ClearApprovers(p); }, "HOUSE RELEASE");
@@ -186,7 +182,7 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
 
     CheckOp<NoteMint>(N, NOTE_OP_MINT, 66, [](NoteMint& p) { ClearProofs(p.vReserveProofs); ClearApprovers(p); }, "NOTE MINT");
     CheckOp<NoteTransfer>(N, NOTE_OP_TRANSFER, 21, [](NoteTransfer& p) { p.vchSenderSig.clear(); }, "NOTE TRANSFER");
-    CheckOp<NoteRedeem>(N, NOTE_OP_REDEEM, 35, [](NoteRedeem& p) { p.vchHolderSig.clear(); p.vchPreAuthSig.clear(); p.vApproverIndex.clear(); p.vApproverSig.clear(); }, "NOTE REDEEM");
+    CheckOp<NoteRedeem>(N, NOTE_OP_REDEEM, 31, [](NoteRedeem& p) { p.vchHolderSig.clear(); p.vchPreAuthSig.clear(); }, "NOTE REDEEM");
     CheckOp<NoteLock>(N, NOTE_OP_LOCK, 33, [](NoteLock& p) { p.vchHolderSig.clear(); ClearApprovers(p); }, "NOTE LOCK");
     CheckOp<NoteUnlock>(N, NOTE_OP_UNLOCK, 21, [](NoteUnlock& p) { ClearApprovers(p); }, "NOTE UNLOCK");
     CheckOp<NoteClaim>(N, NOTE_OP_CLAIM, 9, [](NoteClaim& p) { p.vchHolderSig.clear(); }, "NOTE CLAIM");
@@ -199,11 +195,11 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
 
     CheckOp<DepositOriginate>(D, DEPOSIT_OP_ORIGINATE, 31, [](DepositOriginate& p) { ClearApprovers(p); }, "DEPOSIT ORIGINATE");
     CheckOp<DepositTransfer>(D, DEPOSIT_OP_TRANSFER, 28, [](DepositTransfer& p) { p.vchSenderSig.clear(); }, "DEPOSIT TRANSFER");
-    CheckOp<DepositWithdraw>(D, DEPOSIT_OP_WITHDRAW, 12, [](DepositWithdraw& p) { p.vchHolderSig.clear(); }, "DEPOSIT WITHDRAW");
+    CheckOp<DepositWithdraw>(D, DEPOSIT_OP_WITHDRAW, 16, [](DepositWithdraw& p) { p.vchHolderSig.clear(); }, "DEPOSIT WITHDRAW");
     CheckOp<DepositClaim>(D, DEPOSIT_OP_CLAIM, 9, [](DepositClaim& p) { p.vchHolderSig.clear(); }, "DEPOSIT CLAIM");
     CheckOp<DepositDemand>(D, DEPOSIT_OP_DEMAND, 30, [](DepositDemand& p) { p.vchPreAuthSig.clear(); }, "DEPOSIT DEMAND");
     CheckOp<DepositProtest>(D, DEPOSIT_OP_PROTEST, 48, [](DepositProtest& p) { p.vchPreAuthSig.clear(); p.vchHolderSig.clear(); }, "DEPOSIT PROTEST");
-    CheckOp<DepositDischarge>(D, DEPOSIT_OP_DISCHARGE, 18, [](DepositDischarge& p) { p.vchPreAuthSig.clear(); }, "DEPOSIT DISCHARGE");
+    CheckOp<DepositDischarge>(D, DEPOSIT_OP_DISCHARGE, 22, [](DepositDischarge& p) { p.vchPreAuthSig.clear(); }, "DEPOSIT DISCHARGE");
 
     CheckOp<PoolCreate>(P, POOL_OP_CREATE, 44, [](PoolCreate& p) { p.vchCreatorSig.clear(); ClearApprovers(p); }, "POOL CREATE");
     CheckOp<PoolAddLiq>(P, POOL_OP_ADD_LIQ, 64, [](PoolAddLiq& p) { p.vchProviderSig.clear(); }, "POOL ADD_LIQ");
@@ -211,7 +207,7 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
     CheckOp<PoolSwap>(P, POOL_OP_SWAP, 65, [](PoolSwap& p) { p.vchTraderSig.clear(); }, "POOL SWAP");
     CheckOp<PoolRetire>(P, POOL_OP_RETIRE, 50, [](PoolRetire& p) { p.vchTriggerSig.clear(); ClearApprovers(p); }, "POOL RETIRE");
 
-    CheckOp<SettleExchange>(S, SETTLE_OP_EXCHANGE, 93, [](SettleExchange& p) {
+    CheckOp<SettleExchange>(S, SETTLE_OP_EXCHANGE, 89, [](SettleExchange& p) {
         p.vchPresentSigOfANotes.clear();
         p.vchPresentSigOfBNotes.clear();
         p.vApproverIndexA.clear();
@@ -219,10 +215,8 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
         p.vApproverIndexB.clear();
         p.vApproverSigB.clear();
     }, "SETTLE EXCHANGE");
-    CheckOp<SettleNet>(S, SETTLE_OP_NET, 71, [](SettleNet& p) { p.vPresentSig.clear(); ClearApprovers(p); }, "SETTLE NET");
+    CheckOp<SettleNet>(S, SETTLE_OP_NET, 67, [](SettleNet& p) { p.vPresentSig.clear(); ClearApprovers(p); }, "SETTLE NET");
 
-    CheckOp<OracleBond>(O, ORACLE_OP_BOND, 60, [](OracleBond& p) { p.vchSig.clear(); }, "ORACLE BOND");
-    CheckOp<OracleSubmit>(O, ORACLE_OP_SUBMIT, 104, [](OracleSubmit& p) { p.vchSig.clear(); }, "ORACLE SUBMIT");
 
     // Gram-notes release: the issued-token ops (issued.h).
     const int32_t T = TRANSACTION_TOKEN_VERSION;
@@ -230,13 +224,15 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
     CheckOp<IssuedMint>(T, ISSUED_OP_MINT, 42, [](IssuedMint& p) { p.vchIssuerSig.clear(); }, "TOKEN MINT");
     CheckOp<IssuedBurn>(T, ISSUED_OP_BURN, 42, [](IssuedBurn&) {}, "TOKEN BURN");
     // 5b: + vVault (the house targets), a bound field
-    CheckOp<IssuedFreeze>(T, ISSUED_OP_FREEZE, 93, [](IssuedFreeze& p) { p.vchFreezeSig.clear(); }, "TOKEN FREEZE");
+    CheckOp<IssuedFreeze>(T, ISSUED_OP_FREEZE, 80, [](IssuedFreeze& p) { p.vchFreezeSig.clear(); }, "TOKEN FREEZE");
 }
 
 BOOST_AUTO_TEST_CASE(binding_covers_the_issued_annex)
 {
     // Gram-notes release: which outputs carry which issued units is bound whole, in every credit version.
     for (int32_t nVersion = TRANSACTION_BILL_VERSION; nVersion <= TRANSACTION_TOKEN_VERSION; nVersion++) {
+        if (nVersion == TRANSACTION_ORACLE_VERSION)
+            continue;   // retired (Gold B): no annex
         CMutableTransaction m = Credit(nVersion, 1, std::vector<unsigned char>());
         m.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
         CIssuedOut o;
@@ -464,8 +460,10 @@ BOOST_AUTO_TEST_CASE(binding_height_per_network)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::BETA)->GetConsensus().nCreditBindingHeight, 0);
     const std::unique_ptr<CChainParams> easynet = CreateChainParams(CBaseChainParams::EASYNET);
     BOOST_CHECK(easynet->GetConsensus().CreditBindingActive(0));
-    // ...and credits treasury changes only from its deposit start (L1 1,100); every other network from the start
-    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 1100);
+    // ...and credits treasury changes only from its deposit start (L1 1,676 for the v1.2.0 restart; 1,100 at v1.1.0);
+    // every other network from the start. Building the params also checks easynet's genesis hash (an assert).
+    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 1676);
+    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x485b81d796286e671b322fc07ebb88c7e6da9d1e9e4eeaae06a26af6dcaa7107"));
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nDepositStartL1Height, 0);
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nDepositStartL1Height, 0);
 }

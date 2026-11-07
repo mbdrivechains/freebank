@@ -60,9 +60,10 @@ void CChainParams::UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64
     consensus.vDeployments[d].nTimeout = nTimeout;
 }
 
-void CChainParams::UpdateNotePoolHeight(int nHeight)
+void CChainParams::UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime)
 {
-    consensus.nNotePoolHeight = nHeight;
+    consensus.nNotePoolTime = nNotePoolTime;
+    consensus.nDollarPoolTime = nDollarPoolTime;
 }
 
 void CChainParams::UpdateDepositStartL1Height(int nHeight)
@@ -70,10 +71,10 @@ void CChainParams::UpdateDepositStartL1Height(int nHeight)
     consensus.nDepositStartL1Height = nHeight;
 }
 
-void CChainParams::UpdateCreateFeeForTest(uint64_t nCreateFeeMg)
+void CChainParams::UpdateCreateFeeForTest(int64_t nCreateFeeSats)
 {
     for (Consensus::GramStep& step : consensus.vGramSchedule)
-        step.p.nCreateFeeMg = nCreateFeeMg;
+        step.p.nCreateFeeSats = nCreateFeeSats;
 }
 
 /**
@@ -133,9 +134,9 @@ public:
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
         // Gram-notes release: one entry from genesis (the figures are proposals until the Monte Carlo sets them).
         consensus.vGramSchedule = {{0, Consensus::GramParams()}};
-        consensus.nFullForfeitHeight = std::numeric_limits<int>::max();
-        consensus.nDollarPoolHeight = std::numeric_limits<int>::max();
-        consensus.nNotePoolHeight = std::numeric_limits<int>::max();
+        // No forks (D-2026-11-05-3): one time, the end of Michael's bidding; main and easynet inherit it.
+        consensus.nDollarPoolTime = Consensus::LATER_RULES_TIME_MAIN;
+        consensus.nNotePoolTime = Consensus::LATER_RULES_TIME_MAIN;
         consensus.nDepositStartL1Height = 0;
         consensus.nDeferSilenceWindow = 4032;  // ~4 weeks after 2 missed cadences
         consensus.nTokenClaimWindow = 4032;    // the token claim window: ~4 weeks from insolvency
@@ -143,13 +144,6 @@ public:
         consensus.nCollectWindow = 26280;          // v0.2.28: collect for 6 months (or until the book is empty), then pay
         consensus.nInsolventClaimWindow = 105120;  // v0.2.28: claims close 2 years after insolvency; CLOSE then
         assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow);
-        consensus.nOracleQuorumMin = 3;
-        consensus.nOracleBrakePpmPerBlock = 347;  // ~5%/day / 144 blocks
-        consensus.nOracleBrakeElapsedCap = 144;   // censor-charge bounded to one day's fall
-        consensus.nOracleUnbondDelay = 2016;      // provisional; decorative while inert
-        consensus.nOracleOpWindow = 6;            // ~1h at 144 blk/day: a price older than the
-                                                  // row-1 hourly cadence promise can never enter a
-                                                  // fix; 6 << the 144 brake cap; 2.1% of G3's ~2d
         // Withdrawal poison-row guard from genesis (operator sign-off 2026-09-24, H = 0).
         // Until v0.2.19 these params served BOTH the eCash beta and eCash mainnet, so one H
         // covered both; mainnet (CMainParams below) inherits it.
@@ -314,35 +308,44 @@ public:
  * never mixes with beta or mainnet and can run beside a beta node. Fixed seed
  * 163.47.9.132:28455, no DNS seed. An easynet build (configure --with-easynet) runs
  * it with no flag. Each new FreeBank-easynet chain takes the next magic last byte (03 for L1 resets 3 and 4, 05 for
- * the v1.1.0 restart on reset 4): it no longer follows the L1's reset number.
+ * the v1.1.0 restart on reset 4, 06 for the Gold B v1.2.0 restart): it no longer follows the L1's reset number.
  */
+/** No forks (D-2026-11-05-3): easynet's switch time for the later rules. Set at the release that carries them (rel.sh
+ *  release-draft refuses LATER_RULE_NEVER here). */
+static constexpr int64_t EASYNET_LATER_RULES_TIME = 1794787200;   // 2026-11-16 00:00 UTC, 7 days after v1.2.0
+
 class CEasynetParams : public CBetaParams {
 public:
     CEasynetParams() {
         strNetworkID = "easynet";
 
-        // Its own network. Gram-notes release (v1.1.0, scope 7h): FreeBank-easynet restarts as a fresh chain on the same
+        // Its own network. Gold B (v1.2.0) restarts it fresh again: magic 06, genesis 3, deposits from L1 1,676.
+        // Gram-notes release (v1.1.0, scope 7h): FreeBank-easynet restarts as a fresh chain on the same
         // L1 (reset 4), so the last byte moves to 05: the old chain's blocks and peers stay apart (-reindex finds blocks
         // by this magic, and the old chain is moved aside, not carried on). Before: 03, kept on reset 4 so the
         // reset-4 chain carried on in place. The L1 pin keeps reset-3 and reset-4 nodes apart.
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;
-        pchMessageStart[3] = 0x05;
+        pchMessageStart[3] = 0x06;   // Gold B (v1.2.0): a fresh chain again (B's rules from genesis, a new units DB)
         nDefaultPort = 28455;
 
-        genesis = CreateGenesisBlock("FreeBank easynet genesis 2: gram notes (v1.1.0), easynet slot 130, 2026-11-04",
+        genesis = CreateGenesisBlock("FreeBank easynet genesis 3: Gold B (v1.2.0), easynet slot 130, 2026-11-07",
                                      CScript() << OP_RETURN,
-                                     1793750400, 1, 0);   // 2026-11-04 00:00Z: before every L1 block it will use
+                                     1794009600, 1, 0);   // 2026-11-07 00:00Z: before every L1 block it will use
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0x14796ddc0c8aac3af9ce728d506ad7d44ab5885bee2bf89d9703ea19af6e83f4"));
+        assert(consensus.hashGenesisBlock == uint256S("0x485b81d796286e671b322fc07ebb88c7e6da9d1e9e4eeaae06a26af6dcaa7107"));
         // The fresh chain binds credit signatures from genesis.
         consensus.nCreditBindingHeight = 0;
-        // ...and credits only treasury changes from L1 block 1,100 (scope 7h): the 23.3 ECX of the old chain's money
-        // in the treasury at L1 1,099 (sequence 7, three bundles paid, none pending; easynet 2026-11-04 01:11Z) stays
-        // the old chain's. Each later deposit credits what it added (DEPOSITS_664_SPEC).
-        consensus.nDepositStartL1Height = 1100;
+        // ...and credits only treasury changes from L1 block 1,676 (Gold B restart): the 73.29792050 ECX in the treasury at
+        // L1 1,675 (sequence 8, no bundle pending or in voting; easynet 2026-11-07 21:03Z) stays the old chains'. Each
+        // later deposit credits what it added (DEPOSITS_664_SPEC). (v1.1.0's chain: 1,100.)
+        consensus.nDepositStartL1Height = 1676;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
+        // No forks (D-2026-11-05-3): easynet switches the later rules on days after the release that carries them, so
+        // they can be seen working before mainnet's date. EASYNET_LATER_RULES_TIME: set at that release.
+        consensus.nDollarPoolTime = EASYNET_LATER_RULES_TIME;
+        consensus.nNotePoolTime = EASYNET_LATER_RULES_TIME;
 
         vSeeds.clear();
         // The easynet seed on freebanktest (no DNS seed): see pnSeed6_easynet.
@@ -380,10 +383,19 @@ public:
         consensus.nDemandWindow = 12;  // B3: gate-testable; ~8.4h on the 30s demo signet
         consensus.vDeferInterestSchedule = {{0, 1000}};  // same as main (10%/yr from block 0)
         assert(DeferScheduleIsValid(consensus.vDeferInterestSchedule));
-        consensus.vGramSchedule = {{0, Consensus::GramParams()}};   // same as main
-        consensus.nFullForfeitHeight = std::numeric_limits<int>::max();
-        consensus.nDollarPoolHeight = std::numeric_limits<int>::max();
-        consensus.nNotePoolHeight = std::numeric_limits<int>::max();
+        {
+            // Same as main, but the ramp's period is one block: gates can't age escrow 180 days, and a house's escrow
+            // then counts at the full 10x four blocks after it arrives (the ramp itself is unit-tested on main values).
+            Consensus::GramParams gp;
+            gp.nRampPeriodBlocks = 1;
+            gp.nSwapDeadlineSecs = 120;     // a swap's deadline and pay window in minutes, so a gate can wait them out
+            gp.nSwapPayWindowSecs = 60;
+            gp.nSwapBidWindowSecs = 30;     // the day before T_f, shortened so a gate can cut a bid before it
+            consensus.vGramSchedule = {{0, gp}};
+        }
+        consensus.nDollarPoolTime = Consensus::LATER_RULE_NEVER;    // regtest: -dollarpooltime
+        consensus.nNotePoolTime = Consensus::LATER_RULE_NEVER;      // regtest: -housepooltime
+        consensus.fClockIsHeight = true;                            // regtest windows count blocks (gates mine N blocks)
         consensus.nDepositStartL1Height = 0;
         consensus.nDeferSilenceWindow = 40;    // gate-testable silence clock (main: 4032)
         consensus.nTokenClaimWindow = 20;      // gate-testable claim window (main: 4032)
@@ -391,12 +403,6 @@ public:
         consensus.nCollectWindow = 600;        // gate-testable (main: 26280); above the discount gates' 400-500-block bills
         consensus.nInsolventClaimWindow = 700; // gate-testable (main: 105120); after the collect window, as on main
         assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow);
-        consensus.nOracleQuorumMin = 3;
-        consensus.nOracleBrakePpmPerBlock = 100000; // 10%/block: brake behavior testable in few blocks
-        consensus.nOracleBrakeElapsedCap = 12;
-        consensus.nOracleUnbondDelay = 16;
-        consensus.nOracleOpWindow = 3;            // mechanical floor 2 + 1 margin; small enough
-                                                  // that the gate proves expiry in 3 blocks
         consensus.nWithdrawalGuardHeight = 0;     // poison-row guard active from genesis on regtest
         consensus.nCreditBindingHeight = 0;       // credit binding from genesis on regtest
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
@@ -494,9 +500,9 @@ void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime,
     globalChainParams->UpdateVersionBitsParameters(d, nStartTime, nTimeout);
 }
 
-void UpdateNotePoolHeight(int nHeight)
+void UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime)
 {
-    globalChainParams->UpdateNotePoolHeight(nHeight);
+    globalChainParams->UpdateLaterRuleTimes(nNotePoolTime, nDollarPoolTime);
 }
 
 void UpdateDepositStartL1Height(int nHeight)
@@ -504,9 +510,9 @@ void UpdateDepositStartL1Height(int nHeight)
     globalChainParams->UpdateDepositStartL1Height(nHeight);
 }
 
-void UpdateCreateFeeForTest(uint64_t nCreateFeeMg)
+void UpdateCreateFeeForTest(int64_t nCreateFeeSats)
 {
-    globalChainParams->UpdateCreateFeeForTest(nCreateFeeMg);
+    globalChainParams->UpdateCreateFeeForTest(nCreateFeeSats);
 }
 
 void UpdateChainDormantForTest(bool fDormant)

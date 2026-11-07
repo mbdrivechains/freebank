@@ -5,10 +5,12 @@
 // Issued tokens in the wallet (gram-notes release, issued.h, docs-local/GOLD_USD_SCOPE.md step 2): build, sign and
 // send the v18 ops, list the wallet's token coins, and the RPCs over them.
 
+#include <notices.h>
 #include <wallet/wallet.h>
 
 #include <base58.h>
 #include <bill.h>
+#include <houserate.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <house.h>
@@ -201,22 +203,14 @@ bool PickTokenCoins(const std::vector<CIssuedWalletCoin>& vCoins, uint64_t nUnit
     return false;
 }
 
-/** D-2026-11-04-1 (3b): a token or pool creation burns nCreateFeeMg of gold's worth of sECX at the payout price of the
- *  tip (what the next block checks against), plus 2% so a price step before it is mined doesn't refuse it. */
+/** D-2026-11-04-1 (3b), Gold B: a token or pool creation burns nCreateFeeSats of sECX. */
 bool AddCreationBurn(CMutableTransaction& mtx, std::string& strFail)
 {
     const int nNext = chainActive.Height() + 1;
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nNext);
-    if (gp.nCreateFeeMg == 0)
+    if (gp.nCreateFeeSats <= 0)
         return true;
-    uint64_t nPrice = 0;
-    CUnitsView view(punitsdb.get());
-    if (!PayoutPrice(view, nNext - 1, gp, nPrice) || nPrice == 0) {
-        strFail = "No payout price (getgoldfix): creating a token or a pool burns 1 g of gold's worth of sECX at the payout price";
-        return false;
-    }
-    const CAmount nBurn = CreationBurnSats(nPrice, gp.nCreateFeeMg);
-    mtx.vout.push_back(CTxOut(nBurn + nBurn / 50, CreationBurnScript()));
+    mtx.vout.push_back(CTxOut(gp.nCreateFeeSats, CreationBurnScript()));
     return true;
 }
 
@@ -345,7 +339,7 @@ bool CWallet::BurnIssued(std::string& strFail, uint256& txidOut, const uint256& 
 
 bool CWallet::FreezeIssued(std::string& strFail, uint256& txidOut, const uint256& tokenID,
                            const std::vector<COutPoint>& vOutpoint, const std::vector<uint64_t>& vFrozen, bool fFreeze,
-                           const CAmount& nFee, const std::vector<CVaultFreezeTarget>& vVault)
+                           const CAmount& nFee)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
@@ -362,7 +356,6 @@ bool CWallet::FreezeIssued(std::string& strFail, uint256& txidOut, const uint256
     fz.tokenID = tokenID;
     fz.vOutpoint = vOutpoint;
     fz.vFrozen = vFrozen;
-    fz.vVault = vVault;
     CMutableTransaction mtx;
     mtx.nIssuedOp = fFreeze ? ISSUED_OP_FREEZE : ISSUED_OP_UNFREEZE;
     mtx.vchIssuedPayload = EncodeIssued(fz);
@@ -619,261 +612,115 @@ bool CWallet::SwapToken(std::string& strFail, uint256& txidOut, const uint256& t
     return CommitIssuedTx(strFail, txidOut, mtx, vPick, nFee, nullptr, {cToken, cSats});
 }
 
-bool CWallet::BondIssuer(std::string& strFail, uint256& txidOut, const uint256& tokenID, const CAmount& nAmount,
-                         const CAmount& nFee)
+static bool HouseApproverKeys(const CWallet& wallet, const CHouse& house, std::vector<uint32_t>& vIdx, std::vector<CKey>& vKey)
 {
-    AssertLockHeld(cs_main);
-    AssertLockHeld(cs_wallet);
-    CIssuedToken token;
-    {
-        CUnitsView view(punitsdb.get());
-        if (!view.Get(IssuedTokenKey(tokenID), token)) { strFail = "Unknown token"; return false; }
-    }
-    CKey keyIssuer;
-    if (!GetKey(CPubKey(token.vchIssuerKey).GetID(), keyIssuer)) { strFail = "This wallet doesn't hold the token's issuer key"; return false; }
-    if (nAmount < token.nBondSats) { strFail = "A bond can't shrink (unbond instead)"; return false; }
-    IssuedBond bond;
-    bond.tokenID = tokenID;
-    CMutableTransaction mtx;
-    mtx.nIssuedOp = ISSUED_OP_BOND;
-    mtx.vout.push_back(CTxOut(nAmount, IssuedBondScript(tokenID)));
-    mtx.vchIssuedPayload = EncodeIssued(bond);
-    std::vector<std::pair<COutPoint, CTxOut>> vEscrow;
-    if (!token.bondOutpoint.IsNull())   // consolidate the bond coin the token already has
-        vEscrow.emplace_back(token.bondOutpoint, CTxOut(token.nBondSats, IssuedBondScript(tokenID)));
-    return CommitIssuedTx(strFail, txidOut, mtx, {}, nFee, [&](const CTransaction& tx) {
-        if (!keyIssuer.Sign(IssuedSigHash(tx), bond.vchIssuerSig))
-            return false;
-        mtx.vchIssuedPayload = EncodeIssued(bond);
-        return true;
-    }, vEscrow);
-}
-
-// ---- Gold vaults (step 5) ------------------------------------------------------------------------------------------
-
-bool CWallet::PledgeGold(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint32_t nPartnerIndex,
-                         const uint256& tokenID, uint64_t nUnits, const CAmount& nFee)
-{
-    AssertLockHeld(cs_main);
-    AssertLockHeld(cs_wallet);
-    CHouse house;
-    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house"; return false; }
-    if (nPartnerIndex >= house.vPartner.size()) { strFail = "Invalid partner index"; return false; }
-    CKey keyPartner;
-    if (!GetKey(CPubKey(house.vPartner[nPartnerIndex].vchPubKey).GetID(), keyPartner)) {
-        strFail = "This wallet does not hold that partner's key";
-        return false;
-    }
-    {
-        // D-2026-11-04-1 (3a): a token new to the house takes one of its 8 slots, so it comes in by the partners'
-        // agreement (movetill, M-of-N); then any partner may pledge it.
-        if (!HouseVaultTotalsForChecks(nHouseID).count(tokenID)) {   // no check scope here: the units DB at the tip
-            strFail = "The house holds none of this token: a token new to the house comes in by its partners' agreement "
-                      "(movetill, M-of-N); then any partner may pledge it";
-            return false;
-        }
-    }
-    std::vector<CIssuedWalletCoin> vCoins, vPick;
-    ListIssuedCoins(tokenID, vCoins);
-    uint64_t nUnitsIn = 0, nFrozenIn = 0;
-    if (!PickTokenCoins(vCoins, nUnits, vPick, nUnitsIn, nFrozenIn)) { strFail = "Insufficient unfrozen token units"; return false; }
-
-    // A TOPUP: the ECX placeholder at vout[0] (decisions log 16) and the gold into the partner's capital vault.
-    CMutableTransaction mtx;
-    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
-    mtx.nHouseOp = HOUSE_OP_TOPUP;
-    mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, HouseEscrowScript(house.houseID)));
-    if (nUnitsIn > nUnits) {
-        CPubKey pubChange;
-        if (!GetKeyFromPool(pubChange, true)) { strFail = "Keypool ran out"; return false; }
-        mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, GetScriptForDestination(pubChange.GetID())));
-        mtx.vIssuedOut = {AnnexOut(1, tokenID, nUnitsIn - nUnits, nFrozenIn)};
-    }
-    CVaultMove m;
-    m.nHouseID = nHouseID;
-    m.nKind = VAULT_CAPITAL;
-    m.nPartner = nPartnerIndex;
-    m.tokenID = tokenID;
-    m.nDelta = (int64_t)nUnits;
-    mtx.vVaultMove = {m};
-    HouseTopup topup;
-    topup.nHouseID = nHouseID;
-    topup.nPartnerIndex = nPartnerIndex;
-    mtx.vchHousePayload = EncodeIssued(topup);
-    return CommitIssuedTx(strFail, txidOut, mtx, vPick, nFee, [&](const CTransaction& tx) {
-        if (!keyPartner.Sign(HouseTopupSigHash(house.houseID, nPartnerIndex, BillHashOutputs(tx)), topup.vchSig))
-            return false;
-        mtx.vchHousePayload = EncodeIssued(topup);
-        return true;
-    });
-}
-
-bool CWallet::ClearDustSlot(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint32_t nPartnerIndex,
-                            const uint256& tokenClear, const uint256& tokenAdd, uint64_t nAddUnits, const CAmount& nFee)
-{
-    AssertLockHeld(cs_main);
-    AssertLockHeld(cs_wallet);
-    CHouse house;
-    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house"; return false; }
-    if (nPartnerIndex >= house.vPartner.size()) { strFail = "Invalid partner index"; return false; }
-    if (tokenClear == tokenAdd) { strFail = "The token added must differ from the one cleared"; return false; }
-    CKey keyPartner;
-    if (!GetKey(CPubKey(house.vPartner[nPartnerIndex].vchPubKey).GetID(), keyPartner)) {
-        strFail = "This wallet does not hold that partner's key";
-        return false;
-    }
-    uint64_t nClear = 0;
-    {
-        CUnitsView view(punitsdb.get());
-        view.Get(VaultKey(nHouseID, VAULT_CAPITAL, nPartnerIndex, tokenClear), nClear);
-        CVaultFrozen f;
-        if (view.Get(VaultFrozenKey(nHouseID, tokenClear), f) && f.nFrozen > 0) {
-            strFail = "The issuer has frozen this token in the house's vaults: frozen gold leaves only with the house's "
-                      "last units of it, still frozen";
-            return false;
-        }
-    }
-    if (nClear == 0) { strFail = "The partner holds none of that token in the house's capital"; return false; }
-    if (nAddUnits == 0)
-        nAddUnits = nClear;
-    if (nAddUnits < nClear) { strFail = "Add at least as many units as the dust taken out"; return false; }
-
-    std::vector<CIssuedWalletCoin> vCoins, vPick;
-    ListIssuedCoins(tokenAdd, vCoins);
-    uint64_t nUnitsIn = 0, nFrozenIn = 0;
-    if (!PickTokenCoins(vCoins, nAddUnits, vPick, nUnitsIn, nFrozenIn)) { strFail = "Insufficient unfrozen units of the token added"; return false; }
-    CPubKey pubOut, pubChange;
-    if (!GetKeyFromPool(pubOut, true) || !GetKeyFromPool(pubChange, true)) { strFail = "Keypool ran out"; return false; }
-
-    // A TOPUP (D-2026-11-04-1, 3a): the ECX placeholder at vout[0], the dust out to this wallet at vout[1], any change
-    // of the token added after it; the vaults: the token added in, the partner's whole dust entry out.
-    CMutableTransaction mtx;
-    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
-    mtx.nHouseOp = HOUSE_OP_TOPUP;
-    mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, HouseEscrowScript(house.houseID)));
-    mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, GetScriptForDestination(pubOut.GetID())));
-    mtx.vIssuedOut = {AnnexOut(1, tokenClear, nClear, 0)};
-    if (nUnitsIn > nAddUnits) {
-        mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, GetScriptForDestination(pubChange.GetID())));
-        mtx.vIssuedOut.push_back(AnnexOut(2, tokenAdd, nUnitsIn - nAddUnits, nFrozenIn));
-    }
-    CVaultMove mAdd, mOut;
-    mAdd.nHouseID = mOut.nHouseID = nHouseID;
-    mAdd.nKind = mOut.nKind = VAULT_CAPITAL;
-    mAdd.nPartner = mOut.nPartner = nPartnerIndex;
-    mAdd.tokenID = tokenAdd;
-    mAdd.nDelta = (int64_t)nAddUnits;
-    mOut.tokenID = tokenClear;
-    mOut.nDelta = -(int64_t)nClear;
-    mtx.vVaultMove = mAdd.tokenID < mOut.tokenID ? std::vector<CVaultMove>{mAdd, mOut} : std::vector<CVaultMove>{mOut, mAdd};   // strict key order
-    HouseTopup topup;
-    topup.nHouseID = nHouseID;
-    topup.nPartnerIndex = nPartnerIndex;
-    mtx.vchHousePayload = EncodeIssued(topup);
-    return CommitIssuedTx(strFail, txidOut, mtx, vPick, nFee, [&](const CTransaction& tx) {
-        if (!keyPartner.Sign(HouseTopupSigHash(house.houseID, nPartnerIndex, BillHashOutputs(tx)), topup.vchSig))
-            return false;
-        mtx.vchHousePayload = EncodeIssued(topup);
-        return true;
-    });
-}
-
-bool CWallet::MoveTill(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const uint256& tokenID,
-                       int64_t nDelta, const CAmount& nFee)
-{
-    AssertLockHeld(cs_main);
-    AssertLockHeld(cs_wallet);
-    CHouse house;
-    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house"; return false; }
-    // The approvers: the first M partners whose keys this wallet holds.
-    std::vector<uint32_t> vIdx;
-    std::vector<CKey> vKey;
+    vIdx.clear();
+    vKey.clear();
     for (uint32_t i = 0; i < house.vPartner.size() && vIdx.size() < house.nThresholdM; i++) {
         if (house.vPartner[i].status != HOUSE_PARTNER_ACTIVE)
             continue;
         CKey k;
-        if (GetKey(CPubKey(house.vPartner[i].vchPubKey).GetID(), k)) {
+        if (wallet.GetKey(CPubKey(house.vPartner[i].vchPubKey).GetID(), k)) {
             vIdx.push_back(i);
             vKey.push_back(k);
         }
     }
-    if (vIdx.size() < house.nThresholdM) { strFail = "This wallet doesn't hold enough of the house's partner keys"; return false; }
+    return vIdx.size() >= house.nThresholdM;
+}
 
+// ---- Gold B: the house's rate (HOUSE_OP_RATE) and charter (HOUSE_OP_CHARTER) ----
+
+static bool CommitHouseOp(CWallet* pwallet, std::string& strFail, uint256& txidOut, uint8_t nOp, const CAmount& nFee,
+                          const std::function<bool(const CTransaction&, CMutableTransaction&)>& fnSign)
+{
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_HOUSE_VERSION;
-    mtx.nHouseOp = HOUSE_OP_TILL;
-    std::vector<CIssuedWalletCoin> vPick;
-    if (nDelta > 0) {
-        std::vector<CIssuedWalletCoin> vCoins;
-        ListIssuedCoins(tokenID, vCoins);
-        uint64_t nUnitsIn = 0, nFrozenIn = 0;
-        if (!PickTokenCoins(vCoins, (uint64_t)nDelta, vPick, nUnitsIn, nFrozenIn)) { strFail = "Insufficient unfrozen token units"; return false; }
-        if (nUnitsIn > (uint64_t)nDelta) {
-            CPubKey pubChange;
-            if (!GetKeyFromPool(pubChange, true)) { strFail = "Keypool ran out"; return false; }
-            mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, GetScriptForDestination(pubChange.GetID())));
-            mtx.vIssuedOut = {AnnexOut(0, tokenID, nUnitsIn - (uint64_t)nDelta, nFrozenIn)};
-        }
-    } else {
-        CPubKey pubOut;
-        if (!GetKeyFromPool(pubOut, true)) { strFail = "Keypool ran out"; return false; }
-        mtx.vout.push_back(CTxOut(ISSUED_COIN_VALUE, GetScriptForDestination(pubOut.GetID())));
-        mtx.vIssuedOut = {AnnexOut(0, tokenID, (uint64_t)(-nDelta), 0)};
+    mtx.nHouseOp = nOp;
+    return pwallet->CommitIssuedTx(strFail, txidOut, mtx, std::vector<CIssuedWalletCoin>(), nFee,
+                                   [&](const CTransaction& tx) { return fnSign(tx, mtx); });
+}
+
+static bool WalletPostHouseRate(CWallet* pwallet, std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nBid,
+                                uint64_t nAsk, const CAmount& nFee)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(pwallet->cs_wallet);
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(chainActive.Height() + 1);
+    if (!HouseRateShapeOK(nBid, nAsk, gp.nRateSpreadBps)) {
+        strFail = strprintf("Need 0 < bid <= ask <= bid x %.2f", 1.0 + gp.nRateSpreadBps / 10000.0); return false;
     }
-    CVaultMove m;
-    m.nHouseID = nHouseID;
-    m.nKind = VAULT_TILL;
-    m.tokenID = tokenID;
-    m.nDelta = nDelta;
-    mtx.vVaultMove = {m};
-    HouseTill till;
-    till.nHouseID = nHouseID;
-    mtx.vchHousePayload = EncodeIssued(till);
-    return CommitIssuedTx(strFail, txidOut, mtx, vPick, nFee, [&](const CTransaction& tx) {
-        const uint256 h = HouseTillSigHash(house.houseID, tx);
-        till.vApproverIndex = vIdx;
-        till.vApproverSig.assign(vKey.size(), std::vector<unsigned char>());
-        for (size_t k = 0; k < vKey.size(); k++)
-            if (!vKey[k].Sign(h, till.vApproverSig[k]))
-                return false;
-        mtx.vchHousePayload = EncodeIssued(till);
+    std::vector<unsigned char> vchKey;
+    if (!HouseRateKeyForChecks(nHouseID, vchKey)) { strFail = "The house has no rate key yet (sethouseratekey)"; return false; }
+    CKey key;
+    if (!pwallet->GetKey(CPubKey(vchKey).GetID(), key)) { strFail = "This wallet doesn't hold the house's rate key"; return false; }
+    HouseRate rate;
+    rate.nHouseID = nHouseID;
+    rate.nKind = HOUSE_RATE_POST;
+    rate.nBid = nBid;
+    rate.nAsk = nAsk;
+    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
+        if (!key.Sign(HouseRateSigHash(nHouseID, tx, rate), rate.vchRateSig))
+            return false;
+        m.vchHousePayload = EncodeIssued(rate);
         return true;
     });
 }
 
-bool CWallet::ProveEquity(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const CAmount& nFee,
-                          int64_t& nEquityOut, std::vector<uint32_t>& vOverdueOut)
+static bool WalletHouseApproved(CWallet* pwallet, std::string& strFail, const CHouse& house, std::vector<uint32_t>& vIdx,
+                                std::vector<CKey>& vKey)
 {
+    if (!HouseApproverKeys(*pwallet, house, vIdx, vKey)) {
+        strFail = strprintf("This wallet holds fewer than %u of the house's partner keys", house.nThresholdM); return false;
+    }
+    return true;
+}
+
+static bool WalletSetHouseRateKey(CWallet* pwallet, std::string& strFail, uint256& txidOut, uint32_t nHouseID,
+                                  const CPubKey& pubKey, const CAmount& nFee)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(pwallet->cs_wallet);
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house"; return false; }
-    const int nNext = chainActive.Height() + 1;
-    const char cStatus = HouseEffectiveStatus(house, nNext);
-    if (cStatus == HOUSE_STATUS_INSOLVENT || cStatus == HOUSE_STATUS_WOUNDDOWN) {
-        strFail = "The house is already insolvent or wound down"; return false;
-    }
-    const uint32_t nPriceHeight = (uint32_t)chainActive.Height();
-    uint64_t nSatsPerGram = 0;
-    if (!PayoutPriceForChecks((int)nPriceHeight, nSatsPerGram) || nSatsPerGram == 0) {
-        strFail = "No payout price (the price feed is stale and no pool is deep)"; return false;
-    }
-    vOverdueOut = HouseOverdueBills(house, nNext);
-    LOCK(mempool.cs);
-    CCoinsViewMemPool viewMempool(pcoinsTip.get(), mempool);
-    const CAmount amountEscrow = HouseEscrowPotAtTip(house, [&](const COutPoint& o, Coin& c) { return viewMempool.GetCoin(o, c); });
-    std::string strReason;
-    if (!HouseEquityMg(house, nNext, nSatsPerGram, amountEscrow, vOverdueOut, nEquityOut, strReason)) {
-        strFail = "Equity: " + strReason; return false;
-    }
-    if (nEquityOut >= 0) { strFail = strprintf("Equity is not negative (%d mg)", nEquityOut); return false; }
-    HouseEquity eq;
-    eq.nHouseID = nHouseID;
-    eq.nPriceHeight = nPriceHeight;
-    eq.vOverdueBillID = vOverdueOut;
-    CMutableTransaction mtx;
-    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
-    mtx.nHouseOp = HOUSE_OP_EQUITY;
-    mtx.vchHousePayload = EncodeIssued(eq);
-    return CommitIssuedTx(strFail, txidOut, mtx, std::vector<CIssuedWalletCoin>(), nFee, [](const CTransaction&) { return true; });
+    std::vector<uint32_t> vIdx;
+    std::vector<CKey> vKey;
+    if (!WalletHouseApproved(pwallet, strFail, house, vIdx, vKey)) return false;
+    if (!pubKey.IsCompressed()) { strFail = "The rate key must be a compressed public key"; return false; }
+    HouseRate rate;
+    rate.nHouseID = nHouseID;
+    rate.nKind = HOUSE_RATE_SETKEY;
+    rate.vchRatePubKey = std::vector<unsigned char>(pubKey.begin(), pubKey.end());
+    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
+        const uint256 h = HouseRateSigHash(nHouseID, tx, rate);
+        rate.vApproverIndex = vIdx;
+        rate.vApproverSig.assign(vKey.size(), {});
+        for (size_t i = 0; i < vKey.size(); i++)
+            if (!vKey[i].Sign(h, rate.vApproverSig[i]))
+                return false;
+        m.vchHousePayload = EncodeIssued(rate);
+        return true;
+    });
+}
+
+static bool WalletHouseCharter(CWallet* pwallet, std::string& strFail, uint256& txidOut, HouseCharter op, const CAmount& nFee)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(pwallet->cs_wallet);
+    CHouse house;
+    if (!phousetree->GetHouse(op.nHouseID, house)) { strFail = "Unknown house"; return false; }
+    std::vector<uint32_t> vIdx;
+    std::vector<CKey> vKey;
+    if (!WalletHouseApproved(pwallet, strFail, house, vIdx, vKey)) return false;
+    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_CHARTER, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
+        const uint256 h = HouseCharterSigHash(op.nHouseID, tx, op);
+        op.vApproverIndex = vIdx;
+        op.vApproverSig.assign(vKey.size(), {});
+        for (size_t i = 0; i < vKey.size(); i++)
+            if (!vKey[i].Sign(h, op.vApproverSig[i]))
+                return false;
+        m.vchHousePayload = EncodeIssued(op);
+        return true;
+    });
 }
 
 // ---- RPCs ----------------------------------------------------------------------------------------------------------
@@ -925,7 +772,7 @@ UniValue TokenToUniv(const CIssuedToken& t)
 {
     UniValue o(UniValue::VOBJ);
     o.pushKV("token_id", t.tokenID.GetHex());
-    o.pushKV("kind", t.nKind == ISSUED_KIND_GOLD_MG ? "gold_mg" : t.nKind == ISSUED_KIND_USD_CENTS ? "usd_cents" :
+    o.pushKV("kind", t.nKind == ISSUED_KIND_GOLD_MG ? "gold_mg_retired" : t.nKind == ISSUED_KIND_USD_CENTS ? "usd_cents" :
                      t.nKind == ISSUED_KIND_POOL_LP ? "pool_lp" : "unknown");   // v1.1.1: pool_lp (was "unknown")
     o.pushKV("ticker", t.strTicker);
     o.pushKV("issuer_key", HexStr(t.vchIssuerKey));
@@ -937,11 +784,6 @@ UniValue TokenToUniv(const CIssuedToken& t)
     o.pushKV("create_height", t.nCreateHeight);
     o.pushKV("supply", (uint64_t)t.nSupply);
     o.pushKV("burns_queued", (uint64_t)t.nBurnSeq);
-    // Review round 1 (G1): trusted = bonded, backed, no overdue bond shortfall (only then may it enter a vault or set
-    // the pool price); issuing_ok = trusted and a payout price exists.
-    o.pushKV("trusted", (bool)t.fTrusted);
-    o.pushKV("untrusted_since", (int64_t)t.nUntrustedSince);
-    o.pushKV("issuing_ok", (bool)t.fBackingOk);
     return o;
 }
 
@@ -953,18 +795,19 @@ UniValue createissuedtoken(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 5 || request.params.size() > 7)
         throw std::runtime_error(
             "createissuedtoken \"kind\" \"ticker\" \"backing_contract\" \"backing_address\" \"upstream\" ( freeze_key fee )\n"
-            "\nCreate an issued token (gram-notes release): a gold token in milligrams or a dollar token in cents,\n"
-            "minted by this wallet's new issuer key. Its id is the transaction id. Burns 1 g of gold's worth of sECX at\n"
-            "the payout price (D-2026-11-04-1); refused while there is no payout price.\n"
+            HELP_ROLE_TOKEN_ISSUER
+            "\nCreate an issued token: a dollar token in cents,\n"
+            "minted by this wallet's new issuer key. Its id is the transaction id. Burns the fixed creation fee (0.1 ECX,\n"
+            "GramParams::nCreateFeeSats). Gold B: gold is held on Ethereum, so only dollar tokens are created here.\n"
             "\nArguments:\n"
-            "1. kind              (string) \"gold_mg\" or \"usd_cents\"\n"
+            "1. kind              (string) \"usd_cents\" (\"gold_mg\" is refused under Gold B)\n"
             "2. ticker            (string) 1-12 characters, A-Z and 0-9\n"
             "3. backing_contract  (string) the Ethereum token contract held as backing, 0x + 20 bytes\n"
             "4. backing_address   (string) the Ethereum account that holds it, 0x + 20 bytes\n"
             "5. upstream          (string) the company behind the contract, 1-32 of a-z, 0-9, '-'\n"
             "6. freeze_key        (boolean, optional, default false) also take a freeze key (declared now or never)\n"
             "7. fee               (numeric, optional, default 0.001)\n"
-            + HelpExampleCli("createissuedtoken", "gold_mg GOLDA 0x68749665ff8d2d112fa859aa293f07a622782f38 0x1111111111111111111111111111111111111111 tether"));
+            + HelpExampleCli("createissuedtoken", "usd_cents USDA 0xdac17f958d2ee523a2206206994597c13d831ec7 0x1111111111111111111111111111111111111111 tether"));
     IssuedCreate create;
     const std::string strKind = request.params[0].get_str();
     if (strKind == "gold_mg")
@@ -972,7 +815,7 @@ UniValue createissuedtoken(const JSONRPCRequest& request)
     else if (strKind == "usd_cents")
         create.nKind = ISSUED_KIND_USD_CENTS;
     else
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "kind must be gold_mg or usd_cents");
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "kind must be usd_cents");
     create.strTicker = request.params[1].get_str();
     create.vchBackingContract = ParseBytes20(request.params[2], "backing_contract");
     create.vchBackingAddress = ParseBytes20(request.params[3], "backing_address");
@@ -1002,6 +845,7 @@ UniValue mintissued(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
             "mintissued \"token_id\" units \"address\" ( fee )\n"
+            HELP_ROLE_TOKEN_ISSUER
             "\nMint units of a token this wallet issues, to an address.\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
     const uint64_t nUnits = ParseUnits(request.params[1]);
@@ -1052,6 +896,7 @@ UniValue burnissued(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
             "burnissued \"token_id\" units \"eth_address\" ( fee )\n"
+            HELP_ROLE_TOKEN_ISSUER
             "\nBurn units of a token and ask its issuer to pay them out on Ethereum at eth_address.\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
     const uint64_t nUnits = ParseUnits(request.params[1]);
@@ -1075,25 +920,16 @@ UniValue FreezeRPC(const JSONRPCRequest& request, bool fFreeze)
     if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
         throw std::runtime_error(
             std::string(fFreeze ? "freezeissued" : "unfreezeissued") +
-            " \"token_id\" [{\"txid\":\"hex\",\"vout\":n,\"frozen\":units} | {\"house\":id,\"frozen\":units},...] ( fee )\n"
-            "\nSet the frozen units of coins of a token whose freeze key this wallet holds, or of the token in a house's\n"
-            "vaults (freeze raises, unfreeze lowers). A freeze zeroes value for counting, never spendability; frozen\n"
-            "vault gold stays in the vault until unfrozen or the house closes, and counts zero after a 30-day grace.\n");
+            " \"token_id\" [{\"txid\":\"hex\",\"vout\":n,\"frozen\":units},...] ( fee )\n"
+            "\nSet the frozen units of coins of a token whose freeze key this wallet holds (freeze raises, unfreeze\n"
+            "lowers). A freeze zeroes value for counting, never spendability.\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
     std::vector<COutPoint> vOut;
     std::vector<uint64_t> vFrozen;
-    std::vector<CVaultFreezeTarget> vVault;
     for (const UniValue& e : request.params[1].get_array().getValues()) {
         const int64_t n = find_value(e, "frozen").get_int64();
         if (n < 0 || n > MAX_MONEY)
             throw JSONRPCError(RPC_INVALID_PARAMETER, "frozen out of range");
-        if (!find_value(e, "house").isNull()) {
-            CVaultFreezeTarget t;
-            t.nHouseID = (uint32_t)find_value(e, "house").get_int();
-            t.nFrozen = (uint64_t)n;
-            vVault.push_back(t);
-            continue;
-        }
         vOut.push_back(COutPoint(ParseHashO(e, "txid"), find_value(e, "vout").get_int()));
         vFrozen.push_back((uint64_t)n);
     }
@@ -1103,7 +939,7 @@ UniValue FreezeRPC(const JSONRPCRequest& request, bool fFreeze)
     LOCK2(cs_main, pwallet->cs_wallet);
     uint256 txid;
     std::string strFail;
-    if (!pwallet->FreezeIssued(strFail, txid, tokenID, vOut, vFrozen, fFreeze, nFee, vVault))
+    if (!pwallet->FreezeIssued(strFail, txid, tokenID, vOut, vFrozen, fFreeze, nFee))
         throw JSONRPCError(RPC_WALLET_ERROR, strFail);
     return txid.GetHex();
 }
@@ -1149,7 +985,7 @@ UniValue getissuedtoken(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
             "getissuedtoken \"token_id\"\n"
-            "\nAn issued token's chain record (gram-notes release): kind, keys, backing, supply.\n");
+            "\nAn issued token's chain record: kind, keys, backing (declared, not checked), supply.\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
     LOCK(cs_main);
     CIssuedToken token;
@@ -1159,272 +995,482 @@ UniValue getissuedtoken(const JSONRPCRequest& request)
     return TokenToUniv(token);
 }
 
-UniValue submitoracleobs(const JSONRPCRequest& request)
+UniValue gethousecapital(const JSONRPCRequest& request)
 {
-    CWallet* const pwallet = WalletOrThrow(request);
-    if (!pwallet)
-        return NullUniValue;
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
-            "submitoracleobs id [{\"stream\":n,\"subject\":\"hex\",\"value\":n,\"aux\":n,\"aux2\":n},...] ( fee )\n"
-            "\nOne price-feed submission of any observations (gram-notes release): stream 1 gold per ECX (sats per\n"
-            "gram), 2 gold per dollar (cents per gram), 3 a token's backing (subject = token id, value = transferable\n"
-            "balance in its units, aux = the Ethereum block, aux2 = units of the token's burns paid out in total), 4 a backing-address claim\n"
-            "(subject = token id, value 1, aux = the Ethereum block). fee: default 0.0001 (reports are routine; a\n"
-            "higher default would set the chain's fee estimate for every other wallet).\n");
-    const uint32_t nID = request.params[0].get_int();
-    std::vector<COracleObs> vObs;
-    for (const UniValue& e : request.params[1].get_array().getValues()) {
-        COracleObs o;
-        o.nStream = (uint8_t)find_value(e, "stream").get_int();
-        const UniValue& subj = find_value(e, "subject");
-        if (!subj.isNull())
-            o.subject = ParseHashV(subj, "subject");
-        o.nValue = (uint64_t)find_value(e, "value").get_int64();
-        const UniValue& aux = find_value(e, "aux");
-        if (!aux.isNull())
-            o.nAux = (uint64_t)aux.get_int64();
-        const UniValue& aux2 = find_value(e, "aux2");
-        if (!aux2.isNull())
-            o.nAux2 = (uint64_t)aux2.get_int64();
-        vObs.push_back(o);
+            "gethousecapital houseid\n"
+            "\nA house's rate and capital as the chain counts them (Gold B, D-2026-11-07-1 and -3). FreeBank doesn't check\n"
+            "what a house holds; it shows whether the house pays.\n"
+            "\nResult: the rate in effect for the next block (bid, ask, sats per gram), its highest ask of the last 30 days\n"
+            "(the floors, the ramp and bill repayment use it) and highest bid of the last 90 days (the waterfall's); the\n"
+            "sECX escrow and the attested till (sECX the house showed it controls at a recent block; it can spend it\n"
+            "afterwards), in sats and in mg at the 30-day ask; the issuing caps (capital_cap_mg on the ramp: each escrow\n"
+            "tranche counts 1x, doubling per 180 clean days up to 10x; a protest restarts it; an issue is checked against both caps less\n"
+            "pending_swaps_mg, the notes still owed by open swaps); rate_fresh (issuing needs a rate posted within 24 h of the chain clock;\n"
+            "rate_posted_time and rate_fresh_until are on that clock, median-time based); and overdue_bills_seen, the bills in its\n"
+            "book the chain sees as overdue. That count is never complete: a house can repay a bill for its borrower, so not\n"
+            "every bad loan shows. A house closes only when it doesn't pay a demand (D-2026-11-07-3).\n");
+    const uint32_t nHouseID = request.params[0].get_int();
+    LOCK(cs_main);
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown house");
+    const int nNext = chainActive.Height() + 1;
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nNext);
+    UniValue o(UniValue::VOBJ);
+    uint64_t nBid = 0, nAsk = 0, nBid90 = 0, nAsk30 = 0, nUnused = 0;
+    if (HouseRateForChecks(nHouseID, nNext, nBid, nAsk)) {
+        o.pushKV("bid", nBid);
+        o.pushKV("ask", nAsk);
+    } else {
+        o.pushKV("bid", NullUniValue);
+        o.pushKV("ask", NullUniValue);
     }
-    const CAmount nFee = request.params.size() > 2 && !request.params[2].isNull() ? AmountFromValue(request.params[2]) : 10000;
-    EnsureWalletIsUnlocked(pwallet);
-    uint256 txid;
-    std::string strFail;
-    if (!pwallet->SubmitOracleObs(strFail, txid, nID, vObs, nFee))
-        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
-    UniValue r(UniValue::VOBJ);
-    r.pushKV("txid", txid.GetHex());
-    return r;
+    // Issuing needs a rate posted within nRateRefreshSecs (24 h) of the chain clock (monotone, median-time based).
+    {
+        CHouseRate rate;
+        if (HouseRateRecordForChecks(nHouseID, rate)) {
+            o.pushKV("rate_posted_height", (uint64_t)rate.nPostHeight);
+            o.pushKV("rate_posted_time", rate.nPostTime);
+            o.pushKV("rate_fresh_until", rate.nPostTime + (int64_t)gp.nRateRefreshSecs);
+        }
+        o.pushKV("rate_fresh", HouseRateFreshForChecks(nHouseID, (int64_t)gp.nRateRefreshSecs));
+    }
+    o.pushKV("ask_30d_high", HouseRateMaxForChecks(nHouseID, nNext, 30, nUnused, nAsk30) ? UniValue(nAsk30) : NullUniValue);
+    o.pushKV("bid_90d_high", HouseRateMaxForChecks(nHouseID, nNext, 90, nBid90, nUnused) ? UniValue(nBid90) : NullUniValue);
+    const CAmount amountTill = HouseAttestedTillSats(house, nNext);
+    CHouseCapital cap;
+    const bool fCap = HouseCapitalForChecks(house, nNext, amountTill, cap);
+    o.pushKV("escrow_sats", (int64_t)house.ActiveEscrow());
+    o.pushKV("escrow_mg", fCap ? UniValue(cap.nEscrowMg) : NullUniValue);
+    o.pushKV("till_attested_sats", (int64_t)amountTill);
+    o.pushKV("till_mg", fCap ? UniValue(cap.nTillMg) : NullUniValue);
+    o.pushKV("notes_mg", (uint64_t)house.nMintedUnits);
+    o.pushKV("deposits_mg", (uint64_t)house.nDepositUnits);
+    // Notes still owed by open swaps (units 'W'): the issue checks take them off both caps (GOLD_B §4); the caps shown are gross.
+    o.pushKV("pending_swaps_mg", HousePendingSwapUnitsForChecks(nHouseID));
+    // The ramp (GOLD_B §5): each escrow tranche at 1x, doubling per 180 clean days, up to the 10% floor's 10x.
+    o.pushKV("capital_cap_mg", fCap ? UniValue(cap.nCapacityMg) : NullUniValue);
+    o.pushKV("capital_cap_at_full_ramp_mg", (uint64_t)((unsigned __int128)cap.nEscrowMg * 10000 / gp.nCapitalMinBps));
+    o.pushKV("till_cap_mg", (uint64_t)((unsigned __int128)cap.nTillMg * 10000 / gp.nTillMinBps));
+    o.pushKV("demand_interest_mg", HouseDemandInterestForChecks(house, nNext));
+    // The bills the chain sees as overdue - never complete (a house can repay a bill for its borrower, D-2026-11-07-3).
+    {
+        const std::vector<uint32_t> vOverdue = HouseOverdueBills(house, nNext);   // judged on the chain clock
+        o.pushKV("overdue_bills_seen", (uint64_t)vOverdue.size());
+        UniValue ids(UniValue::VARR);
+        for (uint32_t id : vOverdue)
+            ids.push_back((uint64_t)id);
+        o.pushKV("overdue_bill_ids", ids);   // never complete as a measure of loan quality (D-2026-11-07-3)
+    }
+    return o;
 }
 
-UniValue issuerbond(const JSONRPCRequest& request)
+
+// ---- Gold B RPCs: rate, charter, swap ----
+
+uint8_t ParseRelated(const UniValue& v)
 {
-    CWallet* const pwallet = WalletOrThrow(request);
-    if (!pwallet)
-        return NullUniValue;
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
-        throw std::runtime_error(
-            "issuerbond \"token_id\" amount ( fee )\n"
-            "\nLock (or top up to) an issuer bond of `amount` ECX for a token this wallet issues. A token counts in\n"
-            "houses' capital and tills only up to k x its bond in grams (valued at the payout view when locked).\n");
-    const uint256 tokenID = ParseTokenID(request.params[0]);
-    const CAmount nAmount = AmountFromValue(request.params[1]);
-    const CAmount nFee = ParseFee(request, 2);
-    EnsureWalletIsUnlocked(pwallet);
-    pwallet->BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, pwallet->cs_wallet);
-    uint256 txid;
-    std::string strFail;
-    if (!pwallet->BondIssuer(strFail, txid, tokenID, nAmount, nFee))
-        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
-    return txid.GetHex();
+    const std::string str = v.get_str();
+    if (str == "undeclared") return HOUSE_RELATED_UNDECLARED;
+    if (str == "no") return HOUSE_RELATED_NO;
+    if (str == "yes") return HOUSE_RELATED_YES;
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "related must be \"yes\", \"no\" or \"undeclared\"");
 }
 
-UniValue pledgegold(const JSONRPCRequest& request)
+const char* RelatedName(uint8_t n)
 {
-    CWallet* const pwallet = WalletOrThrow(request);
-    if (!pwallet)
-        return NullUniValue;
-    if (request.fHelp || request.params.size() < 4 || request.params.size() > 5)
-        throw std::runtime_error(
-            "pledgegold houseid partner_index \"token_id\" units ( fee )\n"
-            "\nPledge gold tokens into a house's owners' capital (the partner's vault), as that partner.\n");
-    const uint32_t nHouseID = request.params[0].get_int();
-    const uint32_t nPartner = request.params[1].get_int();
-    const uint256 tokenID = ParseTokenID(request.params[2]);
-    const uint64_t nUnits = ParseUnits(request.params[3]);
-    const CAmount nFee = ParseFee(request, 4);
-    EnsureWalletIsUnlocked(pwallet);
-    pwallet->BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, pwallet->cs_wallet);
-    uint256 txid;
-    std::string strFail;
-    if (!pwallet->PledgeGold(strFail, txid, nHouseID, nPartner, tokenID, nUnits, nFee))
-        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
-    return txid.GetHex();
+    return n == HOUSE_RELATED_YES ? "yes" : n == HOUSE_RELATED_NO ? "no" : "undeclared";
 }
 
-UniValue cleardustslot(const JSONRPCRequest& request)
+UniValue TxidResult(const uint256& txid)
 {
-    CWallet* const pwallet = WalletOrThrow(request);
-    if (!pwallet)
-        return NullUniValue;
-    if (request.fHelp || request.params.size() < 4 || request.params.size() > 6)
-        throw std::runtime_error(
-            "cleardustslot houseid partner_index \"token_clear\" \"token_add\" ( units_add fee )\n"
-            "\nClear a dust slot (D-2026-11-04-1): a house holds at most 8 tokens, and a token it holds at most 1,000 mg of\n"
-            "in all its vaults is dust. As that partner, take the partner's whole capital entry of token_clear out to this\n"
-            "wallet, and pledge units_add (default: as many as taken out; never fewer) of token_add, a token the house\n"
-            "already holds, so capital never falls. Till dust leaves by movetill (M-of-N).\n");
-    const uint32_t nHouseID = request.params[0].get_int();
-    const uint32_t nPartner = request.params[1].get_int();
-    const uint256 tokenClear = ParseTokenID(request.params[2]);
-    const uint256 tokenAdd = ParseTokenID(request.params[3]);
-    const uint64_t nAdd = request.params.size() > 4 && !request.params[4].isNull() ? ParseUnits(request.params[4]) : 0;
-    const CAmount nFee = ParseFee(request, 5);
-    EnsureWalletIsUnlocked(pwallet);
-    pwallet->BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, pwallet->cs_wallet);
-    uint256 txid;
-    std::string strFail;
-    if (!pwallet->ClearDustSlot(strFail, txid, nHouseID, nPartner, tokenClear, tokenAdd, nAdd, nFee))
-        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
-    return txid.GetHex();
+    UniValue o(UniValue::VOBJ);
+    o.pushKV("txid", txid.GetHex());
+    return o;
 }
 
-UniValue movetill(const JSONRPCRequest& request)
+UniValue posthouserate(const JSONRPCRequest& request)
 {
     CWallet* const pwallet = WalletOrThrow(request);
     if (!pwallet)
         return NullUniValue;
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
-            "movetill houseid \"token_id\" units ( fee )\n"
-            "\nMove gold into (units > 0) or out of (units < 0) a house's till vault, approved by the house's partners\n"
-            "whose keys this wallet holds. Out only while the house is open or stressed.\n");
+            "posthouserate houseid bid ask ( fee )\n"
+            "\nPost the house's binding rate in sats per gram (Gold B, D-2026-11-07-1), signed by its rate key, which this\n"
+            "wallet must hold. It takes effect from the next block. The ask is at most 2% above the bid; the bid may rise\n"
+            "at most 25% in 24 hours, and may fall any amount.\n");
     const uint32_t nHouseID = request.params[0].get_int();
-    const uint256 tokenID = ParseTokenID(request.params[1]);
-    const int64_t nDelta = request.params[2].get_int64();
-    if (nDelta == 0 || nDelta > MAX_MONEY || nDelta < -MAX_MONEY)
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "units out of range");
+    const int64_t nBid = request.params[1].get_int64(), nAsk = request.params[2].get_int64();
+    if (nBid <= 0 || nAsk <= 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "bid and ask must be positive");
     const CAmount nFee = ParseFee(request, 3);
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, pwallet->cs_wallet);
     uint256 txid;
     std::string strFail;
-    if (!pwallet->MoveTill(strFail, txid, nHouseID, tokenID, nDelta, nFee))
+    if (!WalletPostHouseRate(pwallet, strFail, txid, nHouseID, (uint64_t)nBid, (uint64_t)nAsk, nFee))
         throw JSONRPCError(RPC_WALLET_ERROR, strFail);
-    return txid.GetHex();
+    return TxidResult(txid);
 }
 
-UniValue gethousegold(const JSONRPCRequest& request)
+UniValue sethouseratekey(const JSONRPCRequest& request)
 {
-    if (request.fHelp || request.params.size() != 1)
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
-            "gethousegold houseid\n"
-            "\nA house's gold (gram-notes release): its vaults, and its capital and till counted for issuing (backing,\n"
-            "bond caps and the half limit applied) and for the equity test, in milligrams.\n");
+            "sethouseratekey houseid ( \"pubkey\" fee )\n"
+            "\nRegister the key that signs the house's rate postings, approved by the house's M-of-N partner keys in this\n"
+            "wallet. Without a pubkey, a new key of this wallet is used.\n"
+            "\nResult: {\"txid\", \"pubkey\"}\n");
     const uint32_t nHouseID = request.params[0].get_int();
-    LOCK(cs_main);
-    CHouse house;
-    if (!phousetree->GetHouse(nHouseID, house))
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown house");
-    const int nTip = chainActive.Height();
-    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nTip);
-    CUnitsView view(punitsdb.get());
-    CGoldCount issuing, equity;
-    HouseGoldCounted(view, house, nTip, gp, false, issuing);
-    HouseGoldCounted(view, house, nTip, gp, true, equity);
-    UniValue o(UniValue::VOBJ);
-    o.pushKV("capital_counted_mg", (uint64_t)issuing.nCapitalMg);
-    o.pushKV("till_counted_mg", (uint64_t)issuing.nTillMg);
-    o.pushKV("capital_raw_mg", (uint64_t)equity.nCapitalRawMg);
-    o.pushKV("till_raw_mg", (uint64_t)equity.nTillRawMg);
-    o.pushKV("notes_mg", (uint64_t)house.nMintedUnits);
-    o.pushKV("capital_cap_mg", (uint64_t)((unsigned __int128)issuing.nCapitalMg * 10000 / gp.nCapitalMinBps));
-    o.pushKV("till_cap_mg", (uint64_t)((unsigned __int128)issuing.nTillMg * 10000 / gp.nTillMinBps));
-    UniValue vaults(UniValue::VARR);
-    for (const std::pair<UnitsKey, UnitsValue>& p : view.Scan(UnitsKey(UNITS_VAULT).U32(nHouseID), UnitsKey(), SIZE_MAX)) {
-        const std::vector<unsigned char>& k = p.first.v;
-        if (k.size() != 42)
-            continue;
-        uint256 token;
-        std::copy(k.begin() + 10, k.end(), token.begin());
-        uint64_t n = 0;
-        CDataStream ss(p.second, SER_DISK, CLIENT_VERSION);
-        ss >> n;
-        UniValue e(UniValue::VOBJ);
-        e.pushKV("kind", k[5] == VAULT_CAPITAL ? "capital" : "till");
-        e.pushKV("partner", (uint64_t)(((uint32_t)k[6] << 24) | ((uint32_t)k[7] << 16) | ((uint32_t)k[8] << 8) | (uint32_t)k[9]));
-        e.pushKV("token_id", token.GetHex());
-        e.pushKV("units", (uint64_t)n);
-        vaults.push_back(e);
+    const CAmount nFee = ParseFee(request, 2);
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+    CPubKey pubKey;
+    if (request.params.size() > 1 && !request.params[1].isNull() && !request.params[1].get_str().empty()) {
+        const std::vector<unsigned char> v = ParseHex(request.params[1].get_str());
+        pubKey = CPubKey(v.begin(), v.end());
+        if (!pubKey.IsFullyValid())
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid public key");
+    } else if (!pwallet->GetKeyFromPool(pubKey)) {
+        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, "Keypool ran out");
     }
-    o.pushKV("vaults", vaults);
-    // 5b: issuers' freezes on the house's vault gold: units, and whether the grace has run (then they count zero).
-    UniValue frozen(UniValue::VARR);
-    for (const std::pair<UnitsKey, UnitsValue>& p : view.Scan(UnitsKey(UNITS_VAULT_FROZEN).U32(nHouseID), UnitsKey(), SIZE_MAX)) {
-        const std::vector<unsigned char>& k = p.first.v;
-        if (k.size() != 37)
-            continue;
-        uint256 token;
-        std::copy(k.begin() + 5, k.end(), token.begin());
-        CVaultFrozen f;
-        try {
-            CDataStream ss(p.second, SER_DISK, CLIENT_VERSION);
-            ss >> f;
-        } catch (const std::exception&) {
-            continue;
-        }
-        if (f.nFrozen == 0)
-            continue;
-        UniValue e(UniValue::VOBJ);
-        e.pushKV("token_id", token.GetHex());
-        e.pushKV("frozen", (uint64_t)f.nFrozen);
-        e.pushKV("grace_ends", (uint64_t)f.nGraceStart + gp.nFreezeGraceBlocks);
-        e.pushKV("counts_zero", (int64_t)nTip >= (int64_t)f.nGraceStart + (int64_t)gp.nFreezeGraceBlocks);
-        frozen.push_back(e);
-    }
-    o.pushKV("frozen", frozen);
-    // Equity (R3-1) at the tip's payout price: gold + sECX escrow + the book less overdue bills - notes - deposits -
-    // the interest accrued on demanded notes (D-2026-11-04-1, 3c).
-    // Below zero, anyone may prove it (proveequity) and claims open.
-    {
-        const std::vector<uint32_t> vOverdue = HouseOverdueBills(house, nTip + 1);
-        o.pushKV("overdue_bills", (uint64_t)vOverdue.size());
-        uint64_t nSatsPerGram = 0;
-        int64_t nEquity = 0;
-        std::string strReason;
-        LOCK(mempool.cs);
-        CCoinsViewMemPool viewMempool(pcoinsTip.get(), mempool);
-        const CAmount amountEscrow = HouseEscrowPotAtTip(house, [&](const COutPoint& out, Coin& c) { return viewMempool.GetCoin(out, c); });
-        o.pushKV("escrow_sats", (int64_t)amountEscrow);
-        // D-2026-11-04-1 (3c): the interest the house's demanded notes have accrued, which equity counts as owed.
-        o.pushKV("demand_interest_mg", HouseDemandInterestForChecks(house, nTip + 1));
-        if (PayoutPriceForChecks(nTip, nSatsPerGram) && nSatsPerGram > 0 &&
-                HouseEquityMg(house, nTip + 1, nSatsPerGram, amountEscrow, vOverdue, nEquity, strReason))
-            o.pushKV("equity_mg", nEquity);
-        else
-            o.pushKV("equity_mg", NullUniValue);
-        if (house.nEquityNegativeHeight)
-            o.pushKV("equity_proven_negative_height", (uint64_t)house.nEquityNegativeHeight);
-    }
+    uint256 txid;
+    std::string strFail;
+    if (!WalletSetHouseRateKey(pwallet, strFail, txid, nHouseID, pubKey, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    UniValue o = TxidResult(txid);
+    o.pushKV("pubkey", HexStr(pubKey.begin(), pubKey.end()));
     return o;
 }
 
-UniValue proveequity(const JSONRPCRequest& request)
+UniValue addchartertoken(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 7 || request.params.size() > 8)
+        throw std::runtime_error(
+            "addchartertoken houseid chain_id \"contract\" decimals grams_num grams_den \"related\" ( fee )\n"
+            "\nAdd a gold token (on an Ethereum chain) to the house's charter: the tokens it pays in kind on a swap demand\n"
+            "(GOLD_B.md §2). One token = grams_num / grams_den grams. related: \"yes\", \"no\" or \"undeclared\", the\n"
+            "partners' declaration whether the token's issuer is related to them. Approved by the M-of-N in this wallet.\n"
+            "The chain checks nothing on Ethereum: the charter is the house's statement.\n");
+    HouseCharter op;
+    op.nHouseID = request.params[0].get_int();
+    op.nKind = HOUSE_CHARTER_ADD;
+    const int64_t nChain = request.params[1].get_int64();
+    if (nChain <= 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "chain_id must be positive");
+    op.nChainID = (uint64_t)nChain;
+    op.vchContract = ParseBytes20(request.params[2], "contract");
+    const int nDecimals = request.params[3].get_int();
+    if (nDecimals < 0 || nDecimals > 36)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "decimals 0-36");
+    op.nDecimals = (uint8_t)nDecimals;
+    const int64_t nNum = request.params[4].get_int64(), nDen = request.params[5].get_int64();
+    if (nNum <= 0 || nDen <= 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "grams_num and grams_den must be positive");
+    op.nGramsNum = (uint64_t)nNum;
+    op.nGramsDen = (uint64_t)nDen;
+    op.nRelated = ParseRelated(request.params[6]);
+    const CAmount nFee = ParseFee(request, 7);
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+    uint256 txid;
+    std::string strFail;
+    if (!WalletHouseCharter(pwallet, strFail, txid, op, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue removechartertoken(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "removechartertoken houseid index ( fee )\n"
+            "\nRemove the charter entry at index (gethousecharter). It stops counting 30 days after this, so demands already\n"
+            "named against it stand. The house's last entry can't be removed. Approved by the M-of-N in this wallet.\n");
+    HouseCharter op;
+    op.nHouseID = request.params[0].get_int();
+    op.nKind = HOUSE_CHARTER_REMOVE;
+    op.nIndex = request.params[1].get_int();
+    const CAmount nFee = ParseFee(request, 2);
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+    uint256 txid;
+    std::string strFail;
+    if (!WalletHouseCharter(pwallet, strFail, txid, op, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue setcharterrelated(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
+        throw std::runtime_error(
+            "setcharterrelated houseid index \"related\" ( fee )\n"
+            "\nRestate the partners' related-issuer declaration (\"yes\", \"no\", \"undeclared\") for the charter entry at\n"
+            "index. Approved by the M-of-N in this wallet.\n");
+    HouseCharter op;
+    op.nHouseID = request.params[0].get_int();
+    op.nKind = HOUSE_CHARTER_RELATED;
+    op.nIndex = request.params[1].get_int();
+    op.nRelated = ParseRelated(request.params[2]);
+    const CAmount nFee = ParseFee(request, 3);
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    LOCK2(cs_main, pwallet->cs_wallet);
+    uint256 txid;
+    std::string strFail;
+    if (!WalletHouseCharter(pwallet, strFail, txid, op, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue gethousecharter(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "gethousecharter houseid\n"
+            "\nThe house's charter: the gold tokens it pays in kind, by index. remove_at is the time an entry stops counting\n"
+            "(0 = not being removed). A statement by the house; the chain checks nothing on Ethereum.\n");
+    const uint32_t nHouseID = request.params[0].get_int();
+    LOCK(cs_main);
+    CHouseCharter charter;
+    UniValue arr(UniValue::VARR);
+    if (HouseCharterForChecks(nHouseID, charter)) {
+        for (size_t i = 0; i < charter.vToken.size(); i++) {
+            const CCharterToken& t = charter.vToken[i];
+            UniValue o(UniValue::VOBJ);
+            o.pushKV("index", (uint64_t)i);
+            o.pushKV("chain_id", t.nChainID);
+            o.pushKV("contract", "0x" + HexStr(t.vchContract));
+            o.pushKV("decimals", (int)t.nDecimals);
+            o.pushKV("grams_num", t.nGramsNum);
+            o.pushKV("grams_den", t.nGramsDen);
+            o.pushKV("related", RelatedName(t.nRelated));
+            o.pushKV("related_height", (uint64_t)t.nRelatedHeight);
+            o.pushKV("added_time", t.nAddedTime);
+            o.pushKV("remove_at", t.nRemoveAt);
+            arr.push_back(o);
+        }
+    }
+    return arr;
+}
+
+/** A hash lock as the plain hex of sha256(s), byte for byte - what an Ethereum HTLC and the app print. (ParseHashV would
+ *  reverse it, txid-style, and no preimage would ever match.) */
+uint256 ParseHashLock(const UniValue& v)
+{
+    std::string str = v.get_str();
+    if (str.size() >= 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X'))
+        str = str.substr(2);
+    if (str.size() != 64 || !IsHex(str))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "hash_lock must be 32 bytes of hex (sha256 of the secret)");
+    const std::vector<unsigned char> v32 = ParseHex(str);
+    uint256 h;
+    std::copy(v32.begin(), v32.end(), h.begin());
+    if (h.IsNull())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "hash_lock is null");
+    return h;
+}
+
+std::string HashLockHex(const uint256& h) { return HexStr(h.begin(), h.end()); }
+
+UniValue swapnotes(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 7 || request.params.size() > 8)
+        throw std::runtime_error(
+            "swapnotes houseid units chain_id \"contract\" \"eth_address\" \"hash_lock\" \"payout_address\" ( fee )\n"
+            "\nDemand units mg (at least 10 g) of the house's notes in a gold token on its charter (GOLD_B.md §4). The notes\n"
+            "leave circulation. The house locks the tokens for eth_address under hash_lock = sha256(s); revealing s claims\n"
+            "them and settles the swap (swapdone). Unsettled after 72 hours of chain time, the house owes it in sECX at the\n"
+            "lower of its bid at the demand and its highest bid in the day before the deadline, paid to payout_address\n"
+            "(swappay); unpaid a day later it can be\n"
+            "protested (swapprotest). One holder's plain coins summing to exactly units are handed in.\n");
+    const uint32_t nHouseID = request.params[0].get_int();
+    const uint64_t nUnits = ParseUnits(request.params[1]);
+    const int64_t nChain = request.params[2].get_int64();
+    if (nChain <= 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "chain_id must be positive");
+    const std::vector<unsigned char> vchContract = ParseBytes20(request.params[3], "contract");
+    const std::vector<unsigned char> vchEth = ParseBytes20(request.params[4], "eth_address");
+    const uint256 hashLock = ParseHashLock(request.params[5]);
+    const CTxDestination dest = DecodeDestination(request.params[6].get_str());
+    if (!IsValidDestination(dest))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid payout address");
+    const CAmount nFee = ParseFee(request, 7);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->SwapNotesInKind(strFail, txid, nHouseID, nUnits, (uint64_t)nChain, vchContract, vchEth, hashLock,
+                                  GetScriptForDestination(dest), nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue swapdone(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "swapdone \"hash_lock\" \"preimage\" ( fee )\n"
+            "\nSettle a swap as delivered: post s (hex) with sha256(s) = hash_lock before its deadline. Anyone may; the house\n"
+            "normally does, copying s from Ethereum once the holder has claimed the tokens. A holder who posts s before\n"
+            "claiming the tokens gives up the notes: claim on Ethereum first.\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
+    const std::vector<unsigned char> vchPre = ParseHex(request.params[1].get_str());
+    const CAmount nFee = ParseFee(request, 2);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->SwapDone(strFail, txid, hashLock, vchPre, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue swappay(const JSONRPCRequest& request)
 {
     CWallet* const pwallet = WalletOrThrow(request);
     if (!pwallet)
         return NullUniValue;
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
         throw std::runtime_error(
-            "proveequity houseid ( fee )\n"
-            "\nProve a house's equity negative (gold + sECX escrow at the payout price + loan book less bills unpaid 3 days\n"
-            "past maturity - notes - deposits), listing its overdue bills. Anyone may; claims open from that block.\n"
-            "Refused when equity isn't negative.\n");
-    const uint32_t nHouseID = request.params[0].get_int();
+            "swappay \"hash_lock\" ( fee )\n"
+            "\nPay a swap in sECX from this wallet to its payout address: before its deadline at the house's bid at the\n"
+            "demand; after it at the lower of that and the house's highest bid in the day before the deadline (any shortfall\n"
+            "is kept in grams). Anyone may; it is how the house settles a swap it doesn't deliver. Run from the holder's own\n"
+            "wallet it pays the holder from the holder's coins and closes the swap: the house's wallet runs it.\n"
+            "\nResult: {\"txid\", \"paid_sats\"}\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
     const CAmount nFee = ParseFee(request, 1);
     EnsureWalletIsUnlocked(pwallet);
-    pwallet->BlockUntilSyncedToCurrentChain();
-    LOCK2(cs_main, pwallet->cs_wallet);
     uint256 txid;
     std::string strFail;
-    int64_t nEquity = 0;
-    std::vector<uint32_t> vOverdue;
-    if (!pwallet->ProveEquity(strFail, txid, nHouseID, nFee, nEquity, vOverdue))
+    CAmount amountPaid = 0;
+    if (!pwallet->SwapPay(strFail, txid, hashLock, nFee, amountPaid))
         throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    UniValue o = TxidResult(txid);
+    o.pushKV("paid_sats", amountPaid);
+    return o;
+}
+
+UniValue swapprotest(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "swapprotest \"hash_lock\" ( fee )\n"
+            "\nProtest a swap still unpaid a day after its deadline: an unpaid demand, which starts the house's 7-day cure\n"
+            "(or, within 180 days of its last cure, fails it). Anyone may.\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
+    const CAmount nFee = ParseFee(request, 1);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->SwapProtest(strFail, txid, hashLock, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue swapexpire(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "swapexpire \"hash_lock\" ( fee )\n"
+            "\nAt or after a swap's deadline, fix its rate at the house's bid then. Optional: any later swap op fixes it.\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
+    const CAmount nFee = ParseFee(request, 1);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->SwapExpire(strFail, txid, hashLock, nFee))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    return TxidResult(txid);
+}
+
+UniValue swapclaim(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "swapclaim \"hash_lock\" ( fee )\n"
+            "\nAt a failed house (after its bills are collected), claim a pending swap, or a shortfall the house paid within\n"
+            "90 days before it failed, at the noteholders' rank: its exact pro-rata share of the escrow pot goes to the\n"
+            "swap's payout address. Anyone may; this wallet pays the fee.\n"
+            "\nResult: {\"txid\", \"paid_sats\"}\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
+    const CAmount nFee = ParseFee(request, 1);
+    EnsureWalletIsUnlocked(pwallet);
+    uint256 txid;
+    std::string strFail;
+    CAmount amountPaid = 0;
+    if (!pwallet->SwapClaimFromEscrow(strFail, txid, hashLock, nFee, amountPaid))
+        throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    UniValue o = TxidResult(txid);
+    o.pushKV("paid_sats", amountPaid);
+    return o;
+}
+
+UniValue getswap(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "getswap \"hash_lock\"\n"
+            "\nA swap's record: house, units (mg), the token, the Ethereum address, the house's bid at the demand, the\n"
+            "deadline (chain active time), status (pending, done, paid, protested), any shortfall in mg, and the bid at the\n"
+            "deadline once fixed.\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
+    LOCK(cs_main);
+    CSwapRecord r;
+    if (!SwapRecordForChecks(hashLock, r))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown swap");
+    CChainClock clock;
+    const bool fClock = ChainClockForChecks(clock);
     UniValue o(UniValue::VOBJ);
-    o.pushKV("txid", txid.GetHex());
-    o.pushKV("equity_mg", nEquity);
-    UniValue bills(UniValue::VARR);
-    for (uint32_t id : vOverdue)
-        bills.push_back((uint64_t)id);
-    o.pushKV("overdue_bills", bills);
+    o.pushKV("hash_lock", HashLockHex(hashLock));
+    o.pushKV("houseid", (uint64_t)r.nHouseID);
+    o.pushKV("units_mg", r.nUnits);
+    o.pushKV("chain_id", r.nChainID);
+    o.pushKV("contract", "0x" + HexStr(r.vchContract));
+    o.pushKV("eth_address", "0x" + HexStr(r.vchEthAddress));
+    o.pushKV("bid_at_demand", r.nBid0);
+    o.pushKV("demand_height", (uint64_t)r.nDemandHeight);
+    o.pushKV("deadline_active", r.nDeadlineActive);
+    o.pushKV("active_now", fClock ? UniValue(clock.nActiveTime) : NullUniValue);
+    o.pushKV("status", r.nStatus == SWAP_DONE ? "done" : r.nStatus == SWAP_PAID ? "paid" :
+                       r.nStatus == SWAP_PROTESTED ? "protested" : r.nStatus == SWAP_CLAIMED ? "claimed" : "pending");
+    o.pushKV("shortfall_mg", r.nShortfallMg);
+    o.pushKV("settle_time", r.nSettleTime);
+    o.pushKV("bid_at_deadline", r.nBidT ? UniValue(r.nBidT) : NullUniValue);
     return o;
 }
 
@@ -1436,9 +1482,10 @@ UniValue createtokenpool(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 5)
         throw std::runtime_error(
             "createtokenpool \"token_id\" units sats ( fee_bps fee )\n"
-            "\nCreate the token/sECX pool of a gold token (one per token) with this wallet's units and sats; the LP\n"
-            "shares come back to the wallet. fee_bps 1-100, default 30. Burns 1 g of gold's worth of sECX at the payout\n"
-            "price (D-2026-11-04-1); refused while there is no payout price.\n");
+            HELP_ROLE_POOL
+            "\nCreate the token/sECX pool of a dollar token (one per token) with this wallet's units and sats; the LP\n"
+            "shares come back to the wallet. fee_bps 1-100, default 30. Burns the fixed creation fee (0.1 ECX). Dollar\n"
+            "pools open at the later-rules time (getblockchaininfo dollar_pools_open).\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
     const uint64_t nUnits = ParseUnits(request.params[1]);
     const CAmount nSats = request.params[2].get_int64();
@@ -1464,6 +1511,7 @@ UniValue addtokenliquidity(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "addtokenliquidity \"token_id\" units ( fee max_sats )\n"
+            HELP_ROLE_POOL
             "\nAdd units, and the sats that match the pool's ratio, to a token pool; LP shares come back. max_sats\n"
             "(optional): refuse if the ratio, which follows the pool's pending transactions, asks more sats than this.\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
@@ -1550,12 +1598,9 @@ static UniValue TokenPoolToJSON(const CUnitsView& view, const uint256& tokenID, 
     o.pushKV("lp_supply", (uint64_t)pool.nLpSupply);
     o.pushKV("create_height", pool.nCreateHeight);
     o.pushKV("custody_txid", pool.outSats.hash.GetHex());   // vout 0 = token side, vout 1 = sats side
-    uint64_t nView = 0;
-    bool fDeep = false;
-    if (TokenPoolView(view, tokenID, nTip, gp, nView, fDeep)) {
-        o.pushKV("view_sats_per_gram", (uint64_t)nView);
-        o.pushKV("deep", fDeep);
-    }
+    // Spot price from the reserves (sats per token unit x 1000): a market, never a price the chain uses (Gold B).
+    if (pool.nUnits > 0)
+        o.pushKV("spot_sats_per_1000_units", (int64_t)((unsigned __int128)pool.nSats * 1000 / pool.nUnits));
     return o;
 }
 
@@ -1564,7 +1609,7 @@ UniValue gettokenpool(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
             "gettokenpool \"token_id\"\n"
-            "\nA token pool (confirmed): reserves, LP supply, fee, its 144-block view, and the chain's payout price.\n");
+            "\nA token pool (confirmed): reserves, LP supply, fee and spot price. A market; the chain uses no pool price.\n");
     const uint256 tokenID = ParseTokenID(request.params[0]);
     LOCK(cs_main);
     CUnitsView view(punitsdb.get());
@@ -1573,10 +1618,7 @@ UniValue gettokenpool(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "The token has no pool");
     const int nTip = chainActive.Height();
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nTip);
-    UniValue o = TokenPoolToJSON(view, tokenID, pool, nTip, gp);
-    uint64_t nPayout = 0;
-    o.pushKV("payout_price_sats_per_gram", PayoutPrice(view, nTip, gp, nPayout) ? UniValue((uint64_t)nPayout) : NullUniValue);
-    return o;
+    return TokenPoolToJSON(view, tokenID, pool, nTip, gp);
 }
 
 UniValue listtokenpools(const JSONRPCRequest& request)
@@ -1584,10 +1626,9 @@ UniValue listtokenpools(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 0)
         throw std::runtime_error(
             "listtokenpools\n"
-            "\nEvery token pool (confirmed), in token-id order, with the fields of gettokenpool. The chain's payout price is\n"
-            "given once, at the top level (getgoldfix has the oracle side).\n"
-            "\nResult: {\"payout_price_sats_per_gram\": n|null, \"pools\": [ {token_id, ticker, lp_token_id, fee_bps, units,\n"
-            "sats, lp_supply, create_height, custody_txid, view_sats_per_gram, deep}, ... ]}\n");
+            "\nEvery token pool (confirmed), in token-id order, with the fields of gettokenpool.\n"
+            "\nResult: {\"pools\": [ {token_id, ticker, lp_token_id, fee_bps, units, sats, lp_supply, create_height,\n"
+            "custody_txid, spot_sats_per_1000_units}, ... ]}\n");
     LOCK(cs_main);
     CUnitsView view(punitsdb.get());
     const int nTip = chainActive.Height();
@@ -1605,8 +1646,6 @@ UniValue listtokenpools(const JSONRPCRequest& request)
         arr.push_back(TokenPoolToJSON(view, pool.tokenID, pool, nTip, gp));
     }
     UniValue o(UniValue::VOBJ);
-    uint64_t nPayout = 0;
-    o.pushKV("payout_price_sats_per_gram", PayoutPrice(view, nTip, gp, nPayout) ? UniValue((uint64_t)nPayout) : NullUniValue);
     o.pushKV("pools", arr);
     return o;
 }
@@ -1620,16 +1659,21 @@ const CRPCCommand issuedCommands[] = {
     { "token",            "freezeissued",           &freezeissued,           {"token_id", "coins", "fee"} },
     { "token",            "unfreezeissued",         &unfreezeissued,         {"token_id", "coins", "fee"} },
     { "token",            "listissued",             &listissued,             {"token_id"} },
-    { "token",            "submitoracleobs",        &submitoracleobs,        {"id", "observations", "fee"} },
-    { "token",            "issuerbond",             &issuerbond,             {"token_id", "amount", "fee"} },
-    { "token",            "pledgegold",             &pledgegold,             {"houseid", "partner_index", "token_id", "units", "fee"} },
-    { "token",            "movetill",               &movetill,               {"houseid", "token_id", "units", "fee"} },
-    { "token",            "cleardustslot",          &cleardustslot,          {"houseid", "partner_index", "token_clear", "token_add", "units_add", "fee"} },
-    { "token",            "proveequity",            &proveequity,            {"houseid", "fee"} },
     { "token",            "createtokenpool",        &createtokenpool,        {"token_id", "units", "sats", "fee_bps", "fee"} },
     { "token",            "addtokenliquidity",      &addtokenliquidity,      {"token_id", "units", "fee", "max_sats"} },
     { "token",            "removetokenliquidity",   &removetokenliquidity,   {"token_id", "lp_units", "fee"} },
     { "token",            "swaptoken",              &swaptoken,              {"token_id", "direction", "amount_in", "fee", "min_out"} },
+    { "house",            "posthouserate",          &posthouserate,          {"houseid", "bid", "ask", "fee"} },
+    { "house",            "sethouseratekey",        &sethouseratekey,        {"houseid", "pubkey", "fee"} },
+    { "house",            "addchartertoken",        &addchartertoken,        {"houseid", "chain_id", "contract", "decimals", "grams_num", "grams_den", "related", "fee"} },
+    { "house",            "removechartertoken",     &removechartertoken,     {"houseid", "index", "fee"} },
+    { "house",            "setcharterrelated",      &setcharterrelated,      {"houseid", "index", "related", "fee"} },
+    { "notes",            "swapnotes",              &swapnotes,              {"houseid", "units", "chain_id", "contract", "eth_address", "hash_lock", "payout_address", "fee"} },
+    { "notes",            "swapdone",               &swapdone,               {"hash_lock", "preimage", "fee"} },
+    { "notes",            "swappay",                &swappay,                {"hash_lock", "fee"} },
+    { "notes",            "swapprotest",            &swapprotest,            {"hash_lock", "fee"} },
+    { "notes",            "swapexpire",             &swapexpire,             {"hash_lock", "fee"} },
+    { "notes",            "swapclaim",              &swapclaim,              {"hash_lock", "fee"} },
 };
 
 // v1.1.1: the read-only ones never touch a wallet, so they are registered with the node's commands, also under
@@ -1637,7 +1681,9 @@ const CRPCCommand issuedCommands[] = {
 const CRPCCommand issuedNodeCommands[] = {
     //  category              name                      actor (function)         argNames
     { "token",            "getissuedtoken",         &getissuedtoken,         {"token_id"} },
-    { "token",            "gethousegold",           &gethousegold,           {"houseid"} },
+    { "token",            "gethousecapital",        &gethousecapital,        {"houseid"} },
+    { "house",            "gethousecharter",        &gethousecharter,        {"houseid"} },
+    { "notes",            "getswap",                &getswap,                {"hash_lock"} },
     { "token",            "gettokenpool",           &gettokenpool,           {"token_id"} },
     { "token",            "listtokenpools",         &listtokenpools,         {} },
 };

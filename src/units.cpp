@@ -29,8 +29,12 @@ bool CUnitsDB::CheckOrWriteVersion(std::string& strError)
     }
     if (fVersion && nVersion == UNITS_DB_VERSION_CURRENT)
         return true;
+    // Gold B also changed the transaction wire format (the vault-move field is gone), so -reindex can't re-read blocks an
+    // older build wrote: the data directory's blocks/ and chainstate/ must be resynced from peers (review 2026-11-07).
     strError = strprintf("The units database (blocks/Units) was written by an earlier build (layout %u, this build %u): "
-                         "restart with -reindex", fVersion ? nVersion : 0, UNITS_DB_VERSION_CURRENT);
+                         "delete the data directory's blocks/ and chainstate/ folders and restart to resync from peers "
+                         "(-reindex can't read blocks written before Gold B)", fVersion ? nVersion : 0,
+                         UNITS_DB_VERSION_CURRENT);
     return false;
 }
 

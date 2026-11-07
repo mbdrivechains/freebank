@@ -876,7 +876,7 @@ BOOST_AUTO_TEST_CASE(ccoins_write)
 //            fNote 1 + nNoteUnits 8 + nDemandHeight 4            -> 13
 //            fDeposit 1 + principal 8 + rate 4 + mat 4 + orig 4  -> 21
 //            fPoolEscrow 1 + fLpShare 1 + nLpUnits 8             -> 10
-//            fOracleBond 1                                       ->  1
+//            fCustody 1                                       ->  1
 //   Coin = 1 + 3 + 58 = 62. TxInUndo adds the one-byte legacy version dummy
 //   that is emitted whenever nHeight > 0, so 63. A coloured coin adds the
 //   32-byte asset id: 94 / 95.

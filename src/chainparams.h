@@ -80,10 +80,12 @@ public:
     const CCheckpointData& Checkpoints() const { return checkpointData; }
     const ChainTxData& TxData() const { return chainTxData; }
     void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime, int64_t nTimeout);
-    /** Regtest (-housepoolheight) and unit tests only: the height house note pools open. */
-    void UpdateNotePoolHeight(int nHeight);
+    /** Regtest (-housepooltime, -dollarpooltime, -fullforfeittime) and unit tests only: when each later rule switches
+     *  on (D-2026-11-05-3; Consensus::LATER_RULE_NEVER = never, 0 = from genesis). */
+    void UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime);
     /** Unit tests only: the creation burn (D-2026-11-04-1, 3b) on every gram step. */
-    void UpdateCreateFeeForTest(uint64_t nCreateFeeMg);
+    void UpdateCreateFeeForTest(int64_t nCreateFeeSats);
+    /** Regtest (-oracleunbonddelay) only: a reporter's withdraw delay on every gram step. */
     /** Regtest (-depositstartheight) only: the L1 height deposits count from. */
     void UpdateDepositStartL1Height(int nHeight);
     void UpdateChainDormant(bool fDormant);
@@ -137,11 +139,12 @@ void UpdateVersionBitsParameters(Consensus::DeploymentPos d, int64_t nStartTime,
 /** v0.2.19: regtest only (-dormant), so gates can show a dormant chain and its switch-on. */
 void UpdateChainDormantForTest(bool fDormant);
 
-/** Gram-notes release: regtest (-housepoolheight) and unit tests only, the height house note pools open. */
-void UpdateNotePoolHeight(int nHeight);
+/** No forks (D-2026-11-05-3): regtest and unit tests only, when each later rule switches on. */
+void UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime);
 
 /** Unit tests only: the creation burn (D-2026-11-04-1, 3b) on every gram step. */
-void UpdateCreateFeeForTest(uint64_t nCreateFeeMg);
+void UpdateCreateFeeForTest(int64_t nCreateFeeSats);
+/** Regtest (-oracleunbonddelay) only. */
 
 /** Regtest (-depositstartheight) only: the L1 height deposits count from. */
 void UpdateDepositStartL1Height(int nHeight);
