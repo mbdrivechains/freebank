@@ -426,6 +426,13 @@ bool CTxMemPool::addUnchecked(const uint256& hash, const CTxMemPoolEntry &entry,
         setWithdrawalRefund.insert(entry.GetWITHDRAWALID());
     }
 
+    // Gold B N1: index a swap op by its hash lock (ATMP's swap-op-pending guard)
+    uint256 hashLock;
+    if (tx.nVersion == TRANSACTION_NOTE_VERSION && IsNoteSwapOp(tx.nNoteOp) && NoteSwapOpHashLock(tx, hashLock)) {
+        mapSwapTxLock[hash] = hashLock;
+        mapSwapLockCount[hashLock]++;
+    }
+
     return true;
 }
 
@@ -451,6 +458,13 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
         setWithdrawalRefund.erase(it->GetWITHDRAWALID());
     }
     setAssetTx.erase(hash);
+    const auto itLock = mapSwapTxLock.find(hash);
+    if (itLock != mapSwapTxLock.end()) {
+        const auto itCount = mapSwapLockCount.find(itLock->second);
+        if (itCount != mapSwapLockCount.end() && --itCount->second == 0)
+            mapSwapLockCount.erase(itCount);
+        mapSwapTxLock.erase(itLock);
+    }
 
     totalTxSize -= it->GetTxSize();
     cachedInnerUsage -= it->DynamicMemoryUsage();
@@ -611,6 +625,8 @@ void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigne
 void CTxMemPool::_clear()
 {
     setAssetTx.clear();
+    mapSwapTxLock.clear();
+    mapSwapLockCount.clear();
     mapLinks.clear();
     mapTx.clear();
     mapNextTx.clear();
@@ -1039,7 +1055,7 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
 size_t CTxMemPool::DynamicMemoryUsage() const {
     LOCK(cs);
     // Estimate the overhead of mapTx to be 12 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.
-    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + cachedInnerUsage;
+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + cachedInnerUsage;
 }
 
 void CTxMemPool::RemoveStaged(setEntries &stage, bool updateDescendants, MemPoolRemovalReason reason) {

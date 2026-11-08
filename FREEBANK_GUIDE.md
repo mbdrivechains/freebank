@@ -525,7 +525,8 @@ notes, deposits and pool reserves.
 
 1. **One state-changing operation per house per block.** A second op on the same house
    while one is pooled is refused with *"...already in the mempool - retry next block"*.
-   Mine a block between operations on the same house, bill, pool or oracle submitter.
+   Mine a block between operations on the same house, bill, pool or oracle submitter. One
+   exception (v1.2.1): a pooled rate post gives way to any other op on its house (4.13).
 2. **A returned txid does not mean acceptance** (the callout in section 3). Assert on
    `getrawmempool` or on chain state, never on exit status.
 
@@ -574,13 +575,14 @@ of `mybank`'s notes. Once two wallets are loaded, a bare `$FB` only works for no
 ### 4.1 Discount houses
 
 ```bash
-$FB registerhouse 0 1 "solo"    1000 "[0.5]"          0.001   # tier 0: bonded solo
-$FB registerhouse 1 1 "encsolo" 1000 "[0.5]"          0.001   # tier 1: encumbered solo
-$FB registerhouse 2 2 "fixed"   1000 "[0.3,0.3]"      0.001   # tier 2: restricted M-of-N, fixed partner set
-$FB registerhouse 3 2 "club"    1000 "[0.3,0.3,0.3]"  0.001   # tier 3: multi-partner, open to admission
+$FB registerhouse 0 1 "solo"    1000 "[0.5]"          0.001   # tier 0: solo (tier 1 is the same today)
+$FB registerhouse 2 2 "fixed"   1000 "[0.3,0.3]"      0.001   # tier 2: fixed partnership, M-of-N, the set never changes
+$FB registerhouse 3 2 "club"    1000 "[0.3,0.3,0.3]"  0.001   # tier 3: open partnership, partners can join and leave
 ```
 
-- Tiers set the issuance multiplier on pledged escrow: 1.0× / 1.5× / 2.0× / 3.0×. Minimum
+- The tier says how the house is owned, not how much it may issue (since v1.2.0 the cap is the escrow ramp and the
+  till, 4.13). Solo: one partner, threshold 1, and the pledge frees at wind-down. Partnerships: 2 or more partners,
+  threshold at least 2, and each pledge waits the ~3-year tail after wind-down. Minimum
   pledge 0.1 coin; up to 64 partners. Duplicate `classid` is refused. The fourth argument
   (`denommg`) is a recorded number only; nothing in consensus reads it.
 - **Members-only houses (v0.2.19)**, for co-ops: an optional seventh argument to
@@ -951,6 +953,10 @@ $FB gethousecapital $H                # bid, ask (in effect for the next block),
 
 - Every payment names the rate it accepts and is invalid on a mismatch; the wallet fills it in from the chain. A
   payment built just before the house posts a new rate can be refused: build it again.
+- A rate post takes the house's one op in a block, so since v1.2.1 a pooled post gives way: the node drops it for any
+  other op on the house (a redemption, a demand, an attestation, a new rate key), and a post sent while another op on
+  the house is pooled is refused. The house's own wallet waits a block after its own post. Re-post after the next
+  block if your post was dropped.
 - A holder who redeems is paid at the bid. A formal demand (`demandnote`, `demanddeposit`) is paid at no less than the
   bid when it was made, whatever the house posts afterwards.
 - A bill repays in the house's notes at par, or in sECX at its highest ask of the last 30 days. A bill held outside a
@@ -987,7 +993,7 @@ FreeBank to settle the swap.
 ```bash
 $W swapnotes $H 20000 1 <contract> <holder's eth address> <hash lock H> "<payout address>"   # notes leave circulation
 $FB getswap <H>                       # status, units_mg, bid_at_demand, deadline_active, active_now, bid_at_deadline, shortfall_mg
-$W swapdone <H> <s>                   # within 72 h of active time: the swap is done
+$W swapdone <H> <s>                   # within 72 h of active time: the swap is done (normally the house posts s)
 $W swappay <H>                        # the house pays sECX instead: before the deadline at the demand's bid
 $W swapexpire <H>                     # anyone, after the deadline: fixes the bid the failed swap pays at
 $W swapprotest <H>                    # anyone, a day after the deadline if still unpaid: a protest (5, below)
@@ -999,6 +1005,9 @@ $W swapprotest <H>                    # anyone, a day after the deadline if stil
   only if the house fails within 90 days of paying the swap (`swapclaim`, below).
 - Active time is the sum of the gaps between FreeBank blocks in eCash block time, each counted up to an hour, so a
   stalled chain doesn't run the deadline out.
+- From a holder's own wallet (one that owns the swap's payout address and holds none of the house's partner keys),
+  `swappay` is refused: it would pay you with your own coins and close the swap. `swapdone` is refused there too unless
+  you add `claimed` = true (`swapdone <H> <s> 0.001 true`) once you have claimed the tokens on Ethereum (v1.2.1).
 
 **5. Protest, cure and failure.** A house closes only when it doesn't pay a demand.
 
@@ -2100,7 +2109,7 @@ arguments (default 0.001 coin). "Wallet" RPCs run in a wallet (`-rpcwallet=<name
 | `removechartertoken` · `setcharterrelated` | wallet | `houseid index [related] [fee]` | 4.13 |
 | `gethousecharter` | wallet | `houseid` | 4.13 |
 | `swapnotes` | wallet | `houseid units chain_id contract eth_address hash_lock payout_address [fee]` | 4.13 |
-| `swapdone` | wallet | `hash_lock preimage [fee]` | 4.13 |
+| `swapdone` | wallet | `hash_lock preimage [fee] [claimed]` | 4.13 |
 | `swappay` · `swapexpire` · `swapprotest` · `swapclaim` | wallet | `hash_lock [fee]` | 4.13 |
 | `getswap` | wallet | `hash_lock` | 4.13 |
 | `get_block_template` · `connect_block` · `get_bmm_inclusions` · `setcoinbasetag` | node | `connect_block block main_block_hash`; `get_bmm_inclusions critical_hash`; `setcoinbasetag name` | 7.4, 8 |
@@ -2122,7 +2131,7 @@ chassis's colored-coin subsystem, came back in v0.2.18 rebuilt under new rules (
 | **CTIP** | The single mainchain UTXO holding all coins escrowed to a sidechain; every deposit and withdrawal spends and recreates it. |
 | **M1–M8** | BIP 300/301 message types: M1 propose a sidechain, M2 ack it, M3 propose a withdrawal bundle, M4 ack/nack bundles, M5 deposit, M6 payout, M7 the BMM commitment (the miner's accept, in the coinbase), M8 the BMM request (the sidechain's bid transaction). |
 | **slot 130** | FreeBank's sidechain number. |
-| **house / partner / pledge / tier** | A discount house is a registered issuer; partners are its co-owner keys; a pledge is a partner's locked coin; the tier fixes governance shape and leverage. |
+| **house / partner / pledge / tier** | A discount house is a registered issuer; partners are its co-owner keys; a pledge is a partner's locked coin; the tier fixes how the house is owned (solo, fixed or open partnership). |
 | **till** | A house's liquid reserve — the specific coins it attests. Distinct from pledged escrow (capital). |
 | **attestation** | `attesthouse`: proving the till coin-by-coin against the UTXO set. |
 | **Stressed / Deferred (suspended) / Insolvent / Wound-down** | House statuses; the first three are derived at the tip. |
@@ -2139,7 +2148,7 @@ chassis's colored-coin subsystem, came back in v0.2.18 rebuilt under new rules (
 | **asset** | A fixed batch of units, 1 unit = 1 sat of ECX locked in its coins; identified by the txid that created it. |
 | **members-only / redeem-only house** | A house whose notes and deposit receipts go only to its members' keys; redeem-only also stops notes passing between members. |
 | **light mode** | `freebankd` with an enforcer and no eCash node REST endpoint (`-mainchainrest=` empty, v0.2.25). |
-| **λ, ρ, θ** | Leverage multiplier by tier; 10% liquid-reserve floor; 2.5%, the far end of the brassage ramp. |
+| **ρ, θ** | 10% liquid-reserve floor; 2.5%, the far end of the brassage ramp. (λ, the old leverage multiplier by tier, went with v1.2.0: the cap is the escrow ramp.) |
 
 ### 9.4 Reading a drivechain's footprint from coinbases
 

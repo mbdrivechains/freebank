@@ -106,6 +106,33 @@ uint256 BMMCache::GetMainChildBlockHashLocked(const uint256& hashBlock) const
 void BMMCache::ClearBMMBlocks()
 {
     mapBMMBlocks.clear();
+    ClearBidResend();
+}
+
+void BMMCache::MarkBidResend(const uint256& hashPrevBlock, const uint256& hashMerkleRoot)
+{
+    if (hashPrevBlock != hashResendPrev || hashMerkleRoot != hashResendRoot) {
+        hashResendPrev = hashPrevBlock;
+        hashResendRoot = hashMerkleRoot;
+        nResendRefusals = 0;
+    }
+    nResendRefusals++;
+}
+
+bool BMMCache::GetBidResend(const uint256& hashPrevBlock, uint256& hashMerkleRoot) const
+{
+    // The first refusal plus MAX_BID_RESENDS resends
+    if (hashResendRoot.IsNull() || hashPrevBlock != hashResendPrev || nResendRefusals > MAX_BID_RESENDS)
+        return false;
+    hashMerkleRoot = hashResendRoot;
+    return true;
+}
+
+void BMMCache::ClearBidResend()
+{
+    hashResendPrev.SetNull();
+    hashResendRoot.SetNull();
+    nResendRefusals = 0;
 }
 
 void BMMCache::StoreBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle)

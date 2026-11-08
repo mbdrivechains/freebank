@@ -1186,7 +1186,7 @@ public:
                          const uint256& hashLock, const CScript& scriptPayout, const CAmount& nFee);
     /** The swap's later ops, anyone's: DONE (the preimage), PAY (the sECX owed, from this wallet), PROTEST, EXPIRE. */
     bool SwapDone(std::string& strFail, uint256& txidOut, const uint256& hashLock, const std::vector<unsigned char>& vchPreimage,
-                  const CAmount& nFee);
+                  const CAmount& nFee, bool fClaimed = false);
     bool SwapPay(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee, CAmount& amountPaidOut);
     bool SwapProtest(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee);
     bool SwapExpire(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee);

@@ -102,6 +102,14 @@ public:
 
     bool HaveBMMRequestForPrevBlock(const uint256& hashPrevBlock) const;
 
+    // A bid on L1 tip hashPrevBlock refused by the L1's own node as a conflict with another bid from the same wallet
+    // (L1Client::LastBMMRequestConflicted): RefreshBMM resends the same block's bid on the next call, at most
+    // MAX_BID_RESENDS times per tip. Cleared with the bid blocks (a new tip) or by ClearBidResend.
+    static const int MAX_BID_RESENDS = 6;
+    void MarkBidResend(const uint256& hashPrevBlock, const uint256& hashMerkleRoot);
+    bool GetBidResend(const uint256& hashPrevBlock, uint256& hashMerkleRoot) const;
+    void ClearBidResend();
+
     void AddCheckedMainBlock(const uint256& hashBlock);
 
     bool MainBlockChecked(const uint256& hashMainBlock) const;
@@ -142,6 +150,11 @@ private:
     // BMM blocks that we have created with the intention of connecting to the
     // side blockchain once the BMM h* hash is included on the mainchain
     std::map<uint256 /* hashMerkleRoot */, CBlock> mapBMMBlocks;
+
+    // The bid to resend (MarkBidResend): its L1 tip, its block's merkle root, and how often it was refused on that tip
+    uint256 hashResendPrev;
+    uint256 hashResendRoot;
+    int nResendRefusals = 0;
 
     // Cache of sidechain block hashes which we have already verified with the
     // mainchain as having the BMM h* hash included.

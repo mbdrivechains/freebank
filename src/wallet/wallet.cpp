@@ -4076,7 +4076,7 @@ static void CollectWalletNoteCoins(CWallet* pwallet, uint32_t nHouseID,
     }
 }
 
-static bool HouseStateChangePending(uint32_t nHouseID);   // defined below (T-s6: settle-aware)
+static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID);   // defined below (T-s6: settle-aware; H1: rate POSTs yield)
 static bool HouseFailFastEnabled();                       // defined below (A8: regtest-only escape)
 
 /** The issuing caps the wallet's fail-fasts check (consensus's CapitalCapUnits / TillCapUnits in validation.cpp): the
@@ -4101,7 +4101,7 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     // house - incl. a v16 SETTLE, which takes BOTH its houses' slots. Without
     // this the ATMP guard still rejects, but CommitTransaction does not surface
     // that to the RPC caller (the house-review precedent).
-    if (HouseStateChangePending(nHouseID)) {
+    if (HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -4462,7 +4462,7 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
     // A lock takes the house's one-per-block slot (it writes nTokenUnits): fail fast like MintNote. The customer's
     // half of a one-step lock is not sent here; the house checks the slot when it approves.
-    if (!pmtxUnsent && HouseStateChangePending(nHouseID)) {
+    if (!pmtxUnsent && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -4616,7 +4616,7 @@ bool CWallet::ApproveNoteLock(std::string& strFail, CMutableTransaction& mtx, No
     NoteLock lock;
     if (!DecodeNotePayload(mtx.vchNotePayload, lock)) { strFail = "The lock's payload does not decode!"; return false; }
     if (lock.nUnits == 0 || lock.nUnits > (uint64_t)MAX_MONEY) { strFail = "Invalid note units!"; return false; }
-    if (HouseStateChangePending(lock.nHouseID)) {
+    if (HouseStateChangePending(this, lock.nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -4652,7 +4652,7 @@ bool CWallet::UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHous
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
-    if (HouseStateChangePending(nHouseID)) {
+    if (HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -5010,7 +5010,7 @@ bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHo
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
-    if (HouseStateChangePending(nHouseID)) {
+    if (HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
     }
     BlockUntilSyncedToCurrentChain();
@@ -5289,7 +5289,7 @@ bool CWallet::ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHous
     // PROTEST takes the house slot - fail fast on a pending house-state op
     // (A8/C7c: ATMP would refuse anyway, but CommitTransaction does not
     // surface that, and the refused tx would pin its fee inputs).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -5420,7 +5420,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     nRemainingOut = 0;
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
     // A discharge is a REDEEM - it takes the house slot (A8/C7c fail-fast).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -5655,7 +5655,7 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -5851,7 +5851,7 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -6121,7 +6121,7 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -6358,7 +6358,7 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -6540,7 +6540,7 @@ bool CWallet::DemandDeposit(std::string& strFail, uint256& txidOut, uint32_t nHo
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
     }
     BlockUntilSyncedToCurrentChain();
@@ -6601,7 +6601,7 @@ bool CWallet::ProtestDeposit(std::string& strFail, uint256& txidOut, const uint2
             !DecodeDepositPayload(txDemand->vchDepositPayload, d)) { strFail = "Could not read the demand!"; return false; }
     CKey keyHolder;
     if (!GetKey(CPubKey(d.vchHolderPubKey).GetID(), keyHolder)) { strFail = "This wallet is not the receipt's holder!"; return false; }
-    if (HouseFailFastEnabled() && HouseStateChangePending(coin.nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, coin.nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
     }
     CHouse house;
@@ -6697,7 +6697,7 @@ bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& 
         if (!DecodeDepositPayload(txC->vchDepositPayload, pr)) { strFail = "Undecodable protest!"; return false; }
         vchKey = pr.vchHolderPubKey; vchPayout = pr.vchPayoutScript; vchPreAuth = pr.vchPreAuthSig;
     } else { strFail = "That transaction is not a deposit demand or protest!"; return false; }
-    if (HouseFailFastEnabled() && HouseStateChangePending(coin.nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, coin.nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!"; return false;
     }
     CHouse house;
@@ -6746,7 +6746,7 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -7059,13 +7059,42 @@ static bool HouseFailFastEnabled()
     return !(fRegtest && !gArgs.GetBoolArg("-housefailfast", true));
 }
 
-static bool HouseStateChangePending(uint32_t nHouseID)
+static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vector<uint256>& vRatePost);
+
+/** H1 (stage A, plain v1.2.1): a pooled rate POST yields - the node evicts it for any other op on its house (ATMP's
+ *  fnRatePostYields) - so it doesn't count as pending, unless it is pwalletOwn's own POST: the op about to be built may
+ *  spend that POST's unconfirmed change, and the node never displaces a POST the incomer spends, so it would refuse the
+ *  op. The house's own wallet waits a block after its own POST, as before. pwalletOwn null: every pooled POST counts. */
+static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID)
+{
+    std::vector<uint256> vRatePost;
+    if (HouseStateChangePendingExceptRatePosts(nHouseID, vRatePost))
+        return true;
+    if (vRatePost.empty())
+        return false;
+    if (!pwalletOwn)
+        return true;
+    LOCK(pwalletOwn->cs_wallet);
+    for (const uint256& hash : vRatePost) {
+        if (pwalletOwn->GetWalletTx(hash))
+            return true;
+    }
+    return false;
+}
+
+static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vector<uint256>& vRatePost)
 {
     LOCK(mempool.cs);
     for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
         const CTransaction& mtx = mi->GetTx();
         uint32_t nTheirs = 0;
         bool fMatch = false;
+        if (IsHouseRatePostTx(mtx)) {
+            memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
+            if (nTheirs == nHouseID)
+                vRatePost.push_back(mtx.GetHash());
+            continue;
+        }
         if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) &&
                 !IsHouseMemberOp(mtx.nHouseOp) && mtx.vchHousePayload.size() >= 4) {
             memcpy(&nTheirs, mtx.vchHousePayload.data(), 4); fMatch = true;
@@ -7167,7 +7196,7 @@ bool CWallet::CreatePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     // surface an ATMP rejection to the caller).
     if (ppooltree->HavePool(nPoolID)) { strFail = "This house already has its pool (one per house)!"; return false; }
     if (PoolOpPending(nPoolID)) { strFail = "Another pool op for this pool is already pending (one op per pool per block) - retry next block!"; return false; }
-    if (HouseStateChangePending(nPoolID)) { strFail = "A house/note/deposit op for this house is pending - a status-gated CREATE would brick the template; retry next block!"; return false; }
+    if (HouseStateChangePending(this, nPoolID)) { strFail = "A house/note/deposit op for this house is pending - a status-gated CREATE would brick the template; retry next block!"; return false; }
     CHouse house;
     if (!phousetree->GetHouse(nPoolID, house)) { strFail = "Unknown house!"; return false; }
     if (HouseEffectiveStatus(house, chainActive.Height() + 1) != HOUSE_STATUS_OPEN) { strFail = "House is not effectively open - cannot charter its pool!"; return false; }
@@ -7536,7 +7565,7 @@ bool CWallet::RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     CPool pool;
     if (!ppooltree->GetPool(nPoolID, pool)) { strFail = "Unknown pool!"; return false; }
     if (PoolOpPending(nPoolID)) { strFail = "Another pool op for this pool is already pending (one op per pool per block) - retry next block!"; return false; }
-    if (HouseStateChangePending(nPoolID)) { strFail = "A house/note/deposit op for this house is pending (RETIRE burns units - one house change per block); retry next block!"; return false; }
+    if (HouseStateChangePending(this, nPoolID)) { strFail = "A house/note/deposit op for this house is pending (RETIRE burns units - one house change per block); retry next block!"; return false; }
     if (pool.nLpSupply != POOL_MIN_LIQUIDITY) { strFail = "Pool is not at the locked floor: remove ALL issued LP first (only the never-issued floor may remain)!"; return false; }
     CHouse house;
     if (!phousetree->GetHouse(nPoolID, house)) { strFail = "Unknown house!"; return false; }
@@ -7813,7 +7842,7 @@ static bool SettlePreflight(uint32_t nA, uint32_t nB, CHouse& houseA, CHouse& ho
             return false;
         }
     }
-    if (HouseStateChangePending(nA) || HouseStateChangePending(nB)) {
+    if (HouseStateChangePending(nullptr, nA) || HouseStateChangePending(nullptr, nB)) {
         strFail = "A house-state-changing op for one of these houses is already pending - retry next block!";
         return false;
     }
@@ -8321,7 +8350,7 @@ static bool NettingPreflight(const std::vector<uint32_t>& vHouseID, std::map<uin
                                 nID, h.nLastSettleHeight);
             return false;
         }
-        if (HouseStateChangePending(nID)) {
+        if (HouseStateChangePending(nullptr, nID)) {
             strFail = strprintf("A house-state-changing op for house %u is already pending - retry next block!", nID);
             return false;
         }
@@ -9052,7 +9081,7 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
     // txid for a transaction that was never admitted. Both layers are
     // load-bearing: this one for the message, ATMP's for every other
     // implementation and for hostile peers.
-    if (HouseStateChangePending(prop.nHouseID)) {
+    if (HouseStateChangePending(this, prop.nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool "
                   "(a second one would brick our own BMM template) - retry next block!";
         return false;
@@ -9376,7 +9405,7 @@ bool CWallet::CompleteDiscount(std::string& strFail, uint256& txidOut, const std
     // The house checked this in round 2, but rounds are separated in time and it
     // is US who broadcast. A v11 op co-pooling with another op of the same house
     // bricks that house's own BMM template, and nothing downstream would say so.
-    if (HouseStateChangePending(d.nHouseID)) {
+    if (HouseStateChangePending(this, d.nHouseID)) {
         strFail = "A house-state-changing op for the buying house is now in the mempool "
                   "(broadcasting would brick its BMM template) - retry next block!";
         return false;
@@ -9589,7 +9618,7 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
 
-    if (HouseStateChangePending(bill.nOwnerHouseID)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID)) {
         strFail = "A house-state-changing op for the owning house is already in the mempool - retry next block!";
         return false;
     }
@@ -9712,7 +9741,7 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
 
-    if (HouseStateChangePending(bill.nOwnerHouseID)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID)) {
         strFail = "A house-state-changing op for the owning house is already in the mempool - retry next block!";
         return false;
     }
@@ -9900,7 +9929,7 @@ bool CWallet::ClaimBillIntoHouseEscrow(std::string& strFail, uint256& txidOut, c
     // Deferred/Insolvent house's escrow. No quorum - the destination is fixed - and the fee comes from this wallet.
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
-    if (HouseStateChangePending(bill.nOwnerHouseID)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -9976,7 +10005,7 @@ bool CWallet::HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut,
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
 
-    if (HouseStateChangePending(bill.nOwnerHouseID)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -10363,7 +10392,7 @@ bool CWallet::TopupHouse(std::string& strFail, uint256& txidOut, const uint32_t 
     // RetirePool, settle, signdiscount, retirebill, claimbillescrow). An
     // operator topping up while any house op was pooled therefore built a tx
     // ATMP would refuse - and the refusal silently darkened their wallet (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -10486,7 +10515,7 @@ bool CWallet::AdmitPartner(std::string& strFail, uint256& txidOut, const uint32_
     }
     // ◄A8: same as TOPUP above - ADMIT mutates the house record, so it takes the
     // slot and must not be built against a pooled op.
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -10590,7 +10619,7 @@ bool CWallet::ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -10704,7 +10733,7 @@ bool CWallet::WinddownHouse(std::string& strFail, uint256& txidOut, const uint32
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -10821,7 +10850,7 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -10946,7 +10975,7 @@ bool CWallet::ReleaseReserves(std::string& strFail, uint256& txidOut, const uint
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -11262,7 +11291,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(nHouseID)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -11559,7 +11588,7 @@ bool CWallet::CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amount
                   "grace), then close!";
         return false;
     }
-    if (HouseStateChangePending(nHouseID)) {
+    if (HouseStateChangePending(this, nHouseID)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!";
         return false;
     }
@@ -13530,14 +13559,48 @@ bool CWallet::SwapNotesInKind(std::string& strFail, uint256& txidOut, uint32_t n
     });
 }
 
+/** W2 (stage A, plain v1.2.1): whose wallet is this, for a swap? The holder's if it owns the swap's payout script (the
+ *  holder chose it at swapnotes) or sent the swap itself (security's v1.2.1 review R3: a payout address outside the
+ *  wallet); the house's if it holds any of the house's partner keys. Both can be true (one wallet running the house and
+ *  holding its notes). */
+static void SwapWalletRoles(const CWallet& wallet, const uint256& hashLock, const CSwapRecord& r, bool& fHolder, bool& fHouse)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const CScript scriptPayout(r.vchPayoutScript.begin(), r.vchPayoutScript.end());
+    fHolder = ::IsMine(wallet, scriptPayout) != ISMINE_NO;
+    for (auto it = wallet.mapWallet.begin(); !fHolder && it != wallet.mapWallet.end(); ++it) {
+        const CTransaction& wtx = *it->second.tx;
+        uint256 hashTheirs;
+        if (wtx.nVersion == TRANSACTION_NOTE_VERSION && wtx.nNoteOp == NOTE_OP_SWAP &&
+                NoteSwapOpHashLock(wtx, hashTheirs) && hashTheirs == hashLock && wallet.IsFromMe(wtx))
+            fHolder = true;
+    }
+    fHouse = false;
+    CHouse house;
+    if (phousetree->GetHouse(r.nHouseID, house)) {
+        for (const HousePartner& p : house.vPartner)
+            fHouse |= wallet.HaveKey(CPubKey(p.vchPubKey).GetID());
+    }
+}
+
 bool CWallet::SwapDone(std::string& strFail, uint256& txidOut, const uint256& hashLock, const std::vector<unsigned char>& vchPreimage,
-                       const CAmount& nFee)
+                       const CAmount& nFee, bool fClaimed)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
     LOCK2(cs_main, cs_wallet);
     CSwapRecord r;
     if (!OpenSwapRecord(hashLock, r, strFail)) return false;
+    // W2: posting s discharges the holder's notes. From the holder's own wallet that is right only once the holder has
+    // claimed the tokens on Ethereum (which reveals s there anyway); before that it gives the notes up for nothing.
+    bool fHolder = false, fHouse = false;
+    SwapWalletRoles(*this, hashLock, r, fHolder, fHouse);
+    if (fHolder && !fHouse && !fClaimed) {
+        strFail = "This is the swap's holder's wallet: swapdone settles the swap as delivered and your notes are gone. "
+                  "Claim the tokens on Ethereum first; then, if you still want to post s yourself, run swapdone with "
+                  "claimed=true. Normally the house posts s.";
+        return false;
+    }
     uint256 hashCheck;
     CSHA256().Write(vchPreimage.data(), vchPreimage.size()).Finalize(hashCheck.begin());
     if (hashCheck != hashLock) { strFail = "sha256(preimage) is not the hash lock"; return false; }
@@ -13556,6 +13619,16 @@ bool CWallet::SwapPay(std::string& strFail, uint256& txidOut, const uint256& has
     LOCK2(cs_main, cs_wallet);
     CSwapRecord r;
     if (!OpenSwapRecord(hashLock, r, strFail)) return false;
+    // W2: SWAP_PAY pays the holder and closes the swap. From the holder's own wallet it pays the holder with the
+    // holder's coins and wipes the house's debt, so it is refused there. Anyone else may pay (the house, a guarantor).
+    bool fHolder = false, fHouse = false;
+    SwapWalletRoles(*this, hashLock, r, fHolder, fHouse);
+    if (fHolder && !fHouse) {
+        strFail = "This is the swap's holder's wallet: swappay would pay you with your own coins and close the swap, "
+                  "wiping what the house owes. The house runs swappay. If it doesn't pay, protest (swapprotest); if it "
+                  "fails, claim from its escrow (swapclaim).";
+        return false;
+    }
     uint64_t nBid = 0, nAsk = 0;
     if (!HouseRateForChecks(r.nHouseID, chainActive.Height() + 1, nBid, nAsk) || nBid == 0) { strFail = "The house has no rate in effect"; return false; }
     CChainClock clock;

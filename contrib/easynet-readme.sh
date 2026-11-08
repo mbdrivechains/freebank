@@ -18,7 +18,8 @@ them or accept them as payment.** The full notice is NOTICE.md, in this tarball.
 - Fixed seed 163.47.9.132:28455. The easynet L1 node is reachable at 163.47.9.132:28533.
 - Run it against an easynet L1 node and enforcer (slot 130, \`--fork=ecash\`): github.com/mbdrivechains/bitcoin,
   releases easynet-N.
-- **v1.2.0 (Gold B: each house's own rate) starts a new FreeBank-easynet chain** on the same L1: a new genesis and
+- **v1.2.1 runs the v1.2.0 chain** (node and wallet fixes only): swap the binaries and keep the data directory.
+- **v1.2.0 (Gold B: each house's own rate) started a new FreeBank-easynet chain** on the same L1: a new genesis and
   magic (was fb4bea05, the v1.1.0 chain). Start from an empty data directory; move the old one aside. The new chain
   credits only slot-130 treasury changes in L1 blocks from 1,676: the treasury's money before it belongs to the old
   chains (a fresh chain would otherwise credit every deposit again after its withdrawals were paid). Credit signatures

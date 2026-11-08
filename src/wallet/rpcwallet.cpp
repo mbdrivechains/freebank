@@ -6495,7 +6495,11 @@ UniValue registerhouse(const JSONRPCRequest& request)
             "registerhouse\n"
             HELP_ROLE_HOUSE
             "\nArguments:\n"
-            "1. \"tier\"      (numeric, required) liability tier 0-3\n"
+            "1. \"tier\"      (numeric, required) how the house is owned, not how much it may issue (the cap is\n"
+            "                 the escrow ramp and the till, gethousecapital): 0 or 1 = solo (one partner, threshold\n"
+            "                 1; its pledge frees at wind-down); 2 = fixed partnership (2+ partners, threshold 2+,\n"
+            "                 the set never changes); 3 = open partnership (as 2, and partners can be admitted and\n"
+            "                 exit). A partnership's pledges wait the 157,680-block tail after wind-down.\n"
             "2. \"threshold\" (numeric, required) approvals M for threshold ops (1 for solo)\n"
             "3. \"classid\"   (string, required) note-class id, [a-z0-9]{1,16}, globally unique\n"
             "4. \"denommg\"   (numeric, required) note denomination unit in mg of gold\n"

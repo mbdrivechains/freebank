@@ -36,7 +36,8 @@ FreeBank is a C++ fork of the BitAssets sidechain chassis (MIT).
 > credited and v1.0.2 what a credit transaction's signatures cover (below); while mainnet is dormant,
 > both run it exactly as v1.0.0 does, and the mainnet M1 names v1.0.0. **v1.1.0 (gram notes) and v1.2.0 (Gold B,
 > each house's own rate) each change the rules from genesis** (below): each runs mainnet, still dormant, and easynet,
-> which restarts on each; every network on them starts fresh. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
+> which restarts on each; every network on them starts fresh. v1.2.1 fixes the node and wallet on v1.2.0's rules
+> (a pooled rate post gives way, block bids retry, swap safety in the wallet): swap the binary and keep the chain. The v0.2.x releases run the **eCash beta** network; v0.2.29 is beta's last release.
 
 > **New here?** Start with [`FREEBANK_GUIDE.md`](FREEBANK_GUIDE.md) — a single self-contained
 > knowledge document (thesis, a verified regtest quick start, the full instrument cookbook,

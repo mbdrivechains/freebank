@@ -529,6 +529,12 @@ private:
     // life. Nothing in the pool may spend such a tx's outputs.
     std::set<uint256> setAssetTx;
 
+    // Gold B (security stage A N1 follow-up, plain v1.2.1): the hash lock of every pooled swap op (the six
+    // NOTE_OP_SWAP* ops), kept on add and remove, so ATMP's one-swap-op-per-hash-lock guard is one lookup instead of a
+    // scan that decoded every pooled swap op for each arrival. Counted because a reorg can return two.
+    std::map<uint256 /* txid */, uint256 /* hash lock */> mapSwapTxLock;
+    std::map<uint256 /* hash lock */, uint32_t /* pooled swap ops */> mapSwapLockCount;
+
 public:
     indirectmap<COutPoint, const CTransaction*> mapNextTx;
     std::map<uint256, CAmount> mapDeltas;
@@ -672,6 +678,13 @@ public:
     {
         LOCK(cs);
         return setAssetTx.count(hash);
+    }
+
+    /** Gold B N1: does the pool hold a swap op with this hash lock? */
+    bool HaveSwapLock(const uint256& hashLock) const
+    {
+        LOCK(cs);
+        return mapSwapLockCount.count(hashLock);
     }
 
     CTransactionRef get(const uint256& hash) const;

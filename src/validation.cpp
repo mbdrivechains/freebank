@@ -1131,6 +1131,15 @@ static bool GetHouseSlotSet(const CTransaction& mtx, std::vector<uint32_t>& vHou
  * the eviction itself is the attack, a perpetual-eviction defence at one
  * attest per block. External linkage so the unit suite pins the whitelist
  * structurally (b3_contextual_tests, the CheckNoteOperation idiom). */
+/** H1 (stage A, plain v1.2.1): a house rate POST (HOUSE_OP_RATE, kind POST). The kind byte follows the leading house
+ * id (HouseRate's serialization), so this stays a pure byte read like GetHouseSlotIDs. External linkage for the unit
+ * suite. */
+bool IsHouseRatePostTx(const CTransaction& mtx)
+{
+    return mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp == HOUSE_OP_RATE &&
+           mtx.vchHousePayload.size() >= 5 && mtx.vchHousePayload[4] == HOUSE_RATE_POST;
+}
+
 bool IsAttestDisplaceable(const CTransaction& mtx)
 {
     return mtx.nVersion == TRANSACTION_SETTLE_VERSION ||
@@ -1863,6 +1872,40 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
         }
 
+        // The incomer's parent txids, hoisted ONCE for every displacement site
+        // below (the rate-POST yield and the house-slot mirror guard). Both
+        // consult it through SpendsPooledOrDescendant, which walks the pooled
+        // entry's descendant set - so this set must be built out here, never
+        // rebuilt per pooled entry, or the walk becomes O(pool^2) per arrival.
+        std::set<uint256> setInPrevouts;
+        for (const CTxIn& in : tx.vin)
+            setInPrevouts.insert(in.prevout.hash);
+
+        // H1 (stage A, plain v1.2.1): A POOLED RATE POST YIELDS. A POST takes
+        // its house's one-op-per-block slot (consensus) though it changes no
+        // house record, so the rate key alone, re-posting every block at no
+        // cost, kept every other op on the house out of the mempool: the
+        // partners' SETKEY (a stolen rate key could not be revoked), ATTEST,
+        // DEFER, TOPUP, and the holders' DEMAND, REDEEM, SWAP and protests -
+        // the house's only closure trigger. Now each guard below that would
+        // refuse the incomer for a pooled POST on its house records the POST
+        // instead (fnRatePostYields), and the POSTs recorded are evicted once
+        // the incomer is accepted, just before addUnchecked - so a refused
+        // incomer evicts nothing. Never a POST the incomer spends, and never
+        // for an incoming POST: a POST still waits behind any pooled op on its
+        // house, and the rate key re-posts once the slot is free. An incomer
+        // that signals BIP125 replaceability displaces nothing (security
+        // v1.2.1 review R2): it could evict the POST and then be replaced,
+        // paying only replacement fees, so it waits behind the POST as before.
+        const bool fIncomerMayDisplacePost = !IsHouseRatePostTx(tx) && !SignalsOptInRBF(tx);
+        std::set<uint256> setRatePostYield;
+        auto fnRatePostYields = [&](CTxMemPool::txiter mi) {
+            if (!fIncomerMayDisplacePost || !IsHouseRatePostTx(mi->GetTx()) || SpendsPooledOrDescendant(setInPrevouts, pool, mi))
+                return false;
+            setRatePostYield.insert(mi->GetTx().GetHash());
+            return true;
+        };
+
         // Contextual bill checks - keeps invalid bill operations out of the
         // mempool so the BMM block assembler never templates them
         if (tx.nVersion == TRANSACTION_BILL_VERSION) {
@@ -2013,8 +2056,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 if (!GetHouseSlotSet(mi->GetTx(), vTheirs))
                     continue;
                 for (const uint32_t nTheirs : vTheirs) {
-                    if (setOurs.count(nTheirs))
+                    if (setOurs.count(nTheirs)) {
+                        if (fnRatePostYields(mi))
+                            break;
                         return state.DoS(0, false, REJECT_DUPLICATE, "settle-house-op-in-mempool");
+                    }
                 }
             }
         }
@@ -2111,7 +2157,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         uint32_t nTheirs = 0;
                         if (mtx.vchHousePayload.size() >= 4) {
                             memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
-                            if (nTheirs == nHouseIDNewLE)
+                            if (nTheirs == nHouseIDNewLE && !fnRatePostYields(mi))
                                 return state.DoS(0, false, REJECT_DUPLICATE, "house-op-in-mempool");
                         }
                     }
@@ -2218,19 +2264,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // any number of copies, each on its own coin, passed the pool while a block can hold only one: the
             // template dropped them one per try and, past MAX_TEMPLATE_EVICTIONS, built blocks from no pool txs, an
             // inclusion halt at no cost (re-sending the dropped copies kept every block empty). Checked before any
-            // contextual work; the scan decodes swap ops only.
+            // contextual work. v1.2.1: one lookup in the pool's hash-lock index (CTxMemPool::HaveSwapLock), not a scan.
             if (IsNoteSwapOp(tx.nNoteOp)) {
                 uint256 hashMine;
                 if (!NoteSwapOpHashLock(tx, hashMine))
                     return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
-                for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                    const CTransaction& mtx = mi->GetTx();
-                    if (mtx.nVersion != TRANSACTION_NOTE_VERSION || !IsNoteSwapOp(mtx.nNoteOp))
-                        continue;
-                    uint256 hashTheirs;
-                    if (NoteSwapOpHashLock(mtx, hashTheirs) && hashTheirs == hashMine)
-                        return state.DoS(0, false, REJECT_DUPLICATE, "swap-op-pending");
-                }
+                if (pool.HaveSwapLock(hashMine))
+                    return state.DoS(0, false, REJECT_DUPLICATE, "swap-op-pending");
             }
             if (IsTokenClaimOp(tx.nNoteOp)) {
                 // v0.2.21: a token CLAIM takes no house slot, so two pooled claims must not share a token (Y): the
@@ -2279,12 +2319,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         if (nTheirs == nHouseTouched)
                             return state.DoS(0, false, REJECT_DUPLICATE, "note-op-in-mempool");
                     }
-                    // A governance op for the same house?
+                    // A governance op for the same house? (A rate POST yields: H1.)
                     else if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && !IsHouseRegisterOp(mtx.nHouseOp) && !IsHouseMemberOp(mtx.nHouseOp) &&
                             mtx.vchHousePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
-                        if (nTheirs == nHouseTouched)
+                        if (nTheirs == nHouseTouched && !fnRatePostYields(mi))
                             return state.DoS(0, false, REJECT_DUPLICATE, "note-op-in-mempool");
                     }
                     // A deposit ORIGINATE/WITHDRAW/CLAIM for the same house also
@@ -2324,7 +2364,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                             mtx.vchHousePayload.size() >= 4) {
                         uint32_t nTheirs = 0;
                         memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
-                        if (nTheirs == nHouseDemanded)
+                        if (nTheirs == nHouseDemanded && !fnRatePostYields(mi))
                             return state.DoS(0, false, REJECT_DUPLICATE, "note-op-in-mempool");
                     }
                 }
@@ -2354,7 +2394,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
                     std::vector<uint32_t> vTheirs;
                     if (GetHouseSlotSet(mi->GetTx(), vTheirs) &&
-                            std::find(vTheirs.begin(), vTheirs.end(), nHouseDemanded) != vTheirs.end())
+                            std::find(vTheirs.begin(), vTheirs.end(), nHouseDemanded) != vTheirs.end() &&
+                            !fnRatePostYields(mi))
                         return state.DoS(0, false, REJECT_DUPLICATE, "deposit-demand-house-op-in-mempool");
                 }
             }
@@ -2388,7 +2429,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         memcpy(&nTheirs, mtx.vchPoolPayload.data(), 4);   // pool RETIRE burns X (house-state-changing)
                         fTheirsHouseChanging = true;
                     }
-                    if (fTheirsHouseChanging && nTheirs == nHouseTouched)
+                    if (fTheirsHouseChanging && nTheirs == nHouseTouched && !fnRatePostYields(mi))
                         return state.DoS(0, false, REJECT_DUPLICATE, "deposit-op-in-mempool");
                 }
             }
@@ -2425,7 +2466,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         mtx.vchHousePayload.size() >= 4) {
                     uint32_t nTheirs = 0;
                     memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
-                    if (nTheirs == nPoolTouched)
+                    if (nTheirs == nPoolTouched && !fnRatePostYields(mi))
                         return state.DoS(0, false, REJECT_DUPLICATE, "pool-op-in-mempool");
                 }
                 // An incoming RETIRE burns X from its house (house-state-CHANGING,
@@ -2458,20 +2499,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         memcpy(&nTheirs, mtx.vchDepositPayload.data(), 4);
                         fTheirsHouseChanging = true;
                     }
-                    if (fTheirsHouseChanging && nTheirs == nPoolTouched)
+                    if (fTheirsHouseChanging && nTheirs == nPoolTouched && !fnRatePostYields(mi))
                         return state.DoS(0, false, REJECT_DUPLICATE, "pool-op-in-mempool");
                 }
             }
         }
 
-        // The incomer's parent txids, hoisted ONCE for every displacement site
-        // below (the house-slot mirror guard). Both consult it
-        // through SpendsPooledOrDescendant, which walks the pooled entry's
-        // descendant set - so this set must be built out here, never rebuilt
-        // per pooled entry, or the walk becomes O(pool^2) per arrival.
-        std::set<uint256> setInPrevouts;
-        for (const CTxIn& in : tx.vin)
-            setInPrevouts.insert(in.prevout.hash);
+        // (setInPrevouts is hoisted above the bill checks, with the H1 rate-POST yield.)
 
         // THE UNIVERSAL HOUSE-SLOT MIRROR GUARD, slot-keyed on BOTH sides
         // (T-s5, widened ◄T-d5): the INCOMING tx takes a house slot and the
@@ -2566,6 +2600,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         if (fAttest && fDisplaceable &&
                                 !SpendsPooledOrDescendant(setInPrevouts, pool, mi))
                             vDisplace.push_back(mi->GetSharedTx());
+                        else if (fnRatePostYields(mi))
+                            ;   // H1: evicted once the incomer is accepted (before addUnchecked)
                         else if (mtx.nVersion == TRANSACTION_SETTLE_VERSION)
                             return state.DoS(0, false, REJECT_DUPLICATE, "house-op-settle-in-mempool");
                         else
@@ -2672,6 +2708,19 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         std::string errString;
         if (!pool.CalculateMemPoolAncestors(entry, setAncestors, nLimitAncestors, nLimitAncestorSize, nLimitDescendants, nLimitDescendantSize, errString)) {
             return state.DoS(0, false, REJECT_NONSTANDARD, "too-long-mempool-chain", false, errString);
+        }
+
+        // H1 (security v1.2.1 re-read, R2's gap): an incomer that would displace
+        // a rate POST must not hang off a replaceable parent either - replacing
+        // that parent later evicts the incomer too, so the POST would be gone
+        // for replacement fees. Refused, not admitted beside the POST: two
+        // pooled ops on one house slot is the state the guards exist to stop.
+        // Before any removal, so a refused incomer evicts nothing.
+        if (!setRatePostYield.empty()) {
+            for (CTxMemPool::txiter itAnc : setAncestors) {
+                if (SignalsOptInRBF(itAnc->GetTx()))
+                    return state.DoS(0, false, REJECT_DUPLICATE, "house-slot-op-in-mempool");
+            }
         }
 
         // A transaction that spends outputs that would be replaced by it is invalid. Now
@@ -2888,6 +2937,28 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 plTxnReplaced->push_back(it->GetSharedTx());
         }
         pool.RemoveStaged(allConflicting, false, MemPoolRemovalReason::REPLACED);
+
+        // H1: the pooled rate POSTs this incomer was refused for yield now that
+        // it is accepted. EXPIRY, not CONFLICT, as at the J2 site: the owning
+        // wallet must see the removal (its fInMempool flag), and the rate key
+        // re-posts once the slot is free. AFTER RemoveStaged(allConflicting),
+        // never before: allConflicting holds iterators, and a POST (or one of
+        // its descendants) can also be a BIP125 conflict of the incomer -
+        // removing it first left them dangling, and the conflict loop and
+        // RemoveStaged then read and erased freed entries (security, v1.2.1
+        // review). Looked up again by txid, so a POST already removed as a
+        // conflict is skipped. setAncestors stays valid: SpendsPooledOrDescendant
+        // keeps every recorded POST and its descendants out of the incomer's
+        // ancestry.
+        for (const uint256& hashPost : setRatePostYield) {
+            CTxMemPool::txiter itPost = pool.mapTx.find(hashPost);
+            if (itPost == pool.mapTx.end())
+                continue;
+            const CTransactionRef refPost = itPost->GetSharedTx();
+            LogPrintf("%s: %s on a house displaces pooled rate POST %s (H1)\n", __func__, hash.ToString(),
+                      hashPost.ToString());
+            pool.removeRecursive(*refPost, MemPoolRemovalReason::EXPIRY);
+        }
 
         // This transaction should only count for fee estimation if:
         // - it isn't a BIP 125 replacement transaction (may not be widely supported)

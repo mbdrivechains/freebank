@@ -763,6 +763,27 @@ BOOST_AUTO_TEST_CASE(l1client_grpcurl_failure_classify)
     BOOST_CHECK(ClassifyGrpcurlFailure(-1, "") == GrpcurlFailure::OTHER);
 }
 
+// easynet 2026-11-07, FreeBank block 416: two sidechains bidding at once from one enforcer wallet picked the same
+// coin, and the L1 node refused the second bid as a replacement paying no more. The exact output from that night.
+BOOST_AUTO_TEST_CASE(l1client_bmm_request_own_node_conflict)
+{
+    const std::string strNight = "ERROR:\n  Code: Unknown\n  Message: error creating BMM request: failed to broadcast BMM "
+        "request tx via RPC: ErrorObject { code: ServerError(-26), message: \"insufficient fee, rejecting replacement "
+        "403ee7182d0cb217617cbe260ee50c0704b756648c3b38daa6411c7a57a01391, not enough additional fees to relay; 0.0\"";
+    BOOST_CHECK(GrpcurlBMMRequestOwnNodeConflict(66, strNight));
+    BOOST_CHECK_MESSAGE(!GrpcurlBMMRequestNotSent(66, strNight), "a conflict is not a definite not-sent (p2p broadcast comes first)");
+    BOOST_CHECK(GrpcurlBMMRequestOwnNodeConflict(66, "Message: error creating BMM request: failed to broadcast BMM request "
+        "tx via RPC: ErrorObject { code: ServerError(-26), message: \"txn-mempool-conflict\""));
+    // Not a conflict: another broadcast refusal, the p2p step, a timeout, a build failure, another exit code
+    BOOST_CHECK(!GrpcurlBMMRequestOwnNodeConflict(66, "Message: error creating BMM request: failed to broadcast BMM request "
+        "tx via RPC: ErrorObject { code: ServerError(-26), message: \"min relay fee not met\""));
+    BOOST_CHECK(!GrpcurlBMMRequestOwnNodeConflict(66, "Message: error creating BMM request: failed to broadcast nonstandard tx: "
+        "rejecting replacement"));
+    BOOST_CHECK(!GrpcurlBMMRequestOwnNodeConflict(68, "ERROR:\n  Code: DeadlineExceeded\n"));
+    BOOST_CHECK(!GrpcurlBMMRequestOwnNodeConflict(66, "Message: error creating BMM request: failed to build BMM tx: Insufficient funds"));
+    BOOST_CHECK(!GrpcurlBMMRequestOwnNodeConflict(0, strNight));
+}
+
 BOOST_AUTO_TEST_CASE(l1client_bmm_request_not_sent)
 {
     // Definite: the enforcer refused before building the tx, or never got the call

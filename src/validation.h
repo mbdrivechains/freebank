@@ -353,6 +353,10 @@ bool CheckTokenOperationAtTip(const CTransaction& tx, CValidationState& state);
 /** v0.2.21: does a token CLAIM share a token (Y) with a pooled claim of the same house? (The mempool refuses it.) */
 bool TokenClaimConflictsMempool(const CTransaction& tx);
 
+/** H1 (stage A, plain v1.2.1): is mtx a house rate POST (HOUSE_OP_RATE, kind POST)? A pooled POST yields to any other op
+ *  on its house: ATMP evicts it rather than refuse the op, and the wallet's fail-fast doesn't count it. */
+bool IsHouseRatePostTx(const CTransaction& mtx);
+
 bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransactionRef &tx,
                         bool* pfMissingInputs, std::list<CTransactionRef>* plTxnReplaced,
                         bool bypass_limits, const CAmount nAbsurdFee);

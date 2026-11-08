@@ -4,6 +4,11 @@
 
 #include <policy/policy.h>
 #include <txmempool.h>
+#include <arith_uint256.h>
+#include <house.h>
+#include <note.h>
+#include <streams.h>
+#include <validation.h>
 #include <util.h>
 
 #include <test/test_bitcoin.h>
@@ -579,6 +584,86 @@ BOOST_AUTO_TEST_CASE(MempoolSizeLimitTest)
     // ... unless it has gone all the way to 0 (after getting past half of it)
 
     SetMockTime(0);
+}
+
+// Gold B (security stage A N1 follow-up, plain v1.2.1): the pool indexes each swap op by its hash lock on add and
+// drops it on remove, so ATMP's one-swap-op-per-hash-lock guard is one lookup (CTxMemPool::HaveSwapLock).
+BOOST_AUTO_TEST_CASE(swap_lock_index)
+{
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+    LOCK(pool.cs);
+    auto SwapDone = [](const uint256& hashLock, unsigned char nIn) {
+        NoteSwapDone d;
+        d.nHouseID = 7;
+        d.hashLock = hashLock;
+        d.vchPreimage = std::vector<unsigned char>(32, nIn);
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << d;
+        CMutableTransaction m;
+        m.nVersion = TRANSACTION_NOTE_VERSION;
+        m.nNoteOp = NOTE_OP_SWAP_DONE;
+        m.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        m.vin.resize(1);
+        m.vin[0].prevout.hash = ArithToUint256(arith_uint256(0x5a00 + nIn));
+        m.vout.resize(1);
+        m.vout[0].nValue = 1000;
+        m.vout[0].scriptPubKey = CScript() << OP_TRUE;
+        return CTransaction(m);
+    };
+    const uint256 hashA = ArithToUint256(arith_uint256(0xa11)), hashB = ArithToUint256(arith_uint256(0xb11));
+    const CTransaction txA1 = SwapDone(hashA, 1), txA2 = SwapDone(hashA, 2), txB = SwapDone(hashB, 3);
+    BOOST_CHECK(!pool.HaveSwapLock(hashA));
+    pool.addUnchecked(txA1.GetHash(), entry.FromTx(txA1));
+    pool.addUnchecked(txB.GetHash(), entry.FromTx(txB));
+    BOOST_CHECK(pool.HaveSwapLock(hashA));
+    BOOST_CHECK(pool.HaveSwapLock(hashB));
+    // Two with one lock (a reorg can return both): the lock stays until both are gone
+    pool.addUnchecked(txA2.GetHash(), entry.FromTx(txA2));
+    pool.removeRecursive(txA1);
+    BOOST_CHECK(pool.HaveSwapLock(hashA));
+    pool.removeRecursive(txA2);
+    BOOST_CHECK(!pool.HaveSwapLock(hashA));
+    BOOST_CHECK(pool.HaveSwapLock(hashB));
+    pool.clear();
+    BOOST_CHECK(!pool.HaveSwapLock(hashB));
+    // A plain tx is not indexed
+    CMutableTransaction plain;
+    plain.vin.resize(1);
+    plain.vout.resize(1);
+    plain.vout[0].nValue = 1000;
+    pool.addUnchecked(CTransaction(plain).GetHash(), entry.FromTx(plain));
+    BOOST_CHECK(!pool.HaveSwapLock(uint256()));
+}
+
+// H1 (stage A, plain v1.2.1): the rate POST test that ATMP's yield and the wallet's fail-fast key on
+BOOST_AUTO_TEST_CASE(house_rate_post_tx)
+{
+    HouseRate rate;
+    rate.nHouseID = 42;
+    rate.nKind = HOUSE_RATE_POST;
+    rate.nBid = rate.nAsk = 1000;
+    auto Tx = [](const HouseRate& r, uint8_t nOp) {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << r;
+        CMutableTransaction m;
+        m.nVersion = TRANSACTION_HOUSE_VERSION;
+        m.nHouseOp = nOp;
+        m.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        return CTransaction(m);
+    };
+    BOOST_CHECK(IsHouseRatePostTx(Tx(rate, HOUSE_OP_RATE)));
+    BOOST_CHECK_EQUAL(Tx(rate, HOUSE_OP_RATE).vchHousePayload[4], HOUSE_RATE_POST);   // the kind follows the house id
+    rate.nKind = HOUSE_RATE_SETKEY;
+    BOOST_CHECK(!IsHouseRatePostTx(Tx(rate, HOUSE_OP_RATE)));                         // SETKEY never yields
+    rate.nKind = HOUSE_RATE_POST;
+    BOOST_CHECK(!IsHouseRatePostTx(Tx(rate, HOUSE_OP_ATTEST)));                       // not a rate op
+    CMutableTransaction m(Tx(rate, HOUSE_OP_RATE));
+    m.nVersion = TRANSACTION_NOTE_VERSION;
+    BOOST_CHECK(!IsHouseRatePostTx(CTransaction(m)));                                 // not a house tx
+    m.nVersion = TRANSACTION_HOUSE_VERSION;
+    m.vchHousePayload.resize(4);
+    BOOST_CHECK(!IsHouseRatePostTx(CTransaction(m)));                                 // too short to hold a kind
 }
 
 BOOST_AUTO_TEST_SUITE_END()

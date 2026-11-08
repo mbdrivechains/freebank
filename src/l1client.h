@@ -171,6 +171,10 @@ public:
      * the L1 definitely sent no bid (a refusal before any broadcast), so the
      * tip may be bid on again; false means a bid may have gone out. */
     virtual uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent) = 0;
+    /* After the last SendBMMRequest returned a null txid without fNotSent: true if the L1's own node refused the bid
+     * as a conflict with another bid from the same wallet (two sidechains bidding at once from one enforcer wallet
+     * pick the same unconfirmed coin; easynet 2026-11-07). RefreshBMM then resends the same block's bid. */
+    virtual bool LastBMMRequestConflicted() const { return false; }
     virtual bool GetCTIP(std::pair<uint256, uint32_t>& ctip) = 0;
     virtual bool GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFees) = 0;
     virtual bool GetBlockCount(int& nBlocks) = 0;
@@ -308,6 +312,13 @@ GrpcurlFailure ClassifyGrpcurlFailure(int nExit, const std::string& strError);
  *  and an UNIMPLEMENTED method never reach it. Everything else - a timeout, an Unknown from the
  *  broadcast, any other code, a killed grpcurl - may come after the bid went out. Pure. */
 bool GrpcurlBMMRequestNotSent(int nExit, const std::string& strError);
+
+/** True if a failed CreateBmmCriticalDataTransaction call was refused by the L1's own node, at the enforcer's RPC
+ *  broadcast step, as a conflict with a transaction already in that node's mempool: another bid from the same wallet
+ *  took the coin (-26 "insufficient fee, rejecting replacement", or "txn-mempool-conflict"). It is not classed as
+ *  NotSent: an enforcer given --p2p-broadcast-addr sends to those peers before its own node. A resend for the same
+ *  block is safe either way, since both bids commit to the same h*. Pure. */
+bool GrpcurlBMMRequestOwnNodeConflict(int nExit, const std::string& strError);
 
 //
 // Enforcer wire helpers - exposed for unit tests (l1client_tests.cpp).

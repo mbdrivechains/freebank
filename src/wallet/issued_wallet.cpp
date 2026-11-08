@@ -1333,19 +1333,26 @@ UniValue swapdone(const JSONRPCRequest& request)
     CWallet* const pwallet = WalletOrThrow(request);
     if (!pwallet)
         return NullUniValue;
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
-            "swapdone \"hash_lock\" \"preimage\" ( fee )\n"
+            "swapdone \"hash_lock\" \"preimage\" ( fee claimed )\n"
             "\nSettle a swap as delivered: post s (hex) with sha256(s) = hash_lock before its deadline. Anyone may; the house\n"
             "normally does, copying s from Ethereum once the holder has claimed the tokens. A holder who posts s before\n"
-            "claiming the tokens gives up the notes: claim on Ethereum first.\n");
+            "claiming the tokens gives up the notes: claim on Ethereum first. From the holder's own wallet (one that owns the\n"
+            "swap's payout address and holds none of the house's partner keys) it is refused unless claimed is true.\n"
+            "\nArguments:\n"
+            "1. \"hash_lock\"  (string, required) the swap's hash lock\n"
+            "2. \"preimage\"   (string, required) s, hex\n"
+            "3. fee          (numeric, optional) default 0.001\n"
+            "4. claimed      (boolean, optional, default false) the holder says the tokens are claimed on Ethereum\n");
     const uint256 hashLock = ParseHashLock(request.params[0]);
     const std::vector<unsigned char> vchPre = ParseHex(request.params[1].get_str());
     const CAmount nFee = ParseFee(request, 2);
+    const bool fClaimed = request.params.size() > 3 && !request.params[3].isNull() && request.params[3].get_bool();
     EnsureWalletIsUnlocked(pwallet);
     uint256 txid;
     std::string strFail;
-    if (!pwallet->SwapDone(strFail, txid, hashLock, vchPre, nFee))
+    if (!pwallet->SwapDone(strFail, txid, hashLock, vchPre, nFee, fClaimed))
         throw JSONRPCError(RPC_WALLET_ERROR, strFail);
     return TxidResult(txid);
 }
@@ -1360,8 +1367,9 @@ UniValue swappay(const JSONRPCRequest& request)
             "swappay \"hash_lock\" ( fee )\n"
             "\nPay a swap in sECX from this wallet to its payout address: before its deadline at the house's bid at the\n"
             "demand; after it at the lower of that and the house's highest bid in the day before the deadline (any shortfall\n"
-            "is kept in grams). Anyone may; it is how the house settles a swap it doesn't deliver. Run from the holder's own\n"
-            "wallet it pays the holder from the holder's coins and closes the swap: the house's wallet runs it.\n"
+            "is kept in grams). Anyone may; it is how the house settles a swap it doesn't deliver. It is refused from the\n"
+            "holder's own wallet (one that owns the swap's payout address and holds none of the house's partner keys): there\n"
+            "it would pay the holder from the holder's coins and close the swap. The house's wallet runs it.\n"
             "\nResult: {\"txid\", \"paid_sats\"}\n");
     const uint256 hashLock = ParseHashLock(request.params[0]);
     const CAmount nFee = ParseFee(request, 1);
@@ -1669,7 +1677,7 @@ const CRPCCommand issuedCommands[] = {
     { "house",            "removechartertoken",     &removechartertoken,     {"houseid", "index", "fee"} },
     { "house",            "setcharterrelated",      &setcharterrelated,      {"houseid", "index", "related", "fee"} },
     { "notes",            "swapnotes",              &swapnotes,              {"houseid", "units", "chain_id", "contract", "eth_address", "hash_lock", "payout_address", "fee"} },
-    { "notes",            "swapdone",               &swapdone,               {"hash_lock", "preimage", "fee"} },
+    { "notes",            "swapdone",               &swapdone,               {"hash_lock", "preimage", "fee", "claimed"} },
     { "notes",            "swappay",                &swappay,                {"hash_lock", "fee"} },
     { "notes",            "swapprotest",            &swapprotest,            {"hash_lock", "fee"} },
     { "notes",            "swapexpire",             &swapexpire,             {"hash_lock", "fee"} },

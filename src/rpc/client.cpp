@@ -365,6 +365,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "swapnotes", 2, "chain_id" },
     { "swapnotes", 7, "fee" },
     { "swapdone", 2, "fee" },
+    { "swapdone", 3, "claimed" },
     { "swappay", 1, "fee" },
     { "swapprotest", 1, "fee" },
     { "swapexpire", 1, "fee" },

@@ -1676,7 +1676,24 @@ struct FakeL1Client : public L1Client {
     bool VerifyBMM(const uint256&, const uint256&, uint256&, uint32_t&) override { return false; }
     int nBids = 0;
     bool fBehind = false;
-    uint256 SendBMMRequest(const uint256&, const uint256&, int, CAmount, bool& fNotSent) override { nBids++; fNotSent = true; return uint256(); }
+    // The next bids' outcome: a txid back (txidNext), a conflict at the L1 node (fConflictNext), a bid that may have
+    // gone out (fMaybeSentNext), else a definite refusal
+    uint256 txidNext;
+    bool fConflictNext = false, fMaybeSentNext = false, fLastConflict = false;
+    std::vector<std::pair<uint256, uint256>> vBids; // (h*, L1 tip) of each bid
+    uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashMain, int, CAmount, bool& fNotSent) override
+    {
+        nBids++;
+        vBids.emplace_back(hashBMM, hashMain);
+        fLastConflict = false;
+        fNotSent = false;
+        if (!txidNext.IsNull()) return txidNext;
+        if (fConflictNext) { fLastConflict = true; return uint256(); }
+        if (fMaybeSentNext) return uint256();
+        fNotSent = true;
+        return uint256();
+    }
+    bool LastBMMRequestConflicted() const override { return fLastConflict; }
     std::vector<SidechainDeposit> vDepositsToReport;
     bool IsBehindItsNode(std::string& strWhy) override { if (fBehind) strWhy = "behind"; return fBehind; }
     bool GetCTIP(std::pair<uint256, uint32_t>&) override { return false; }
@@ -1844,6 +1861,96 @@ PEGBIND_BOTH_LAYOUTS(c4_orphaned_l1_block_fails_stored_side_blocks)
         LayoutName(layout) << ": the mark stayed after the L1 block returned");
 }
 
+
+// ---------------------------------------------------------------------------
+// easynet 2026-11-07, FreeBank block 416: a bid refused by the L1 node as a
+// conflict with another bid from the same enforcer wallet (two sidechains
+// bidding at once) claimed the tip as "may have gone out", so no bid went out
+// until the next L1 block, 61 minutes later. Now the same block's bid (same
+// h*) is resent on the next call, at most MAX_BID_RESENDS times per tip.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(bid_conflict_resends_same_block)
+{
+    FakeL1Client l1;
+    for (int h = 0; h <= 3; h++)
+        l1.vChain.push_back(ArithToUint256(arith_uint256(0xb416000 + h)));
+    const uint256 hashTip = l1.vChain.back();
+    MainCacheScope cache(std::deque<uint256>(l1.vChain.begin(), l1.vChain.end()));
+    for (const uint256& u : l1.vChain)
+        bmmCache.AddCheckedMainBlock(u);
+    auto Refresh = [&](uint256& txid) {
+        SidechainClient client;
+        std::string strError;
+        uint256 hashCreated, hashConnected, hashConnectedRoot;
+        int nTxn = 0;
+        CAmount nFees = 0;
+        txid.SetNull();
+        client.RefreshBMM(0, strError, hashCreated, hashConnected, hashConnectedRoot, txid, nTxn, nFees,
+                          true /* fCreateNew */, uint256());
+        return strError;
+    };
+    // The first bid on the tip, as RefreshBMM leaves it after the L1 node refused it as a conflict: the block cached,
+    // the tip claimed, the resend marked
+    CBlock bid;
+    bid.vtx.push_back(MakeTransactionRef(CMutableTransaction()));
+    bid.hashMerkleRoot = ArithToUint256(arith_uint256(0xb416b));
+    BOOST_REQUIRE(bmmCache.StoreBMMBlock(bid));
+    bmmCache.StorePrevBlockBMMCreated(hashTip);
+    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    uint256 txid;
+
+    // Refused again: resent with the same h* on the same tip, still due
+    l1.fConflictNext = true;
+    std::string strError = Refresh(txid);
+    BOOST_REQUIRE_EQUAL(l1.nBids, 1);
+    BOOST_CHECK(l1.vBids[0] == std::make_pair(bid.hashMerkleRoot, hashTip));
+    BOOST_CHECK(txid.IsNull());
+    BOOST_CHECK_MESSAGE(strError.find("resends it") != std::string::npos, strError);
+    uint256 hashRoot;
+    BOOST_CHECK(bmmCache.GetBidResend(hashTip, hashRoot) && hashRoot == bid.hashMerkleRoot);
+
+    // Taken: the same h* again, the resend cleared, and no further bid on this tip
+    l1.fConflictNext = false;
+    l1.txidNext = ArithToUint256(arith_uint256(0xb416f));
+    Refresh(txid);
+    BOOST_REQUIRE_EQUAL(l1.nBids, 2);
+    BOOST_CHECK(l1.vBids[1] == std::make_pair(bid.hashMerkleRoot, hashTip));
+    BOOST_CHECK(txid == l1.txidNext);
+    BOOST_CHECK(!bmmCache.GetBidResend(hashTip, hashRoot));
+    strError = Refresh(txid);
+    BOOST_CHECK_EQUAL(l1.nBids, 2);
+    BOOST_CHECK_EQUAL(strError, "Can't create new BMM request - already created for mainchain tip!");
+
+    // A conflict that never clears: MAX_BID_RESENDS resends after the first refusal, then the tip is left alone
+    l1.txidNext.SetNull();
+    l1.fConflictNext = true;
+    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    for (int i = 0; i < BMMCache::MAX_BID_RESENDS + 4; i++)
+        Refresh(txid);
+    BOOST_CHECK_EQUAL(l1.nBids, 2 + BMMCache::MAX_BID_RESENDS);
+
+    // A resend that may have gone out (not a conflict) is not resent again
+    l1.nBids = 0;
+    l1.fConflictNext = false;
+    l1.fMaybeSentNext = true;
+    bmmCache.ClearBidResend();
+    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    Refresh(txid);
+    Refresh(txid);
+    BOOST_CHECK_EQUAL(l1.nBids, 1);
+
+    // Behind its node: no resend
+    l1.nBids = 0;
+    l1.fBehind = true;
+    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    BOOST_CHECK_EQUAL(Refresh(txid), "behind");
+    BOOST_CHECK_EQUAL(l1.nBids, 0);
+    l1.fBehind = false;
+
+    // A new tip clears the bid blocks and the resend with them
+    bmmCache.ClearBMMBlocks();
+    BOOST_CHECK(!bmmCache.GetBidResend(hashTip, hashRoot));
+}
 
 // ---------------------------------------------------------------------------
 // v0.2.17 D4: no new BMM bid while the L1 view (the enforcer) is behind its

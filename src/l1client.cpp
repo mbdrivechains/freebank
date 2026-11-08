@@ -105,6 +105,7 @@ public:
     bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx) override;
     bool VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime) override;
     uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent) override;
+    bool LastBMMRequestConflicted() const override { return m_fLastBidConflict; }
     bool GetCTIP(std::pair<uint256, uint32_t>& ctip) override;
     bool GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFees) override;
     bool GetBlockCount(int& nBlocks) override;
@@ -127,6 +128,7 @@ public:
     friend EnforcerSettingsCheck (::CheckEnforcerSettings)(std::string& strError);
 
 private:
+    std::atomic<bool> m_fLastBidConflict{false}; // set by SendBMMRequest (LastBMMRequestConflicted)
     /*
      * Invoke a ValidatorService method and parse the JSON reply. The enforcer
      * is only ever invoked at runtime by service name - nothing of it is
@@ -2004,6 +2006,7 @@ L1Client::Commitment EnforcerL1Client::ReadBmmCommitment(const uint256& hashMain
 uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent)
 {
     fNotSent = false;
+    m_fLastBidConflict = false;
     // WalletService/CreateBmmCriticalDataTransaction. Builds, funds (from the
     // enforcer wallet), signs and broadcasts the BMM request in one call.
     if (amount == CAmount(0))
@@ -2039,10 +2042,13 @@ uint256 EnforcerL1Client::SendBMMRequest(const uint256& hashBMM, const uint256& 
                                 /*fRetrySafe=*/false);
     if (nExit != 0) {
         fNotSent = GrpcurlBMMRequestNotSent(nExit, strOutput);
+        m_fLastBidConflict = !fNotSent && GrpcurlBMMRequestOwnNodeConflict(nExit, strOutput);
         std::string strDetail = strOutput.substr(0, 300);
         std::replace(strDetail.begin(), strDetail.end(), '\n', ' ');
         LogPrintf("ERROR Enforcer client: BMM request failed (%s %d: %s); %s\n", EnforcerStatusLabel(), nExit, strDetail,
-            fNotSent ? "no bid was sent" : "the bid may have gone out");
+            fNotSent ? "no bid was sent" :
+            m_fLastBidConflict ? "the L1 node refused it as a conflict with another bid from this wallet; the next refresh resends it" :
+                                 "the bid may have gone out");
         return uint256();
     }
 
@@ -2553,6 +2559,14 @@ bool GrpcurlBMMRequestNotSent(int nExit, const std::string& strError)
     if (nExit == 1 && strError.find("Failed to dial target host") != std::string::npos)
         return true;
     return false;
+}
+
+bool GrpcurlBMMRequestOwnNodeConflict(int nExit, const std::string& strError)
+{
+    if (nExit != 66 || strError.find("failed to broadcast BMM request tx via RPC") == std::string::npos)
+        return false;
+    return strError.find("rejecting replacement") != std::string::npos ||
+           strError.find("txn-mempool-conflict") != std::string::npos;
 }
 
 const std::string& DefaultMainchainTransport()
