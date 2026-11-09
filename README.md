@@ -159,20 +159,20 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   note's share, never more than the token backing. RPCs: `registertokenkeyset`, `posttokens`,
   `claimtokens`, `signtokenclaims`, `relaytokenclaims`, `collecttokens`, `gettokenclaims`.
 - **Discounting** (credit creation, the point of the whole thing): a house buys a bill of
-  exchange from a holder, paying with its **own notes minted in the same operation** under
-  the full reserve/leverage discipline, and books the bill as a loan asset — the Scottish
+  exchange from a holder, paying with its **own notes minted in the same operation** within
+  its capital and till caps, and books the bill as a loan asset — the Scottish
   discount-house mechanism, on-chain. Because the discount appends a real chain link,
   recourse on a defaulted bill runs holder-passive: the paying party (drawer, acceptor, or
   any prior endorser, the discount seller included) is subrogated in a fixed cascade, and a
   match-funding rule caps the book a house may build against its free escrow. Ops:
   discount, recourse, house-side retire/claim.
-- **Reserve attestation and a lazy solvency machine**: houses attest their liquid till on
-  a consensus cadence, proven coin-by-coin against the UTXO set. A missed cadence derives
-  *Stressed*; an expired recovery window derives *Insolvent* — both computed at read time
-  from on-chain heights (inherently reorg-safe). Insolvency triggers a waterfall:
-  noteholders claim pro-rata from the locked escrow pot, then a whole-house residual
-  settlement. From v1.1.0 a missed cadence or a low attestation no longer stresses an open house (stress starts
-  only with a protested, unpaid demand); from v1.2.0 a failed house pays as Gold B, above, says.
+- **Reserve attestation and a lazy solvency machine**: houses attest their till, proven
+  coin-by-coin against the UTXO set; since v1.2.0 the till counts in sECX and must be at least 2% of
+  the house's notes for it to issue. A house turns *Stressed* only when a protested demand goes unpaid
+  (since v1.1.0; before that a missed attestation did it), and *Insolvent* if it neither pays nor
+  suspends payment within its 7-day cure. Statuses are computed at read time from chain data
+  (inherently reorg-safe). A failed house's noteholders claim from the locked escrow pot first, as
+  Gold B, above, says.
 - **The option clause**, translated from the Scottish record: a stressed house may suspend
   redemption, paying interest at the protocol rate on demanded notes until it pays, with its till locked into the
   claim pot. A suspension lasts at most 12 months (from v0.2.28), then the house is Insolvent; it ends earlier
@@ -192,7 +192,7 @@ The full policy: [doc/PRODUCER_POLICY.md](doc/PRODUCER_POLICY.md).
   exchange (`createnetting`, `joinnetting`, `fundnetting`, `signnetting`, `decodenetting`).
   `listsettlements` shows both.
 - **Assets** (v0.2.18): anyone can create a fixed batch of units, 1 unit = 1 sat of ECX locked in
-  the coins that carry it, for example a token for gold a custodian holds. The asset's id is the
+  the coins that carry it, for example a receipt or a share its issuer stands behind. The asset's id is the
   txid that created it; tickers are not unique, and a token is only as good as its issuer. RPCs:
   `createasset`, `transferasset`, `transferassetcontrol`, `listmyassets`, `listassets`.
 - **The unit up to v1.0.x is ECX.** v0.2.17 removed the gram display (`getgramrate` and the `*_grams` RPC
@@ -495,7 +495,8 @@ v1.0.2 makes a credit transaction's input signatures cover what it does:
   re-encode a payload signature to shift an unconfirmed transaction's id.
 - **Two-node convergence.** A second node boots before the first block exists and
   independently validates every block from genesis; both must match on tip, the full UTXO
-  set, and every side-database (bills, houses, notes, deposits, pools, oracle) at each
+  set, and every side-database (bills, houses, notes, deposits, pools, and the units records: rates,
+  charters, swaps; up to v1.1.0 the oracle) at each
   checkpoint — catching any rule written differently in the producer than the validator.
 - **Reorg coverage** across every operation family, asserting disconnect is an exact
   inverse — including a deep (200+ block) reorg replayed byte-for-byte against a

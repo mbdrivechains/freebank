@@ -45,7 +45,8 @@ concentrates on what FreeBank changed:
   endpoints, process spawning, coinbase and fees, the deposit checks).
 - The areas that matter most: the mainchain client (`src/l1client.*`), deposits and withdrawals (`src/sidechain.*`,
   `src/validation.cpp`), the miner and coinbase (`src/miner.cpp`), the credit layer (`src/bill.*`, `src/house.*`,
-  `src/note.*`, `src/deposit.*`, `src/pool.*`, `src/settle.*`, `src/oracle.*`), and the wallet
+  `src/note.*`, `src/deposit.*`, `src/pool.*`, `src/settle.*`, `src/houserate.*`, `src/issued*`, `src/units.*`,
+  `src/creditbind.*`), and the wallet
   (`src/wallet/wallet.cpp`, `src/wallet/rpcwallet.cpp`).
 - **Third-party libraries** are built from source tarballs pinned by sha256 in `depends/packages/*.mk` (at
   v0.2.25, unchanged since v0.2.18: Boost 1.64.0, OpenSSL 1.0.1k, Berkeley DB 4.8.30, libevent 2.1.13, ZeroMQ
