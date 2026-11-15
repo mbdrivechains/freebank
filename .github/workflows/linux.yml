@@ -13,7 +13,7 @@ jobs:
   # NOT here: they need the drivechain-patched mainchain binary, which no GitHub
   # runner has - those run on the maintainer box (contrib/ci/local-ci.sh).
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned 2026-11-15: ubuntu-latest moved to 26.04 (no libdb_cxx headers; Boost 1.64 b2 fails)
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +72,7 @@ jobs:
   # box; this is an independent enforcement of the portability contract.
   portable-release-gate:
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned 2026-11-15: ubuntu-latest moved to 26.04 (no libdb_cxx headers; Boost 1.64 b2 fails)
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
