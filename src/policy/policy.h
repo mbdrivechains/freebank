@@ -23,6 +23,10 @@ static const unsigned int DEFAULT_BLOCK_MAX_WEIGHT = MAX_BLOCK_WEIGHT - 4000;
 static const unsigned int DEFAULT_BLOCK_MIN_TX_FEE = 1;
 /** The maximum weight for transactions we're willing to relay/mine */
 static const unsigned int MAX_STANDARD_TX_WEIGHT = 400000;
+/** MM-1 (R1 cost): the most outputs a standard FreeBank tx (versions 11-18) may have. The tag step runs consensus's
+ *  per-output taggers, and bill DISCOUNT and six note ops decode the op's payload for each output, so it costs outputs x
+ *  payload. No FreeBank op needs more than ~130 (100 note or deposit outputs, 64 partners or issued outs, plus change). */
+static const unsigned int MAX_STANDARD_FREEBANK_OUTPUTS = 256;
 /** Maximum number of signature check operations in an IsStandard() P2SH script */
 static const unsigned int MAX_P2SH_SIGOPS = 15;
 /** The maximum number of sigops we're willing to relay/mine in a single tx */
@@ -91,6 +95,9 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
      * @return True if all inputs (scriptSigs) use only standard transaction forms
      */
 bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs);
+/** MM-1 (security 11-11): FreeBank script-family outputs carry their own family's consensus tag, and a FreeBank op's
+ *  dust is a tagged base. Run after the inputs are known (MM1-R1: no per-output tagging for a tx with made-up inputs). */
+bool AreFreeBankOutputsStandard(const CTransaction& tx, std::string& reason);
     /**
      * Check if the transaction is over standard P2WSH resources limit:
      * 3600bytes witnessScript size, 80bytes per witness stack element, 100 witness stack elements

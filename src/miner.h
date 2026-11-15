@@ -189,6 +189,8 @@ private:
     void resetBlock();
     /** v0.2.18: withdrawal ids the template already creates (bad-withdrawal-not-new) */
     std::set<uint256> setBlockWithdrawalIDs;
+    /** D-2026-11-11-3: houses whose rate op (POST or SETKEY) the template already holds (one per house per block) */
+    std::set<uint32_t> setBlockRateHouses;
     /** Add a tx to the block */
     void AddToBlock(CTxMemPool::txiter iter);
 

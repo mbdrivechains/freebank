@@ -53,4 +53,9 @@ public:
 
 void InitSignatureCache();
 
+/** UR3-4 (FreeBank): look up / record a (hash, signature, pubkey) that pubkey.Verify accepted, in the script
+ *  signature cache. Only FbVerifyStrict (validation.cpp) calls these, inside an FbSigCacheScope. */
+bool SignatureCacheHas(const uint256& hash, const std::vector<unsigned char>& vchSig, const CPubKey& pubkey);
+void SignatureCacheAdd(const uint256& hash, const std::vector<unsigned char>& vchSig, const CPubKey& pubkey);
+
 #endif // BITCOIN_SCRIPT_SIGCACHE_H

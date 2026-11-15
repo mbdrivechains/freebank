@@ -79,10 +79,16 @@ bool HouseRateWindowMax(const CUnitsView& units, uint32_t nHouseID, uint32_t nHe
     return true;
 }
 
-bool HouseRateFresh(const CUnitsView& units, uint32_t nHouseID, int64_t nNow, int64_t nMaxAgeSecs)
+bool HouseRateFresh(const CUnitsView& units, uint32_t nHouseID, uint32_t nHeight, int64_t nNow, int64_t nMaxAgeSecs)
 {
+    // D-2026-11-11-3 (RS-1): the posting in effect at nHeight, as HouseRateAt prices it - a POST at nHeight itself
+    // counts from the next block. Rate ops share a block with the house's other ops now, so otherwise a stale house
+    // could POST and MINT in one block and issue at the stale price.
     CHouseRate r;
-    return units.Get(HouseRateKey(nHouseID), r) && nNow - r.nPostTime <= nMaxAgeSecs;
+    if (!units.Get(HouseRateKey(nHouseID), r))
+        return false;
+    const int64_t nPostTime = r.nPostHeight < nHeight ? r.nPostTime : r.nPrevPostTime;
+    return nPostTime != 0 && nNow - nPostTime <= nMaxAgeSecs;
 }
 
 bool HouseRateShapeOK(uint64_t nBid, uint64_t nAsk, uint32_t nSpreadBps)
@@ -101,6 +107,19 @@ static void RaiseDay(CUnitsView& units, uint32_t nHouseID, uint32_t nDay, uint64
     day.nMaxBid = std::max(day.nMaxBid, nBid);
     day.nMaxAsk = std::max(day.nMaxAsk, nAsk);
     units.Put(RateDayKey(nHouseID, nDay), day);
+}
+
+void ArmHouseRateRestore(CUnitsView& units, uint32_t nHouseID, uint32_t nHeight, int64_t nNow, const Consensus::GramParams& gp)
+{
+    CHouseRate r;
+    if (!units.Get(HouseRateKey(nHouseID), r))
+        return;
+    uint64_t nMaxBid = 0, nMaxAsk = 0;
+    if (!HouseRateWindowMax(units, nHouseID, nHeight, nNow, RATE_RESTORE_DAYS, nMaxBid, nMaxAsk))
+        return;
+    r.nRestoreMax = nMaxBid;
+    r.nRestoreUntil = nNow + (int64_t)gp.nRateRiseWindowSecs;
+    units.Put(HouseRateKey(nHouseID), r);
 }
 
 bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uint64_t nAsk, uint32_t nHeight,
@@ -125,25 +144,61 @@ bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uin
     next.nPostTime = nNow;
     next.nPostActive = nActiveNow;
     if (fFirst) {
-        next.nRiseBaseBid = nBid;
-        next.nRiseBaseTime = nNow;
+        next.nRiseCurStart = nNow;
+        next.nRiseCurMin = nBid;
+        next.nRisePrevMin = nBid;
     } else {
-        // The bid may rise at most nRateRiseBps over the bid in effect when the rise window last restarted; the window
-        // restarts once it is nRateRiseWindowSecs old (a stolen rate key can't post a huge bid and demand at it).
-        next.nRiseBaseBid = r.nRiseBaseBid;
-        next.nRiseBaseTime = r.nRiseBaseTime;
-        if (nNow - r.nRiseBaseTime >= (int64_t)gp.nRateRiseWindowSecs) {
-            next.nRiseBaseBid = r.nBid;
-            next.nRiseBaseTime = nNow;
+        // UR1-5 (switch-on): the bid may be at most (1 + nRateRiseBps) x the lowest bid in effect over the last
+        // nRateRiseWindowSecs. It used to be measured from the bid in effect when a 24 h window last restarted, so a
+        // house could post +25% just before the restart and +25% again just after: 56% in two blocks. Now the current
+        // and previous windows' minimums both count, and they always cover the last W (a stolen rate key can't post a
+        // huge bid and demand at it). A post after a cut is bounded by the cut (SA-H2); the partners' SETKEY restore
+        // below is the way back up.
+        const int64_t nW = (int64_t)gp.nRateRiseWindowSecs;
+        next.nRiseCurStart = r.nRiseCurStart;
+        next.nRiseCurMin = std::min(r.nRiseCurMin, r.nBid);
+        next.nRisePrevMin = r.nRisePrevMin;
+        if (nNow - r.nRiseCurStart >= nW) {
+            // The closing window becomes the previous one: the lowest bid in effect in it. If the current bid has been
+            // in effect for the whole last W, it was the only one, so the previous window carries just it.
+            next.nRisePrevMin = nNow - r.nPostTime >= nW ? r.nBid : std::min(r.nRiseCurMin, r.nBid);
+            next.nRiseCurStart = nNow;
+            next.nRiseCurMin = r.nBid;   // in effect when the new window starts
         }
-        if ((unsigned __int128)nBid * 10000 > (unsigned __int128)next.nRiseBaseBid * (10000 + gp.nRateRiseBps)) {
+        const uint64_t nBase = std::min(next.nRisePrevMin, next.nRiseCurMin);
+        const bool fRise = (unsigned __int128)nBid * 10000 > (unsigned __int128)nBase * (10000 + gp.nRateRiseBps);
+        // SA-H2: a pending SETKEY restore lets this first post within W go back up to the recent high, never above it.
+        // Only a post that NEEDS it is a restore (above the normal bound): a re-post of the current bid is not, so it
+        // can't be used to reset the bound (security's switch-on review, SW-1).
+        const bool fRestore = fRise && r.nRestoreUntil != 0 && nNow <= r.nRestoreUntil && nBid <= r.nRestoreMax;
+        if (fRise && !fRestore) {
             strReject = "bad-house-rate-rise";
             return false;
+        }
+        if (fRestore) {
+            // The bound runs from the restored bid R, so the thief's cut no longer counts - but for a full W after the
+            // restore nothing above R (SW-1): the previous window's minimum becomes ceil(R / (1 + rise)), so the ceiling is R (+ at most
+            // one unit of rounding). R can be re-posted; a rise above R waits until R has been in effect for W, when a
+            // window restart carries R alone. Repeated SETKEY / restore cycles inside one W never pass the 30-day high,
+            // since restoring never raises it.
+            const uint64_t nFloorMin = (uint64_t)(((unsigned __int128)nBid * 10000 + (10000 + gp.nRateRiseBps) - 1) /
+                                                  (10000 + gp.nRateRiseBps));
+            // The cap rides in the previous window only; the current one holds R itself, so when this window
+            // closes (W after the restore) the previous window carries R (or any lower bid posted since) and the
+            // normal 25% runs from it.
+            next.nRiseCurStart = nNow;
+            next.nRisePrevMin = nFloorMin;
+            next.nRiseCurMin = nBid;
+        } else {
+            next.nRiseCurMin = std::min(next.nRiseCurMin, nBid);
         }
         next.nPrevBid = r.nBid;
         next.nPrevAsk = r.nAsk;
         next.nPrevPostActive = r.nPostActive;
+        next.nPrevPostTime = r.nPostTime;
     }
+    next.nRestoreMax = 0;      // one-shot: any post clears a pending restore
+    next.nRestoreUntil = 0;
     // Day records: the old rate stayed in effect on every day from its posting to now; the days it was never posted on
     // get it now (bounded: no rule reads further back than RATE_DAY_FILL_MAX days). Today gets the old and the new.
     const uint32_t nToday = RateDayOf(nNow);
@@ -236,6 +291,13 @@ bool ApplyHouseCharter(CUnitsView& units, const HouseCharter& op, uint32_t nHeig
             return false;
         }
         CCharterToken& t = charter.vToken[op.nIndex];
+        // UR1-1 (switch-on, Michael 2026-11-10): the op names the token too (chain id + contract, in the signed
+        // payload), and it must be the one at nIndex. An ADD renumbers from live entries, so a signed removal or
+        // relabel used to land on whatever token had moved into that index.
+        if (t.nChainID != op.nChainID || t.vchContract != op.vchContract) {
+            strReject = "bad-house-charter-mismatch";
+            return false;
+        }
         if (op.nKind == HOUSE_CHARTER_REMOVE) {
             if (t.nRemoveAt != 0) {
                 strReject = "bad-house-charter-removing";
@@ -376,13 +438,13 @@ void RecordDemandBid(CUnitsView& units, uint32_t nHouseID, uint32_t nHeight)
         units.Put(DemandBidKey(nHouseID, nHeight), nBid);
 }
 
-bool HouseRateFreshForChecks(uint32_t nHouseID, int64_t nMaxAgeSecs)
+bool HouseRateFreshForChecks(uint32_t nHouseID, int nHeight, int64_t nMaxAgeSecs)
 {
     if (g_nHouseRateTestOverride)
         return true;
     return WithChecksView([&](const CUnitsView& units) {
         CChainClock clock;
-        return GetChainClock(units, clock) && HouseRateFresh(units, nHouseID, clock.nMonoTime, nMaxAgeSecs);
+        return GetChainClock(units, clock) && HouseRateFresh(units, nHouseID, (uint32_t)nHeight, clock.nMonoTime, nMaxAgeSecs);
     });
 }
 
@@ -489,15 +551,23 @@ int64_t ClockBlocksForChecks(int nHeight)
         CChainClock clock;
         if (!GetChainClock(units, clock))
             return false;
-        // A height without its record: past the scope's tip (the mempool's next block, a wallet's payment margin) or,
-        // not expected after the reindex B's units layout forces, a past one. Count one clock block per block from the
-        // tip's clock either way: a wallet pricing interest at tip + N then keeps N clock blocks of margin, and a
-        // window judged early in the mempool is judged again at connect (CreateNewBlock drops a package that fails).
+        // SA-H3 (Michael 2026-11-11): a PAST height (at or below the clock's tip) without its record means a damaged units
+        // DB; a window judged on a made-up clock could come out either way, so fail closed (-1 and the flag the mempool
+        // and connect act on). A height past the tip (the mempool's next block, a wallet's payment margin) counts one
+        // clock block per block from the tip's clock: a wallet pricing interest at tip + N keeps N clock blocks of margin,
+        // and a window judged early in the mempool is judged again at connect.
+        if ((int64_t)nAt <= (int64_t)clock.nHeight) {
+            g_fClockRecordMissing = true;
+            nActive = -2;
+            return false;
+        }
         nActive = clock.nActiveTime + ((int64_t)nAt - (int64_t)clock.nHeight) * CLOCK_BLOCK_SECS;
         if (nActive < 0)
             nActive = 0;
         return true;
     });
+    if (nActive == -2)
+        return -1;   // SA-H3: a missing past record
     return nActive < 0 ? 0 : nActive / CLOCK_BLOCK_SECS;
 }
 

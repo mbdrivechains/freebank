@@ -6,6 +6,8 @@
 // The main block cache (vMainBlockHash, mapMainBlock) has its own leaf mutex:
 // nothing else is locked while it is held.
 #define LOCK_MAIN_CACHE std::lock_guard<std::mutex> lockMainCache(csMainBlockCache)
+// UR5-5: the bid state and the small sets beside it (see csBid in bmmcache.h), also a leaf mutex.
+#define LOCK_BID std::lock_guard<std::mutex> lockBid(csBid)
 
 BMMCache::BMMCache()
 {
@@ -14,6 +16,7 @@ BMMCache::BMMCache()
 
 bool BMMCache::StoreBMMBlock(const CBlock& block)
 {
+    LOCK_BID;
     if (!block.vtx.size())
         return false;
 
@@ -30,6 +33,7 @@ bool BMMCache::StoreBMMBlock(const CBlock& block)
 
 bool BMMCache::GetBMMBlock(const uint256& hashMerkleRoot, CBlock& block)
 {
+    LOCK_BID;
     if (mapBMMBlocks.find(hashMerkleRoot) == mapBMMBlocks.end())
         return false;
 
@@ -40,6 +44,7 @@ bool BMMCache::GetBMMBlock(const uint256& hashMerkleRoot, CBlock& block)
 
 std::vector<CBlock> BMMCache::GetBMMBlockCache() const
 {
+    LOCK_BID;
     std::vector<CBlock> vBlock;
     for (const auto& b : mapBMMBlocks) {
         vBlock.push_back(b.second);
@@ -49,6 +54,7 @@ std::vector<CBlock> BMMCache::GetBMMBlockCache() const
 
 std::vector<uint256> BMMCache::GetBroadcastedWithdrawalBundleCache() const
 {
+    LOCK_BID;
     std::vector<uint256> vHash;
     for (const auto& u : setWithdrawalBundleBroadcasted) {
         vHash.push_back(u);
@@ -105,12 +111,16 @@ uint256 BMMCache::GetMainChildBlockHashLocked(const uint256& hashBlock) const
 
 void BMMCache::ClearBMMBlocks()
 {
+    LOCK_BID;
     mapBMMBlocks.clear();
-    ClearBidResend();
+    hashResendPrev.SetNull();
+    hashResendRoot.SetNull();
+    nResendRefusals = 0;
 }
 
 void BMMCache::MarkBidResend(const uint256& hashPrevBlock, const uint256& hashMerkleRoot)
 {
+    LOCK_BID;
     if (hashPrevBlock != hashResendPrev || hashMerkleRoot != hashResendRoot) {
         hashResendPrev = hashPrevBlock;
         hashResendRoot = hashMerkleRoot;
@@ -121,6 +131,7 @@ void BMMCache::MarkBidResend(const uint256& hashPrevBlock, const uint256& hashMe
 
 bool BMMCache::GetBidResend(const uint256& hashPrevBlock, uint256& hashMerkleRoot) const
 {
+    LOCK_BID;
     // The first refusal plus MAX_BID_RESENDS resends
     if (hashResendRoot.IsNull() || hashPrevBlock != hashResendPrev || nResendRefusals > MAX_BID_RESENDS)
         return false;
@@ -130,6 +141,7 @@ bool BMMCache::GetBidResend(const uint256& hashPrevBlock, uint256& hashMerkleRoo
 
 void BMMCache::ClearBidResend()
 {
+    LOCK_BID;
     hashResendPrev.SetNull();
     hashResendRoot.SetNull();
     nResendRefusals = 0;
@@ -137,21 +149,25 @@ void BMMCache::ClearBidResend()
 
 void BMMCache::StoreBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle)
 {
+    LOCK_BID;
     setWithdrawalBundleBroadcasted.insert(hashWithdrawalBundle);
 }
 
 void BMMCache::ForgetBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle)
 {
+    LOCK_BID;
     setWithdrawalBundleBroadcasted.erase(hashWithdrawalBundle);
 }
 
 void BMMCache::StorePrevBlockBMMCreated(const uint256& hashPrevBlock)
 {
+    LOCK_BID;
     setPrevBlockBMMCreated.insert(hashPrevBlock);
 }
 
 bool BMMCache::HaveBroadcastedWithdrawalBundle(const uint256& hashWithdrawalBundle) const
 {
+    LOCK_BID;
     if (hashWithdrawalBundle.IsNull())
         return false;
 
@@ -411,16 +427,19 @@ bool BMMCache::HaveMainBlock(const uint256& hash) const
 
 bool BMMCache::HaveBMMRequestForPrevBlock(const uint256& hashPrevBlock) const
 {
+    LOCK_BID;
     return setPrevBlockBMMCreated.count(hashPrevBlock);
 }
 
 void BMMCache::AddCheckedMainBlock(const uint256& hashBlock)
 {
+    LOCK_BID;
     setMainBlockChecked.insert(hashBlock);
 }
 
 bool BMMCache::MainBlockChecked(const uint256& hashBlock) const
 {
+    LOCK_BID;
     return setMainBlockChecked.count(hashBlock);
 }
 
@@ -478,15 +497,18 @@ uint256 BMMCache::GetMainBlockThroughT(const uint256& hashMain, const uint256& h
 
 void BMMCache::CacheWithdrawalID(const uint256& wtid)
 {
+    LOCK_BID;
     setWITHDRAWALIDCache.insert(wtid);
 }
 
 std::set<uint256> BMMCache::GetCachedWithdrawalID()
 {
+    LOCK_BID;
     return setWITHDRAWALIDCache;
 }
 
 bool BMMCache::IsMyWT(const uint256& wtid)
 {
+    LOCK_BID;
     return setWITHDRAWALIDCache.count(wtid);
 }

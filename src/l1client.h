@@ -167,6 +167,10 @@ public:
     virtual std::vector<SidechainDeposit> UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex) = 0;
     virtual bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx) = 0;
     virtual bool VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime) = 0;
+    /** UR5-1 (plain v1.2.2): VerifyBMM as a three-way answer, for a transport with no commitment reader
+     *  (ReadBmmCommitment UNKNOWN). YES: committed. NO: the L1 says definitely not (JSON-RPC: verifybmm's "h* not
+     *  found in block"). UNKNOWN: no answer. Defined in l1client.cpp (L1Answer is complete there). */
+    virtual L1Answer VerifyBMMAnswer(const uint256& hashMainBlock, const uint256& hashBMM);
     /* The bid's txid, or null if none came back. On a null txid fNotSent says
      * the L1 definitely sent no bid (a refusal before any broadcast), so the
      * tip may be bid on again; false means a bid may have gone out. */
@@ -319,6 +323,10 @@ bool GrpcurlBMMRequestNotSent(int nExit, const std::string& strError);
  *  NotSent: an enforcer given --p2p-broadcast-addr sends to those peers before its own node. A resend for the same
  *  block is safe either way, since both bids commit to the same h*. Pure. */
 bool GrpcurlBMMRequestOwnNodeConflict(int nExit, const std::string& strError);
+
+/** FB-14: the L1 block pin in force: -mainchainblockpin if given; else none if -mainchainchallenge is given (a signet
+ *  L1); else this network's built-in pin (CChainParams::DefaultMainchainBlockPin, empty on regtest). */
+std::string MainchainBlockPinArg();
 
 //
 // Enforcer wire helpers - exposed for unit tests (l1client_tests.cpp).
@@ -473,6 +481,33 @@ struct L1PegEvents {
     std::vector<L1WithdrawalEvent> vWithdrawal;
 };
 
+/** One change to the treasury, in running-number order: a deposit, or a paid withdrawal bundle (its M6's txid). */
+struct TreasuryChange {
+    uint64_t nSequence = 0;
+    const L1DepositEvent* pDeposit = nullptr;
+    const L1WithdrawalEvent* pPaid = nullptr;
+    uint256 txid;   // the deposit's outpoint hash, or the payout's M6 txid
+};
+enum class TreasuryScan { OK, FAIL_CLOSED };
+
+/** UpdateDeposits' decision, pure (ultra s5 #3, UR5-3; extracted so a unit test can drive it): every deposit and every
+ *  paid ('S') withdrawal event, as changes sorted by running number (stable: deposits before payouts). A paid event
+ *  whose L1 block is below this chain's deposit start is skipped; one with no running number, no M6 or an M6 that
+ *  won't decode is skipped if its L1 block is at or before nLastRecordedPos (the newest recorded treasury change's
+ *  position; -1 = none), else the whole scan fails closed. fnMainchainPos: an L1 block's list position (-1 if not on
+ *  the list); fnBelowDepositStart: whether it is below the deposit start. */
+TreasuryScan ScanTreasuryChanges(const L1PegEvents& events, int nLastRecordedPos,
+                                 const std::function<int(const uint256&)>& fnMainchainPos,
+                                 const std::function<bool(const uint256&)>& fnBelowDepositStart,
+                                 std::vector<TreasuryChange>& vOut);
+
+/** The timeout of an enforcer call that asks for the whole L1 history (GetTwoWayPegData with no start block), in
+ *  seconds. Used by GetPegEvents and FetchWithdrawalEvents (ultra s5 #2, UR5-2: the latter had the 15 s default). */
+static const int ENFORCER_WHOLE_HISTORY_TIMEOUT = 60;
+
+/** Unit tests only: called with (method, timeout seconds) at the start of every EnforcerL1Client enforcer call. */
+extern std::function<void(const std::string&, int)> g_fnEnforcerCallSpyForTest;
+
 /**
  * L1Oracle: the L1 answers ConnectBlock and CheckBlock depend on, asked as of a
  * named L1 block, never the enforcer's current tip. GetL1Oracle() is the
@@ -524,6 +559,16 @@ uint256 BundleM6id(const CTransaction& txBundle);
  *  a reply we cannot fully read is never taken for "no such event". proto3
  *  JSON omits an empty list: no "blocks" or no "events" is none. Pure. */
 bool ParsePegEvents(const UniValue& response, L1PegEvents& events);
+
+/** UR5-11 (the JSON-RPC transport: regtest and BitcoinX only, init refuses it elsewhere): the deposit events in BitcoinX's
+ *  listsidechaindepositsbyblock reply (oldest first; the whole history up to the end block). A deposit's value is its
+ *  treasury output less the treasury output it spends - the deposit before it; the first spends none. Its running
+ *  number orders it by (L1 height << 20 | tx index), which is all the treasury scan uses it for. Deposits in blocks
+ *  below nStartHeight (-1: none) are left out, but still chain the treasury. False (can't tell) when any entry can't be
+ *  read, or a deposit doesn't spend the treasury before it (a payout between: BitcoinX withdrawals aren't supported,
+ *  docs-local/UR5_11.md). Pure, given fnHeight. */
+bool BuildJsonRpcDepositEvents(const UniValue& deposits, const std::function<bool(const uint256&, int&)>& fnHeight,
+                               int nStartHeight, std::vector<L1DepositEvent>& vOut);
 
 /** v0.2.17 D3: what a failed GetTwoWayPegData call means. NO only for the
  *  enforcer's "start block is not an ancestor of end block"; UNKNOWN for

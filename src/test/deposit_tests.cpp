@@ -136,18 +136,6 @@ BOOST_AUTO_TEST_CASE(deposit_maturity_interest_math)
     BOOST_CHECK_EQUAL(DepositMaturityInterest((uint64_t)MAX_MONEY, 4000000000U, 10000), MAX_MONEY);
 }
 
-BOOST_AUTO_TEST_CASE(deposit_claim_entitlement_math)
-{
-    // Full pot covers all principal -> capped at par.
-    BOOST_CHECK_EQUAL(DepositClaimEntitlement(100000, 1000000, 100000), 100000);
-    // Pot is half the snapshot -> pro-rata half.
-    BOOST_CHECK_EQUAL(DepositClaimEntitlement(100000, 500000, 1000000), 50000);
-    // Degenerate inputs -> 0.
-    BOOST_CHECK_EQUAL(DepositClaimEntitlement(100000, 500000, 0), 0);
-    BOOST_CHECK_EQUAL(DepositClaimEntitlement(0, 500000, 1000000), 0);
-    BOOST_CHECK_EQUAL(DepositClaimEntitlement(100000, 0, 1000000), 0);
-}
-
 BOOST_AUTO_TEST_CASE(deposit_shape_valid)
 {
     CValidationState state;
@@ -657,15 +645,6 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnGetCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-claim-house-closed");
-    }
-    // The junior-tranche math: with notes senior (nInsolventUnits > 0), the deposit
-    // pot is only the residual pot - notePar, so deposits provably cannot reach the
-    // note tranche.
-    {
-        // pot 1e6, notes claim 800000 par, deposit principal 500000 -> depositPot =
-        // 200000, so a 500000-principal deposit is capped at 200000, NOT 500000.
-        BOOST_CHECK_EQUAL(DepositClaimEntitlement(500000, /*depositPot=*/200000, /*snap=*/500000), 200000);
-        // And the senior tranche (800000) is untouched: pot(1e6) - depositTake(<=200000) >= 800000.
     }
 }
 

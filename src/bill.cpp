@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bill.h>
+#include <house.h>   // HashNetworkTag (UR-ext-13)
 
 #include <coins.h>            // Coin, for the shared payload-pure output tagger
 #include <consensus/validation.h>
@@ -27,6 +28,7 @@ uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAm
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/issue");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
     ss << amount;
     ss << amountEscrow;   // binds the posted bond -> no token-escrow replay
@@ -43,6 +45,7 @@ uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned cha
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/endorse");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
     ss << vchTo;
     ss << nAtHeight;
@@ -57,11 +60,14 @@ uint256 BillHashOutputs(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 BillRetireSigHash(const uint256& billID, const uint256& hashOutputs)
+uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/retire");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
+    ss << nRateNamed;   // UR1-6 (switch-on, Michael 2026-11-10): the rate the payer names is signed too, so no one can
+                        // rewrite it under the acceptor's signature (a new txid, the same effects)
     ss << hashOutputs;
     return ss.GetHash();
 }
@@ -70,6 +76,7 @@ uint256 BillClaimSigHash(const uint256& billID, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/claim");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
     ss << hashOutputs;
     return ss.GetHash();
@@ -88,6 +95,7 @@ uint256 BillDiscountSigHash(const BillDiscount& x, const uint256& billID,
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/discount");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << x.nBillID;
     ss << billID;                 // canonical identity - immune to dense-id renumbering
     ss << x.nHouseID;
@@ -116,10 +124,12 @@ uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/recourse");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << x.nBillID;
     ss << billID;
     ss << x.vchPayerPubKey;
     ss << x.vchPrevHolderPubKey;
+    ss << x.nRateNamed;           // UR1-6 (switch-on)
     ss << hashPrevouts;
     ss << hashOutputs;            // pins the payment to the holder
     return ss.GetHash();
@@ -130,6 +140,7 @@ static uint256 BillHRetireTaggedSigHash(const std::string& strTag, const BillHRe
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << strTag;   // its own tag per op: an op 7 retire sig never verifies here, nor op 9's as op 10's
+    HashNetworkTag(ss);   // UR-ext-13
     ss << x.nBillID;
     ss << billID;
     ss << x.nOwnerHouseID;
@@ -140,6 +151,7 @@ static uint256 BillHRetireTaggedSigHash(const std::string& strTag, const BillHRe
     ss << x.nPrevLoanBookFace;
     ss << x.nPrevLoanWtMatHi;
     ss << x.nPrevLoanWtMatLo;
+    ss << x.nRateNamed;           // UR1-6 (switch-on)
     ss << hashPrevouts;           // R-i6: the acceptor authorizes exactly these notes and this escrow
     ss << hashOutputs;            // pins the sECX part (custody key for op 9, the house escrow for op 10)
     return ss.GetHash();
@@ -200,7 +212,7 @@ template bool DecodeBillPayload<BillHRetireNotes>(const std::vector<unsigned cha
 template bool DecodeBillPayload<BillHClaimEscrow>(const std::vector<unsigned char>&, BillHClaimEscrow&);
 template bool DecodeBillPayload<BillHClaim>(const std::vector<unsigned char>&, BillHClaim&);
 
-void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin)
+void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, BillTagCache* pCache)
 {
     if (tx.nVersion != TRANSACTION_BILL_VERSION)
         return;
@@ -226,11 +238,22 @@ void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin)
             coin.SetBill(false, 0);
             return;
         }
-        BillDiscount d;
-        if (!DecodeBillPayload(tx.vchBillPayload, d))
+        // MM-2: decoded once per transaction when the caller passes a cache (AddCoins tags every output).
+        BillDiscount dLocal;
+        const BillDiscount* d = &dLocal;
+        if (pCache) {
+            if (!pCache->fTried) {
+                pCache->fOk = DecodeBillPayload(tx.vchBillPayload, pCache->d);
+                pCache->fTried = true;
+            }
+            if (!pCache->fOk)
+                return;
+            d = &pCache->d;
+        } else if (!DecodeBillPayload(tx.vchBillPayload, dLocal)) {
             return;
-        if (n >= 1 && (size_t)(n - 1) < d.vUnits.size() && n <= (uint32_t)d.nNoteOutputs)
-            coin.SetNote(d.nHouseID, d.vUnits[n - 1], 0);
+        }
+        if (n >= 1 && (size_t)(n - 1) < d->vUnits.size() && n <= (uint32_t)d->nNoteOutputs)
+            coin.SetNote(d->nHouseID, d->vUnits[n - 1], 0);
         return;
     }
     // v0.2.28: ops 10/11 put the money into the owning HOUSE's escrow at vout[0] (consensus pins the exact script and

@@ -33,8 +33,34 @@
 #include <set>
 
 
+bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& strReject)
+{
+    if (tx.nVersion != TRANSACTION_HOUSE_VERSION || tx.nHouseOp != HOUSE_OP_RATE)
+        return true;
+    HouseRate rate;
+    if (!DecodeHousePayload(tx.vchHousePayload, rate) || rate.nKind != HOUSE_RATE_POST)
+        return true;
+    CUnitsView units(punitsdb.get());   // scratch: written to, then dropped
+    std::vector<unsigned char> vchKey;
+    if (!units.Get(RateKeyKey(rate.nHouseID), vchKey)) {
+        strReject = "bad-house-rate-nokey";
+        return false;
+    }
+    if (!FbVerifyStrict(CPubKey(vchKey), HouseRateSigHash(rate.nHouseID, tx, rate), rate.vchRateSig)) {
+        strReject = "bad-house-rate-sig";   // e.g. the SETKEY that made this key the rate key was disconnected
+        return false;
+    }
+    CChainClock clock;
+    if (!GetChainClock(units, clock)) {
+        strReject = "bad-house-rate-noclock";
+        return false;
+    }
+    return ApplyHouseRatePost(units, rate.nHouseID, rate.nBid, rate.nAsk, (uint32_t)nHeight, clock.nMonoTime,
+                              Params().GetConsensus().GramAt(nHeight), strReject, clock.nActiveTime);
+}
+
 bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnitsView& units, int nHeight,
-                     CValidationState& state, const std::function<bool(uint32_t, CHouse&)>* pfnGetHouse)
+                     CValidationState& state)
 {
     // Frozen units: what the spent coins carry (the annex's at creation, or a later FREEZE's) must go where this
     // transaction's annex puts them, token by token; the spent coins' FREEZE records go with them.
@@ -75,11 +101,15 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-payload");
         if (rate.nKind == HOUSE_RATE_SETKEY) {
             units.Put(RateKeyKey(rate.nHouseID), rate.vchRatePubKey);
+            // SA-H2 (switch-on): the partners' new key may restore the house's recent high once (houserate.h)
+            CChainClock clock;
+            if (GetChainClock(units, clock))
+                ArmHouseRateRestore(units, rate.nHouseID, (uint32_t)nHeight, clock.nMonoTime, Params().GetConsensus().GramAt(nHeight));
         } else {
             std::vector<unsigned char> vchKey;
             if (!units.Get(RateKeyKey(rate.nHouseID), vchKey))
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-rate-nokey");
-            if (!CPubKey(vchKey).VerifyStrict(HouseRateSigHash(rate.nHouseID, tx, rate), rate.vchRateSig))
+            if (!FbVerifyStrict(CPubKey(vchKey), HouseRateSigHash(rate.nHouseID, tx, rate), rate.vchRateSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-sig");
             CChainClock clock;
             if (!GetChainClock(units, clock))
@@ -222,7 +252,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
     case ISSUED_OP_CREATE: {
         IssuedCreate x;
         DecodeIssuedPayload(tx.vchIssuedPayload, x);   // shape checked
-        if (!CPubKey(x.vchIssuerKey).VerifyStrict(IssuedSigHash(tx), x.vchIssuerSig))
+        if (!FbVerifyStrict(CPubKey(x.vchIssuerKey), IssuedSigHash(tx), x.vchIssuerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-create-sig");
         CIssuedToken token;
         token.tokenID = tx.GetHash();
@@ -246,7 +276,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
         CIssuedToken token;
         if (!units.Get(IssuedTokenKey(x.tokenID), token))
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-mint-token");
-        if (!CPubKey(token.vchIssuerKey).VerifyStrict(IssuedSigHash(tx), x.vchIssuerSig))
+        if (!FbVerifyStrict(CPubKey(token.vchIssuerKey), IssuedSigHash(tx), x.vchIssuerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-mint-sig");
         if (token.nSupply > (uint64_t)MAX_MONEY - x.nUnits)
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-mint-supply");
@@ -260,6 +290,11 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
         CIssuedToken token;
         if (!units.Get(IssuedTokenKey(x.tokenID), token))
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-burn-token");
+        // UR2-1 (switch-on, Michael 2026-11-10): a token pool's LP shares are not burnable. The pool counts its own
+        // LP supply (CTokenPool::nLpSupply), so a BURN would drop the token record's supply but not the pool's, strand
+        // the burner's share of the reserves, and desync the two counts. LP shares leave only through the pool's REMOVE.
+        if (token.nKind == ISSUED_KIND_POOL_LP)
+            return state.DoS(100, false, REJECT_INVALID, "bad-issued-burn-lp");
         if (token.nSupply < x.nUnits)
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-burn-supply");   // unreachable: supply covers every coin
         CIssuedBurn burn;
@@ -293,7 +328,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-freeze-token");
         if (token.vchFreezeKey.empty())
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-freeze-no-key");
-        if (!CPubKey(token.vchFreezeKey).VerifyStrict(IssuedSigHash(tx), x.vchFreezeSig))
+        if (!FbVerifyStrict(CPubKey(token.vchFreezeKey), IssuedSigHash(tx), x.vchFreezeSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-freeze-sig");
         std::set<COutPoint> setSpent;
         for (const CTxIn& in : tx.vin)
@@ -441,6 +476,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
 // The units view the issuing checks read: ConnectBlock's or the mempool's while a scope is open (UnitsCheckScope).
 static const CUnitsView* g_pUnitsCheckView = nullptr;
 
+bool g_fClockRecordMissing = false;
 UnitsCheckScope::UnitsCheckScope(const CUnitsView* pView) : pPrev(g_pUnitsCheckView) { g_pUnitsCheckView = pView; }
 UnitsCheckScope::~UnitsCheckScope() { g_pUnitsCheckView = pPrev; }
 const CUnitsView* UnitsCheckScope::Current() { return g_pUnitsCheckView; }

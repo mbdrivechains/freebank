@@ -11,6 +11,7 @@
 #include <note.h>
 #include <deposit.h>
 #include <pool.h>
+#include <sidechain.h>
 
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
@@ -433,6 +434,26 @@ bool CTxMemPool::addUnchecked(const uint256& hash, const CTxMemPoolEntry &entry,
         mapSwapLockCount[hashLock]++;
     }
 
+    // UR-ext-8: index the coins a FREEZE/UNFREEZE targets
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION &&
+            (tx.nIssuedOp == ISSUED_OP_FREEZE || tx.nIssuedOp == ISSUED_OP_UNFREEZE)) {
+        IssuedFreeze fz;
+        if (DecodeIssuedPayload(tx.vchIssuedPayload, fz) && !fz.vOutpoint.empty()) {
+            for (const COutPoint& o : fz.vOutpoint)
+                mapFreezeTargetCount[o]++;
+            mapTxFreezeTargets[hash] = fz.vOutpoint;
+        }
+    }
+
+    // UR-ext-9: index the withdrawal ids this tx creates
+    std::vector<uint256> vWID;
+    GetTxWithdrawalIDs(tx, vWID);
+    if (!vWID.empty()) {
+        for (const uint256& wid : vWID)
+            mapWithdrawalTx.emplace(wid, hash);
+        mapTxWithdrawalIDs[hash] = std::move(vWID);
+    }
+
     return true;
 }
 
@@ -464,6 +485,28 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
         if (itCount != mapSwapLockCount.end() && --itCount->second == 0)
             mapSwapLockCount.erase(itCount);
         mapSwapTxLock.erase(itLock);
+    }
+    const auto itFz = mapTxFreezeTargets.find(hash);
+    if (itFz != mapTxFreezeTargets.end()) {
+        for (const COutPoint& o : itFz->second) {
+            const auto itCount = mapFreezeTargetCount.find(o);
+            if (itCount != mapFreezeTargetCount.end() && --itCount->second == 0)
+                mapFreezeTargetCount.erase(itCount);
+        }
+        mapTxFreezeTargets.erase(itFz);
+    }
+    const auto itWID = mapTxWithdrawalIDs.find(hash);
+    if (itWID != mapTxWithdrawalIDs.end()) {
+        for (const uint256& wid : itWID->second) {
+            auto range = mapWithdrawalTx.equal_range(wid);
+            for (auto itW = range.first; itW != range.second; ) {
+                if (itW->second == hash)
+                    itW = mapWithdrawalTx.erase(itW);
+                else
+                    ++itW;
+            }
+        }
+        mapTxWithdrawalIDs.erase(itWID);
     }
 
     totalTxSize -= it->GetTxSize();
@@ -627,6 +670,10 @@ void CTxMemPool::_clear()
     setAssetTx.clear();
     mapSwapTxLock.clear();
     mapSwapLockCount.clear();
+    mapTxWithdrawalIDs.clear();
+    mapWithdrawalTx.clear();
+    mapTxFreezeTargets.clear();
+    mapFreezeTargetCount.clear();
     mapLinks.clear();
     mapTx.clear();
     mapNextTx.clear();
@@ -651,7 +698,8 @@ static void CheckInputsAndUpdateCoins(const CTransaction& tx, CCoinsViewCache& m
     bool fCheckResult = tx.IsCoinBase() || Consensus::CheckTxInputs(tx, state, mempoolDuplicate, spendheight, txfee);
     assert(fCheckResult);
     CTxUndo undo;
-    UpdateCoins(tx, mempoolDuplicate, undo, 1000000);
+    const bool fUpdated = UpdateCoins(tx, mempoolDuplicate, undo, 1000000);
+    assert(fUpdated); // -checkmempool consistency check: a pooled tx always passed CheckTxInputs
 }
 
 void CTxMemPool::check(const CCoinsViewCache *pcoins) const
@@ -1055,7 +1103,7 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
 size_t CTxMemPool::DynamicMemoryUsage() const {
     LOCK(cs);
     // Estimate the overhead of mapTx to be 12 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.
-    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + cachedInnerUsage;
+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
 }
 
 void CTxMemPool::RemoveStaged(setEntries &stage, bool updateDescendants, MemPoolRemovalReason reason) {

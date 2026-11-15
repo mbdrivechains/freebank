@@ -316,13 +316,6 @@ uint256 DepositProtestSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t n
  * the INTEREST only, capped at MAX_MONEY. */
 CAmount DepositMaturityInterest(uint64_t nPrincipal, uint32_t nBlocks, uint32_t nRateBps);
 
-/** Subordinated pro-rata entitlement at insolvency: burning `nPrincipal` against
- * the frozen deposit tranche (amountDepositPot backing nSnapshotPrincipal of
- * senior-to-partners-but-junior-to-notes claims) entitles the holder to
- * min(nPrincipal, floor(nPrincipal * amountDepositPot / nSnapshotPrincipal)).
- * 128-bit; 0 if nSnapshotPrincipal == 0. */
-CAmount DepositClaimEntitlement(uint64_t nPrincipal, const CAmount& amountDepositPot, uint64_t nSnapshotPrincipal);
-
 /** Sum a principal vector with overflow protection (false on overflow or a zero
  * total / any zero element). */
 bool SumDepositPrincipal(const std::vector<uint64_t>& vPrincipal, uint64_t& total);

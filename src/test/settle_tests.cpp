@@ -13,6 +13,10 @@
 #include <bill.h>           // BillHashOutputs
 #include <chainparams.h>    // CreateChainParams (per-network cadence pins)
 #include <coins.h>
+#include <consensus/params.h>   // GramParams (SA-W1)
+#include <houserate.h>        // per-house rates in a test view (SA-W1)
+#include <issued.h>           // UnitsCheckScope (SA-W1)
+#include <units.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <house.h>
@@ -297,11 +301,12 @@ BOOST_AUTO_TEST_CASE(settle_band_max_magnitude)
     BOOST_CHECK(!SettleResidualInBand(50000, 50000, 0, 1, 1000, 1000));     // mode 0 with residual
     BOOST_CHECK(!SettleResidualInBand(50000, 50000, 1, 0, 1000, 1000));     // mode 1 with dU == 0
     BOOST_CHECK(!SettleResidualInBand(60000, 45000, 0, 0, 1000, 1000));     // dU != 0 must be mode 1
-    // Min-residual floor: dU below SETTLE_MIN_RESIDUAL cannot be mode 1.
-    BOOST_CHECK(!SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL - 1, 50000, 1,
-                                      SETTLE_MIN_RESIDUAL - 1, 1000, 1000));
-    BOOST_CHECK(SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL, 50000, 1,
-                                     SETTLE_MIN_RESIDUAL, 1000, 1000));
+    // Min-residual floor (UR1-2, D-2026-11-11-2): the residual PAYMENT below SETTLE_MIN_RESIDUAL_SATS can't be mode 1
+    // (at 1000 sats/g, 545 mg pays 545 sats).
+    BOOST_CHECK(!SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL_SATS - 1, 50000, 1,
+                                      SETTLE_MIN_RESIDUAL_SATS - 1, 1000, 1000));
+    BOOST_CHECK(SettleResidualInBand(50000 + (uint64_t)SETTLE_MIN_RESIDUAL_SATS, 50000, 1,
+                                     SETTLE_MIN_RESIDUAL_SATS, 1000, 1000));
 }
 
 BOOST_AUTO_TEST_CASE(settle_tx_trailer_roundtrip)
@@ -808,6 +813,165 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
         mtx.vout[0].nValue = 15001;
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-band");
     }
+}
+
+// ===========================================================================
+// testing (2026-11-11): operator's decision D-2026-11-11-2 (Michael, "Yes, all three (Recommended)", design session),
+// rules 2 and 3, on the exchange (op 1). Both FAIL on master 33f2e72; they pass once freebankd's commit for the three
+// rules lands.
+//   Rule 2 (SA-W1, security stage A, High): a settlement is valid only if the highest ask is at most 1.05 x the lowest
+//   bid of its houses at the block (SettleBandForChecks). Today any band is taken, so a sock-puppet house with
+//   bid = ask = 1 drags the round's rate to ~0 (the creditor is paid nothing), and one with a huge ask pulls it up.
+//   Rule 3 (UR1-2): the mode-1 residual is at least 546 sats (SETTLE_MIN_RESIDUAL_SATS), the payment, not |dU| in mg.
+//   Today the floor compares mg with a sats-named 10,000, so it is 10 g of imbalance whatever gold is worth.
+// ===========================================================================
+namespace {
+// house N posts (bid, ask) from the block after nPostHeight; both in effect at nHeight
+struct RatePost { uint32_t nHouse; uint64_t nBid, nAsk; };
+// each house posts its (bid, ask) ten blocks before nHeight (first posts: no cap); all in effect at nHeight
+void SW1Post(CUnitsView& units, const std::vector<RatePost>& vPost, int nHeight)
+{
+    Consensus::GramParams gp;
+    std::string strReject;
+    const int64_t T = 400 * RATE_DAY_SECONDS;
+    AdvanceChainClock(units, nHeight - 20, T - 2000, gp);
+    int nAt = nHeight - 10;
+    for (const RatePost& p : vPost) {
+        BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, p.nHouse, p.nBid, p.nAsk, nAt, T, gp, strReject),
+                              "SA-W1 setup: house " + std::to_string(p.nHouse) + "'s post " + std::to_string(p.nBid) +
+                              "/" + std::to_string(p.nAsk) + " was refused: " + strReject);
+    }
+    AdvanceChainClock(units, nHeight - 1, T + 600, gp);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(sa_w1_exchange_band_is_narrow)
+{
+    CKey kA1; kA1.MakeNewKey(true);
+    CKey kB1; kB1.MakeNewKey(true);
+    CKey kB2; kB2.MakeNewKey(true);
+    CKey presA; presA.MakeNewKey(true);
+    CKey presB; presB.MakeNewKey(true);
+    CKey redA; redA.MakeNewKey(true);
+    CKey redB; redB.MakeNewKey(true);
+    const std::vector<CKey> apprA{kA1};
+    const std::vector<CKey> apprB{kB1, kB2};
+    const int H = 1100;
+    const CHouse hA = MakeSettleHouse(1, {PK(kA1)}, 1, 1200000, 150000, 1000, PK(redA));
+    const CHouse hB = MakeSettleHouse(2, {PK(kB1), PK(kB2)}, 2, 900000, 100000, 1000, PK(redB));
+    const std::map<uint32_t, CHouse> houses{{1, hA}, {2, hB}};
+
+    // The mode-1 exchange of the vectors above: |dU| = 15 g, residual 15,000 sats, i.e. 1,000 sats per gram - inside
+    // [lowest bid, highest ask] in every case below, so only the band's width decides.
+    struct Case { uint64_t nBidA, nAskA, nBidB, nAskB; bool fValid; const char* what; };
+    const Case cases[] = {
+        {1000, 1000, 1000, 1000, true,  "equal rates"},
+        {1000, 1020, 1000, 1020, true,  "each house's own 2% spread"},
+        {1000, 1000, 1050, 1050, true,  "the highest ask exactly 1.05 x the lowest bid"},
+        {1000, 1000, 1051, 1051, false, "the highest ask 1.051 x the lowest bid"},
+        {1000, 1000, 1, 1,       false, "house B a sock puppet at bid = ask = 1 (security's W1)"},
+        {1000, 1000, 1200, 1200, false, "house B's ask 20% above (the mirror: debtors pay more)"},
+    };
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;              // the houses' own rates
+    for (const Case& c : cases) {
+        CUnitsView units(nullptr);
+        SW1Post(units, {{1, c.nBidA, c.nAskA}, {2, c.nBidB, c.nAskB}}, H);
+        UnitsCheckScope scope(&units);
+        SettleExchange x;
+        const CMutableTransaction mtx = BuildSignedSettle(x, hA, hB, apprA, apprB, presA, presB, 1);
+        const std::string r = SettleOpReject(mtx, houses, H);
+        const std::string strCase = std::string(c.what) + " (A " + std::to_string(c.nBidA) + "/" +
+                                    std::to_string(c.nAskA) + ", B " + std::to_string(c.nBidB) + "/" +
+                                    std::to_string(c.nAskB) + ")";
+        if (c.fValid)
+            BOOST_CHECK_MESSAGE(r == "OK", "SA-W1 control: an exchange inside the 5% band was refused, " + strCase +
+                                ": " + r);
+        else
+            BOOST_CHECK_MESSAGE(r != "OK" && r.find("band") != std::string::npos,
+                                "SA-W1: an exchange whose band is wider than 5% was " +
+                                (r == "OK" ? std::string("ACCEPTED") : "refused for another reason (" + r + ")") +
+                                ", " + strCase);
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
+}
+
+// testing (2026-11-11): SW-7 (security 11-11). D-2026-11-11-2 rule 2 covers every settlement exchange, mode 0 (a 1:1
+// swap, no residual) included (design confirmed the entry covers it, 11-11). 9133b60 checked the band only in mode 1,
+// so a mode-0 swap between houses more than 5% apart was taken. Refused with bad-settle-band-too-wide, DoS 0 (chain
+// state: no ban); at or under 1.05 x it passes. FAILS on master 0bfb20e; passes once the band check runs in both modes.
+BOOST_AUTO_TEST_CASE(sw7_mode0_exchange_band_is_narrow)
+{
+    CKey kA1; kA1.MakeNewKey(true);
+    CKey kB1; kB1.MakeNewKey(true);
+    CKey kB2; kB2.MakeNewKey(true);
+    CKey presA; presA.MakeNewKey(true);
+    CKey presB; presB.MakeNewKey(true);
+    CKey redA; redA.MakeNewKey(true);
+    CKey redB; redB.MakeNewKey(true);
+    const std::vector<CKey> apprA{kA1};
+    const std::vector<CKey> apprB{kB1, kB2};
+    const int H = 1100;
+    const CHouse hA = MakeSettleHouse(1, {PK(kA1)}, 1, 1200000, 150000, 1000, PK(redA));
+    const CHouse hB = MakeSettleHouse(2, {PK(kB1), PK(kB2)}, 2, 900000, 100000, 1000, PK(redB));
+    auto fnGetHouse = [&](uint32_t nID, CHouse& h) {
+        if (nID == 1) { h = hA; return true; }
+        if (nID == 2) { h = hB; return true; }
+        return false;
+    };
+    struct Case { uint64_t nRateB; bool fValid; const char* what; };
+    const Case cases[] = {
+        {1000, true,  "equal rates"},
+        {1050, true,  "house B at 1050: the highest ask exactly 1.05 x the lowest bid"},
+        {1051, false, "house B at 1051"},
+        {1,    false, "house B a sock puppet at bid = ask = 1"},
+    };
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;
+    for (const Case& c : cases) {
+        CUnitsView units(nullptr);
+        SW1Post(units, {{1, 1000, 1000}, {2, c.nRateB, c.nRateB}}, H);
+        UnitsCheckScope scope(&units);
+        SettleExchange x;
+        const CMutableTransaction mtx = BuildSignedSettle(x, hA, hB, apprA, apprB, presA, presB, 0);
+        BOOST_REQUIRE_EQUAL(x.nMode, 0);
+        CValidationState state;
+        CHouse outA, outB;
+        const bool fOk = CheckSettleOperation(CTransaction(mtx), state, H, fnGetHouse, outA, outB);
+        int nDoS = -1;
+        state.IsInvalid(nDoS);
+        if (c.fValid) {
+            BOOST_CHECK_MESSAGE(fOk, std::string("SW-7 control: a mode-0 exchange inside the 5% band was refused, ") +
+                                c.what + ": " + state.GetRejectReason());
+        } else {
+            BOOST_CHECK_MESSAGE(!fOk && state.GetRejectReason() == "bad-settle-band-too-wide",
+                                std::string("SW-7: a mode-0 exchange whose band is wider than 5% was ") +
+                                (fOk ? std::string("ACCEPTED") : "refused for another reason (" +
+                                                                 state.GetRejectReason() + ")") + ", " + c.what);
+            BOOST_CHECK_MESSAGE(fOk || nDoS == 0, std::string("SW-7: the too-wide refusal scores DoS ") +
+                                std::to_string(nDoS) + " (chain state: must be 0, no ban), " + c.what);
+        }
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
+}
+
+BOOST_AUTO_TEST_CASE(ur1_2_residual_floor_is_546_sats)
+{
+    // With rates (the contextual check): |dU| mg at 1,000 sats per gram pays |dU| sats.
+    BOOST_CHECK_MESSAGE(SettleResidualInBand(1000, 0, 1, 1000, 1000, 1000),
+                        "UR1-2: a 1 g residual paying 1,000 sats was refused (the floor still counts 10 g of mg)");
+    BOOST_CHECK_MESSAGE(SettleResidualInBand(546, 0, 1, 546, 1000, 1000),
+                        "UR1-2: a residual paying exactly 546 sats was refused");
+    BOOST_CHECK_MESSAGE(!SettleResidualInBand(545, 0, 1, 545, 1000, 1000),
+                        "UR1-2 control: a residual paying 545 sats (dust) was accepted");
+    BOOST_CHECK_MESSAGE(!SettleResidualInBand(20000, 0, 1, 400, 20, 20),
+                        "UR1-2: 20 g at 20 sats per gram, a 400-sat (dust) residual, was accepted (the floor reads the "
+                        "grams, not the payment)");
+    // Without rates (the context-free shape check): the payment is in the payload, so the floor applies there too.
+    BOOST_CHECK_MESSAGE(!SettleResidualInBand(20000, 0, 1, 545, 0, 0),
+                        "UR1-2: the shape check took a 545-sat residual on 20 g");
+    BOOST_CHECK_MESSAGE(SettleResidualInBand(1000, 0, 1, 546, 0, 0),
+                        "UR1-2: the shape check refused a 546-sat residual on 1 g");
 }
 
 // The cadence is per-network consensus (main 144, regtest 12) and must never

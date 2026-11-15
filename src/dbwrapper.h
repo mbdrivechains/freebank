@@ -10,11 +10,17 @@
 #include <serialize.h>
 #include <streams.h>
 #include <util.h>
+#include <uint256.h>
 #include <utilstrencodings.h>
 #include <version.h>
 
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
+
+#include <cassert>
+#include <map>
+#include <string>
+#include <utility>
 
 static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
 static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
@@ -111,6 +117,27 @@ public:
         ssKey.clear();
     }
 
+    /** UR-ext-10: a write whose key and value are already serialized (SER_DISK, CLIENT_VERSION), as
+     *  StagedDBWrapper keeps them. The value is obfuscated here exactly as Write() does. */
+    void WriteSerialized(const std::string& strKey, const std::string& strValue)
+    {
+        ssValue.write(strValue.data(), strValue.size());
+        ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
+        leveldb::Slice slKey(strKey.data(), strKey.size());
+        leveldb::Slice slValue(ssValue.data(), ssValue.size());
+        batch.Put(slKey, slValue);
+        size_estimate += 3 + (slKey.size() > 127) + slKey.size() + (slValue.size() > 127) + slValue.size();
+        ssValue.clear();
+    }
+
+    /** UR-ext-10: an erase whose key is already serialized. */
+    void EraseSerialized(const std::string& strKey)
+    {
+        leveldb::Slice slKey(strKey.data(), strKey.size());
+        batch.Delete(slKey);
+        size_estimate += 2 + (slKey.size() > 127) + slKey.size();
+    }
+
     size_t SizeEstimate() const { return size_estimate; }
 };
 
@@ -183,6 +210,16 @@ public:
         return piter->value().size();
     }
 
+    /** FB-6 (regtest getsidedbhashes): the key's raw bytes and the value's de-obfuscated bytes, as every node agrees on
+     *  them (the obfuscation key differs per node). */
+    void GetRawKeyValue(std::string& strKey, std::string& strValue) {
+        leveldb::Slice slKey = piter->key(), slValue = piter->value();
+        strKey.assign(slKey.data(), slKey.size());
+        CDataStream ssValue(slValue.data(), slValue.data() + slValue.size(), SER_DISK, CLIENT_VERSION);
+        ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
+        strValue.assign(ssValue.begin(), ssValue.end());
+    }
+
 };
 
 class CDBWrapper
@@ -222,6 +259,11 @@ private:
     std::vector<unsigned char> CreateObfuscateKey() const;
 
 public:
+    /** FB-6 (regtest getsidedbhashes): SHA256 over every (key, value) record in key order - the key raw, the value
+     *  de-obfuscated - leaving out the obfuscation key's own record; nCount gets the number of records hashed. Two nodes
+     *  holding the same state get the same hash. Reads LevelDB only (never a stage's overlay). */
+    uint256 HashAllRecords(size_t& nCount);
+
     /**
      * @param[in] path        Location in the filesystem where leveldb data will be stored.
      * @param[in] nCacheSize  Configures various leveldb cache settings.
@@ -376,6 +418,133 @@ public:
         pdb->CompactRange(&slKey1, &slKey2);
     }
 
+};
+
+/** UR-ext-10 (switch-on): a database whose writes can be STAGED and committed in one atomic batch with a marker.
+ *  While a stage is open, SWrite/SErase go to an in-memory overlay (last write per key wins) and SRead/SExists read
+ *  the overlay first, so a multi-step undo sees its own writes; CommitStage then writes every staged change plus the
+ *  marker in a single LevelDB batch, and AbortStage drops them. A crash can no longer land between a record write and
+ *  its marker step (the BillDB R-3 treatment, for HouseDB and PoolDB). Iterators (cursors) do NOT see the overlay:
+ *  nothing that runs inside a stage may list records. */
+class StagedDBWrapper : public CDBWrapper
+{
+public:
+    using CDBWrapper::CDBWrapper;
+
+    void BeginStage() { AssertStageLock(); fStaged = true; mapStage.clear(); }
+    void AbortStage() { if (fStaged) AssertStageLock(); fStaged = false; mapStage.clear(); }
+    bool Staged() const { return fStaged; }
+
+    /** Write every staged change and (keyMarker, valueMarker) in one synced batch, then close the stage. */
+    template <typename K, typename V>
+    bool CommitStage(const K& keyMarker, const V& valueMarker)
+    {
+        CDBBatch batch(*this);
+        for (const auto& kv : mapStage) {
+            if (kv.second.first)
+                batch.WriteSerialized(kv.first, kv.second.second);
+            else
+                batch.EraseSerialized(kv.first);
+        }
+        batch.Write(keyMarker, valueMarker);
+        const bool fOk = WriteBatch(batch, true);
+        AbortStage();
+        return fOk;
+    }
+
+    /** Close the stage, committing its changes with no marker (a datadir that never had one keeps none). */
+    bool CommitStageNoMarker()
+    {
+        CDBBatch batch(*this);
+        for (const auto& kv : mapStage) {
+            if (kv.second.first)
+                batch.WriteSerialized(kv.first, kv.second.second);
+            else
+                batch.EraseSerialized(kv.first);
+        }
+        const bool fOk = WriteBatch(batch, true);
+        AbortStage();
+        return fOk;
+    }
+
+protected:
+    /** The overlay has no lock of its own: the lock that serialises the undo against every reader (cs_main for
+     *  HouseDB and PoolDB, txdb.cpp) must be held whenever a stage is open (security, UR-ext-10 hardening 2). */
+    virtual void AssertStageLock() const {}
+
+    /** A cursor reads LevelDB only, never the overlay: nothing may list records while a stage is open, or it would read
+     *  the state before the undo's own writes (security, UR-ext-10 hardening 1). */
+    void AssertNoStageForCursor() const { assert(!fStaged); }
+
+    template <typename K>
+    static std::string StageKey(const K& key)
+    {
+        CDataStream ss(SER_DISK, CLIENT_VERSION);
+        ss << key;
+        return std::string(ss.begin(), ss.end());
+    }
+
+    template <typename K, typename V>
+    bool SRead(const K& key, V& value) const
+    {
+        if (fStaged) {
+            AssertStageLock();
+            const auto it = mapStage.find(StageKey(key));
+            if (it != mapStage.end()) {
+                if (!it->second.first)
+                    return false;
+                try {
+                    CDataStream ss(it->second.second.data(), it->second.second.data() + it->second.second.size(),
+                                   SER_DISK, CLIENT_VERSION);
+                    ss >> value;
+                } catch (const std::exception&) {
+                    return false;
+                }
+                return true;
+            }
+        }
+        return Read(key, value);
+    }
+
+    template <typename K, typename V>
+    bool SWrite(const K& key, const V& value, bool fSync = false)
+    {
+        if (fStaged) {
+            AssertStageLock();
+            CDataStream ss(SER_DISK, CLIENT_VERSION);
+            ss << value;
+            mapStage[StageKey(key)] = std::make_pair(true, std::string(ss.begin(), ss.end()));
+            return true;
+        }
+        return Write(key, value, fSync);
+    }
+
+    template <typename K>
+    bool SErase(const K& key, bool fSync = false)
+    {
+        if (fStaged) {
+            AssertStageLock();
+            mapStage[StageKey(key)] = std::make_pair(false, std::string());
+            return true;
+        }
+        return Erase(key, fSync);
+    }
+
+    template <typename K>
+    bool SExists(const K& key) const
+    {
+        if (fStaged) {
+            AssertStageLock();
+            const auto it = mapStage.find(StageKey(key));
+            if (it != mapStage.end())
+                return it->second.first;
+        }
+        return Exists(key);
+    }
+
+private:
+    bool fStaged = false;
+    std::map<std::string, std::pair<bool, std::string>> mapStage;   // serialized key -> (present, serialized value)
 };
 
 #endif // BITCOIN_DBWRAPPER_H

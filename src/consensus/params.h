@@ -42,7 +42,7 @@ struct GramParams {
     // Gold B (D-2026-11-07-1; GOLD_B.md §1, §4, §9): each house's own rate and the chain clock.
     uint32_t nRateSpreadBps = 200;          // ask <= bid x (1 + 2%)
     uint32_t nRateRiseBps = 2500;           // the bid may rise at most 25% ...
-    uint32_t nRateRiseWindowSecs = 86400;   // ... per 24 h (from the bid in effect when the window restarted); no fall cap
+    uint32_t nRateRiseWindowSecs = 86400;   // ... over the lowest bid in effect in the last 24 h (UR1-5); no fall cap
     uint32_t nRateRefreshSecs = 86400;      // to issue, a house must have posted its rate within 24 h
     uint32_t nActiveGapCapSecs = 3600;      // active time leaves out gaps over 1 h between blocks (the swap deadline)
     uint32_t nCharterRemovalSecs = 2592000; // removing a charter token takes effect 30 days after it is posted

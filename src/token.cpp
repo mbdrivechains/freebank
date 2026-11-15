@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <token.h>
+#include <house.h>   // HashNetworkTag (UR-ext-13)
 
 #include <crypto/sha256.h>
 #include <hash.h>
@@ -60,6 +61,7 @@ uint256 TokenKeysetSigHash(const NoteTokenKeyset& ks, const uint256& hashPrevout
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankToken/keyset");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << ks.nHouseID;
     ss << ks.vchPostingPubKey;
     ss << ks.vKey;
@@ -71,6 +73,7 @@ uint256 TokenPostSigHash(const NoteTokenPost& post, const uint256& hashPrevouts)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankToken/post");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << post.nHouseID;
     ss << post.nKeysetID;
     ss << post.vIssued;
@@ -84,6 +87,7 @@ uint256 TokenClaimSigHash(uint32_t nHouseID, const uint256& y, const std::vector
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankToken/claim");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << y;
     ss << vchPayoutScript;

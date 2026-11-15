@@ -356,6 +356,46 @@ bool TokenClaimConflictsMempool(const CTransaction& tx);
 /** H1 (stage A, plain v1.2.1): is mtx a house rate POST (HOUSE_OP_RATE, kind POST)? A pooled POST yields to any other op
  *  on its house: ATMP evicts it rather than refuse the op, and the wallet's fail-fast doesn't count it. */
 bool IsHouseRatePostTx(const CTransaction& mtx);
+/** Every house slot a transaction takes (none for a rate op: those have their own slot, D-2026-11-11-3). The one list
+ *  the mempool guards, the template and the wallet's fail-fasts all read (TW-5). */
+bool GetHouseSlotSet(const CTransaction& mtx, std::vector<uint32_t>& vHouse);
+/** UR3-8: the house whose STAGED effective status an op reads without taking its slot (note DEMAND, deposit DEMAND, pool
+ *  CREATE). False for every other tx. */
+bool GetHouseStatusReaderID(const CTransaction& mtx, uint32_t& nHouse);
+/** UR3-8: what a tx holds on house state in the mempool: the house slots it takes, or the house whose status it reads. */
+struct HouseStateKeys {
+    std::vector<uint32_t> vSlot;   // GetHouseSlotSet
+    uint32_t nStatusReader = 0;    // GetHouseStatusReaderID (0 when it takes a slot or reads none)
+    bool Any() const { return !vSlot.empty() || nStatusReader != 0; }
+};
+HouseStateKeys GetHouseStateKeys(const CTransaction& mtx);
+/** UR3-8: can't share a template on house state: both take one house's slot, or one takes the slot of the house whose
+ *  status the other reads. Symmetric; two readers never conflict. Every house-slot scan in ATMP goes through this. */
+bool HouseStateKeysConflict(const HouseStateKeys& a, const HouseStateKeys& b);
+
+class CPubKey;
+/** UR3-4 (ultra s3 #4): every FreeBank payload signature check (house approvals, holder, drawer, issuer, rate-key and
+ *  presenter signatures). Exactly pubkey.VerifyStrict(hash, sig) outside an FbSigCacheScope. Inside one (ATMP and the
+ *  mempool sweeps only) a signature the script signature cache already holds as valid is not verified again, and one
+ *  that verifies is added: the sweep re-runs every pooled op's full contextual check at each tip change, and this is
+ *  what made that cost ECDSA per signature. The strict-encoding checks always run. The cache key is (hash, pubkey,
+ *  sig), so a changed approver set needs no special case: a different key is a different entry. ConnectBlock and
+ *  TestBlockValidity never open a scope, so block validation runs the plain check. */
+bool FbVerifyStrict(const CPubKey& pubkey, const uint256& hash, const std::vector<unsigned char>& vchSig);
+/** UR3-4: opens the FreeBank signature cache for this thread until it goes out of scope (nests). */
+class FbSigCacheScope {
+public:
+    FbSigCacheScope();
+    ~FbSigCacheScope();
+    FbSigCacheScope(const FbSigCacheScope&) = delete;
+    FbSigCacheScope& operator=(const FbSigCacheScope&) = delete;
+private:
+    bool fPrev;
+};
+/** UR3-4: is an FbSigCacheScope open on this thread? (Unit tests.) */
+bool FbSigCacheScopeOpen();
+/** D-2026-11-11-3: a house rate op (POST or SETKEY) and its house, by byte reads (no decode). False for any other tx. */
+bool HouseRateOpOf(const CTransaction& mtx, uint32_t& nHouseID, bool& fSetKey);
 
 bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransactionRef &tx,
                         bool* pfMissingInputs, std::list<CTransactionRef>* plTxnReplaced,
@@ -378,7 +418,10 @@ int VersionBitsTipStateSinceHeight(const Consensus::Params& params, Consensus::D
 /** Spend tx's inputs and add its outputs. The asset colour of the outputs is
  *  computed from the spent coins (ComputeAssetTags; the caller has validated
  *  the tx) and returned in pAssetTagsOut when given. */
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& undo, int nHeight, AssetTags* pAssetTagsOut = nullptr, const uint32_t nNewBillIDIn = 0, const uint32_t nNewHouseIDIn = 0);
+/** Apply tx to the coins view. Returns false (and logs) if the asset colour of its outputs breaks an asset rule, which
+ * CheckTxInputs should already have refused (UR-ext-1, plain v1.2.2: the caller rejects the block, it no longer
+ * aborts the node). The view is then part-updated: the caller must discard it. */
+bool UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& undo, int nHeight, AssetTags* pAssetTagsOut = nullptr, const uint32_t nNewBillIDIn = 0, const uint32_t nNewHouseIDIn = 0);
 
 /** Transaction validation functions */
 
@@ -487,7 +530,21 @@ enum class L1Answer;
 /** v0.2.17 B3 + D1: the pending bundle's outcome on the L1 as of hashMainBlock
  *  (see validation.cpp). Used by ConnectBlock and the block builder. */
 L1Answer GetBundleOutcomeOnL1(const SidechainWithdrawalBundle& bundle, const CBlockIndex* pindexPrev,
-                              const uint256& hashMainBlock, char& cOutcome);
+                              const uint256& hashMainBlock, char& cOutcome, uint256* pHashPaidL1 = nullptr);
+struct L1WithdrawalEvent;
+/** PG-1 (D-2026-11-13-3): the coinbase commit that counts an L1 payout from slot 130 FreeBank did not expect: any 'S'
+ *  that isn't the pending bundle's own payment (IsUnexpectedPayout). 77 bytes: OP_RETURN, the header FC 5F 41 4C, the m6id, the L1 block
+ *  that carries the event, the payouts' total (8 bytes LE). */
+CScript GenerateUnexpectedPayoutCommit(const uint256& m6id, const uint256& hashL1Block, CAmount amount);
+bool ParseUnexpectedPayoutCommit(const CScript& script, uint256& m6id, uint256& hashL1Block, CAmount& amount);
+/** The payouts' total of a paid event's M6 (vout[1..]: vout[0] is the treasury's change); 0 if the event has no M6. */
+CAmount UnexpectedPayoutAmount(const L1WithdrawalEvent& ev);
+/** PG-1: is this L1 'S' event a payout FreeBank did not expect? Not for the pending bundle (that is its paid mark);
+ *  yes for an m6id FreeBank never made and for a FAILED bundle; for a paid bundle, yes in any L1 block other than the
+ *  one its paid mark recorded (security's R3). */
+bool IsUnexpectedPayout(const L1WithdrawalEvent& ev, const std::set<uint256>& setPendingM6id);
+/** The m6id of the pending (latest, CREATED) bundle, if any. */
+std::set<uint256> PendingBundleM6ids();
 /** v0.2.17 A1 + A4, v1.0.1 R1/R4: is deposit record d what the L1 recorded, and
  *  what does it credit (see validation.cpp)? For a block whose own L1 block is
  *  hashBlockMain. Used by ConnectBlock and the block builder. */
@@ -505,6 +562,20 @@ bool IsWitnessEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& pa
 
 /** When there are blocks in the active chain with missing data, rewind the chainstate and remove them from the block index */
 bool RewindBlockIndex(const CChainParams& params);
+
+/** SW-2 (startup): a crash after some side DBs committed a disconnect's undo but before the chainstate flushed leaves
+ *  them at the tip's parent; finish that disconnect (DisconnectBlock skips each DB whose marker is not at the block)
+ *  and let ActivateBestChain reconnect it. A no-op otherwise. */
+bool FinishInterruptedSideDBDisconnect(const CChainParams& params);
+
+/** The mempool's size limit in bytes: -maxmempool (MB), or the regtest-only -maxmempoolbytes test hook. */
+int64_t MaxMempoolBytes();
+/** Regtest-only test hooks (invariant J: inert on every public network; init refuses them there). */
+extern int64_t g_nMaxMempoolBytesOverride;   // -maxmempoolbytes; 0 = unset
+extern std::string g_strTestCrashPoint;      // -testcrashpoint; empty = unset
+/** The -testcrashpoint names, and the hook: _exit(1) at the named point when it is set (regtest only). */
+bool IsKnownTestCrashPoint(const std::string& strName);
+void TestCrashPoint(const char* pszName);
 
 /** Update uncommitted block structures (currently: only the witness nonce). This is safe for submitted blocks. */
 void UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPrev, const Consensus::Params& consensusParams);
@@ -585,7 +656,7 @@ extern std::unique_ptr<BitAssetDB> passettree;
 extern std::unique_ptr<BillDB> pbilltree;
 
 /** The bills in a house's book unpaid GramParams::nBillOverdueBlocks past maturity at nHeight (sorted, at most
- *  MAX_EQUITY_OVERDUE_BILLS). Information for the RPCs and the explorer only - never complete as a measure of loan
+ *  MAX_OVERDUE_BILLS_LISTED). Information for the RPCs and the explorer only - never complete as a measure of loan
  *  quality, since a house can repay a bill for its borrower (D-2026-11-07-3); no consensus rule reads it. */
 std::vector<uint32_t> HouseOverdueBills(const CHouse& house, int nHeight);
 extern std::unique_ptr<HouseDB> phousetree;

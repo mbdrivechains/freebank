@@ -386,8 +386,14 @@ namespace Consensus { struct GramParams; }
  *  spends go where its annex says (a later FREEZE is read from the units DB); a v18 op's keys, token and effects. The
  *  inputs must still be unspent in `view`. */
 struct CHouse;
+/** UR1-5 follow-up (testing's rate_restore_clock_edge (B)): would a pooled rate POST still apply at the tip? The same
+ *  checks as ConnectIssuedTx's POST branch (the rate key's signature, then spread, rise cap and restore at the tip's
+ *  clock), on a scratch view over the units DB, and no coins: safe before a reorg's re-adds. False with strReject when
+ *  it no longer would. A non-POST tx is never stale here. */
+bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& strReject);
+
 bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnitsView& units, int nHeight,
-                     CValidationState& state, const std::function<bool(uint32_t, CHouse&)>* pfnGetHouse = nullptr);
+                     CValidationState& state);
 
 /** Gold B (D-2026-11-07-1; GOLD_B.md §5): a house's capital as the floors and the ramp count it, in mg at the house's
  *  highest ask of the last 30 days (so a lower quote can't raise it): its sECX escrow (the active partners' pledges) and
@@ -418,6 +424,12 @@ public:
 private:
     const CUnitsView* pPrev;
 };
+
+/** SA-H3 (Michael 2026-11-11, second list): a clock read for a past height whose record is missing (a damaged units DB)
+ *  fails closed: ClockBlocksForChecks returns -1 and raises this flag. The mempool then refuses the tx
+ *  (bad-clock-record-missing, no ban) and block connect stops the node instead of judging the block, whatever the
+ *  checks computed from the missing clock. Reset where each tx (mempool) or block (connect) starts; cs_main. */
+extern bool g_fClockRecordMissing;
 /** Par-eligible for settlement: effectively Open, and its till (attested sECX at A30, Gold B) at least nTillMinBps of
  *  its notes. */
 bool GoldParEligible(const CHouse& house, int nHeight);

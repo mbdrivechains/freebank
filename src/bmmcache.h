@@ -147,6 +147,12 @@ private:
     // block-submit RPC write them from other threads.
     mutable std::mutex csVerified;
 
+    // UR5-5 (plain v1.2.2): guards mapBMMBlocks, the resend state, setWithdrawalBundleBroadcasted,
+    // setPrevBlockBMMCreated, setMainBlockChecked and setWITHDRAWALIDCache (a leaf lock: no method that holds it calls
+    // out). RPC bid paths also hold csBMMRpc, but createwithdrawal, listmywithdrawals and refundallwithdrawals read
+    // and write the withdrawal-ID cache from separate RPC threads without it.
+    mutable std::mutex csBid;
+
     // BMM blocks that we have created with the intention of connecting to the
     // side blockchain once the BMM h* hash is included on the mainchain
     std::map<uint256 /* hashMerkleRoot */, CBlock> mapBMMBlocks;

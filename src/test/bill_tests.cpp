@@ -5,6 +5,10 @@
 #include <bill.h>
 
 #include <coins.h>
+#include <consensus/params.h>   // GramParams (SA-N2)
+#include <houserate.h>        // per-house rates in a test view (SA-N2)
+#include <issued.h>           // UnitsCheckScope (SA-N2)
+#include <units.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <key.h>
@@ -19,6 +23,15 @@
 #include <boost/test/unit_test.hpp>
 
 #include <functional>
+
+// Contextual bill-op validator (validation.cpp, external linkage; not in a public header) - UR1-6's tests drive it.
+bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHeight, const CAmount& nTxFee,
+                        const std::function<bool(uint32_t, CBill&)>& fnGetBill,
+                        const std::function<bool(const uint256&)>& fnHaveBillHash,
+                        const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                        const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
+                        const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
+                        CBill& billOut, CHouse& houseOut, bool& fHouseChanged, bool fMempool);
 
 BOOST_FIXTURE_TEST_SUITE(bill_tests, BasicTestingSetup)
 
@@ -94,7 +107,7 @@ BOOST_AUTO_TEST_CASE(bill_sighash_domain_separation)
     const uint256 hashOutputs = uint256S("02");
 
     // Retire and claim messages over identical inputs must differ
-    BOOST_CHECK(BillRetireSigHash(billID, hashOutputs) != BillClaimSigHash(billID, hashOutputs));
+    BOOST_CHECK(BillRetireSigHash(billID, 0, hashOutputs) != BillClaimSigHash(billID, hashOutputs));   // UR1-6: + nRateNamed
 
     // hashOutputs must matter (anti-replay: the signature pins the outputs)
     BOOST_CHECK(BillClaimSigHash(billID, hashOutputs) != BillClaimSigHash(billID, uint256S("03")));
@@ -1463,6 +1476,313 @@ BOOST_AUTO_TEST_CASE(bill_payload_leading_id_contract)
         k.vchEncryptedBody[7] ^= 0xff;
         BOOST_CHECK(k.vchEncryptedBody != i.vchEncryptedBody);
     }
+}
+
+// ===========================================================================
+// testing (2026-11-10): UR1-6 (ultra s1 #6; Michael signed it off 2026-11-10, freebank
+// docs-local/CONSENSUS_SIGNOFF_2026-11-10.md item 6). nRateNamed - the rate a bill payer names - is in no signature on
+// ops 3 RETIRE, 6 RECOURSE, 7 HRETIRE, 9 HRETIRE_NOTES and 10 HRETIRE_ESCROW. An ask can be named high (BoundHouseRate
+// takes any rate at or above the 30-day ask), so when the payment has headroom, a relayer or miner can rewrite
+// nRateNamed anywhere in [ask, rate the payment covers] under the same signature: same effects, a new txid, and any
+// unconfirmed child orphaned. The fix binds nRateNamed into each digest; ops 3 and 7 share BillRetireSigHash, which
+// gains it as BillRetireSigHash(billID, nRateNamed, hashOutputs) (agreed with freebankd 2026-11-10).
+// FAILS on master a00fb05; passes once the fix lands. UR16RetireDigest uses the new three-argument form when it exists
+// and falls back to master's two-argument form, so this file builds before and after the fix.
+// ===========================================================================
+
+namespace {
+template <typename B, typename R, typename H>
+auto UR16RetireDigestImpl(int, const B& billID, const R& nRate, const H& hashOutputs)
+    -> decltype(BillRetireSigHash(billID, nRate, hashOutputs))
+{
+    return BillRetireSigHash(billID, nRate, hashOutputs);   // the fix
+}
+template <typename B, typename R, typename H>
+uint256 UR16RetireDigestImpl(long, const B& billID, const R&, const H& hashOutputs)
+{
+    return BillRetireSigHash(billID, hashOutputs);          // master: nRateNamed is not in the digest
+}
+uint256 UR16RetireDigest(const uint256& billID, uint64_t nRate, const uint256& hashOutputs)
+{
+    return UR16RetireDigestImpl(0, billID, nRate, hashOutputs);
+}
+
+std::vector<unsigned char> UR16Pub(const CKey& key)
+{
+    const CPubKey pub = key.GetPubKey();
+    return std::vector<unsigned char>(pub.begin(), pub.end());
+}
+
+const int UR16_HEIGHT = 5000;
+
+// Runs one bill op against a single bill and (optionally) a single house; returns "" on accept, else the reason.
+std::string UR16Run(const CMutableTransaction& mtx, const CBill& bill, const CHouse* pHouse)
+{
+    const CBill b = bill;
+    const CHouse h = pHouse ? *pHouse : CHouse();
+    const bool fHouse = pHouse != nullptr;
+    std::function<bool(uint32_t, CBill&)> getBill = [b](uint32_t id, CBill& out) {
+        if (id != b.nBillID) return false;
+        out = b; return true;
+    };
+    std::function<bool(const uint256&)> haveHash = [b](const uint256& x) { return x == b.billID; };
+    std::function<bool(uint32_t, CHouse&)> getHouse = [h, fHouse](uint32_t id, CHouse& out) {
+        if (!fHouse || id != h.nHouseID) return false;
+        out = h; return true;
+    };
+    std::function<bool(const COutPoint&, Coin&)> noCoin = [](const COutPoint&, Coin&) { return false; };
+    std::function<bool(uint32_t, uint256&)> noBlock = [](uint32_t, uint256&) { return false; };
+    CValidationState state;
+    CBill billOut;
+    CHouse houseOut;
+    bool fHouseChanged = false;
+    if (CheckBillOperation(CTransaction(mtx), state, UR16_HEIGHT, 100000, getBill, haveHash, getHouse, noCoin, noBlock,
+                           billOut, houseOut, fHouseChanged, false))
+        return std::string();
+    return state.GetRejectReason().empty() ? std::string("(refused, no reason)") : state.GetRejectReason();
+}
+
+template <typename T>
+CMutableTransaction UR16Tx(uint8_t nOp, const T& payload, const std::vector<unsigned char>& vchPayee, CAmount nPaid)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_BILL_VERSION;
+    mtx.nBillOp = nOp;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("16"), 0)));
+    mtx.vout.push_back(CTxOut(nPaid, BillScriptForPubKey(vchPayee)));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << payload;
+    mtx.vchBillPayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+} // namespace
+
+// The digests themselves: two payloads differing only in nRateNamed must not share a digest.
+BOOST_AUTO_TEST_CASE(ur1_6_bill_digests_bind_nratenamed)
+{
+    const uint256 billID = uint256S("0a0b");
+    const uint256 hp = uint256S("1111");
+    const uint256 ho = uint256S("2222");
+
+    BOOST_CHECK_MESSAGE(UR16RetireDigest(billID, 1000, ho) != UR16RetireDigest(billID, 1400, ho),
+                        "UR1-6: the retire digest that ops 3 RETIRE and 7 HRETIRE sign does not bind nRateNamed");
+
+    BillRecourse r;
+    r.nBillID = 7;
+    r.vchPayerPubKey = std::vector<unsigned char>(33, 0x02);
+    r.vchPrevHolderPubKey = std::vector<unsigned char>(33, 0x03);
+    r.nRateNamed = 1000;
+    BillRecourse r2 = r;
+    r2.nRateNamed = 1400;
+    BOOST_CHECK_MESSAGE(BillRecourseSigHash(r, billID, hp, ho) != BillRecourseSigHash(r2, billID, hp, ho),
+                        "UR1-6: op 6 RECOURSE's digest does not bind nRateNamed");
+
+    BillHRetireNotes hn;
+    hn.nBillID = 7;
+    hn.nOwnerHouseID = 3;
+    hn.amountFace = 10000;
+    hn.nBillMaturityHeight = 8000;
+    hn.nUnitsBurned = 4000;
+    hn.nRateNamed = 1000;
+    BillHRetireNotes hn2 = hn;
+    hn2.nRateNamed = 1400;
+    BOOST_CHECK_MESSAGE(BillHRetireNotesSigHash(hn, billID, hp, ho) != BillHRetireNotesSigHash(hn2, billID, hp, ho),
+                        "UR1-6: op 9 HRETIRE_NOTES's digest does not bind nRateNamed");
+    BOOST_CHECK_MESSAGE(BillHRetireEscrowSigHash(hn, billID, hp, ho) != BillHRetireEscrowSigHash(hn2, billID, hp, ho),
+                        "UR1-6: op 10 HRETIRE_ESCROW's digest does not bind nRateNamed");
+}
+
+// The malleability itself, through the contextual check: op 3 (holder-held) and op 7 (house-held). The rate is 1000
+// sats per gram in unit tests; the payer pays 15,000 sats for a 10,000 mg face, which covers any named rate up to 1,500.
+BOOST_AUTO_TEST_CASE(ur1_6_retire_rate_rewrite_breaks_the_signature)
+{
+    CKey keyAcceptor, keyHolder;
+    keyAcceptor.MakeNewKey(true);
+    keyHolder.MakeNewKey(true);
+    const CAmount nFaceMg = 10000;
+    const CAmount nPaid = 15000;
+
+    // ---- op 3 RETIRE: a holder-held bill (no owner house), repaid at the reference house's 30-day ask.
+    {
+        CBill bill;
+        bill.nBillID = 1;
+        bill.billID = uint256S("ab01");
+        bill.amount = nFaceMg;
+        bill.nIssuedHeight = 4000;
+        bill.nMaturityHeight = 8000;
+        bill.vchAcceptorPubKey = UR16Pub(keyAcceptor);
+        bill.vchHolderPubKey = UR16Pub(keyHolder);
+        bill.nRefHouseID = 5;
+        bill.nOwnerHouseID = 0;
+        bill.status = BILL_STATUS_ACTIVE;
+
+        BillRetire retire;
+        retire.nBillID = 1;
+        retire.nRateNamed = 1000;
+        CMutableTransaction mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
+        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1000, BillHashOutputs(CTransaction(mtx))),
+                                       retire.vchAcceptorSig));
+        mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
+        const std::string strHonest = UR16Run(mtx, bill, nullptr);
+        BOOST_CHECK_MESSAGE(strHonest.empty(), "UR1-6 control: the signed op 3 RETIRE was refused: " + strHonest);
+
+        BillRetire rewritten = retire;   // a third party rewrites the rate, keeping the acceptor's signature
+        rewritten.nRateNamed = 1400;
+        const CMutableTransaction mtx2 = UR16Tx(BILL_OP_RETIRE, rewritten, bill.vchHolderPubKey, nPaid);
+        BOOST_CHECK(CTransaction(mtx2).GetHash() != CTransaction(mtx).GetHash());
+        const std::string strRewritten = UR16Run(mtx2, bill, nullptr);
+        BOOST_CHECK_MESSAGE(strRewritten == "bad-bill-retire-sig",
+                            "UR1-6: op 3 RETIRE with nRateNamed rewritten 1000 -> 1400 under the acceptor's signature "
+                            "was " + (strRewritten.empty() ? std::string("ACCEPTED (a new txid, no new signature)")
+                                                           : "refused for another reason: " + strRewritten));
+
+        // A payer who really names 1400 and signs it is still accepted (1400 >= the ask, and the payment covers it).
+        BillRetire named = rewritten;
+        named.vchAcceptorSig.clear();
+        CMutableTransaction mtx3 = UR16Tx(BILL_OP_RETIRE, named, bill.vchHolderPubKey, nPaid);
+        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1400, BillHashOutputs(CTransaction(mtx3))),
+                                       named.vchAcceptorSig));
+        mtx3 = UR16Tx(BILL_OP_RETIRE, named, bill.vchHolderPubKey, nPaid);
+        const std::string strNamed = UR16Run(mtx3, bill, nullptr);
+        BOOST_CHECK_MESSAGE(strNamed.empty(), "UR1-6 control: op 3 RETIRE signed at 1400 was refused: " + strNamed);
+    }
+
+    // ---- op 7 HRETIRE: the same bill held by house 3 (its custody key is the holder), repaid at the house's ask.
+    {
+        CHouse house;
+        house.nHouseID = 3;
+        house.status = HOUSE_STATUS_OPEN;
+        house.nLoanBookFace = (uint64_t)nFaceMg;
+        house.SetLoanWtMaturity((unsigned __int128)(uint64_t)nFaceMg * 8000u);
+
+        CBill bill;
+        bill.nBillID = 2;
+        bill.billID = uint256S("ab02");
+        bill.amount = nFaceMg;
+        bill.nIssuedHeight = 4000;
+        bill.nMaturityHeight = 8000;
+        bill.vchAcceptorPubKey = UR16Pub(keyAcceptor);
+        bill.vchHolderPubKey = UR16Pub(keyHolder);   // the custody key the discount pinned
+        bill.nRefHouseID = 3;
+        bill.nOwnerHouseID = 3;
+        bill.status = BILL_STATUS_ACTIVE;
+
+        BillHRetire hr;
+        hr.nBillID = 2;
+        hr.nOwnerHouseID = 3;
+        hr.amountFace = nFaceMg;
+        hr.nBillMaturityHeight = 8000;
+        hr.nPrevLoanBookFace = house.nLoanBookFace;
+        hr.nPrevLoanWtMatHi = house.nLoanWtMatHi;
+        hr.nPrevLoanWtMatLo = house.nLoanWtMatLo;
+        hr.nRateNamed = 1000;
+        CMutableTransaction mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
+        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1000, BillHashOutputs(CTransaction(mtx))),
+                                       hr.vchAcceptorSig));
+        mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
+        const std::string strHonest = UR16Run(mtx, bill, &house);
+        BOOST_CHECK_MESSAGE(strHonest.empty(), "UR1-6 control: the signed op 7 HRETIRE was refused: " + strHonest);
+
+        BillHRetire rewritten = hr;
+        rewritten.nRateNamed = 1400;
+        const CMutableTransaction mtx2 = UR16Tx(BILL_OP_HRETIRE, rewritten, bill.vchHolderPubKey, nPaid);
+        const std::string strRewritten = UR16Run(mtx2, bill, &house);
+        BOOST_CHECK_MESSAGE(strRewritten == "bad-bill-hretire-sig",
+                            "UR1-6: op 7 HRETIRE with nRateNamed rewritten 1000 -> 1400 under the acceptor's signature "
+                            "was " + (strRewritten.empty() ? std::string("ACCEPTED (a new txid, no new signature)")
+                                                           : "refused for another reason: " + strRewritten));
+    }
+}
+
+// ===========================================================================
+// testing (2026-11-11): SA-N2 (security stage A, Medium). Operator's decision D-2026-11-11-2 rule 1 (Michael, "Yes, all
+// three (Recommended)", design session): a RETIRE of a privately held bill (op 3) pays the holder at least
+// max(face at the reference house's 30-day highest ask, the bill's bond) - the floor RECOURSE already uses. Today it
+// pays only the face at the reference's ask, so a drawee who controls the reference house posts a first rate of 1 sat
+// per gram (a first post has no bound) and retires the bill for almost nothing - and its bond comes back to it too.
+// FAILS on master 33f2e72; passes once freebankd's commit for the three rules lands. The refusal is the existing
+// "bad-bill-retire-payment" (the rule is the payment floor of that check).
+// ===========================================================================
+namespace {
+// One op 3 RETIRE of a 10 g holder-held bill bonded nEscrow sats, naming nRate, paying the holder nPaid; "" = accepted.
+std::string SAN2Retire(CAmount nEscrow, uint64_t nRate, CAmount nPaid)
+{
+    static CKey keyAcceptor, keyHolder;
+    if (!keyAcceptor.IsValid()) { keyAcceptor.MakeNewKey(true); keyHolder.MakeNewKey(true); }
+    CBill bill;
+    bill.nBillID = 1;
+    bill.billID = uint256S("a2b1");
+    bill.amount = 10000;                       // 10 g of face (mg)
+    bill.amountEscrow = nEscrow;               // the bond the drawee posted (sats)
+    bill.nIssuedHeight = 4000;
+    bill.nMaturityHeight = 8000;
+    bill.vchAcceptorPubKey = UR16Pub(keyAcceptor);
+    bill.vchHolderPubKey = UR16Pub(keyHolder);
+    bill.nRefHouseID = 5;
+    bill.nOwnerHouseID = 0;
+    bill.status = BILL_STATUS_ACTIVE;
+    BillRetire retire;
+    retire.nBillID = 1;
+    retire.nRateNamed = nRate;
+    CMutableTransaction mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
+    BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, nRate, BillHashOutputs(CTransaction(mtx))),
+                                   retire.vchAcceptorSig));
+    mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
+    return UR16Run(mtx, bill, nullptr);
+}
+std::string SAN2Said(const std::string& r) { return r.empty() ? std::string("ACCEPTED") : "refused (" + r + ")"; }
+} // namespace
+
+// At the suite's rate (every house 1000 sats per gram), the bill's face is 10,000 sats.
+BOOST_AUTO_TEST_CASE(sa_n2_retire_pays_at_least_the_bond)
+{
+    // The bond above the face's value: the bond is the floor.
+    std::string r = SAN2Retire(50000, 1000, 50000);
+    BOOST_CHECK_MESSAGE(r.empty(), "SA-N2 control: a RETIRE paying the 50,000-sat bond was " + SAN2Said(r));
+    r = SAN2Retire(50000, 1000, 49999);
+    BOOST_CHECK_MESSAGE(r == "bad-bill-retire-payment",
+                        "SA-N2: a RETIRE paying 49,999 sats on a bill bonded 50,000 (face 10,000 sats at the ask) was " +
+                        SAN2Said(r));
+    r = SAN2Retire(50000, 1000, 10000);
+    BOOST_CHECK_MESSAGE(r == "bad-bill-retire-payment",
+                        "SA-N2: a RETIRE paying only the face (10,000 sats) on a bill bonded 50,000 was " + SAN2Said(r));
+    // The bond below the face's value: the face at the 30-day ask stays the floor (unchanged).
+    r = SAN2Retire(4000, 1000, 10000);
+    BOOST_CHECK_MESSAGE(r.empty(), "SA-N2 control: a RETIRE paying the face on a bill bonded 4,000 was " + SAN2Said(r));
+    r = SAN2Retire(4000, 1000, 9999);
+    BOOST_CHECK_MESSAGE(r == "bad-bill-retire-payment",
+                        "SA-N2 control: a RETIRE paying under the face on a bill bonded 4,000 was " + SAN2Said(r));
+}
+
+// The attack itself: the reference house is the drawee's own, new, with a first rate of bid = ask = 1 sat per gram.
+// Its 30-day high ask is 1, so the face is 10 sats. Paying 10 sats must not discharge a bill bonded 50,000.
+BOOST_AUTO_TEST_CASE(sa_n2_rigged_reference_house_gains_nothing)
+{
+    const int64_t DAYSECS = RATE_DAY_SECONDS;
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t T = 400 * DAYSECS;
+    AdvanceChainClock(units, UR16_HEIGHT - 20, T - 2000, gp);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 5, 1, 1, UR16_HEIGHT - 10, T - 1000, gp, strReject),
+                          "SA-N2 setup: the reference house's first post of 1 sat per gram was refused: " + strReject);
+    AdvanceChainClock(units, UR16_HEIGHT - 1, T, gp);
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;              // the reference's real (rigged) rate
+    {
+        UnitsCheckScope scope(&units);
+        uint64_t nMaxBid = 0, nMaxAsk = 0;
+        BOOST_REQUIRE(HouseRateMaxForChecks(5, UR16_HEIGHT, 30, nMaxBid, nMaxAsk));
+        BOOST_REQUIRE_EQUAL(nMaxAsk, 1u);      // the 30-day high ask is the rigged 1 sat per gram
+        std::string r = SAN2Retire(50000, 1, 10);
+        BOOST_CHECK_MESSAGE(r == "bad-bill-retire-payment",
+                            "SA-N2: with the drawee's own reference house at 1 sat per gram, a RETIRE paying 10 sats on "
+                            "a bill bonded 50,000 was " + SAN2Said(r) + " (the drawee discharges for nothing and keeps "
+                            "its bond)");
+        r = SAN2Retire(50000, 1, 50000);
+        BOOST_CHECK_MESSAGE(r.empty(), "SA-N2 control: at the rigged rate, a RETIRE paying the bond was " + SAN2Said(r));
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

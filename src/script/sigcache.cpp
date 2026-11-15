@@ -80,6 +80,27 @@ void InitSignatureCache()
             (nElems*sizeof(uint256)) >>20, (nMaxCacheSize*2)>>20, nElems);
 }
 
+// UR3-4 (FreeBank): FreeBank's own payload signatures (house approvals, holder signatures) use the same cache. An entry
+// means pubkey.Verify(hash, sig) returned true - exactly what the script checker caches - so the two can share it.
+// Never erases: the mempool sweep reads it again at every tip change while the tx stays pooled.
+bool SignatureCacheHas(const uint256& hash, const std::vector<unsigned char>& vchSig, const CPubKey& pubkey)
+{
+    if (vchSig.empty() || !pubkey.IsValid())
+        return false;
+    uint256 entry;
+    signatureCache.ComputeEntry(entry, hash, vchSig, pubkey);
+    return signatureCache.Get(entry, false);
+}
+
+void SignatureCacheAdd(const uint256& hash, const std::vector<unsigned char>& vchSig, const CPubKey& pubkey)
+{
+    if (vchSig.empty() || !pubkey.IsValid())
+        return;
+    uint256 entry;
+    signatureCache.ComputeEntry(entry, hash, vchSig, pubkey);
+    signatureCache.Set(entry);
+}
+
 bool CachingTransactionSignatureChecker::VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& pubkey, const uint256& sighash) const
 {
     uint256 entry;

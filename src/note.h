@@ -698,13 +698,6 @@ void NoteDemandAccrualWindow(const CHouse& house, uint32_t nDemandTag, uint32_t 
 CAmount NoteDemandInterest(const CHouse& house, uint32_t nDemandTag, uint64_t nUnits,
                            uint32_t nPayHeight, const Consensus::Params& consensus);
 
-/** The pro-rata waterfall entitlement: burning nUnits against the insolvency
- * snapshot (amountPot escrow backing nSnapshotUnits claims) entitles the
- * holder to min(nUnits, floor(nUnits * amountPot / nSnapshotUnits)) sats.
- * 128-bit intermediate (the product overflows uint64). Returns 0 if
- * nSnapshotUnits == 0. */
-CAmount NoteClaimEntitlement(uint64_t nUnits, const CAmount& amountPot, uint64_t nSnapshotUnits);
-
 /** Gram-notes release (R2-int-10): the sECX a claim of nUnits mg takes from a failed house's pot when it also takes
  *  nGoldMg of gold - its pro-rata share of the (tranche) pot, floor(nUnits x amountPot / nSnapshotUnits), but no more than
  *  par still owes after the gold, floor((nUnits - nGoldMg) x nSatsPerGram / 1000). 0 when nSatsPerGram is 0. */
@@ -742,6 +735,20 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state);
  *    and mempool acceptance refuses to spend them (unconfirmed-stamp-parent);
  *  - escrow outputs (REDEEM brassage, CLAIM change) get house id 0, so nothing
  *    can chain off them. */
-void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight);
+/** MM-2 (D-2026-11-11-3): one transaction's decoded note payload, for ApplyNoteCoinTags called once per output
+ *  (AddCoins). The payload is decoded on the first call and reused: the same result a fresh decode gives each time, at
+ *  one decode per transaction instead of one per output. One cache serves exactly one transaction. */
+struct NoteTagCache {
+    bool fTried = false;
+    bool fOk = false;
+    NoteMint m;
+    NoteTransfer x;
+    NoteDemand d;
+    NoteProtest pro;
+    NoteLock l;
+    NoteUnlock u;
+};
+void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight,
+                       NoteTagCache* pCache = nullptr);
 
 #endif // BITCOIN_NOTE_H

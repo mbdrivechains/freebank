@@ -274,6 +274,8 @@ class CMainParams : public CBetaParams {
 public:
     CMainParams() {
         strNetworkID = "main";
+        // FB-14: eCash mainnet's fork block, the pin the mainnet seed has run with since 10-31 (-mainchainblockpin).
+        strDefaultMainchainBlockPin = "973728:0000000000000001441a6a4ae49d679d4a30581db3e3eaeeb2fba5da6dc146ed";
 
         // v0.2.19: dormant until a later release switches it on
         consensus.fChainDormant = true;
@@ -298,6 +300,10 @@ public:
             }
         };
         chainTxData = ChainTxData{0, 0, 0};
+        // MM-1 (security 11-10): FreeBank-aware standardness on (policy/policy.cpp: tag-keyed family outputs, the data
+        // cap, at most MAX_STANDARD_FREEBANK_OUTPUTS per FreeBank tx). Relay and mining policy only: no fork.
+        // Regtest keeps it off; FB_STD=1 runs the gates with it on.
+        fRequireStandard = true;
     }
 };
 
@@ -308,7 +314,8 @@ public:
  * never mixes with beta or mainnet and can run beside a beta node. Fixed seed
  * 163.47.9.132:28455, no DNS seed. An easynet build (configure --with-easynet) runs
  * it with no flag. Each new FreeBank-easynet chain takes the next magic last byte (03 for L1 resets 3 and 4, 05 for
- * the v1.1.0 restart on reset 4, 06 for the Gold B v1.2.0 restart): it no longer follows the L1's reset number.
+ * the v1.1.0 restart on reset 4, 06 for the Gold B v1.2.0 restart, 07 for v1.2.2): it no longer follows the L1's
+ * reset number.
  */
 /** No forks (D-2026-11-05-3): easynet's switch time for the later rules. Set at the release that carries them (rel.sh
  *  release-draft refuses LATER_RULE_NEVER here). */
@@ -318,8 +325,13 @@ class CEasynetParams : public CBetaParams {
 public:
     CEasynetParams() {
         strNetworkID = "easynet";
+        nWithdrawalBundleSendDepth = 6;   // main and beta: 144 (the default)
+        // FB-14: the easynet L1's genesis (easynet-4), the pin FreeBank-easynet's seed and the app pass today.
+        strDefaultMainchainBlockPin = "0:000000018a449eb24e2c55744a19ad02db5928fa89296f87cbb2059784b2b211";
 
-        // Its own network. Gold B (v1.2.0) restarts it fresh again: magic 06, genesis 3, deposits from L1 1,676.
+        // Its own network. v1.2.2 restarts it fresh (the switch-on rules from genesis, among them UR-ext-13's network tag
+        // in every payload signature hash, so the v1.2.0 chain's signatures no longer verify): magic 07, genesis 4,
+        // deposits from L1 2,058. Gold B (v1.2.0) restarted it too: magic 06, genesis 3, deposits from L1 1,676.
         // Gram-notes release (v1.1.0, scope 7h): FreeBank-easynet restarts as a fresh chain on the same
         // L1 (reset 4), so the last byte moves to 05: the old chain's blocks and peers stay apart (-reindex finds blocks
         // by this magic, and the old chain is moved aside, not carried on). Before: 03, kept on reset 4 so the
@@ -327,20 +339,20 @@ public:
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;
-        pchMessageStart[3] = 0x06;   // Gold B (v1.2.0): a fresh chain again (B's rules from genesis, a new units DB)
+        pchMessageStart[3] = 0x07;   // v1.2.2: a fresh chain again (the switch-on rules from genesis, a new units DB)
         nDefaultPort = 28455;
 
-        genesis = CreateGenesisBlock("FreeBank easynet genesis 3: Gold B (v1.2.0), easynet slot 130, 2026-11-07",
+        genesis = CreateGenesisBlock("FreeBank easynet genesis 4: switch-on rules (v1.2.2), easynet slot 130, 2026-11-13",
                                      CScript() << OP_RETURN,
-                                     1794009600, 1, 0);   // 2026-11-07 00:00Z: before every L1 block it will use
+                                     1794528000, 1, 0);   // 2026-11-13 00:00Z: before every L1 block it will use
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0x485b81d796286e671b322fc07ebb88c7e6da9d1e9e4eeaae06a26af6dcaa7107"));
+        assert(consensus.hashGenesisBlock == uint256S("0x8b1db1c4912cb8459107a195007248f486d7103d99e5d7d05db29b548e290eed"));
         // The fresh chain binds credit signatures from genesis.
         consensus.nCreditBindingHeight = 0;
-        // ...and credits only treasury changes from L1 block 1,676 (Gold B restart): the 73.29792050 ECX in the treasury at
-        // L1 1,675 (sequence 8, no bundle pending or in voting; easynet 2026-11-07 21:03Z) stays the old chains'. Each
-        // later deposit credits what it added (DEPOSITS_664_SPEC). (v1.1.0's chain: 1,100.)
-        consensus.nDepositStartL1Height = 1676;
+        // ...and credits only treasury changes from L1 block 2,058 (v1.2.2 restart): the 123.29792050 ECX in the treasury
+        // at L1 2,057 (sequence 9, no bundle pending or in vote; easynet 2026-11-15 03:45Z, after the fire) stays the old
+        // chains'. Each later deposit credits what it added (DEPOSITS_664_SPEC). (v1.2.0's chain: 1,676; v1.1.0's: 1,100.)
+        consensus.nDepositStartL1Height = 2058;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
         // No forks (D-2026-11-05-3): easynet switches the later rules on days after the release that carries them, so
         // they can be seen working before mainnet's date. EASYNET_LATER_RULES_TIME: set at that release.
@@ -356,6 +368,10 @@ public:
             }
         };
         chainTxData = ChainTxData{0, 0, 0};
+        // MM-1 (security 11-10): FreeBank-aware standardness on (policy/policy.cpp: tag-keyed family outputs, the data
+        // cap, at most MAX_STANDARD_FREEBANK_OUTPUTS per FreeBank tx). Relay and mining policy only: no fork.
+        // Regtest keeps it off; FB_STD=1 runs the gates with it on.
+        fRequireStandard = true;
     }
 };
 
@@ -366,6 +382,7 @@ class CRegTestParams : public CChainParams {
 public:
     CRegTestParams() {
         strNetworkID = "regtest";
+        nWithdrawalBundleSendDepth = 2;
         consensus.nSubsidyHalvingInterval = 150;
         consensus.BIP16Height = 0; // always enforce P2SH BIP16 on regtest
         consensus.BIP34Height = 100000000; // BIP34 has not activated on regtest (far in the future so block v1 are not rejected in tests)
@@ -508,6 +525,11 @@ void UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime)
 void UpdateDepositStartL1Height(int nHeight)
 {
     globalChainParams->UpdateDepositStartL1Height(nHeight);
+}
+
+void UpdateClockIsHeight(bool fClockIsHeight)
+{
+    globalChainParams->UpdateClockIsHeight(fClockIsHeight);
 }
 
 void UpdateCreateFeeForTest(int64_t nCreateFeeSats)

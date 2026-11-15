@@ -347,7 +347,7 @@ CMutableTransaction BuildHRetire(const World& w, const WBill& wb, const WHouse& 
     mtx.vout.push_back(CTxOut(wb.bill.amount, BillScriptForPubKey(wb.bill.vchHolderPubKey)));
     CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION); ss0 << h;
     SetBillPayload(mtx, ss0);
-    BOOST_REQUIRE(wb.acceptor.Sign(BillRetireSigHash(wb.bill.billID,
+    BOOST_REQUIRE(wb.acceptor.Sign(BillRetireSigHash(wb.bill.billID, h.nRateNamed,   // UR1-6
             BillHashOutputs(CTransaction(mtx))), h.vchAcceptorSig));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << h;
     SetBillPayload(mtx, ss);

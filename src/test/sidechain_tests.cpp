@@ -1152,6 +1152,10 @@ BOOST_AUTO_TEST_CASE(withdrawal_guard_payable_rule)
     SidechainWithdrawal w = MakeWithdrawalRow(L1_P2PKH_REGTEST, COIN, 1000, 0);
     w.amount = w.mainchainFee;
     BOOST_CHECK(!CheckWithdrawalPayable(w, strReason));
+    // testing (mutation 2026-11-13): isolate the amount>0 && fee>0 && amount>fee guard from the dust guard. A zero fee
+    // with a valid, above-dust payout passes every other check, so only the positivity guard rejects it; without this
+    // case removing that guard goes unnoticed (it survived mutation). amount>0 and amount>fee are masked by dust here.
+    BOOST_CHECK(!CheckWithdrawalPayable(MakeWithdrawalRow(L1_P2PKH_REGTEST, COIN, 0, 0), strReason)); // fee == 0
     // Activation predicate
     BOOST_CHECK(WithdrawalGuardActive(10, 10));
     BOOST_CHECK(!WithdrawalGuardActive(9, 10));
@@ -1496,20 +1500,25 @@ BOOST_AUTO_TEST_CASE(loose_tx_sidechain_obj_policy)
     std::string strReject;
     int nDoS = -1;
 
-    // 1. One burn, two withdrawal objects: refused, not pooled, and exactly
-    //    the tx ConnectBlock's burn rule refuses
+    // 1. One burn, two withdrawal objects: the tx ConnectBlock's burn rule
+    //    refuses. UR-ext-9 (plain v1.2.2): the pool now takes at most ONE
+    //    withdrawal object per tx, checked before any burn scan, so it is
+    //    refused as withdrawal-multiple (DoS 0), not pooled.
     const CTransactionRef txShared = MakeTwoWithdrawalTx(FundCoinForTest(11, COIN), COIN, 1);
     BOOST_CHECK(!ConnectBlockClaimsEveryBurn(*txShared));
     BOOST_CHECK(!AcceptForTestDoS(txShared, strReject, nDoS));
-    BOOST_CHECK_EQUAL(strReject, "invalid-withdrawal-burn-already-claimed");
+    BOOST_CHECK_EQUAL(strReject, "withdrawal-multiple");
     BOOST_CHECK_EQUAL(nDoS, 0);
     BOOST_CHECK(!InMempool(txShared));
 
-    // Two burns back two withdrawals: valid in a block, so still accepted
+    // Two burns back two withdrawals: still valid in a block (consensus is
+    // unchanged), but the pool refuses it too under the one-per-tx policy
     const CTransactionRef txTwoBurns = MakeTwoWithdrawalTx(FundCoinForTest(12, COIN), COIN, 2);
     BOOST_CHECK(ConnectBlockClaimsEveryBurn(*txTwoBurns));
-    BOOST_CHECK_MESSAGE(AcceptForTestDoS(txTwoBurns, strReject, nDoS), "two burns refused: " << strReject);
-    BOOST_CHECK(InMempool(txTwoBurns));
+    BOOST_CHECK(!AcceptForTestDoS(txTwoBurns, strReject, nDoS));
+    BOOST_CHECK_EQUAL(strReject, "withdrawal-multiple");
+    BOOST_CHECK_EQUAL(nDoS, 0);
+    BOOST_CHECK(!InMempool(txTwoBurns));
 
     // The wallet's own shape (one burn, one withdrawal) is unaffected
     const CTransactionRef txWallet = MakeWithdrawalTx(FundCoinForTest(13, COIN), COIN, L1_P2PKH_REGTEST, COIN / 10, 5000);
@@ -1561,15 +1570,14 @@ BOOST_AUTO_TEST_CASE(loose_tx_sidechain_obj_policy)
     BOOST_CHECK_EQUAL(nDoS, 0);
     BOOST_CHECK(!InMempool(txBundle));
 
-    // The template draws only from the pool: it carries the valid withdrawals
+    // The template draws only from the pool: it carries the wallet's withdrawal
     // and none of the refused txs
     CBlock block;
     std::string strError;
     BOOST_REQUIRE(BlockAssembler(Params()).GenerateBMMBlock(block, strError, nullptr,
         std::vector<CMutableTransaction>(), uint256(), GetCoinbaseScript()));
-    BOOST_CHECK(BlockHasTx(block, txTwoBurns));
     BOOST_CHECK(BlockHasTx(block, txWallet));
-    for (const CTransactionRef& tx : {txShared, txDeposit, txBundle})
+    for (const CTransactionRef& tx : {txShared, txTwoBurns, txDeposit, txBundle})
         BOOST_CHECK(!BlockHasTx(block, tx));
 }
 

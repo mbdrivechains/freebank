@@ -14,6 +14,8 @@
 #include <script/script.h>
 #include <test/test_bitcoin.h>
 #include <uint256.h>
+#include <undo.h>          // CTxUndo (UR-ext-1)
+#include <validation.h>    // UpdateCoins (UR-ext-1)
 
 #include <boost/test/unit_test.hpp>
 
@@ -251,6 +253,23 @@ BOOST_AUTO_TEST_CASE(asset_addcoins_applies_tags)
     BOOST_CHECK(c0.fBitAssetControl && !c0.fBitAsset && c0.assetID == tx.GetHash());
     BOOST_CHECK(c1.fBitAsset && !c1.fBitAssetControl && c1.assetID == tx.GetHash());
     BOOST_CHECK(!c2.IsAssetColoured());
+}
+
+// testing (2026-11-10): UR-ext-1 (DeepSeek, external s3 round 1), fixed in d48a684. UpdateCoins on the connect path
+// used to assert(fOK) on ComputeAssetTags, so a tx that broke an asset rule after validation aborted the node instead of
+// refusing the block. The regression: such a tx makes UpdateCoins return false (the caller refuses the block), and the
+// process keeps running. On a tree before d48a684 this test aborts the suite.
+BOOST_AUTO_TEST_CASE(testing_ur_ext_1_update_coins_refuses_not_aborts)
+{
+    CCoinsView base;
+    CCoinsViewCache cache(&base);
+    const uint256 idA = uint256S("a1"), idB = uint256S("b2");
+    cache.AddCoin(COutPoint(uint256S("aa"), 0), Units(1000, idA), false);
+    cache.AddCoin(COutPoint(uint256S("aa"), 1), Units(5, idB), false);
+    const CTransaction tx(Spend(2, {1005}));   // units of two assets in one transfer: bad-asset-inputs-mixed
+    CTxUndo undo;
+    BOOST_CHECK_MESSAGE(!UpdateCoins(tx, cache, undo, 100),
+                        "UR-ext-1: UpdateCoins accepted a transfer mixing two assets' units");
 }
 
 BOOST_AUTO_TEST_CASE(asset_metadata_signed_A2)

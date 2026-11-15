@@ -4,6 +4,7 @@
 
 #include <l1client.h>
 
+#include <chainparams.h>
 #include <core_io.h>
 #include <fs.h>
 #include <primitives/transaction.h>
@@ -784,6 +785,31 @@ BOOST_AUTO_TEST_CASE(l1client_bmm_request_own_node_conflict)
     BOOST_CHECK(!GrpcurlBMMRequestOwnNodeConflict(0, strNight));
 }
 
+// FB-14: mainnet and easynet carry their own L1 block pin, used when no pin or signet challenge is passed; an explicit
+// -mainchainblockpin wins; a signet challenge means no block pin; regtest has none built in.
+BOOST_AUTO_TEST_CASE(l1client_builtin_block_pin)
+{
+    const std::string strMain = "973728:0000000000000001441a6a4ae49d679d4a30581db3e3eaeeb2fba5da6dc146ed";
+    gArgs.ForceSetArg("-mainchainblockpin", "");
+    gArgs.ForceSetArg("-mainchainchallenge", "");
+    SelectParams(CBaseChainParams::MAIN);
+    BOOST_CHECK_EQUAL(MainchainBlockPinArg(), strMain);
+    int nHeight = 0;
+    uint256 hash;
+    BOOST_CHECK(ParseMainchainBlockPin(MainchainBlockPinArg(), nHeight, hash));
+    BOOST_CHECK_EQUAL(nHeight, 973728);
+    gArgs.ForceSetArg("-mainchainblockpin", "1:00000000000000000000000000000000000000000000000000000000000000aa");
+    BOOST_CHECK_EQUAL(MainchainBlockPinArg(), "1:00000000000000000000000000000000000000000000000000000000000000aa");
+    gArgs.ForceSetArg("-mainchainblockpin", "");
+    gArgs.ForceSetArg("-mainchainchallenge", "51");
+    BOOST_CHECK_EQUAL(MainchainBlockPinArg(), "");
+    gArgs.ForceSetArg("-mainchainchallenge", "");
+    SelectParams(CBaseChainParams::EASYNET);
+    BOOST_CHECK_EQUAL(MainchainBlockPinArg(), "0:000000018a449eb24e2c55744a19ad02db5928fa89296f87cbb2059784b2b211");
+    SelectParams(CBaseChainParams::REGTEST);
+    BOOST_CHECK_EQUAL(MainchainBlockPinArg(), "");
+}
+
 BOOST_AUTO_TEST_CASE(l1client_bmm_request_not_sent)
 {
     // Definite: the enforcer refused before building the tx, or never got the call
@@ -1190,6 +1216,278 @@ BOOST_AUTO_TEST_CASE(v0225_chain_name_from_enforcer)
         BOOST_CHECK_MESSAGE(ChainNameFromEnforcerChainInfo(reply) == c.second, c.first);
     }
     BOOST_CHECK(ChainNameFromEnforcerChainInfo(UniValue(UniValue::VARR)).empty());
+}
+
+// testing (2026-11-10), ultra s5 UR5-3: UpdateDeposits' decision, extracted as ScanTreasuryChanges (5633feb). Before the
+// fix the inline loop failed the WHOLE batch on any "paid" event lacking its running number or M6 - before the
+// below-start skip and the recorded check ran - so one old payout stopped every new deposit for good. A malformed paid
+// event in processed history (L1 position at or before the newest recorded change's) must now be skipped; only a NEW
+// one fails closed.
+BOOST_AUTO_TEST_CASE(testing_ur5_3_scan_treasury_skips_processed_malformed_payout)
+{
+    const uint256 blkOld = uint256S(std::string(64, 'a'));   // processed history
+    const uint256 blkNew = uint256S(std::string(64, 'b'));   // after the newest recorded change
+    const uint256 blkDep = uint256S(std::string(64, 'c'));   // the new deposit's block
+    const uint256 blkPre = uint256S(std::string(64, 'd'));   // below this chain's deposit start
+    const std::map<uint256, int> pos = {{blkPre, 1}, {blkOld, 2}, {blkNew, 8}, {blkDep, 9}};
+    auto fnPos = [&](const uint256& h) { auto it = pos.find(h); return it == pos.end() ? -1 : it->second; };
+    auto fnBelow = [&](const uint256& h) { return h == blkPre; };
+    const int nLastRecordedPos = 5;
+
+    L1DepositEvent dep;
+    dep.hashMainBlock = blkDep;
+    dep.outpoint = COutPoint(uint256S(std::string(64, 'e')), 0);
+    dep.nSequence = 7;
+    dep.nValue = 100000;
+    auto paid = [](const uint256& blk, bool fSeq, const std::vector<unsigned char>& vchTx) {
+        L1WithdrawalEvent w;
+        w.m6id = uint256S(std::string(64, 'f'));
+        w.hashMainBlock = blk;
+        w.status = 'S';
+        w.fHaveSequence = fSeq;
+        w.nSequence = fSeq ? 3 : 0;
+        w.vchTx = vchTx;
+        return w;
+    };
+    const std::vector<unsigned char> vchGarbage = {0xde, 0xad, 0xbe, 0xef};
+
+    // 1. THE UR5-3 CASE: an OLD paid event with no running number and no M6, plus a NEW deposit -> the deposit is
+    //    credited. (v1.2.1 credited nothing here: the batch failed before the skip ran.)
+    {
+        L1PegEvents ev;
+        ev.vDeposit.push_back(dep);
+        ev.vWithdrawal.push_back(paid(blkOld, false, {}));
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, nLastRecordedPos, fnPos, fnBelow, v) == TreasuryScan::OK);
+        BOOST_REQUIRE_EQUAL(v.size(), 1U);
+        BOOST_CHECK(v[0].pDeposit != nullptr && v[0].pPaid == nullptr);
+        BOOST_CHECK_EQUAL(v[0].nSequence, 7U);
+        BOOST_CHECK(v[0].txid == dep.outpoint.hash);
+    }
+    // 2. an old paid event whose M6 won't decode is skipped the same way
+    {
+        L1PegEvents ev;
+        ev.vDeposit.push_back(dep);
+        ev.vWithdrawal.push_back(paid(blkOld, true, vchGarbage));
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, nLastRecordedPos, fnPos, fnBelow, v) == TreasuryScan::OK);
+        BOOST_CHECK_EQUAL(v.size(), 1U);
+    }
+    // 3. the SAME malformed event in a NEW block still fails closed: its change can't be recorded without the data
+    {
+        L1PegEvents ev;
+        ev.vDeposit.push_back(dep);
+        ev.vWithdrawal.push_back(paid(blkNew, false, {}));
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, nLastRecordedPos, fnPos, fnBelow, v) == TreasuryScan::FAIL_CLOSED);
+    }
+    {
+        L1PegEvents ev;
+        ev.vWithdrawal.push_back(paid(blkNew, true, vchGarbage));
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, nLastRecordedPos, fnPos, fnBelow, v) == TreasuryScan::FAIL_CLOSED);
+    }
+    // 4. nothing recorded yet (-1): no processed history to skip into, so a malformed paid event fails closed
+    {
+        L1PegEvents ev;
+        ev.vWithdrawal.push_back(paid(blkOld, false, {}));
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, -1, fnPos, fnBelow, v) == TreasuryScan::FAIL_CLOSED);
+    }
+    // 5. below this chain's deposit start: skipped whatever its shape (it belongs to the chain before), and the skip
+    //    comes BEFORE the fail-closed test
+    {
+        L1PegEvents ev;
+        ev.vDeposit.push_back(dep);
+        ev.vWithdrawal.push_back(paid(blkPre, false, {}));
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, -1, fnPos, fnBelow, v) == TreasuryScan::OK);
+        BOOST_CHECK_EQUAL(v.size(), 1U);
+    }
+    // 6. a status other than paid is not a treasury change
+    {
+        L1PegEvents ev;
+        L1WithdrawalEvent w = paid(blkNew, false, {});
+        w.status = 'P';
+        ev.vWithdrawal.push_back(w);
+        std::vector<TreasuryChange> v;
+        BOOST_CHECK(ScanTreasuryChanges(ev, nLastRecordedPos, fnPos, fnBelow, v) == TreasuryScan::OK);
+        BOOST_CHECK(v.empty());
+    }
+}
+
+// testing (2026-11-10), ultra s5 UR5-2: FetchWithdrawalEvents asks for the WHOLE slot-130 history, the same call as
+// GetPegEvents' - but used CallValidator's 15 s default where GetPegEvents gave 60 s, so on a long L1 history it timed
+// out and bundles were never proposed (or stayed CREATED once paid or failed). Drive the real
+// ListWithdrawalBundleStatus through a fake grpcurl and record every enforcer call's timeout with the 5633feb spy.
+BOOST_AUTO_TEST_CASE(testing_ur5_2_withdrawal_history_uses_whole_history_timeout)
+{
+    const fs::path dir = fs::temp_directory_path() / fs::unique_path("fb_fake_grpcurl_%%%%%%%%");
+    BOOST_REQUIRE(fs::create_directories(dir));
+    const fs::path script = dir / "grpcurl";
+    {
+        fs::ofstream f(script);
+        f << "#!/bin/sh\n"
+             "for last; do :; done\n"
+             "case \"$last\" in\n"
+             "  */GetChainTip) echo '{\"blockHeaderInfo\": {\"blockHash\": {\"hex\": \"00000000000000000000000000000000000000000000000000000000000000ff\"}, \"height\": 100}}' ;;\n"
+             "  */GetTwoWayPegData) echo '{\"blocks\": []}' ;;\n"
+             "  *) exit 1 ;;\n"
+             "esac\n";
+    }
+    BOOST_REQUIRE_EQUAL(chmod(script.string().c_str(), 0700), 0);
+    gArgs.ForceSetArg("-grpcurlbin", script.string());
+    gArgs.ForceSetArg("-enforcertransport", "grpcurl");
+
+    std::vector<std::pair<std::string, int>> vCall;
+    g_fnEnforcerCallSpyForTest = [&](const std::string& strMethod, int nTimeoutSecs) { vCall.emplace_back(strMethod, nTimeoutSecs); };
+    std::vector<uint256> vHash;
+    GetEnforcerL1Client().ListWithdrawalBundleStatus(vHash);
+    g_fnEnforcerCallSpyForTest = nullptr;
+
+    int nHistoryCalls = 0;
+    for (const auto& c : vCall) {
+        if (c.first != "GetTwoWayPegData") continue;
+        nHistoryCalls++;
+        BOOST_CHECK_MESSAGE(c.second == ENFORCER_WHOLE_HISTORY_TIMEOUT,
+                            "GetTwoWayPegData ran with a " << c.second << " s timeout, want " << ENFORCER_WHOLE_HISTORY_TIMEOUT);
+    }
+    BOOST_CHECK_MESSAGE(nHistoryCalls >= 1, "ListWithdrawalBundleStatus never asked for the withdrawal history");
+    BOOST_CHECK(ENFORCER_WHOLE_HISTORY_TIMEOUT > 15);   // the v1.2.1 default it replaced
+
+    gArgs.ForceSetArg("-grpcurlbin", "grpcurl");
+    gArgs.ForceSetArg("-enforcertransport", DEFAULT_ENFORCER_TRANSPORT);
+    fs::remove_all(dir);
+}
+
+// UR5-11 (the JSON-RPC transport, regtest/BitcoinX only): BitcoinX's listsidechaindepositsbyblock reply, captured
+// 2026-11-11 from a BitcoinX regtest node (three deposits of 25, 7 and 3 BTX to slot 130; the last two in one block),
+// read as v0.2.17 deposit events. The last treasury outpoint is the CTIP BitcoinX itself reported (listsidechainctip).
+BOOST_AUTO_TEST_CASE(ur5_11_jsonrpc_deposit_events_from_bitcoinx)
+{
+    static const char* REPLY = R"JSON([{"nsidechain": 130, "strdest": "mxFakeDestAddr1qqqqqqqqqqqqqqqqqq", "txhex": "020000000861a1c5891eb610a55483b70bc3cdd02b4e116504071cf8714d7e2a60a84129860000000049483045022100a995b9c7f38d1f57343c72eaa143addff61754809256001f620cc15317697670022071102945826a0c65d88f9b0fdab70af8c442b2d53e30c38a9cbde6edafb415c001ffffffff823353e19b7ff5596f92addaacf15ac1e137ae0fc8e0a599cb4cff5d8365ff88000000004847304402207fcd4ce2959ad056389a82079d847f4d76d31246b16ada64d067303ebf55948a02207d17add3d3f846342efe2e74c1eeabd38f37544309349d2cad4d594a6720b4a701ffffffff91092a25baafdc5b547c53307b79e6fa088574538d459d75bcedabb5f8d115d00000000048473044022030ff4fbfcdcf6b901385ede59de8d0515ddef772231c5a80016b63a5238381f402200f44134bdb932da2b86eb9d3dd80181c53521552ed93ad06020574e0d2d0603f01ffffffffa2911a1b3fe723939be526587c6530a034cc9ec0e0ff7767f51543056f83e56a000000004847304402203d0e84a0f32e7b85850a5eb1411d9b61962e3a9a204bf23eac4d7ba64d688c2a02200acbb282f39ff187b482f4f7dd4af5a98c3507766988019fe514df1fa5d790e601ffffffffb3ff5dea93cd49852625e282744eb722165dc1e4b8600f224a2e1a322361ced70000000049483045022100b87fa730b7c7faacf523a4b0c2fb15c28219e65b28e648136ea84bcf123a021d02203c7771258bde7fd8fe0627c4ef2109f8a6b40d7f9b6ff81746e0c1b5266962a501ffffffffd10e18311d46e58ea207319aace2c8c44247c47fe618dae25c59f1f676c5d7ab0000000049483045022100fcda582690b327f3ac355735121ccc6cf0a502836d94f4c9939ab195346d58ca02204208540f3477c96e4e04f18fa727fccdf8e26f4b3a351d0b09bcaeadc4f14c0901ffffffffdf51b32e5dcd8ce078035b7938b9928dc6a294f9e9768e5b8d2e496686ce5b550000000048473044022033e73955ba66a3f9e2f5cc2d3a02917199878e4832e87ac3b2c214269bbb09bc02201cf7d176c2d6850dfaaa7970811c12bec41ad25a7baae2a988299b02b06b267f01ffffffffe2c173022931a1896e433966a1be902cd3154528aa46914ab5bb2418cb17b50b0000000048473044022035985c0aa05a099b62d87a785c554c539a995c9ff60ccb2b292dee4278ed53920220605f88385145b3766c4ef1503e3b3cb96dd04dc8b86dc47544872d738478672201ffffffff03d86e1300000000001976a9149bd4c11bd782a9d8b2e32076d54f0d027719d2f288ac0000000000000000236a216d7846616b6544657374416464723171717171717171717171717171717171717100f902950000000002b48200000000", "nburnindex": 2, "ntx": 1, "hashblock": "4966eb6b4aabd72de5b307a0b854730787320abcfa52e9289171bbceb7f6deb3"}, {"nsidechain": 130, "strdest": "mxFakeDestAddr2qqqqqqqqqqqqqqqqqq", "txhex": "02000000080d26d128e296abadcefb406e71babfb17d492e517f5f8fbe44423ad6c10d00c80000000049483045022100e689c6167f815ef39146731bc05246ddcb78f728846d5348d89cfb9b63c3e66d02206935f91d065bc72020afc7ca21a46be3012cd7ed18ed4fa618bda7822760096401ffffffff3cafa7f39ed30c295d1269e0f14497efd9cc7f1e8568358b75f02d6b3d8e2ad700000000484730440220145375b718a9beb9661c153ce46917597dce4ad7e4b43a402d4ed0768c3a2484022070c09152835d03e6f70a7a6b45a5911828df77174129d8eb957362f11e4aef2201ffffffff68369e1953ed019b30e664b3259496d3df1633416797871c9766f251a1ae18250000000049483045022100e83065f0325d13aa76573405166aa6b1fc60b830e79b35896e08fba4bf09bbf20220325ab1ac24ce37aea349818967082d14a1e9f115ea61a9c325680bbc284b579901ffffffff79ba2a9266c3c06561096636167dcd2a3f5e2f22bbd1561c22233dc09c2ffca80000000049483045022100fe01666aca7369c2b4edfe78f319468f2f60993c3a775d4b7e2bf8ece5d5478602205c8a514da5333826ce5610d0e7be655f4cc01e923ec03b21ff7c39b40b47516c01ffffffff94038ca14c985565dabcaa2b5b1c123e4c066464dac55ba8e6049bc99329c2cb0000000049483045022100a98d5b5b54acdc812c7d12d09130313c7db6752fb1363eb568568a3a5780605502201b6304ecc7e0bbc0eb03e11a69470e1ce45501800dc9874060c62ef661e8ddee01ffffffff9ab5e7e673416abc1efed991c03774816e6b3b1fb909fd4f6351019507def0ae00000000484730440220446c7fdf5cb5a899503018938e83fad42fdea40f7ce2d4d4cbc62ddac99168c002204b1c9cf96fd750b0ff89fa04613a3385544b053840a593e43139443cf30eac1c01ffffffffa4fa17cc51535df270d3f908f7825301d7d7a21fe0367f4e89003e8b4e6c23cd000000006b483045022100fefba99369056a6128709830ccbbd3e52a6f3519f4f55b0b68b9e49e2c4489e902204282e53b5524a01c9bdef3e1314d51846034383d0485a72a67c829bf16e9fac3012103953a4180d358652f4429c0cb39893bd40b2c4f297737cd39124e2bff1c894c2cffffffffa4fa17cc51535df270d3f908f7825301d7d7a21fe0367f4e89003e8b4e6c23cd0200000000ffffffff03b34d0f00000000001976a9142625464e8e532262445e9d35f87f3d77f6804b8f88ac0000000000000000236a216d7846616b654465737441646472327171717171717171717171717171717171710020bcbe0000000002b48200000000", "nburnindex": 2, "ntx": 1, "hashblock": "6a748256e24219742b426fc79bb0eecea17e06e9e148bb37f0f19cb76cd181b0"}, {"nsidechain": 130, "strdest": "mxFakeDestAddr1qqqqqqqqqqqqqqqqqq", "txhex": "02000000041789c1515c7a31a59e4471fe5b368be03165d4d2d0bc28edf0fd53db65ca37700000000049483045022100fdfff062212bc7d1e4b6769855b13b015dc94c8fbae5a3155e108242129f598702205f4dd8c605824ed84415e0a37589185d84bdd4917586096082cd3bd62fcc9e6301ffffffff56c4365d8a179dc4e65c36a0823ab7935af36bea2e14147a29ad16c5a790f6cf0000000049483045022100da993809ae9207af603e118d552a30e4c44335e39536471aa93c22a6e33b0dbe02200a6cd9db2edce59aceb15aee85932f1611017e56ee98e8b57a5d27604ce8737901ffffffffb145e282e329eea31f50bb3e156af3fc605124346ae8dcfb55d4e5f0d9c7ae700000000049483045022100e78bb62f3f16c6b21822f6d257707fed77ab10cf5e1b1187f39aa16669cc32b8022014c7377335d5b692649fde17a818ed098bfa9d595c522aa58b1297dbfd0ff40601ffffffff23382d037c9057f083f2ab78951f0d8387273c59aec72d30f8d15c1e9a4686c10200000000ffffffff0382af1000000000001976a914673a6ff8f2f93c9d3309f64e18dbdd5bd646ac2988ac0000000000000000236a216d7846616b6544657374416464723171717171717171717171717171717171717100c39dd00000000002b48200000000", "nburnindex": 2, "ntx": 2, "hashblock": "6a748256e24219742b426fc79bb0eecea17e06e9e148bb37f0f19cb76cd181b0"}])JSON";
+    UniValue deposits;
+    BOOST_REQUIRE(deposits.read(REPLY));
+    const uint256 hashB1 = uint256S("4966eb6b4aabd72de5b307a0b854730787320abcfa52e9289171bbceb7f6deb3");
+    const uint256 hashB2 = uint256S("6a748256e24219742b426fc79bb0eecea17e06e9e148bb37f0f19cb76cd181b0");
+    const auto fnHeight = [&](const uint256& h, int& n) {
+        if (h == hashB1) { n = 2252; return true; }
+        if (h == hashB2) { n = 2253; return true; }
+        return false;
+    };
+    std::vector<L1DepositEvent> v;
+    BOOST_REQUIRE(BuildJsonRpcDepositEvents(deposits, fnHeight, -1, v));
+    BOOST_REQUIRE_EQUAL(v.size(), 3u);
+    BOOST_CHECK_EQUAL(v[0].nValue, 25 * COIN);
+    BOOST_CHECK_EQUAL(v[1].nValue, 7 * COIN);
+    BOOST_CHECK_EQUAL(v[2].nValue, 3 * COIN);
+    BOOST_CHECK(v[0].hashMainBlock == hashB1 && v[1].hashMainBlock == hashB2 && v[2].hashMainBlock == hashB2);
+    BOOST_CHECK(std::string(v[0].vchAddress.begin(), v[0].vchAddress.end()) == "mxFakeDestAddr1qqqqqqqqqqqqqqqqqq");
+    BOOST_CHECK(std::string(v[1].vchAddress.begin(), v[1].vchAddress.end()) == "mxFakeDestAddr2qqqqqqqqqqqqqqqqqq");
+    for (const L1DepositEvent& ev : v)
+        BOOST_CHECK_EQUAL(ev.outpoint.n, 2u);
+    BOOST_CHECK(v[0].nSequence < v[1].nSequence && v[1].nSequence < v[2].nSequence);   // (height, tx index) order
+    BOOST_CHECK_EQUAL(v[2].outpoint.hash.GetHex(), "c1ce68964b98a0b0816c8b25808f200ea10c6dba7dfb998519282227a4327c92");
+
+    // A window from the second block: its two deposits, still valued against the treasury before them.
+    BOOST_REQUIRE(BuildJsonRpcDepositEvents(deposits, fnHeight, 2253, v));
+    BOOST_REQUIRE_EQUAL(v.size(), 2u);
+    BOOST_CHECK_EQUAL(v[0].nValue, 7 * COIN);
+    BOOST_CHECK_EQUAL(v[1].nValue, 3 * COIN);
+
+    // A gap in the treasury chain (here: the middle deposit missing) can't be read: can't tell, never a guess.
+    UniValue gap(UniValue::VARR);
+    gap.push_back(deposits[0]);
+    gap.push_back(deposits[2]);
+    BOOST_CHECK(!BuildJsonRpcDepositEvents(gap, fnHeight, -1, v));
+    BOOST_CHECK(v.empty());
+
+    // Another slot's entry is refused; so is an unknown block.
+    UniValue other(UniValue::VARR);
+    UniValue e2(UniValue::VOBJ);
+    for (const std::string& k : deposits[0].getKeys())
+        e2.pushKV(k, k == "nsidechain" ? UniValue(7) : deposits[0][k]);
+    other.push_back(e2);
+    BOOST_CHECK(!BuildJsonRpcDepositEvents(other, fnHeight, -1, v));
+    const auto fnNone = [](const uint256&, int&) { return false; };
+    BOOST_CHECK(!BuildJsonRpcDepositEvents(deposits, fnNone, -1, v));
+}
+
+// testing (2026-11-10): UR5-10 (ultra s5). The batched BMM read (ParseEnforcerBmmCommitments, its ReadCommitmentField)
+// and the single-block read (ParseEnforcerBmmCommitment) parse the same enforcer field by two hand-written copies; a
+// drift would make the two give different answers about one L1 block's h* (a consensus answer: a "no" marks a side
+// block invalid for good). freebankd will merge them into one; this pins the behaviour both must keep: for every field
+// value - absent, valid, all-zero, short, long, non-hex, the wrong type - the batched read of the block itself and of an
+// ancestor entry gives exactly the single read's answer, and a value the single read can't tell is never reported as
+// "none". Passes today (no drift yet); guards the consolidation.
+BOOST_AUTO_TEST_CASE(testing_ur5_10_bmm_commitment_parsers_agree)
+{
+    // The enforcer's ConsensusHex field is {"hex": "<64 hex chars>"} (GetHexField); everything else is malformed.
+    const std::string strValid = "11" + std::string(60, 'a') + "22";
+    const auto Hex = [](const std::string& s) { return "\"commitment\": {\"hex\": \"" + s + "\"}"; };
+    const std::vector<std::pair<std::string, std::string>> vField = {
+        {"absent", ""},
+        {"valid", Hex(strValid)},
+        {"all zero", Hex(std::string(64, '0'))},
+        {"upper case", Hex(std::string(64, 'A'))},
+        {"short", Hex(std::string(62, 'a'))},
+        {"long", Hex(std::string(66, 'a'))},
+        {"odd length", Hex(std::string(63, 'a'))},
+        {"non-hex", Hex(std::string(63, 'a') + "z")},
+        {"empty", Hex("")},
+        {"hex not a string", "\"commitment\": {\"hex\": 7}"},
+        {"no hex member", "\"commitment\": {\"value\": \"" + strValid + "\"}"},
+        {"a bare string", "\"commitment\": \"" + strValid + "\""},
+        {"a number", "\"commitment\": 7"},
+        {"null", "\"commitment\": null"},
+    };
+    for (const auto& f : vField) {
+        // The single-block read of {"commitment": {<field>}}.
+        UniValue single;
+        BOOST_REQUIRE(single.read("{\"commitment\": {" + f.second + "}}"));
+        bool fFound = false, fHave1 = false;
+        uint256 hash1;
+        const bool fOk1 = ParseEnforcerBmmCommitment(single, fFound, fHave1, hash1);
+
+        // The batched read: the same field as the block's own, and again as an ancestor entry after a valid block.
+        UniValue batch;
+        BOOST_REQUIRE(batch.read("{\"commitment\": {" + f.second + "}}"));
+        std::vector<std::pair<bool, uint256>> vOwn;
+        const bool fOk2 = ParseEnforcerBmmCommitments(batch, vOwn);
+        UniValue withAncestor;
+        BOOST_REQUIRE(withAncestor.read("{\"commitment\": {" + Hex(strValid) + ", \"ancestorCommitments\": [{" + f.second +
+                                        "}]}}"));
+        std::vector<std::pair<bool, uint256>> vAnc;
+        BOOST_REQUIRE(ParseEnforcerBmmCommitments(withAncestor, vAnc));
+
+        BOOST_CHECK_MESSAGE(fOk1 == fOk2, "UR5-10 (" + f.first + "): the single read says " + (fOk1 ? "readable" : "can't tell") +
+                            ", the batched read of the block says " + (fOk2 ? "readable" : "can't tell"));
+        if (fOk1 && fOk2) {
+            BOOST_CHECK_MESSAGE(fFound, "UR5-10 (" + f.first + "): the single read lost the block");
+            BOOST_REQUIRE_MESSAGE(!vOwn.empty(), "UR5-10 (" + f.first + "): the batched read returned no entry");
+            BOOST_CHECK_MESSAGE(vOwn[0].first == fHave1 && vOwn[0].second == hash1,
+                                "UR5-10 (" + f.first + "): the two reads disagree on the block's commitment");
+        }
+        if (fOk1) {
+            BOOST_CHECK_MESSAGE(vAnc.size() == 2 && vAnc[1].first == fHave1 && vAnc[1].second == hash1,
+                                "UR5-10 (" + f.first + "): an ancestor entry is read differently from the block itself");
+        } else {
+            // Can't tell: the batched read stops before it instead of guessing (never "none" for an unreadable value).
+            BOOST_CHECK_MESSAGE(vAnc.size() == 1, "UR5-10 (" + f.first + "): an unreadable ancestor entry was reported (" +
+                                std::to_string(vAnc.size() - 1) + " ancestor entries)");
+        }
+    }
+
+    // A block the enforcer doesn't know: the single read says so (found = false, readable); the batched read must not
+    // turn it into "no commitment".
+    UniValue notFound;
+    BOOST_REQUIRE(notFound.read("{\"blockNotFound\": {}}"));
+    bool fFound = true, fHave = true;
+    uint256 hash;
+    BOOST_CHECK(ParseEnforcerBmmCommitment(notFound, fFound, fHave, hash) && !fFound && !fHave);
+    std::vector<std::pair<bool, uint256>> vNotFound;
+    BOOST_CHECK_MESSAGE(!ParseEnforcerBmmCommitments(notFound, vNotFound) || vNotFound.empty(),
+                        "UR5-10: the batched read answered for a block the enforcer doesn't know");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -525,7 +525,7 @@ public:
     int64_t GetTxTime() const;
 
     // RelayWalletTransaction may only be called if fBroadcastTransactions!
-    bool RelayWalletTransaction(CConnman* connman);
+    bool RelayWalletTransaction(CConnman* connman, std::string* pstrRefusal = nullptr);
 
     /** Pass this transaction to the mempool. Fails if absolute fee exceeds absurd fee. */
     bool AcceptToMemoryPool(const CAmount& nAbsurdFee, CValidationState& state);
@@ -722,6 +722,18 @@ struct CIssuedWalletCoin
  * A CWallet is an extension of a keystore, which also maintains a set of transactions and balances,
  * and provides the ability to create new transactions.
  */
+/** SA-W6 (stage A; agreed with testing 2026-11-10): the margin a bill repayment names over the payer's ask, in basis
+ *  points (retirebill, recoursebill: margin_bps). 0 names the ask exactly, as before. */
+static const uint32_t DEFAULT_BILL_RATE_MARGIN_BPS = 50;
+static const uint32_t MAX_BILL_RATE_MARGIN_BPS = 2500;
+/** nPrice x (1 + nMarginBps / 10000), rounded up. */
+inline uint64_t WalletRateWithMargin(uint64_t nPrice, uint32_t nMarginBps)
+{
+    const unsigned __int128 n = (unsigned __int128)nPrice * (10000u + nMarginBps) + 9999u;
+    const unsigned __int128 q = n / 10000u;
+    return q > (unsigned __int128)UINT64_MAX ? UINT64_MAX : (uint64_t)q;
+}
+
 class CWallet final : public CCryptoKeyStore, public CValidationInterface
 {
 private:
@@ -1078,8 +1090,11 @@ public:
      * HOUSE's quorum - so a house-held claim runs from the house's wallet. */
     /** v0.2.27: nNoteUnits > 0 on a house-held bill pays up to that many units of the owning house's own notes
      *  (op 9, burned at par) and the rest in sECX; *pnUnitsBurned gets the units actually burned (whole coins). */
+    /** SA-W6: every repayment names the payer's ask times (1 + nMarginBps / 10000), rounded up (default 50 = 0.5%), so
+     *  an ask raised before it confirms doesn't strand it; consensus takes any ask at or above the bound. */
     bool RetireBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee,
-                    uint64_t nNoteUnits = 0, uint64_t* pnUnitsBurned = nullptr);
+                    uint64_t nNoteUnits = 0, uint64_t* pnUnitsBurned = nullptr,
+                    uint32_t nMarginBps = DEFAULT_BILL_RATE_MARGIN_BPS);
     bool ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
 
     /** Discount ceremony (Phase 3.9, B1 T-d7). Three messages, because a discount
@@ -1107,16 +1122,19 @@ public:
      * authority, no title spend, no holder cooperation - which is the whole point.
      * The payer key is chosen automatically: the first key of the liable set this
      * wallet holds. */
-    bool RecourseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
+    bool RecourseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee,
+                      uint32_t nMarginBps = DEFAULT_BILL_RATE_MARGIN_BPS);
     /** Ops 7/8 themselves. Not on the RPC surface - RetireBill/ClaimBillEscrow
      * dispatch here - but members rather than file statics because they need
      * the private SelectCoins. */
-    bool HouseHeldRetireBill(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
+    bool HouseHeldRetireBill(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee,
+                             uint32_t nMarginBps = DEFAULT_BILL_RATE_MARGIN_BPS);
     bool FundSignCommitDepositOp(std::string& strFail, uint256& txidOut, CMutableTransaction& mtx,
                                  const CAmount& amountReceiptIn, const CAmount& amountOutPinned, const CAmount& nFee,
                                  bool fSignReceipt, const CScript& scriptReceipt);
     bool HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut, uint64_t& nUnitsBurnedOut,
-                                    const CBill& bill, const CAmount& nFee, uint64_t nNoteUnits, bool fIntoEscrow = false);
+                                    const CBill& bill, const CAmount& nFee, uint64_t nNoteUnits, bool fIntoEscrow = false,
+                                    uint32_t nMarginBps = DEFAULT_BILL_RATE_MARGIN_BPS);
     bool ClaimBillIntoHouseEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CHouse& house,
                                   const CAmount& nFee);
     bool HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut, const CBill& bill, const CAmount& nFee);
@@ -1181,6 +1199,11 @@ public:
     /** Gold B (GOLD_B.md §4): demand nUnits of the house's notes in a charter token by hash lock (NOTE_OP_SWAP). One
      *  holder's plain coins that sum to exactly nUnits are handed in; the payout script receives an sECX payment if the
      *  swap is paid instead of delivered. */
+    /** SA-W5: only the holder may know a swap's secret s. NewSwapLock derives s from a fresh keypool key's private key
+     *  (HMAC-SHA256, so it is as safe as the wallet's keys) and records only that key's address -> the hash lock
+     *  (address-book data, not secret); GetSwapSecret re-derives s for a hash lock this wallet made (false otherwise). */
+    bool NewSwapLock(std::string& strFail, uint256& hashLockOut);
+    bool GetSwapSecret(const uint256& hashLock, std::vector<unsigned char>& vchSecretOut);
     bool SwapNotesInKind(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, uint64_t nChainID,
                          const std::vector<unsigned char>& vchContract, const std::vector<unsigned char>& vchEthAddress,
                          const uint256& hashLock, const CScript& scriptPayout, const CAmount& nFee);

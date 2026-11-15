@@ -628,7 +628,8 @@ uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned cha
 // (BIP143-style) or a miner could replay them into a transaction paying
 // itself.
 uint256 BillHashOutputs(const CTransaction& tx);
-uint256 BillRetireSigHash(const uint256& billID, const uint256& hashOutputs);
+/** UR1-6 (switch-on): nRateNamed is part of the digest ops 3 RETIRE and 7 HRETIRE sign. */
+uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashOutputs);
 uint256 BillClaimSigHash(const uint256& billID, const uint256& hashOutputs);
 
 /** SHA256d over every input outpoint of tx - bound into the B1 digests (the R-i6
@@ -677,7 +678,14 @@ bool DecodeBillPayload(const std::vector<unsigned char>& vch, T& payload);
  * recurrence of a class this codebase has already been bitten by four times
  * (wallet.cpp:2305-2313). `bill_coin_tagger_matches_addcoins` pins the tagger
  * against AddCoins for every op and index. */
-void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin);
+/** MM-2 (D-2026-11-11-3): one transaction's decoded DISCOUNT payload, for ApplyBillCoinTags called once per output
+ *  (AddCoins): decoded on the first call and reused, the same result as a fresh decode. One cache, one transaction. */
+struct BillTagCache {
+    bool fTried = false;
+    bool fOk = false;
+    BillDiscount d;
+};
+void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, BillTagCache* pCache = nullptr);
 
 /** Context-free checks for a v11 transaction (shape, sizes, payload
  * signatures). Called from CheckTransaction. */

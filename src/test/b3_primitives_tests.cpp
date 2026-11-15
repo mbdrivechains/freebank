@@ -245,8 +245,8 @@ BOOST_AUTO_TEST_CASE(chouse_v9_reads_v8_and_rewrites_byte_identical)
     BOOST_REQUIRE(!v8.empty());
     BOOST_REQUIRE_EQUAL(v8[0], (unsigned char)HOUSE_SER_VERSION);   // version leads
     v8[0] = 8;
-    BOOST_REQUIRE(v8.size() >= 98);
-    v8.resize(v8.size() - 98);           // drop the v14 no-cure height, empty tranche list and cure left (9 bytes), the v13 gram fields (20 bytes), the v12 claim totals (48 bytes), the v11
+    BOOST_REQUIRE(v8.size() >= 112);
+    v8.resize(v8.size() - 112);          // drop the v15 episode counters + end height (14 bytes), the v14 no-cure height, empty tranche list and cure left (9 bytes), the v13 gram fields (20 bytes), the v12 claim totals (48 bytes), the v11
                                          // token u64, the v10 flags byte and the three v9 uint32s
     CHouse fromV8;
     BOOST_REQUIRE(Deser(v8, fromV8));

@@ -56,10 +56,21 @@ bool DecodeHouseRegisterAny(const CTransaction& tx, HouseRegister& reg, uint8_t&
     return false;
 }
 
+/** UR-ext-13 (switch-on, Michael 2026-11-10 for house ops, 2026-11-11 "Agree to both": every payload signature hash):
+ *  every payload signature names its network - the genesis block's hash - right after its domain string. An op signed
+ *  on easynet or regtest then never verifies on main, even where the same ids and keys exist on both (the app derives
+ *  the same seed on every network). One helper, shared by all 48 payload sighashes (house.h), so none can be left out
+ *  by accident; the wallet signs through the same functions. */
+void HashNetworkTag(CHashWriter& ss)
+{
+    ss << Params().GenesisBlock().GetHash();
+}
+
 uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const HouseMemberOp& op, const uint256& hashPrevouts)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/member");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nHouseOp;
     ss << op.nHouseID;
@@ -126,6 +137,7 @@ uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/register");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << declDigest;
     ss << nPartnerIndex;
     ss << amountPledge;   // binds the posted bond (Bills-ISSUE pattern)
@@ -136,6 +148,7 @@ uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/topup");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nPartnerIndex;
     ss << hashOutputs;
@@ -146,6 +159,7 @@ uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned cha
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/admit");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << vchNewPubKey;
     ss << amountPledge;
@@ -156,6 +170,7 @@ uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const u
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/exit");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nPartnerIndex;
     ss << hashOutputs;   // freshness: a leaked exit sig is not a bearer token
@@ -166,6 +181,7 @@ uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/winddown");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << hashOutputs;   // freshness: a leaked winddown sig is not replayable
     return ss.GetHash();
@@ -175,6 +191,7 @@ uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, cons
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/reclaim");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nPartnerIndex;
     ss << hashOutputs;   // binds the reclaim destination
@@ -185,6 +202,7 @@ uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/defer");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     // Bind the anti-replay ANCHOR, not the invocation height. Binding the
     // height would make an invocation valid in exactly ONE block: any mempool
@@ -200,6 +218,7 @@ uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/renew");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nRenewalIndex;   // binds WHICH renewal within an episode
     // nRenewalIndex resets to 0 at every DEFER, so it alone does NOT distinguish
@@ -219,6 +238,7 @@ uint256 HouseRateSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseR
         hPrevouts << in.prevout;
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/rate");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << rate.nKind;
     ss << rate.nBid;
@@ -239,6 +259,7 @@ uint256 HouseCharterSigHash(uint32_t nHouseID, const CTransaction& tx, const Hou
     unsigned_.vApproverSig.clear();
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/charter");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << unsigned_;
     ss << hPrevouts.GetHash();
@@ -250,6 +271,7 @@ uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts,
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/release");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     // The reserve-till coins are OP_TRUE anyone-can-spend, so this approver
     // signature is the ONLY gate on moving them. Binding only houseID+outputs
@@ -290,6 +312,7 @@ uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/attest");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nAsOfHeight;
     ss << amountReserves;
@@ -436,7 +459,10 @@ int64_t ClockSince(uint32_t nStart, int nNow)
 {
     if (nNow <= (int64_t)nStart)
         return 0;
-    const int64_t n = ClockAtHeight(nNow) - ClockAtHeight((int)nStart);
+    const int64_t c0 = ClockAtHeight((int)nStart), c1 = ClockAtHeight(nNow);
+    if (c0 < 0 || c1 < 0)
+        return -1;   // SA-H3: a missing past clock record (g_fClockRecordMissing is set; the caller's result is discarded)
+    const int64_t n = c1 - c0;
     return n > 0 ? n : 0;
 }
 
@@ -445,7 +471,10 @@ uint32_t ClockDeadlineHeight(uint32_t nStart, uint64_t nSpan, int nNow)
     const int64_t nFrom = nStart;
     const int64_t nTo = nNow < nFrom ? nFrom : nNow;
     const int64_t c0 = ClockAtHeight((int)nFrom);
-    const int64_t nElapsed = ClockAtHeight((int)nTo) - c0;
+    const int64_t cTo = ClockAtHeight((int)nTo);
+    if (c0 < 0 || cTo < 0)
+        return std::numeric_limits<uint32_t>::max();   // SA-H3: a missing past clock record (the flag decides)
+    const int64_t nElapsed = cTo - c0;
     if (nElapsed < 0 || (uint64_t)nElapsed < nSpan) {
         // Not run yet by nTo: the clock blocks still to run, one per block from here (exact when the clock is the height).
         const uint64_t n = (uint64_t)nTo + (nSpan - (uint64_t)std::max<int64_t>(nElapsed, 0));
@@ -483,7 +512,12 @@ uint32_t HouseDeferCapInsolventHeight(const CHouse& house, int nNow)
 {
     if (house.nDeferInvokedHeight == 0)
         return 0;
-    return ClockDeadlineHeight(house.nDeferInvokedHeight, Params().GetConsensus().nSuspensionCap, nNow);
+    // UR-ext-12 (switch-on): a suspension inside a protest episode gets what is left of the episode's 12 months, however
+    // many times the house has deferred and recovered in it (the unpaid demand's bound: 7 d cure + 12 months + 1 d).
+    uint64_t nCap = Params().GetConsensus().nSuspensionCap;
+    if (house.fDeferInEpisode && HouseEpisodeCountersCurrent(house))
+        nCap = nCap > house.nEpisodeDeferBlocks ? nCap - house.nEpisodeDeferBlocks : 0;
+    return ClockDeadlineHeight(house.nDeferInvokedHeight, nCap, nNow);
 }
 
 uint32_t HouseDeferInsolventHeight(const CHouse& house, int nNow)
@@ -555,9 +589,11 @@ void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight)
     // episode's start (only protests write it, sticky-earliest within an episode, never cleared by a discharge). Called
     // by every protest op before it overwrites the heights, only when the episode is fresh (nProtestOpen was 0). The
     // undo needs no prior: a protest is refused at an insolvent house, so nNoCureHeight was 0 before it.
-    // Counted from the END of the last episode (design 2026-11-08): its start, or the recovery that ended a suspension
-    // (under B a suspension only starts while a protest stresses the house; an episode without one lasts the cure).
-    const uint32_t nRef = std::max(house.nProtestHeight, house.nDeferEndedHeight);
+    // UR-ext-12 precision 2 (switch-on): counted from the END of the last episode - its last protest paid with the house
+    // not suspended, or the recovery that ended the suspension it was paid in (nEpisodeEndHeight, undone by HouseDB's
+    // per-block record). A fresh protest needs the house at Open or Stressed with nProtestOpen 0, so the previous
+    // episode has always ended by then. 0 = no earlier episode: no spacing check (security's condition 4).
+    const uint32_t nRef = house.nEpisodeEndHeight;
     if (nRef != 0 && nHeight >= nRef && ClockSince(nRef, (int)nHeight) < (int64_t)HOUSE_CURE_SPACING_BLOCKS)
         house.nNoCureHeight = nHeight;
 }
@@ -760,6 +796,7 @@ template bool DecodeHousePayload<HouseRegisterMO>(const std::vector<unsigned cha
 template bool DecodeHousePayload<HouseMemberOp>(const std::vector<unsigned char>&, HouseMemberOp&);
 template bool DecodeHousePayload<HouseRate>(const std::vector<unsigned char>&, HouseRate&);
 template bool DecodeHousePayload<HouseCharter>(const std::vector<unsigned char>&, HouseCharter&);
+template bool DecodeHousePayload<HouseClose>(const std::vector<unsigned char>&, HouseClose&);   // UR1-4: validation.cpp
 
 static bool IsValidHousePubKey(const std::vector<unsigned char>& vch)
 {
@@ -822,6 +859,12 @@ static bool CheckHouseRegisterShape(const CTransaction& tx, const HouseRegister&
     // the co-liability the tier exists for.
     if (!fSolo && reg.nThresholdM < 2)
         return state.DoS(100, false, REJECT_INVALID, "bad-house-register-multi-threshold");
+    // UR1-3 (switch-on, Michael 2026-11-10): an approval set is up to ~78 bytes per approver, and a settle EXCHANGE
+    // carries BOTH houses' sets in one MAX_SETTLE_PAYLOAD (4096): at 25 it no longer fits (testing: 4,133 bytes), so
+    // such a house could never settle bilaterally, and above ~50 its escrow could never be claimed (HCLAIM, 4096).
+    // REGISTER is the only op that sets the threshold; ADMIT adds partners, never approvers needed.
+    if (reg.nThresholdM > MAX_HOUSE_THRESHOLD)
+        return state.DoS(100, false, REJECT_INVALID, "bad-house-register-threshold-too-high");
 
     // Per-partner: valid distinct keys, pledge floor, pledge output at vout[i]
     if (tx.vout.size() < nPartners)
@@ -962,8 +1005,12 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
                     ch.nGramsNum == 0 || ch.nGramsDen == 0 || ch.nRelated > HOUSE_RELATED_YES || ch.nIndex != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-add");
         } else if (ch.nKind == HOUSE_CHARTER_REMOVE || ch.nKind == HOUSE_CHARTER_RELATED) {
-            if (ch.nChainID != 0 || !ch.vchContract.empty() || ch.nDecimals != 0 || ch.nGramsNum != 0 ||
-                    ch.nGramsDen != 0 || ch.nRelated > HOUSE_RELATED_YES ||
+            // UR1-1 (switch-on): the op names the token it means (chain id + contract), checked against nIndex in
+            // ApplyHouseCharter; the add-only fields stay zero.
+            const bool fZeroContract = std::all_of(ch.vchContract.begin(), ch.vchContract.end(),
+                                                   [](unsigned char c) { return c == 0; });
+            if (ch.nChainID == 0 || ch.vchContract.size() != 20 || fZeroContract || ch.nDecimals != 0 ||
+                    ch.nGramsNum != 0 || ch.nGramsDen != 0 || ch.nRelated > HOUSE_RELATED_YES ||
                     (ch.nKind == HOUSE_CHARTER_REMOVE && ch.nRelated != 0))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-index-op");
         } else {

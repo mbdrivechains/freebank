@@ -83,6 +83,7 @@ BITCOIN_TESTS =\
   test/coins_tests.cpp \
   test/enforcerconnect_tests.cpp \
   test/l1client_tests.cpp \
+  test/l1_input_tests.cpp \
   test/compress_tests.cpp \
   test/crypto_tests.cpp \
   test/cuckoocache_tests.cpp \
@@ -163,16 +164,24 @@ test_test_bitcoin_fuzzy_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
 test_test_bitcoin_fuzzy_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 test_test_bitcoin_fuzzy_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS)
 
+# testing (L1 inputs, 2026-11-13): the L1 readers (l1client) pull in validation, txdb, init and the HTTP client, so the
+# fuzz binary links what freebankd links, in freebankd's order (the server library before the wallet and zmq ones).
 test_test_bitcoin_fuzzy_LDADD = \
-  $(LIBUNIVALUE) \
   $(LIBBITCOIN_SERVER) \
+  $(LIBBITCOIN_WALLET) \
   $(LIBBITCOIN_COMMON) \
+  $(LIBUNIVALUE) \
   $(LIBBITCOIN_UTIL) \
+  $(LIBBITCOIN_ZMQ) \
   $(LIBBITCOIN_CONSENSUS) \
   $(LIBBITCOIN_CRYPTO) \
+  $(LIBLEVELDB) \
+  $(LIBLEVELDB_SSE42) \
+  $(LIBMEMENV) \
   $(LIBSECP256K1)
 
-test_test_bitcoin_fuzzy_LDADD += $(BOOST_LIBS) $(CRYPTO_LIBS)
+test_test_bitcoin_fuzzy_LDADD += $(BOOST_LIBS) $(BDB_LIBS) $(SSL_LIBS) $(CRYPTO_LIBS) $(MINIUPNPC_LIBS) \
+  $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS)
 
 nodist_test_test_bitcoin_SOURCES = $(GENERATED_TEST_FILES)
 

@@ -11,6 +11,8 @@
 #include <house.h>
 #include <note.h>
 #include <deposit.h>
+#include <issued.h>
+#include <pool.h>
 
 #include <consensus/validation.h>
 #include <validation.h>
@@ -84,6 +86,42 @@ bool IsStandard(const CScript& scriptPubKey, txnouttype& whichType, const bool w
     return whichType != TX_NONSTANDARD && whichType != TX_WITNESS_UNKNOWN;
 }
 
+/** MM-1 (security 11-11): FreeBank's script families - each an OP_TRUE coin whose only protection is the tag consensus
+ *  gives it (or, for the mutual fund, a spend rule of its own). */
+static bool IsFreeBankFamilyScript(const CScript& script)
+{
+    return IsHouseEscrowScript(script) || IsBillEscrowScript(script) || IsNotePreAuthScript(script) ||
+           IsPoolEscrowScript(script) || IsTokenPoolScript(script);
+}
+
+static bool HasFreeBankTag(const Coin& coin)
+{
+    return coin.fBill || coin.fBillEscrow || coin.fHouseEscrow || coin.fNote || coin.fDeposit || coin.fPoolEscrow ||
+           coin.fLpShare || coin.fCustody || coin.fIssued;
+}
+
+/** MM-1: the tag consensus would give output i of tx - AddCoins itself, run on a scratch view, so policy and consensus
+ *  share one decision (no second list to keep in step). Placeholder dense ids stand in for the ones connect assigns. */
+static std::vector<Coin> FreeBankOutputTags(const CTransaction& tx)
+{
+    CCoinsView viewEmpty;
+    CCoinsViewCache scratch(&viewEmpty);
+    AddCoins(scratch, tx, 1, AssetTags(), 1 /* nBillID placeholder */, 1 /* nHouseID placeholder */, false);
+    std::vector<Coin> v;
+    v.reserve(tx.vout.size());
+    for (size_t i = 0; i < tx.vout.size(); i++)
+        v.push_back(scratch.AccessCoin(COutPoint(tx.GetHash(), (uint32_t)i)));
+    return v;
+}
+
+/** MM-1: a sidechain object output (OP_RETURN AC DC F6 6F <serialization>): a withdrawal's record, at most this big. */
+static const size_t MAX_STANDARD_SIDECHAIN_OBJECT_SCRIPT = 400;
+static bool IsSidechainObjectScript(const CScript& script)
+{
+    return script.size() >= 5 && script[0] == OP_RETURN && script[1] == 0xAC && script[2] == 0xDC && script[3] == 0xF6 &&
+           script[4] == 0x6F;
+}
+
 bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnessEnabled)
 {
     if (tx.nVersion > CTransaction::MAX_STANDARD_VERSION || tx.nVersion < 1) {
@@ -122,38 +160,41 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
 
     unsigned int nDataOut = 0;
     txnouttype whichType;
+    const bool fFreeBankTx = tx.nVersion >= TRANSACTION_BILL_VERSION && tx.nVersion <= TRANSACTION_TOKEN_VERSION;
+    // MM-1 (R1 cost): bounds the tag step (AreFreeBankOutputsStandard) before it can run.
+    if (fFreeBankTx && tx.vout.size() > MAX_STANDARD_FREEBANK_OUTPUTS) {
+        reason = "freebank-too-many-outputs";
+        return false;
+    }
+    unsigned int nSidechainObjects = 0;
     for (size_t o = 0; o < tx.vout.size(); o++) {
         const CTxOut& txout = tx.vout[o];
 
-        // The bill escrow output (<bill_id> OP_DROP OP_TRUE) is nonstandard
-        // by script type but fully validated by the bill consensus rules
-        if (tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp == BILL_OP_ISSUE &&
-                o == 1 && IsBillEscrowScript(txout.scriptPubKey))
+        // MM-1: a family-script output is checked against its consensus tag after the inputs are known
+        // (AreFreeBankOutputsStandard, MM1-R1: no per-output tagging for a tx whose inputs don't exist).
+        if (IsFreeBankFamilyScript(txout.scriptPubKey))
             continue;
-
-        // v0.2.29: a deposit DEMAND / PROTEST re-issues the receipt onto the B3 custody script at vout[0]
-        if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION && o == 0 &&
-                (tx.nDepositOp == DEPOSIT_OP_DEMAND || tx.nDepositOp == DEPOSIT_OP_PROTEST) &&
-                IsNotePreAuthScript(txout.scriptPubKey))
+        // MM-1: a withdrawal's sidechain object - one per tx, size-capped, counted as a data output beside its burn.
+        if (IsSidechainObjectScript(txout.scriptPubKey)) {
+            if (++nSidechainObjects > 1 || txout.scriptPubKey.size() > MAX_STANDARD_SIDECHAIN_OBJECT_SCRIPT) {
+                reason = "sidechain-object";
+                return false;
+            }
+            nDataOut++;
             continue;
-
-        // v0.2.28: ops 10/11 pay a house-held bill's money into the house's escrow at vout[0] (consensus pins it)
-        if (tx.nVersion == TRANSACTION_BILL_VERSION && o == 0 &&
-                (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) &&
-                IsHouseEscrowScript(txout.scriptPubKey))
-            continue;
+        }
+        {
+            uint256 wtID;
+            std::vector<unsigned char> vchSig;
+            if (txout.scriptPubKey.IsWithdrawalRefundRequest(wtID, vchSig)) {   // fixed 102-byte script
+                nDataOut++;
+                continue;
+            }
+        }
 
         // v0.2.28: CLOSE's mutual fund output (consensus pins its value and its place after the partner shares)
         if (tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_CLOSE &&
                 IsMutualFundScript(txout.scriptPubKey))
-            continue;
-
-        // House pledge escrow outputs (same script family) - REGISTER posts
-        // one per partner at vout[0..N-1]; TOPUP / ADMIT post one at vout[0]
-        if (tx.nVersion == TRANSACTION_HOUSE_VERSION &&
-                IsHouseEscrowScript(txout.scriptPubKey) &&
-                (IsHouseRegisterOp(tx.nHouseOp) ||
-                 (o == 0 && (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT))))
             continue;
 
         if (!::IsStandard(txout.scriptPubKey, whichType, witnessEnabled)) {
@@ -166,12 +207,63 @@ bool IsStandardTx(const CTransaction& tx, std::string& reason, const bool witnes
         else if ((whichType == TX_MULTISIG) && (!fIsBareMultisigStd)) {
             reason = "bare-multisig";
             return false;
+        } else if (fFreeBankTx) {
+            // MM-1: dust in a FreeBank op is checked after the inputs are known - a consensus-tagged coin (a note's
+            // dust base) has its value fixed by consensus, an untagged one is held to the dust rule.
         } else if (IsDust(txout, ::dustRelayFee)) {
             reason = "dust";
             return false;
         }
     }
 
+    // MM-1 (security 11-11): one data output - or two, a withdrawal's sidechain object beside its burn.
+    if (nDataOut > (nSidechainObjects == 1 ? 2u : 1u)) {
+        reason = "multi-op-return";
+        return false;
+    }
+
+    return true;
+}
+
+/** MM1-R2 (security 11-11): each script family takes its own family's tag - a note tag on an escrow script is not escrow.
+ *  House, bill and pool escrow share ONE shape (<32-byte push> OP_DROP OP_TRUE; house.cpp, bill.cpp, pool.cpp) and
+ *  consensus tells them apart by tag only, never by script: that shape matches any of the three escrow tags. */
+static bool FamilyTagMatches(const CScript& script, const Coin& coin)
+{
+    if (IsHouseEscrowScript(script))   // == IsBillEscrowScript == IsPoolEscrowScript
+        return coin.fHouseEscrow || coin.fBillEscrow || coin.fPoolEscrow;
+    if (IsNotePreAuthScript(script))
+        return coin.fNote || coin.fDeposit;   // demanded notes and receipts both re-issue onto B3 custody
+    if (IsTokenPoolScript(script))
+        return coin.fCustody;
+    return false;
+}
+
+bool AreFreeBankOutputsStandard(const CTransaction& tx, std::string& reason)
+{
+    const bool fFreeBankTx = tx.nVersion >= TRANSACTION_BILL_VERSION && tx.nVersion <= TRANSACTION_TOKEN_VERSION;
+    bool fHaveFamily = false;
+    for (const CTxOut& out : tx.vout)
+        fHaveFamily = fHaveFamily || IsFreeBankFamilyScript(out.scriptPubKey);
+    if (!fHaveFamily && !fFreeBankTx)
+        return true;
+    const std::vector<Coin> vTag = FreeBankOutputTags(tx);
+    for (size_t o = 0; o < tx.vout.size(); o++) {
+        const CScript& script = tx.vout[o].scriptPubKey;
+        if (IsFreeBankFamilyScript(script)) {
+            // Untagged (or tagged as another family), it is an anyone-can-spend coin the payer may take for escrow.
+            if (o >= vTag.size() || !FamilyTagMatches(script, vTag[o])) {
+                reason = "freebank-untagged-family-output";
+                return false;
+            }
+            continue;
+        }
+        if (fFreeBankTx && !script.IsUnspendable() && IsDust(tx.vout[o], ::dustRelayFee) &&
+                (o >= vTag.size() || !HasFreeBankTag(vTag[o]))) {
+            reason = "dust";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -199,6 +291,13 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
         const Coin& coin = mapInputs.AccessCoin(tx.vin[i].prevout);
+
+        // MM-1 (security 11-11): a coin consensus tagged with a FreeBank family is spent under consensus's rules for
+        // it, whatever the spending tx's version (a note CLAIM or a SETTLE spending escrow included). An UNTAGGED
+        // family-script coin stays nonstandard to spend. The mutual fund has no tag but a spend rule of its own.
+        if ((IsFreeBankFamilyScript(coin.out.scriptPubKey) && FamilyTagMatches(coin.out.scriptPubKey, coin)) ||
+                IsMutualFundScript(coin.out.scriptPubKey))
+            continue;
 
         // Bill title / escrow prevouts are governed by the bill consensus
         // rules; the escrow script has no standard type

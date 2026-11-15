@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <dbwrapper.h>
+#include <crypto/sha256.h>
 
 #include <random.h>
 
@@ -214,3 +215,28 @@ const std::vector<unsigned char>& GetObfuscateKey(const CDBWrapper &w)
 }
 
 } // namespace dbwrapper_private
+
+uint256 CDBWrapper::HashAllRecords(size_t& nCount)
+{
+    nCount = 0;
+    CDataStream ssObfuscateKey(SER_DISK, CLIENT_VERSION);
+    ssObfuscateKey << OBFUSCATE_KEY_KEY;
+    const std::string strSkip(ssObfuscateKey.begin(), ssObfuscateKey.end());
+    CSHA256 hasher;
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    for (pcursor->SeekToFirst(); pcursor->Valid(); pcursor->Next()) {
+        std::string strKey, strValue;
+        pcursor->GetRawKeyValue(strKey, strValue);
+        if (strKey == strSkip)
+            continue;
+        const uint64_t nKey = strKey.size(), nValue = strValue.size();
+        hasher.Write((const unsigned char*)&nKey, sizeof(nKey));
+        hasher.Write((const unsigned char*)strKey.data(), strKey.size());
+        hasher.Write((const unsigned char*)&nValue, sizeof(nValue));
+        hasher.Write((const unsigned char*)strValue.data(), strValue.size());
+        nCount++;
+    }
+    uint256 hash;
+    hasher.Finalize(hash.begin());
+    return hash;
+}

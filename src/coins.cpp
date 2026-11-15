@@ -178,6 +178,10 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
             }
         }
 
+        // MM-2 (D-2026-11-11-3): the bill and note taggers decode the op's payload once for the whole transaction, not
+        // once per output (outputs x payload was the cost: thousands of plain outputs on a valid note op). Same tags.
+        BillTagCache billTagCache;
+        NoteTagCache noteTagCache;
         for (size_t i = 0; i < tx.vout.size(); ++i) {
             // Asset colour (v0.2.18): decided by ComputeAssetTags; an asset tx is
             // a genesis or a plain-version transfer, so no tagger below applies
@@ -195,7 +199,7 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
             // not exist until the issuing tx connects); the threaded id is
             // stamped on immediately below.
             if (tx.nVersion == TRANSACTION_BILL_VERSION) {
-                ApplyBillCoinTags(tx, i, coin);
+                ApplyBillCoinTags(tx, i, coin, &billTagCache);
                 if (fBillTx && (coin.fBill || coin.fBillEscrow))
                     coin.nBillID = nBillID;
             }
@@ -210,7 +214,7 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
                     coin.SetHouseEscrow(nHouseID);
             }
 
-            ApplyNoteCoinTags(tx, i, coin, true /* fConnected */, (uint32_t)nHeight);
+            ApplyNoteCoinTags(tx, i, coin, true /* fConnected */, (uint32_t)nHeight, &noteTagCache);
 
             if (fDepositTx && nDepHouse != 0 && i < vDepPrincipal.size()) {
                 coin.SetDeposit(nDepHouse, vDepPrincipal[i], vDepRate[i], vDepMaturity[i], nDepOrigination);

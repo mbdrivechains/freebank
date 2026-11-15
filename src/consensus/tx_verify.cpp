@@ -1116,9 +1116,15 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nHouseEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-spends-escrow");
         }
-        else if (tx.nNoteOp == NOTE_OP_SWAP_DONE || tx.nNoteOp == NOTE_OP_SWAP_PAY || tx.nNoteOp == NOTE_OP_SWAP_PROTEST) {
+        else if (tx.nNoteOp == NOTE_OP_SWAP_DONE || tx.nNoteOp == NOTE_OP_SWAP_PAY || tx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
+                 tx.nNoteOp == NOTE_OP_SWAP_EXPIRE) {
+            // SA-N4 (Michael 2026-11-11, second list): EXPIRE joins the arm, and none of the four pays into a house escrow
+            // or the noteholders' fund - such an output would enter the UTXO set untagged, an anyone-can-spend coin.
             if (nNoteIn != 0 || nHouseEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-inputs");
+            for (const CTxOut& o : tx.vout)
+                if (IsHouseEscrowScript(o.scriptPubKey) || IsMutualFundScript(o.scriptPubKey))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-stray-escrow");
         }
         else if (tx.nNoteOp == NOTE_OP_SWAP_CLAIM) {
             // Gold B waterfall: no notes in; escrow of the claimed house only (the entitlement bound is contextual).

@@ -169,8 +169,10 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
     CheckOp<HouseExit>(H, HOUSE_OP_EXIT, 18, [](HouseExit& p) { p.vchPartnerSig.clear(); ClearApprovers(p); }, "HOUSE EXIT");
     CheckOp<HouseWinddown>(H, HOUSE_OP_WINDDOWN, 12, [](HouseWinddown& p) { ClearApprovers(p); }, "HOUSE WINDDOWN");
     CheckOp<HouseReclaim>(H, HOUSE_OP_RECLAIM, 10, [](HouseReclaim& p) { p.vchSig.clear(); }, "HOUSE RECLAIM");
-    CheckOp<HouseAttest>(H, HOUSE_OP_ATTEST, 102, [](HouseAttest& p) { ClearProofs(p.vProofs); ClearApprovers(p); }, "HOUSE ATTEST");
-    CheckOp<HouseDefer>(H, HOUSE_OP_DEFER, 16, [](HouseDefer& p) { ClearApprovers(p); }, "HOUSE DEFER");
+    // UR-ext-12 (switch-on): ATTEST +6 (u32 + 2 u8) and DEFER +10 (2 u32 + 2 u8) bytes of undo priors; Bind strips only
+    // the signatures, so the priors are bound like the existing ones.
+    CheckOp<HouseAttest>(H, HOUSE_OP_ATTEST, 108, [](HouseAttest& p) { ClearProofs(p.vProofs); ClearApprovers(p); }, "HOUSE ATTEST");
+    CheckOp<HouseDefer>(H, HOUSE_OP_DEFER, 26, [](HouseDefer& p) { ClearApprovers(p); }, "HOUSE DEFER");
     CheckOp<HouseRenew>(H, HOUSE_OP_RENEW, 12, [](HouseRenew& p) { ClearApprovers(p); }, "HOUSE RENEW");
     CheckOp<HouseRelease>(H, HOUSE_OP_RELEASE, 12, [](HouseRelease& p) { ClearApprovers(p); }, "HOUSE RELEASE");
     // Members-only registration: its founders sign in the inner REGISTER (the open item in the spec's s3).
@@ -460,10 +462,11 @@ BOOST_AUTO_TEST_CASE(binding_height_per_network)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::BETA)->GetConsensus().nCreditBindingHeight, 0);
     const std::unique_ptr<CChainParams> easynet = CreateChainParams(CBaseChainParams::EASYNET);
     BOOST_CHECK(easynet->GetConsensus().CreditBindingActive(0));
-    // ...and credits treasury changes only from its deposit start (L1 1,676 for the v1.2.0 restart; 1,100 at v1.1.0);
-    // every other network from the start. Building the params also checks easynet's genesis hash (an assert).
-    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 1676);
-    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x485b81d796286e671b322fc07ebb88c7e6da9d1e9e4eeaae06a26af6dcaa7107"));
+    // ...and credits treasury changes only from its deposit start (L1 2,058 for the v1.2.2 restart; 1,676 at v1.2.0,
+    // 1,100 at v1.1.0); every other network from the start. Building the params also checks easynet's genesis hash.
+    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 2058);
+    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x8b1db1c4912cb8459107a195007248f486d7103d99e5d7d05db29b548e290eed"));
+    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x07);   // a fresh chain's magic (v1.2.2)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nDepositStartL1Height, 0);
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nDepositStartL1Height, 0);
 }
@@ -583,7 +586,7 @@ BOOST_AUTO_TEST_CASE(policy_failures_of_credit_txs_are_not_bans)
 BOOST_AUTO_TEST_CASE(template_skips_credit_below_binding_height)
 {
     BindingHeightScope scope;
-    const CTransactionRef ptx = MakeTransactionRef(CloseTx(coinbaseTxns[1]));
+    const CTransactionRef ptx = MakeTransactionRef(CloseTx(coinbaseTxns[0]));
     {
         LOCK2(cs_main, mempool.cs);
         TestMemPoolEntryHelper entry;

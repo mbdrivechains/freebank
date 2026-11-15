@@ -48,7 +48,12 @@ static const uint32_t SETTLE_PAR_BAND_BPS = 50;
 
 // Minimum mode-1 residual, sats. Below this the pair should equalize to mode 0
 // via note-splitting; +/-0.5% of dust is sub-sat noise. PROVISIONAL (P-2).
-static const CAmount SETTLE_MIN_RESIDUAL = 10000;
+/** UR1-2 (D-2026-11-11-2): the least a mode-1 residual, and each netting receipt, may pay - in sats, the payment, not
+ *  the grams: P2PKH dust at DUST_RELAY_TX_FEE (policy.h). (Before: 10000 compared with |dU| in mg, a 10 g floor.) */
+static const CAmount SETTLE_MIN_RESIDUAL_SATS = 546;
+/** SA-W1 (D-2026-11-11-2): a settlement's band - the highest ask over the lowest bid of its houses - is at most 5%
+ *  wide, or the settlement is invalid. Final at switch-on (D-2026-11-05-3). */
+static const uint32_t SETTLE_MAX_BAND_BPS = 500;
 
 // Per-house settlement cadence, blocks: a house may enter at most one exchange
 // per window (nLastSettleHeight + cadence <= height). An eligibility comparison,
@@ -169,7 +174,7 @@ uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevou
 /** Payload-pure residual band check (consensus s4 check 6; NO DB read - par
  * is 1:1 by canon). For dU = nUnitsANotes - nUnitsBNotes:
  *   mode 0: dU == 0 and amountResidual == 0;
- *   mode 1: |dU| >= SETTLE_MIN_RESIDUAL and
+ *   mode 1: residual >= SETTLE_MIN_RESIDUAL_SATS and
  *           |dU|*(10^4 - band) <= amountResidual*10^4 <= |dU|*(10^4 + band).
  * All arithmetic u128 under the SETTLE_MAX_UNITS envelope (callers must have
  * shape-checked units <= SETTLE_MAX_UNITS and amountResidual in [0, MAX_MONEY]
@@ -203,7 +208,7 @@ struct SettleNetBundle {
  *
  * A house's net = units it presents - units of its notes presented. Every bundle burns; each issuer's nMintedUnits
  * falls by what was presented of it. Each net creditor is paid vReceive[i] (par +/- SETTLE_PAR_BAND_BPS of its net,
- * net >= SETTLE_MIN_RESIDUAL) at the front of the outputs, ascending house order, to its vchRedemptionDestPK; every
+ * receipt >= SETTLE_MIN_RESIDUAL_SATS) at the front of the outputs, ascending house order, to its vchRedemptionDestPK; every
  * other vReceive is 0. Which debtor's coins fund which creditor is the signers' business, as in the exchange.
  *
  * Priors as in the exchange (ATTEST pattern): undo restores from the payload alone. A house may join a round only if

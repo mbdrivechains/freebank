@@ -8,10 +8,14 @@
 #include <house.h>
 #include <note.h>
 
+#include <chainparams.h>
+#include <coins.h>
 #include <consensus/validation.h>
+#include <issued.h>       // ConnectIssuedTx (the H2 restore tests)
 #include <key.h>
 #include <primitives/transaction.h>
 #include <test/test_bitcoin.h>
+#include <tinyformat.h>
 #include <units.h>
 
 #include <boost/test/unit_test.hpp>
@@ -88,9 +92,19 @@ BOOST_AUTO_TEST_CASE(rate_shape_and_effect)
     BOOST_CHECK(HouseRateAt(units, 7, 13, nBid, nAsk));
     BOOST_CHECK_EQUAL(nBid, 90000u);
 
-    BOOST_CHECK(HouseRateFresh(units, 7, 11 * DAY + 600, gp.nRateRefreshSecs));
-    BOOST_CHECK(!HouseRateFresh(units, 7, 11 * DAY + 601, gp.nRateRefreshSecs));
-    BOOST_CHECK(!HouseRateFresh(units, 8, 10 * DAY, gp.nRateRefreshSecs));   // never posted
+    BOOST_CHECK(HouseRateFresh(units, 7, 13, 11 * DAY + 600, gp.nRateRefreshSecs));
+    BOOST_CHECK(!HouseRateFresh(units, 7, 13, 11 * DAY + 601, gp.nRateRefreshSecs));
+    BOOST_CHECK(!HouseRateFresh(units, 8, 13, 10 * DAY, gp.nRateRefreshSecs));   // never posted
+
+    // D-2026-11-11-3 (RS-1): freshness goes with the price. In the POST's own block (12) the posting in effect is the
+    // one from block 10 (10 * DAY), so a day and a second later the house is stale there, though the block-12 POST
+    // (10 * DAY + 600) would be fresh: a stale house can't POST and issue in one block. From block 13 it counts.
+    BOOST_CHECK(!HouseRateFresh(units, 7, 12, 11 * DAY + 1, gp.nRateRefreshSecs));
+    BOOST_CHECK(HouseRateFresh(units, 7, 13, 11 * DAY + 1, gp.nRateRefreshSecs));
+    // A first posting has no rate in effect in its own block: not fresh there, fresh from the next.
+    BOOST_CHECK(ApplyHouseRatePost(units, 9, 100000, 101000, 20, 20 * DAY, gp, strReject));
+    BOOST_CHECK(!HouseRateFresh(units, 9, 20, 20 * DAY, gp.nRateRefreshSecs));
+    BOOST_CHECK(HouseRateFresh(units, 9, 21, 20 * DAY, gp.nRateRefreshSecs));
 }
 
 BOOST_AUTO_TEST_CASE(rate_rise_cap)
@@ -106,9 +120,14 @@ BOOST_AUTO_TEST_CASE(rate_rise_cap)
     BOOST_CHECK(ApplyHouseRatePost(units, 1, 120000, 120000, 3, t0 + 3600, gp, strReject));
     BOOST_CHECK(ApplyHouseRatePost(units, 1, 125000, 125000, 4, t0 + 7200, gp, strReject));
     BOOST_CHECK(!ApplyHouseRatePost(units, 1, 130000, 130000, 5, t0 + 7300, gp, strReject));
-    // 24 h after the window started it restarts from the bid then in effect.
-    BOOST_CHECK(ApplyHouseRatePost(units, 1, 156250, 156250, 6, t0 + DAY, gp, strReject));
-    BOOST_CHECK(!ApplyHouseRatePost(units, 1, 160000, 160000, 7, t0 + DAY + 60, gp, strReject));
+    // UR1-5 (switch-on): 24 h after the window started, the bound still counts the lowest bid in effect over the last
+    // 24 h (100,000 until t0 + 3600), so 156,250 (+25% on +25%) is refused; 125,000 is the most.
+    BOOST_CHECK(!ApplyHouseRatePost(units, 1, 156250, 156250, 6, t0 + DAY, gp, strReject));
+    BOOST_CHECK_EQUAL(strReject, "bad-house-rate-rise");
+    BOOST_CHECK(ApplyHouseRatePost(units, 1, 125000, 125000, 6, t0 + DAY, gp, strReject));
+    // Once 125,000 has been the lowest bid in effect for a full window, 156,250 is allowed.
+    BOOST_CHECK(ApplyHouseRatePost(units, 1, 156250, 156250, 7, t0 + 3 * DAY, gp, strReject));
+    BOOST_CHECK(!ApplyHouseRatePost(units, 1, 200000, 200000, 8, t0 + 3 * DAY + 60, gp, strReject));
 }
 
 BOOST_AUTO_TEST_CASE(rate_window_max)
@@ -217,6 +236,8 @@ BOOST_AUTO_TEST_CASE(charter_add_remove_related)
     rem.nHouseID = 5;
     rem.nKind = HOUSE_CHARTER_REMOVE;
     rem.nIndex = 0;
+    rem.nChainID = add.nChainID;              // UR1-1: the op names the token at its index
+    rem.vchContract = add.vchContract;
     BOOST_CHECK(!ApplyHouseCharter(units, rem, 12, t0 + 120, gp, strReject));
     BOOST_CHECK_EQUAL(strReject, "bad-house-charter-last");
     HouseCharter add2 = add;
@@ -228,6 +249,7 @@ BOOST_AUTO_TEST_CASE(charter_add_remove_related)
     BOOST_CHECK(!HouseCharterTokenAt(units, 5, 1, add.vchContract, t0 + 240 + gp.nCharterRemovalSecs, tok));
     // Now the second entry is the house's last one not being removed.
     rem.nIndex = 1;
+    rem.vchContract = add2.vchContract;
     BOOST_CHECK(!ApplyHouseCharter(units, rem, 15, t0 + 300, gp, strReject));
     BOOST_CHECK_EQUAL(strReject, "bad-house-charter-last");
 
@@ -236,14 +258,22 @@ BOOST_AUTO_TEST_CASE(charter_add_remove_related)
     rel.nHouseID = 5;
     rel.nKind = HOUSE_CHARTER_RELATED;
     rel.nIndex = 1;
+    rel.nChainID = add2.nChainID;             // UR1-1
+    rel.vchContract = add2.vchContract;
     rel.nRelated = HOUSE_RELATED_YES;
     BOOST_CHECK(ApplyHouseCharter(units, rel, 16, t0 + 360, gp, strReject));
     BOOST_CHECK(HouseCharterTokenAt(units, 5, 1, add2.vchContract, t0 + 360, tok));
     BOOST_CHECK_EQUAL(tok.nRelated, HOUSE_RELATED_YES);
     BOOST_CHECK_EQUAL(tok.nRelatedHeight, 16u);
     rel.nIndex = 0;
+    rel.vchContract = add.vchContract;
     BOOST_CHECK(!ApplyHouseCharter(units, rel, 17, t0 + 240 + gp.nCharterRemovalSecs, gp, strReject));
     BOOST_CHECK_EQUAL(strReject, "bad-house-charter-index");
+    // UR1-1: naming a different token than the one at the index is refused
+    rel.nIndex = 1;
+    rel.vchContract = add.vchContract;        // index 1 is add2's token, not add's
+    BOOST_CHECK(!ApplyHouseCharter(units, rel, 18, t0 + 400, gp, strReject));
+    BOOST_CHECK_EQUAL(strReject, "bad-house-charter-mismatch");
 }
 
 BOOST_AUTO_TEST_CASE(swap_rate_shortfall_and_pending)
@@ -406,6 +436,408 @@ BOOST_AUTO_TEST_CASE(demand_bid_and_anchored_window)
     BOOST_CHECK_EQUAL(nMaxBid, 100000u);
     BOOST_CHECK(HouseRateWindowMax(units, 4, 7, 200 * DAY, 90, nMaxBid, nMaxAsk));
     BOOST_CHECK_EQUAL(nMaxBid, 1u);
+}
+
+// testing (2026-11-10), ultra s1 UR1-5 = security stage A H2. The rise cap measures a bid against the bid in effect
+// when the window last RESTARTED, and the window restarts from whatever was posted last. So 125% just before the window
+// ends and 125% of THAT just after it both pass: 56% over the bid in effect a minute earlier, which is what the cap
+// exists to stop a stolen rate key doing. FAILS on v1.2.1; passes with a rolling-window bound. (rate_rise_cap's
+// "restarts from the bid then in effect" assertion encodes the old behaviour and flips with the fix.)
+BOOST_AUTO_TEST_CASE(testing_ur1_5_rate_rise_window_edge)
+{
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t t0 = 300 * DAY;
+    const int64_t W = gp.nRateRiseWindowSecs;
+    BOOST_REQUIRE(ApplyHouseRatePost(units, 2, 100000, 100000, 1, t0, gp, strReject));
+    // 25% one minute before the window ends: allowed (100,000 was in effect the whole window)
+    BOOST_CHECK(ApplyHouseRatePost(units, 2, 125000, 125000, 2, t0 + W - 60, gp, strReject));
+    // one minute later: 156,250 is 156% of the bid in effect 60 s before - must be refused
+    BOOST_CHECK_MESSAGE(!ApplyHouseRatePost(units, 2, 156250, 156250, 3, t0 + W, gp, strReject),
+                        "a 56% bid rise in two posts 60 s apart was accepted (UR1-5 / stage A H2)");
+}
+
+// testing (2026-11-10), ultra s1 UR1-1. A charter REMOVE (and RELATED) names its target by INDEX, and the approvers'
+// sighash binds only the index (the shape rule forces nChainID 0 and an empty contract on these kinds). An ADD prunes
+// entries whose removal took effect and renumbers the list. So a REMOVE signed for one token lands on another if an
+// unrelated ADD confirms first. Whatever the fix (bind the token's identity, or tombstones), the token the partners
+// did NOT name must never be removed. FAILS on v1.2.1 (it removes C); passes once the op is bound to the token.
+BOOST_AUTO_TEST_CASE(testing_ur1_1_charter_remove_after_renumber)
+{
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t t0 = 400 * DAY;
+    auto tok = [](unsigned char c) { return std::vector<unsigned char>(20, c); };
+    auto add = [&](unsigned char c, uint32_t h, int64_t t) {
+        HouseCharter op;
+        op.nHouseID = 6;
+        op.nKind = HOUSE_CHARTER_ADD;
+        op.nChainID = 1;
+        op.vchContract = tok(c);
+        op.nDecimals = 18;
+        op.nGramsNum = 311034768;
+        op.nGramsDen = 10000000;
+        op.nRelated = HOUSE_RELATED_NO;
+        return ApplyHouseCharter(units, op, h, t, gp, strReject);
+    };
+    BOOST_REQUIRE(add(0x41, 10, t0));        // A, index 0
+    BOOST_REQUIRE(add(0x42, 11, t0 + 60));   // B, index 1  <- the token the partners mean to remove
+    BOOST_REQUIRE(add(0x43, 12, t0 + 120));  // C, index 2
+    BOOST_REQUIRE(add(0x44, 13, t0 + 180));  // D, index 3
+    HouseCharter remA;
+    remA.nHouseID = 6;
+    remA.nKind = HOUSE_CHARTER_REMOVE;
+    remA.nIndex = 0;
+    remA.nChainID = 1;                 // the fix (UR1-1): the op names its token
+    remA.vchContract = tok(0x41);
+    BOOST_REQUIRE(ApplyHouseCharter(units, remA, 14, t0 + 240, gp, strReject));   // A leaves 30 days on
+
+    // Past A's removal: A is dead but still at index 0, so B is still at index 1 - the partners sign "REMOVE 1" for B.
+    const int64_t t2 = t0 + 240 + gp.nCharterRemovalSecs + 1;
+    CCharterToken got;
+    BOOST_REQUIRE(!HouseCharterTokenAt(units, 6, 1, tok(0x41), t2, got));   // A dead
+    // An unrelated ADD confirms first: it prunes A and renumbers to [B, C, D, E].
+    BOOST_REQUIRE(add(0x45, 15, t2));
+    // The signed REMOVE for B (its identity filled in, which v1.2.1 ignores for this kind).
+    HouseCharter remB;
+    remB.nHouseID = 6;
+    remB.nKind = HOUSE_CHARTER_REMOVE;
+    remB.nIndex = 1;
+    remB.nChainID = 1;
+    remB.vchContract = tok(0x42);
+    ApplyHouseCharter(units, remB, 16, t2 + 60, gp, strReject);   // the fix may apply it to B or refuse it: either is fine
+    const int64_t tAfter = t2 + 60 + gp.nCharterRemovalSecs;
+    BOOST_CHECK_MESSAGE(HouseCharterTokenAt(units, 6, 1, tok(0x43), tAfter, got),
+                        "a REMOVE signed for token B removed token C after an ADD renumbered the charter (UR1-1)");
+    BOOST_CHECK(HouseCharterTokenAt(units, 6, 1, tok(0x44), tAfter, got));   // D untouched either way
+    BOOST_CHECK(HouseCharterTokenAt(units, 6, 1, tok(0x45), tAfter, got));   // E untouched either way
+}
+
+// ===========================================================================
+// testing (2026-11-10): item 2 of Michael's sign-off (UR1-5 + stage A H2, freebank
+// docs-local/CONSENSUS_SIGNOFF_2026-11-10.md), H2's second half. A thief holding the rate key cuts the bid to 1; the
+// rise cap then makes the house climb back in 25% steps (about 52 days from 1 to 100,000) even after its partners
+// SETKEY a new key. freebankd's fix (2026-11-10): a partners' SETKEY arms a one-shot restore - the house's first post
+// within W (24 h) of it may go up to the highest bid in effect over the last 30 days, never above; any post clears it.
+// Every op here runs through ConnectIssuedTx over an in-memory units DB, one block per op, each block journaled, so
+// the tests read the same path a block does and can undo it.
+// FAIL on master a00fb05 (no restore: the post at the 30-day max is refused); pass once the restore lands. The undo case
+// is security's invariant-E check of the same change: SETKEY and a restore-level POST, disconnected, leave the units
+// state byte-exact.
+// ===========================================================================
+namespace {
+const uint32_t H2_HOUSE = 2;
+
+CMutableTransaction H2RateTx(const HouseRate& rate, uint32_t nSeq)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+    mtx.nHouseOp = HOUSE_OP_RATE;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("4832"), nSeq)));
+    mtx.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << rate;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+
+// A short chain over one in-memory units DB: each Block() advances the chain clock, connects its rate ops through
+// ConnectIssuedTx and writes the block with its undo record.
+struct H2Chain {
+    CUnitsDB db;
+    CCoinsView coinsBase;
+    CCoinsViewCache coins;
+    std::vector<uint256> vHash;
+    uint32_t nSeq;
+    H2Chain() : db(1 << 20, true, true), coins(&coinsBase), nSeq(0) {}
+
+    CMutableTransaction SetKey(const CKey& key)
+    {
+        HouseRate r;
+        r.nHouseID = H2_HOUSE;
+        r.nKind = HOUSE_RATE_SETKEY;
+        const CPubKey pub = key.GetPubKey();
+        r.vchRatePubKey.assign(pub.begin(), pub.end());
+        return H2RateTx(r, nSeq++);
+    }
+    CMutableTransaction Post(const CKey& key, uint64_t nBid)
+    {
+        HouseRate r;
+        r.nHouseID = H2_HOUSE;
+        r.nKind = HOUSE_RATE_POST;
+        r.nBid = r.nAsk = nBid;
+        CMutableTransaction mtx = H2RateTx(r, nSeq++);
+        BOOST_REQUIRE(key.Sign(HouseRateSigHash(H2_HOUSE, CTransaction(mtx), r), r.vchRateSig));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << r;
+        mtx.vchHousePayload.assign(ss.begin(), ss.end());
+        return mtx;
+    }
+    // One block at nTime holding one op; "" if it connected, else the reason.
+    std::string Block(int64_t nTime, const CMutableTransaction& mtx)
+    {
+        const uint32_t nHeight = vHash.size() + 1;
+        CUnitsView view(&db);
+        AdvanceChainClock(view, nHeight, nTime, Params().GetConsensus().GramAt(nHeight));
+        CValidationState state;
+        const bool fOk = ConnectIssuedTx(CTransaction(mtx), coins, view, (int)nHeight, state);
+        std::map<UnitsKey, UnitsSlot> mapChange, mapBefore;
+        view.GetChanges(mapChange, mapBefore);
+        const uint256 hash = uint256S(strprintf("%x", 0x48000 + nHeight));
+        BOOST_REQUIRE(db.WriteBlock(mapChange, mapBefore, hash));
+        vHash.push_back(hash);
+        return fOk ? std::string() : (state.GetRejectReason().empty() ? std::string("(refused)") : state.GetRejectReason());
+    }
+    void Undo()
+    {
+        const uint256 hash = vHash.back();
+        vHash.pop_back();
+        BOOST_REQUIRE(db.UndoBlock(hash, vHash.empty() ? uint256S("00") : vHash.back()));
+    }
+};
+
+const int64_t H2_T0 = 300 * DAY;
+// The partners' SETKEY, two days after the thief's cut: the cut's own rise window (which on master still allows 125% of
+// the pre-cut bid) has closed, so the climb back is H2's 25% steps from 1.
+const int64_t H2_TKEY = H2_T0 + 12 * DAY;
+
+// Key A posts 100,000 at T0; ten days later a thief holding A cuts the bid to 1.
+void H2Setup(H2Chain& c, const CKey& keyA)
+{
+    BOOST_REQUIRE(c.Block(H2_T0 - 600, c.SetKey(keyA)).empty());
+    BOOST_REQUIRE(c.Block(H2_T0, c.Post(keyA, 100000)).empty());
+    BOOST_REQUIRE(c.Block(H2_T0 + 10 * DAY, c.Post(keyA, 1)).empty());   // the thief's cut (cuts are never capped)
+}
+
+std::string H2Show(const std::string& s) { return s.empty() ? std::string("accepted") : "refused (" + s + ")"; }
+} // namespace
+
+BOOST_AUTO_TEST_CASE(testing_h2_setkey_arms_a_restore)
+{
+    const int64_t W = Params().GetConsensus().GramAt(1).nRateRiseWindowSecs;
+    CKey keyA, keyB, keyC;
+    keyA.MakeNewKey(true);
+    keyB.MakeNewKey(true);
+    keyC.MakeNewKey(true);
+
+    // (a) After the SETKEY: one above the 30-day max is refused; the max itself is accepted. (d) Then +25% over the
+    // restored bid waits until the restored bid has been in effect for a full W (security 11-10, SW-1: a restore that
+    // reset the rise windows let SETKEY + re-post + 25% climb 25% every few blocks, past item 2's "1.25x the lowest bid
+    // of the last 24 h"). testing's first (d) asserted the reset; this replaces it.
+    {
+        H2Chain c;
+        H2Setup(c, keyA);
+        BOOST_REQUIRE(c.Block(H2_TKEY, c.SetKey(keyB)).empty());
+        const std::string strOver = c.Block(H2_TKEY + 600, c.Post(keyB, 100001));
+        BOOST_CHECK_MESSAGE(strOver == "bad-house-rate-rise", "H2 (a): a post one above the 30-day max after the "
+                            "SETKEY was " + H2Show(strOver) + ", want bad-house-rate-rise");
+        const std::string strMax = c.Block(H2_TKEY + 1200, c.Post(keyB, 100000));
+        BOOST_CHECK_MESSAGE(strMax.empty(), "H2 (a): after a cut to 1 and a partners' SETKEY, a post at the 30-day "
+                            "max (100,000) within W was " + H2Show(strMax));
+        // (d), as fixed for security's SW-1 (switch-on review): for a full W after the restore nothing above the
+        // restored bid R; R itself can be re-posted; after R has been in effect for W, the normal 25% applies from R.
+        const std::string strRise = c.Block(H2_TKEY + 1800, c.Post(keyB, 125000));
+        BOOST_CHECK_MESSAGE(strRise == "bad-house-rate-rise", "H2 (d): 25% over the restored bid within W was " +
+                            H2Show(strRise) + " (SW-1: nothing above R for a full W)");
+        const std::string strRepost = c.Block(H2_TKEY + 2400, c.Post(keyB, 100000));
+        BOOST_CHECK_MESSAGE(strRepost.empty(), "H2 (d): re-posting the restored bid was " + H2Show(strRepost));
+        const std::string strNormal = c.Block(H2_TKEY + 1200 + W + 600, c.Post(keyB, 125000));
+        BOOST_CHECK_MESSAGE(strNormal.empty(), "H2 (d): 25% over the restored bid once it had been in effect for W was " +
+                            H2Show(strNormal));
+    }
+    // (e) Security's SW-1 cycle: SETKEY, restore (or re-post) and post, over and over inside one W, never passes the
+    // 30-day high (100,000).
+    {
+        H2Chain c;
+        H2Setup(c, keyA);
+        int64_t t = H2_TKEY;
+        uint64_t nHigh = 0;
+        for (int i = 0; i < 6; i++) {
+            const CKey& k = (i % 2 == 0) ? keyB : keyC;
+            BOOST_REQUIRE(c.Block(t, c.SetKey(k)).empty());
+            t += 600;
+            for (uint64_t nTry : {125000, 100001, 100000}) {
+                if (c.Block(t, c.Post(k, nTry)).empty()) {
+                    nHigh = std::max(nHigh, nTry);
+                    break;
+                }
+            }
+            t += 600;
+        }
+        BOOST_CHECK_MESSAGE(nHigh <= 100000, "H2 (e): repeated SETKEY / restore cycles inside one W reached " +
+                            std::to_string(nHigh) + ", above the 30-day high 100,000 (SW-1 ratchet)");
+    }
+    // (b) A second SETKEY right after the first doesn't let the restore go higher.
+    {
+        H2Chain c;
+        H2Setup(c, keyA);
+        BOOST_REQUIRE(c.Block(H2_TKEY, c.SetKey(keyB)).empty());
+        BOOST_REQUIRE(c.Block(H2_TKEY + 600, c.SetKey(keyC)).empty());
+        const std::string strOver = c.Block(H2_TKEY + 1200, c.Post(keyC, 100001));
+        BOOST_CHECK_MESSAGE(strOver == "bad-house-rate-rise", "H2 (b): after two SETKEYs, one above the 30-day max "
+                            "was " + H2Show(strOver));
+        const std::string strMax = c.Block(H2_TKEY + 1800, c.Post(keyC, 100000));
+        BOOST_CHECK_MESSAGE(strMax.empty(), "H2 (b): after two SETKEYs, the 30-day max was " + H2Show(strMax));
+    }
+    // (c) A first post more than W after the SETKEY gets no restore.
+    {
+        H2Chain c;
+        H2Setup(c, keyA);
+        BOOST_REQUIRE(c.Block(H2_TKEY, c.SetKey(keyB)).empty());
+        const std::string strLate = c.Block(H2_TKEY + W + 600, c.Post(keyB, 100000));
+        BOOST_CHECK_MESSAGE(strLate == "bad-house-rate-rise", "H2 (c): a first post W + 10 min after the SETKEY, at "
+                            "the 30-day max, was " + H2Show(strLate) + ": the restore should have lapsed");
+    }
+}
+
+// Security 11-10 (SW-1): the restore must not reset the rise windows, or SETKEY + re-post + 25% climbs without limit.
+// Each round below is a SETKEY (keys alternate), a re-post of the bid in effect (round 1 of the cut case restores to the
+// 30-day high), then +25%, a block each, ten minutes apart, so every round of a case falls inside one W. Returns the
+// highest bid any accepted post reached.
+namespace {
+uint64_t H2Cycle(H2Chain& c, int64_t& t, uint64_t nBid, const std::vector<CKey>& vKey, int nRounds, uint64_t nRestoreTo)
+{
+    uint64_t nHigh = 0;
+    for (int i = 0; i < nRounds; i++) {
+        const CKey& k = vKey[i % vKey.size()];
+        BOOST_REQUIRE(c.Block(t, c.SetKey(k)).empty());
+        t += 600;
+        const uint64_t nRe = (i == 0 && nRestoreTo) ? nRestoreTo : nBid;
+        if (c.Block(t, c.Post(k, nRe)).empty()) {
+            nBid = nRe;
+            nHigh = std::max(nHigh, nRe);
+        }
+        t += 600;
+        const uint64_t nUp = nBid + nBid / 4;
+        if (c.Block(t, c.Post(k, nUp)).empty()) {
+            nBid = nUp;
+            nHigh = std::max(nHigh, nUp);
+        }
+        t += 600;
+    }
+    return nHigh;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(testing_h2_setkey_cycles_cannot_climb)
+{
+    CKey keyA, keyB, keyC;
+    keyA.MakeNewKey(true);
+    keyB.MakeNewKey(true);
+    keyC.MakeNewKey(true);
+    const std::vector<CKey> vKey = {keyB, keyC};
+
+    // (1) After the thief's cut: five rounds inside one W never take the bid past the 30-day high (100,000).
+    {
+        H2Chain c;
+        H2Setup(c, keyA);
+        int64_t t = H2_TKEY;
+        const uint64_t nHigh = H2Cycle(c, t, 1, vKey, 5, 100000);
+        BOOST_CHECK_MESSAGE(nHigh <= 100000, "H2 cycle (cut): SETKEY + restore + 25% rounds inside one W took the bid "
+                            "to " + std::to_string(nHigh) + ", past the 30-day high 100,000");
+    }
+    // (2) No cut: 100,000 in effect for ten days. Five rounds of SETKEY, re-post of the current bid, +25% inside one W:
+    // the normal bound allows one +25% (to 125,000) and no more.
+    {
+        H2Chain c;
+        BOOST_REQUIRE(c.Block(H2_T0 - 600, c.SetKey(keyA)).empty());
+        BOOST_REQUIRE(c.Block(H2_T0, c.Post(keyA, 100000)).empty());
+        int64_t t = H2_T0 + 10 * DAY;
+        const uint64_t nHigh = H2Cycle(c, t, 100000, vKey, 5, 0);
+        BOOST_CHECK_MESSAGE(nHigh <= 125000, "H2 cycle (no cut): SETKEY + re-post + 25% rounds inside one W took the bid "
+                            "to " + std::to_string(nHigh) + ", past 1.25 x the lowest bid of the last 24 h (125,000)");
+    }
+    // (3) A post at or below the normal bound right after a SETKEY resets nothing. 120,000 for two days, then the house's
+    // own cut to 100,000, in effect for eight; a SETKEY, then 110,000 (under both the normal bound 125,000 and the 30-day
+    // high 120,000), then 137,500 = 1.25 x 110,000: refused, the lowest bid of the last 24 h is still 100,000.
+    {
+        H2Chain c;
+        BOOST_REQUIRE(c.Block(H2_T0 - 600, c.SetKey(keyA)).empty());
+        BOOST_REQUIRE(c.Block(H2_T0, c.Post(keyA, 120000)).empty());
+        BOOST_REQUIRE(c.Block(H2_T0 + 2 * DAY, c.Post(keyA, 100000)).empty());
+        const int64_t t = H2_T0 + 10 * DAY;
+        BOOST_REQUIRE(c.Block(t, c.SetKey(keyB)).empty());
+        const std::string strMid = c.Block(t + 600, c.Post(keyB, 110000));
+        BOOST_CHECK_MESSAGE(strMid.empty(), "H2 (3): 110,000 after the SETKEY (within the normal bound) was " +
+                            H2Show(strMid));
+        const std::string strUp = c.Block(t + 1200, c.Post(keyB, 137500));
+        BOOST_CHECK_MESSAGE(strUp == "bad-house-rate-rise", "H2 (3): 1.25 x 110,000 ten minutes later was " + H2Show(strUp) +
+                            ": the post after the SETKEY reset the rise windows (the lowest bid of the last 24 h is "
+                            "100,000)");
+    }
+}
+
+// Security's invariant-E check: a SETKEY and a restore-level POST in the next block, both disconnected, leave every
+// units key (the rate record with its rise and restore fields, the rate key, the day records, the clock) as it was.
+BOOST_AUTO_TEST_CASE(testing_h2_setkey_restore_undoes_exactly)
+{
+    CKey keyA, keyB;
+    keyA.MakeNewKey(true);
+    keyB.MakeNewKey(true);
+    H2Chain c;
+    H2Setup(c, keyA);
+    const std::vector<std::pair<UnitsKey, UnitsValue>> vBefore = c.db.Scan(UnitsKey(), UnitsKey(), SIZE_MAX);
+    BOOST_REQUIRE(!vBefore.empty());
+
+    BOOST_REQUIRE(c.Block(H2_TKEY, c.SetKey(keyB)).empty());
+    const std::string strRestore = c.Block(H2_TKEY + 600, c.Post(keyB, 100000));
+    BOOST_CHECK_MESSAGE(strRestore.empty(), "H2 undo: the restore-level POST was " + H2Show(strRestore) +
+                        " (no restore on this tree, so the undo below checks less than it should)");
+    BOOST_CHECK(c.db.Scan(UnitsKey(), UnitsKey(), SIZE_MAX) != vBefore);   // the two blocks changed something
+
+    c.Undo();
+    c.Undo();
+    const std::vector<std::pair<UnitsKey, UnitsValue>> vAfter = c.db.Scan(UnitsKey(), UnitsKey(), SIZE_MAX);
+    size_t nDiff = 0;
+    std::map<UnitsKey, UnitsValue> mapB(vBefore.begin(), vBefore.end()), mapA(vAfter.begin(), vAfter.end());
+    for (const auto& p : mapB)
+        if (!mapA.count(p.first) || mapA[p.first] != p.second)
+            nDiff++;
+    for (const auto& p : mapA)
+        if (!mapB.count(p.first))
+            nDiff++;
+    BOOST_CHECK_MESSAGE(nDiff == 0, "H2 undo: after disconnecting the SETKEY and the restore POST, " +
+                        std::to_string(nDiff) + " units key(s) differ from before them (invariant E)");
+}
+
+// testing (2026-11-10): stage A SA-H3 (security 11-08; consensus, on freebankd's second sign-off list for Michael).
+// ClockBlocksForChecks judges block h on the clock record of h - 1. When that record is missing it extrapolates from the
+// chain clock's tip - right for a height past the tip (the mempool's next block, a wallet's margin), wrong for a PAST
+// height, where a missing record means a damaged units DB and any window judged on a made-up clock can come out either
+// way. freebankd's contract (2026-11-10): a missing record at or below the clock's tip returns -1, ClockAtHeight /
+// ClockSince / ClockDeadlineHeight propagate it, the mempool refuses with bad-clock-record-missing and connect treats it
+// as a node-data error. Heights past the tip keep extrapolating. FAILS on master a00fb05 (the past height extrapolates).
+BOOST_AUTO_TEST_CASE(testing_sa_h3_missing_past_clock_record_fails_closed)
+{
+    const bool fClockWas = g_fClockIsHeightForTests;
+    g_fClockIsHeightForTests = false;                       // the real clock (unit tests count blocks by default)
+    BOOST_REQUIRE(!Params().GetConsensus().fClockIsHeight);  // the unit tests' network keeps time
+    const Consensus::GramParams gp = Params().GetConsensus().GramAt(1);
+    CUnitsView units(nullptr);
+    const int64_t t0 = 300 * DAY;
+    for (uint32_t h = 1; h <= 10; h++)
+        AdvanceChainClock(units, h, t0 + (int64_t)h * 600, gp);
+    units.Erase(ClockAtKey(5));                              // one past record lost
+    {
+        UnitsCheckScope scope(&units);
+        // Control: a present record is read as it is.
+        CClockAt at4;
+        BOOST_REQUIRE(units.Get(ClockAtKey(4), at4));
+        BOOST_CHECK_EQUAL(ClockBlocksForChecks(5), at4.nActive / 600);
+        // (a) The missing past record (block 6 reads the record of 5; the tip is 10) fails closed.
+        const int64_t n6 = ClockBlocksForChecks(6);
+        BOOST_CHECK_MESSAGE(n6 == -1, "SA-H3: block 6's clock, whose record (height 5, below the tip 10) is missing, "
+                            "was extrapolated to " + std::to_string(n6) + " instead of failing (-1)");
+        BOOST_CHECK_MESSAGE(ClockAtHeight(6) == -1, "SA-H3: ClockAtHeight(6) doesn't carry the failure (" +
+                            std::to_string(ClockAtHeight(6)) + ")");
+        // (b) Past the tip it still extrapolates, one clock block per block from the tip's clock.
+        CChainClock clock;
+        BOOST_REQUIRE(GetChainClock(units, clock));
+        BOOST_CHECK_EQUAL(ClockBlocksForChecks(15), (clock.nActiveTime + (14 - (int64_t)clock.nHeight) * 600) / 600);
+    }
+    g_fClockIsHeightForTests = fClockWas;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -13,6 +13,10 @@
 #include <chainparams.h>
 #include <consensus/consensus.h>
 #include <coins.h>
+#include <consensus/params.h>   // GramParams (SA-W1)
+#include <houserate.h>        // per-house rates in a test view (SA-W1)
+#include <issued.h>           // UnitsCheckScope (SA-W1)
+#include <units.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <house.h>
@@ -308,7 +312,8 @@ BOOST_AUTO_TEST_CASE(net_shape_vectors)
         BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-residual-out");
     }
     {
-        // A creditor below the 10,000 minimum: 5,000 of house 2's notes against 1,000 of house 1's.
+        // UR1-2 (D-2026-11-11-2): the floor is the payment in sats (546), not the net in mg. A creditor netting +5,000 mg
+        // and paid 5,000 sats is fine (it was refused under the old 10,000 floor on the mg)...
         SettleNet x = n;
         x.vBundle[0].nUnits = 6000;    // house 1 presents 6,000, house 3 presents 30,000 of house 1's...
         x.vBundle[2].nUnits = 1000;    // ...now 1,000: house 1 nets +5,000
@@ -316,7 +321,13 @@ BOOST_AUTO_TEST_CASE(net_shape_vectors)
         CMutableTransaction m = withPayload(x);
         m.vout[0].nValue = 5000;
         m.vout[1].nValue = 74000;
-        BOOST_CHECK_EQUAL(ShapeReject(m), "bad-settle-band");
+        BOOST_CHECK_EQUAL(ShapeReject(m), "OK");
+        // ...and one paid 545 sats is below it.
+        x.vReceive = {545, 74000, 0};
+        CMutableTransaction m2 = withPayload(x);
+        m2.vout[0].nValue = 545;
+        m2.vout[1].nValue = 74000;
+        BOOST_CHECK_EQUAL(ShapeReject(m2), "bad-settle-band");
     }
 }
 
@@ -676,6 +687,95 @@ BOOST_AUTO_TEST_CASE(net_then_exchange_cadence)
     };
     BOOST_CHECK_EQUAL(fnReject(X + nCadence - 1), "bad-settle-cadence");
     BOOST_CHECK_EQUAL(fnReject(X + nCadence), "OK");
+}
+
+// ===========================================================================
+// testing (2026-11-11): operator's decision D-2026-11-11-2 (Michael, "Yes, all three (Recommended)", design session),
+// rules 2 and 3, on netting (op 4). Both FAIL on master 33f2e72; they pass once freebankd's commit for the three rules
+// lands.
+//   Rule 2 (SA-W1): a round is valid only if the highest ask is at most 1.05 x the lowest bid of its houses.
+//   Rule 3 (UR1-2): each netting receipt is at least 546 sats (today: each creditor's net must be 10,000 mg).
+// ===========================================================================
+namespace {
+struct RatePost { uint32_t nHouse; uint64_t nBid, nAsk; };
+// each house posts its (bid, ask) ten blocks before nHeight (first posts: no cap); all in effect at nHeight
+void NW1Post(CUnitsView& units, const std::vector<RatePost>& vPost, int nHeight)
+{
+    Consensus::GramParams gp;
+    std::string strReject;
+    const int64_t T = 400 * RATE_DAY_SECONDS;
+    AdvanceChainClock(units, nHeight - 20, T - 2000, gp);
+    int nAt = nHeight - 10;
+    for (const RatePost& p : vPost) {
+        BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, p.nHouse, p.nBid, p.nAsk, nAt, T, gp, strReject),
+                              "SA-W1 setup: house " + std::to_string(p.nHouse) + "'s post " + std::to_string(p.nBid) +
+                              "/" + std::to_string(p.nAsk) + " was refused: " + strReject);
+    }
+    AdvanceChainClock(units, nHeight - 1, T + 600, gp);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(sa_w1_netting_band_is_narrow)
+{
+    NetSetup s;
+    const int H = 1100;
+    // The round nets +20 g, +30 g, -50 g and pays 20,000 and 30,000 sats: 1,000 sats per gram, inside [lowest bid,
+    // highest ask] in every case, so only the band's width decides.
+    struct Case { uint64_t nRate3; bool fValid; const char* what; };
+    const Case cases[] = {
+        {1000, true,  "all three at 1000"},
+        {1050, true,  "house 3 at 1050: the highest ask exactly 1.05 x the lowest bid"},
+        {1051, false, "house 3 at 1051"},
+        {1,    false, "house 3 a sock puppet at bid = ask = 1 (security's W1)"},
+    };
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;
+    for (const Case& c : cases) {
+        CUnitsView units(nullptr);
+        NW1Post(units, {{1, 1000, 1000}, {2, 1000, 1000}, {3, c.nRate3, c.nRate3}}, H);
+        UnitsCheckScope scope(&units);
+        SettleNet n;
+        const std::string r = NetOpReject(s.Build(n, s.houses), s.houses, H);
+        if (c.fValid)
+            BOOST_CHECK_MESSAGE(r == "OK", std::string("SA-W1 control: a netting round inside the 5% band was refused, ") +
+                                c.what + ": " + r);
+        else
+            BOOST_CHECK_MESSAGE(r != "OK" && r.find("band") != std::string::npos,
+                                "SA-W1: a netting round whose band is wider than 5% was " +
+                                (r == "OK" ? std::string("ACCEPTED") : "refused for another reason (" + r + ")") +
+                                ", " + c.what);
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
+}
+
+BOOST_AUTO_TEST_CASE(ur1_2_netting_receipt_floor_is_546_sats)
+{
+    NetSetup s;
+    SettleNet n;
+    const CMutableTransaction good = s.Build(n, s.houses, false);
+    BOOST_REQUIRE_EQUAL(ShapeReject(good), "OK");
+    // A round where house 1 nets +u12 - 30,000 mg (it presents u12 of house 2's notes; house 3 presents 30,000 of house
+    // 1's) and is paid nRecv1 sats; house 2 nets the rest of its 80,000 and is paid at par.
+    auto round = [&](uint64_t u12, CAmount nRecv1) {
+        SettleNet x = n;
+        x.vBundle[0].nUnits = u12;
+        const CAmount nRecv2 = (CAmount)(80000 - u12);
+        x.vReceive = {nRecv1, nRecv2, 0};
+        CMutableTransaction m = good;
+        m.vchSettlePayload = Encode(x);
+        m.vout[0].nValue = nRecv1;
+        m.vout[1].nValue = nRecv2;
+        return ShapeReject(m);
+    };
+    std::string r = round(31000, 1000);        // nets 1 g, paid 1,000 sats
+    BOOST_CHECK_MESSAGE(r == "OK", "UR1-2: a creditor netting 1 g and paid 1,000 sats was refused (" + r +
+                        "): the floor still counts 10 g of mg");
+    r = round(30546, 546);                     // paid exactly 546 sats
+    BOOST_CHECK_MESSAGE(r == "OK", "UR1-2: a netting receipt of exactly 546 sats was refused (" + r + ")");
+    r = round(30545, 545);                     // 545 sats: dust
+    BOOST_CHECK_MESSAGE(r != "OK", "UR1-2 control: a netting receipt of 545 sats was accepted");
+    r = round(50000, 545);                     // nets 20 g, but paid 545 sats
+    BOOST_CHECK_MESSAGE(r != "OK", "UR1-2: a creditor netting 20 g but paid 545 sats (dust) passed the shape check");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

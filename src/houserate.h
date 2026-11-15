@@ -47,13 +47,25 @@ struct CHouseRate {
     int64_t nPostTime;        // chain clock (monotone) at posting
     uint64_t nPrevBid;        // in effect until the block after nPostHeight; 0 = none (first posting)
     uint64_t nPrevAsk;
-    uint64_t nRiseBaseBid;    // the bid in effect when the rise window last restarted
-    int64_t nRiseBaseTime;
+    // UR1-5 + SA-H2 (switch-on, Michael 2026-11-10; design agreed with security): the rise bound rolls over two
+    // back-to-back windows, the current one (started at most W ago) and the previous one (at least W long), which
+    // between them always cover the last W; a bid may be at most (1 + rise) x the lowest bid in effect in either.
+    int64_t nRiseCurStart;    // chain clock when the current rise window started
+    uint64_t nRiseCurMin;     // the lowest bid in effect since nRiseCurStart
+    uint64_t nRisePrevMin;    // the lowest bid in effect in the previous window
+    // A partners' SETKEY (M-of-N) after a stolen rate key's cut: the first post within W may restore up to the highest
+    // bid in effect over the last RATE_RESTORE_DAYS days, never above it (so repeated SETKEYs can't ratchet). One-shot.
+    uint64_t nRestoreMax;
+    int64_t nRestoreUntil;    // 0 = no restore pending
     int64_t nPostActive;      // chain active time at posting (the swap's bid at T_f reads it; design 2026-11-07)
     int64_t nPrevPostActive;  // the same for the previous posting
+    // D-2026-11-11-3 (security RS-1): the previous posting's clock, so freshness goes with the price - a POST at h
+    // refreshes the house from h+1, when its rate takes effect (HouseRateFresh), never inside its own block.
+    int64_t nPrevPostTime;
 
-    CHouseRate() : nBid(0), nAsk(0), nPostHeight(0), nPostTime(0), nPrevBid(0), nPrevAsk(0), nRiseBaseBid(0),
-                   nRiseBaseTime(0), nPostActive(0), nPrevPostActive(0) {}
+    CHouseRate() : nBid(0), nAsk(0), nPostHeight(0), nPostTime(0), nPrevBid(0), nPrevAsk(0), nRiseCurStart(0),
+                   nRiseCurMin(0), nRisePrevMin(0), nRestoreMax(0), nRestoreUntil(0), nPostActive(0), nPrevPostActive(0),
+                   nPrevPostTime(0) {}
 
     ADD_SERIALIZE_METHODS
     template <typename Stream, typename Operation>
@@ -64,10 +76,14 @@ struct CHouseRate {
         READWRITE(nPostTime);
         READWRITE(nPrevBid);
         READWRITE(nPrevAsk);
-        READWRITE(nRiseBaseBid);
-        READWRITE(nRiseBaseTime);
+        READWRITE(nRiseCurStart);
+        READWRITE(nRiseCurMin);
+        READWRITE(nRisePrevMin);
+        READWRITE(nRestoreMax);
+        READWRITE(nRestoreUntil);
         READWRITE(nPostActive);
         READWRITE(nPrevPostActive);
+        READWRITE(nPrevPostTime);
     }
 };
 
@@ -251,12 +267,19 @@ bool HouseRateAt(const CUnitsView& units, uint32_t nHouseID, uint32_t nHeight, u
 bool HouseRateWindowMax(const CUnitsView& units, uint32_t nHouseID, uint32_t nHeight, int64_t nNow, uint32_t nDays,
                         uint64_t& nMaxBid, uint64_t& nMaxAsk);
 /** Posted within nMaxAgeSecs of nNow (the issuing refresh rule). */
-bool HouseRateFresh(const CUnitsView& units, uint32_t nHouseID, int64_t nNow, int64_t nMaxAgeSecs);
+bool HouseRateFresh(const CUnitsView& units, uint32_t nHouseID, uint32_t nHeight, int64_t nNow, int64_t nMaxAgeSecs);
 
 /** The shape rule every posting meets: 0 < bid <= ask <= bid x (1 + spread). */
 bool HouseRateShapeOK(uint64_t nBid, uint64_t nAsk, uint32_t nSpreadBps);
 /** Apply a posting at block nHeight, clock time nNow. Checks the spread and the bid-rise cap and that the house hasn't
  *  posted in this block; on success writes the rate and the day records. On failure writes nothing. */
+/** UR1-5 + SA-H2: how far back a partners' SETKEY looks for the bid it may restore (the day records). */
+static const uint32_t RATE_RESTORE_DAYS = 30;
+
+/** SA-H2 (switch-on): a partners' SETKEY arms a one-shot restore: the house's first post within the rise window may go
+ *  back up to the highest bid in effect over the last RATE_RESTORE_DAYS days. No rate record yet: nothing to restore. */
+void ArmHouseRateRestore(CUnitsView& units, uint32_t nHouseID, uint32_t nHeight, int64_t nNow, const Consensus::GramParams& gp);
+
 bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uint64_t nAsk, uint32_t nHeight,
                         int64_t nNow, const Consensus::GramParams& gp, std::string& strReject, int64_t nActiveNow = -1);
 /** The house's bid in effect at active time nActive (design 2026-11-07, the swap's bid at T_f): the current posting if
@@ -314,7 +337,7 @@ uint64_t DemandBidForChecks(uint32_t nHouseID, uint32_t nDemandHeight);
 /** Record the bid in effect at a demand (once per house and height). */
 void RecordDemandBid(CUnitsView& units, uint32_t nHouseID, uint32_t nHeight);
 /** Has the house posted its rate within nMaxAgeSecs of the chain's monotone time (issuing needs a fresh rate)? */
-bool HouseRateFreshForChecks(uint32_t nHouseID, int64_t nMaxAgeSecs);
+bool HouseRateFreshForChecks(uint32_t nHouseID, int nHeight, int64_t nMaxAgeSecs);
 /** The house's rate record (its last POST: height, chain-clock time), or false when it has never posted. */
 bool HouseRateRecordForChecks(uint32_t nHouseID, CHouseRate& rate);
 /** The house's charter (every entry, including those past their removal time not yet pruned). */

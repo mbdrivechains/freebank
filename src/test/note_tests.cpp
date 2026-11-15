@@ -6,6 +6,9 @@
 #include <note.h>
 
 #include <house.h>
+#include <houserate.h>   // g_nHouseRateTestOverride (SA-N3)
+#include <issued.h>      // GoldBrassageBps (SA-N3)
+#include <token.h>   // NoteTokenKeyset (UR1-7)
 
 #include <chainparams.h>
 #include <coins.h>
@@ -398,34 +401,51 @@ BOOST_AUTO_TEST_CASE(note_demand_shape)
     BOOST_CHECK(NoteDemandSigHash(1, {1000}, outs) != NoteDemandSigHash(1, {1000}, uint256S("bb")));
 }
 
-BOOST_AUTO_TEST_CASE(note_claim_entitlement_math)
+BOOST_AUTO_TEST_CASE(claim_sats_entitlement_math)
 {
-    // min(U, floor(U*pot/units)) with a 128-bit intermediate (D5).
-    // Under-collateralized: pot 100, units 1000 -> 10% recovery
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(500, 100, 1000), 50);
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(1000, 100, 1000), 100);   // full burn takes the pot
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(1, 100, 1000), 0);        // floor dust
-    // Over-collateralized: par cap, never more than U
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(500, 5000, 1000), 500);
-    // Exactly collateralized
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(250, 1000, 1000), 250);
+    // The failed-house claim (Gram notes, R2-int-10): min(floor(U*pot/snapshot), floor((U-gold)*price/1000)), 128-bit,
+    // capped at MAX_MONEY. Replaces the tests of the retired NoteClaimEntitlement/DepositClaimEntitlement (FB-2a), which
+    // were this with price 1000 (1 sat a mg) and no gold.
+    const uint64_t P1 = 1000;
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(500, 0, 100, 1000, P1), 50);      // under-collateralised: 10% recovery
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(1000, 0, 100, 1000, P1), 100);    // the whole snapshot takes the pot
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(1, 0, 100, 1000, P1), 0);         // floor dust
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(500, 0, 5000, 1000, P1), 500);    // over-collateralised: par caps it
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(250, 0, 1000, 1000, P1), 250);    // exactly collateralised
     // Degenerate inputs
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(0, 100, 1000), 0);
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(500, 0, 1000), 0);
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(500, 100, 0), 0);
-    // The uint64-overflow regime the 128-bit path exists for: U and pot near
-    // the money bounds (product ~2^104)
-    const uint64_t bigU = (uint64_t)MAX_MONEY * 3;                    // lambda-max units
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(bigU, MAX_MONEY, bigU), MAX_MONEY);
-    BOOST_CHECK_EQUAL(NoteClaimEntitlement(bigU / 3, MAX_MONEY, bigU), MAX_MONEY / 3);
-    // Sum of split claims never exceeds the pot (floor rounds down)
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(0, 0, 100, 1000, P1), 0);
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(500, 0, 0, 1000, P1), 0);
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(500, 0, 100, 0, P1), 0);
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(500, 0, 100, 1000, 0), 0);        // no snapshot price
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(500, 500, 100, 1000, P1), 0);     // gold covers it all
+    // The price: par is (U - gold) x price / 1000 sats
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(1000, 0, 1000000, 1000, 250000), 250000);     // 250 sat/mg, pot ample
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(1000, 400, 1000000, 1000, 250000), 150000);   // 400 mg in gold first
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(1000, 0, 100000, 1000, 250000), 100000);      // pro-rata binds
+    // The uint64-overflow regime: U and pot near the money bounds (product ~2^104), and the MAX_MONEY cap
+    const uint64_t bigU = (uint64_t)MAX_MONEY * 3;
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(bigU, 0, MAX_MONEY, bigU, P1), MAX_MONEY);
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(bigU / 3, 0, MAX_MONEY, bigU, P1), MAX_MONEY / 3);
+    BOOST_CHECK_EQUAL(ClaimSatsEntitlement(bigU, 0, MAX_MONEY, bigU, 1000000), MAX_MONEY);
+    // Split claims never take more than the pot (floor rounds down)
     {
-        const CAmount pot = 999;
-        const uint64_t units = 1000;
         CAmount paid = 0;
         for (int i = 0; i < 10; i++)
-            paid += NoteClaimEntitlement(100, pot, units);
-        BOOST_CHECK(paid <= pot);
+            paid += ClaimSatsEntitlement(100, 0, 999, 1000, P1);
+        BOOST_CHECK(paid <= 999);
+    }
+    // The junior tranche: deposits claim against pot - SeniorSatsReserved(notes), so they never reach the notes' par.
+    // pot 1e6, notes 800000 mg at 1 sat/mg -> 800000 reserved; a 500000-principal deposit gets the 200000 left.
+    {
+        const CAmount pot = 1000000;
+        const CAmount reserved = SeniorSatsReserved(800000, 0, pot, P1);
+        BOOST_CHECK_EQUAL(reserved, 800000);
+        const CAmount take = ClaimSatsEntitlement(500000, 0, pot - reserved, 500000, P1);
+        BOOST_CHECK_EQUAL(take, 200000);
+        BOOST_CHECK(pot - take >= reserved);
+        BOOST_CHECK_EQUAL(SeniorSatsReserved(800000, 0, 500000, P1), 500000);   // capped at the pot
+        BOOST_CHECK_EQUAL(SeniorSatsReserved(1001, 0, pot, P1 + 1), 1003);     // rounds up: ceil(1001 x 1001 / 1000)
+        BOOST_CHECK_EQUAL(SeniorSatsReserved(800, 800, pot, P1), 0);           // gold covers the senior claim
     }
 }
 
@@ -1358,6 +1378,226 @@ BOOST_AUTO_TEST_CASE(note_lock_approvals_outside_input_sighash)
     const uint256 d0 = NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
     mtx.vout[0].nValue += 1;
     BOOST_CHECK(NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)) != d0);
+}
+
+// testing (2026-11-10): UR1-7 (ultra s1 #7; Michael signed it off 2026-11-10, freebank
+// docs-local/CONSENSUS_SIGNOFF_2026-11-10.md item 7). The note family's approver-array shape - MINT's inline copy and
+// CheckNoteApproverShape for LOCK, UNLOCK and TOKEN_KEYSET - has no MAX_HOUSE_PARTNERS bound, while the house, bill and
+// settle copies all do. A payload naming more approvers than any house can have partners must fail at shape.
+// FAILS on master a00fb05 (65 approvers pass shape for all four ops); passes once the bound is added. The 64-approver
+// control must pass shape both before and after.
+namespace {
+template <typename T>
+void UR17SetApprovers(T& p, size_t n)
+{
+    p.vApproverIndex.clear();
+    p.vApproverSig.clear();
+    for (size_t i = 0; i < n; i++) {
+        p.vApproverIndex.push_back((uint32_t)i);                        // strictly ascending
+        p.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30)); // shape checks the size only
+    }
+}
+
+template <typename T>
+std::string UR17ShapeReason(uint8_t nOp, const T& payload, const std::vector<CTxOut>& vout)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = nOp;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << payload;
+    mtx.vchNotePayload.assign(ss.begin(), ss.end());
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("17"), 0)));
+    mtx.vout = vout;
+    CValidationState state;
+    return CheckNoteTransactionShape(CTransaction(mtx), state) ? std::string() : state.GetRejectReason();
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(ur1_7_note_approver_count_bounded_at_shape)
+{
+    CKey keyHolder, keyPost, keyToken;
+    const std::vector<unsigned char> pubHolder = FreshPubKey(keyHolder);
+    const std::vector<unsigned char> pubPost = FreshPubKey(keyPost);
+    const std::vector<unsigned char> pubToken = FreshPubKey(keyToken);
+    const std::vector<CTxOut> vNoteOut{CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(pubHolder))};
+    const std::vector<CTxOut> vNone;
+
+    for (const size_t n : {MAX_HOUSE_PARTNERS, MAX_HOUSE_PARTNERS + 1}) {
+        NoteMint mint;
+        mint.nHouseID = 1;
+        mint.vUnits = {100};
+        UR17SetApprovers(mint, n);
+
+        NoteLock lock;
+        lock.nHouseID = 1;
+        lock.nUnits = 100;
+        lock.vchHolderPubKey = pubHolder;
+        lock.vchHolderSig = std::vector<unsigned char>(70, 0x30);
+        UR17SetApprovers(lock, n);
+
+        NoteUnlock unlock;
+        unlock.nHouseID = 1;
+        unlock.vUnits = {100};
+        UR17SetApprovers(unlock, n);
+
+        NoteTokenKeyset ks;
+        ks.nHouseID = 1;
+        ks.vchPostingPubKey = pubPost;
+        ks.vKey.push_back(TokenKey(0, pubToken));
+        UR17SetApprovers(ks, n);
+
+        const std::vector<std::pair<std::string, std::string>> vResult = {
+            {"MINT", UR17ShapeReason(NOTE_OP_MINT, mint, vNoteOut)},
+            {"LOCK", UR17ShapeReason(NOTE_OP_LOCK, lock, vNone)},
+            {"UNLOCK", UR17ShapeReason(NOTE_OP_UNLOCK, unlock, vNoteOut)},
+            {"TOKEN_KEYSET", UR17ShapeReason(NOTE_OP_TOKEN_KEYSET, ks, vNone)},
+        };
+        for (const auto& r : vResult) {
+            if (n <= MAX_HOUSE_PARTNERS) {
+                BOOST_CHECK_MESSAGE(r.second.empty(), "UR1-7 control: " + r.first + " with " + std::to_string(n) +
+                                    " approvers was refused at shape: " + r.second);
+            } else {
+                BOOST_CHECK_MESSAGE(r.second.find("approvers") != std::string::npos,
+                                    "UR1-7: " + r.first + " with " + std::to_string(n) + " approvers (more than "
+                                    "MAX_HOUSE_PARTNERS) passed note shape" +
+                                    (r.second.empty() ? std::string() : " or failed for another reason: " + r.second));
+            }
+        }
+    }
+}
+
+// testing (2026-11-10): stage A SA-N4 (security 11-08; consensus, on freebankd's second sign-off list for Michael).
+// tx_verify's input/structure arm covers NOTE_OP_SWAP_DONE, _PAY and _PROTEST but not NOTE_OP_SWAP_EXPIRE, and none
+// of the four refuses a stray output to a house escrow script or to the noteholders' fund: such an output enters the UTXO
+// set untagged, an anyone-can-spend coin (the escrow lock is <house_id> OP_DROP OP_TRUE). None of these ops pays into
+// escrow or the fund, so each must refuse both. FAILS on master a00fb05 (all accepted); passes once SWAP_EXPIRE joins
+// the arm and stray escrow/fund outputs are refused. The control (no stray output) must pass before and after.
+namespace {
+template <typename T>
+std::string SAN4Inputs(uint8_t nOp, const T& payload, const CScript* pStray)
+{
+    CCoinsView base;
+    CCoinsViewCache cache(&base);
+    const COutPoint fund(uint256S("54a4"), 0);
+    cache.AddCoin(fund, Coin(CTxOut(100000, GetScriptForDestination(CKeyID(uint160(std::vector<unsigned char>(20, 0x54))))), 100, false, false, false,
+                             uint256()), false);
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = nOp;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << payload;
+    mtx.vchNotePayload.assign(ss.begin(), ss.end());
+    mtx.vin.push_back(CTxIn(fund));
+    mtx.vout.push_back(CTxOut(90000, GetScriptForDestination(CKeyID(uint160(std::vector<unsigned char>(20, 0x55))))));
+    if (pStray)
+        mtx.vout.push_back(CTxOut(1000, *pStray));
+    CValidationState state;
+    CAmount fee = 0;
+    return Consensus::CheckTxInputs(CTransaction(mtx), state, cache, 200, fee)
+               ? std::string() : (state.GetRejectReason().empty() ? std::string("(refused)") : state.GetRejectReason());
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(testing_sa_n4_swap_ops_refuse_stray_escrow_and_fund_outputs)
+{
+    const uint256 hashLock = uint256S("5a4e");
+    NoteSwapExpire ex; ex.nHouseID = 3; ex.hashLock = hashLock; ex.nRateNamed = 1000;
+    NoteSwapDone dn; dn.nHouseID = 3; dn.hashLock = hashLock; dn.vchPreimage.assign(32, 0x11);
+    NoteSwapPay pay; pay.nHouseID = 3; pay.hashLock = hashLock; pay.nRateNamed = 1000; pay.fWasProtested = 0;
+    NoteSwapProtest pr; pr.nHouseID = 3; pr.hashLock = hashLock;
+    const CScript scriptEscrow = HouseEscrowScript(uint256S("f00d"));
+    const CScript scriptFund = MutualFundScript();
+    const std::vector<std::pair<std::string, const CScript*>> vStray = {
+        {"a house escrow script", &scriptEscrow}, {"the noteholders' fund script", &scriptFund}};
+
+    struct Op { const char* name; std::function<std::string(const CScript*)> run; };
+    const std::vector<Op> vOp = {
+        {"SWAP_EXPIRE", [&](const CScript* p) { return SAN4Inputs(NOTE_OP_SWAP_EXPIRE, ex, p); }},
+        {"SWAP_DONE", [&](const CScript* p) { return SAN4Inputs(NOTE_OP_SWAP_DONE, dn, p); }},
+        {"SWAP_PAY", [&](const CScript* p) { return SAN4Inputs(NOTE_OP_SWAP_PAY, pay, p); }},
+        {"SWAP_PROTEST", [&](const CScript* p) { return SAN4Inputs(NOTE_OP_SWAP_PROTEST, pr, p); }},
+    };
+    for (const Op& op : vOp) {
+        const std::string strControl = op.run(nullptr);
+        BOOST_CHECK_MESSAGE(strControl.empty(), std::string("SA-N4 control: ") + op.name + " with plain inputs and "
+                            "outputs was refused: " + strControl);
+        for (const auto& stray : vStray) {
+            const std::string strStray = op.run(stray.second);
+            BOOST_CHECK_MESSAGE(!strStray.empty(), std::string("SA-N4: ") + op.name + " with a stray output to " +
+                                stray.first + " was accepted (an untagged anyone-can-spend coin)");
+        }
+    }
+}
+
+// testing (2026-11-10): stage A SA-N3 (security 11-08; consensus, on freebankd's second sign-off list for Michael). A
+// holder-signed REDEEM that names no rate (nRateNamed 0) is valued at no price, so it owes no brassage spread
+// (validation.cpp: nBrassageBps = nRedeemPrice ? owed : 0). At an Open house the spread is 0 anyway; at a Stressed house
+// the spread is what keeps a run from draining the pot the other holders rely on, and naming 0 skips it. The fix: at a
+// house that owes a spread, a REDEEM must pay it (so it can't name rate 0). The unit-test rate override
+// (g_nHouseRateTestOverride) routes rate-0 redemptions through BoundHouseRate and hides this, so the test switches it
+// off. FAILS on master a00fb05 (accepted at the Stressed house); passes with the fix. The Open-house control (rate 0, no
+// spread owed) must stay accepted.
+BOOST_AUTO_TEST_CASE(testing_sa_n3_stressed_redeem_cannot_skip_brassage)
+{
+    const uint64_t U = 1000000;
+    const int H = 20000;
+    CKey keyHolder; keyHolder.MakeNewKey(true);
+    const CPubKey pubHolder = keyHolder.GetPubKey();
+    const std::vector<unsigned char> vchHolder(pubHolder.begin(), pubHolder.end());
+
+    CHouse house;
+    house.nHouseID = 7;
+    house.houseID = uint256S("5a43");
+    house.nTier = HOUSE_TIER_MULTI_PARTNER;
+    house.nThresholdM = 1;
+    house.strClassID = "san3";
+    house.nDenomMgGold = 1000;
+    house.status = HOUSE_STATUS_OPEN;
+    house.nRegisteredHeight = 1000;
+    house.nMintedUnits = 10 * U;
+    house.nLastAttestHeight = H - 10;               // a fresh cadence
+    house.amountLastAttestReserves = 1000;          // a thin till: a spread is owed once the house isn't Open
+    HousePartner p;
+    p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    p.amountPledge = 100 * COIN;
+    p.status = HOUSE_PARTNER_ACTIVE;
+    house.vPartner.push_back(p);
+
+    auto fnNoteCoin = [&](const COutPoint&, Coin& coin) {
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchHolder)), H - 100, false, false, false, uint256());
+        coin.SetNote(7, U, 0);                       // an ordinary (undemanded) note
+        return true;
+    };
+    auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;                    // let a rate-0 redemption take its real path
+
+    for (const bool fStressed : {false, true}) {
+        CHouse h = house;
+        if (fStressed) {                             // an unpaid protest a few blocks ago: Stressed, its cure running
+            h.nProtestOpen = 1;
+            h.nProtestHeight = H - 5;
+            h.nProtestDemandHeight = H - 50;
+        }
+        auto fnGetHouse = [&h](uint32_t id, CHouse& out) { if (id != 7) return false; out = h; return true; };
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(h, H), fStressed ? HOUSE_STATUS_STRESSED : HOUSE_STATUS_OPEN);
+        const uint32_t nSpreadBps = GoldBrassageBps(h, H);
+        if (fStressed)
+            BOOST_REQUIRE_MESSAGE(nSpreadBps > 0, "SA-N3 setup: the Stressed house owes no spread");
+        CMutableTransaction mtx = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U);   // nRateNamed 0, no spread output
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        const bool fOk = CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnNoteCoin, fnNoteCoin, fnNoBlock,
+                                            houseOut, fChanged);
+        if (!fStressed) {
+            BOOST_CHECK_MESSAGE(fOk, "SA-N3 control: a rate-0 REDEEM at an Open house (no spread owed) was refused: " +
+                                state.GetRejectReason());
+        } else {
+            BOOST_CHECK_MESSAGE(!fOk, "SA-N3: a REDEEM naming rate 0 at a Stressed house that owes a " +
+                                std::to_string(nSpreadBps) + " bps spread was accepted with no spread paid");
+        }
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

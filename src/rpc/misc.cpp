@@ -32,6 +32,8 @@
 #include <sidechainclient.h>
 #include <timedata.h>
 #include <txdb.h>
+#include <crypto/sha256.h>
+#include <coins.h>
 #include <issued.h>   // HouseCapitalForChecks
 #include <houserate.h>
 #include <units.h>
@@ -280,7 +282,7 @@ UniValue setmocktime(const JSONRPCRequest& request)
             "   Pass 0 to go back to using the system time."
         );
 
-    if (!Params().MineBlocksOnDemand())
+    if (Params().NetworkIDString() != CBaseChainParams::REGTEST)   // SA-V2: by network, not MineBlocksOnDemand
         throw std::runtime_error("setmocktime for regression testing (-regtest mode) only");
 
     // For now, don't change mocktime if we're in the middle of validation, as
@@ -671,7 +673,10 @@ static void BMMRefuseWhileBehind(const std::string& strMethod)
     // A lone regtest node (the integration gates, a local bench) starts a chain
     // on its own: with no peer and no better header it is not behind, as
     // Bitcoin Core's getblocktemplate allows on regtest.
-    if (Params().MineBlocksOnDemand() && evidence.nPeers == 0 && hashBetterHeader.IsNull())
+    // SW-4 (security 11-11): by network, not MineBlocksOnDemand (main and easynet inherit it from CBetaParams). On a
+    // public network a node with no peers waits for one: a seed starts the chain peered with a second node (net_tests
+    // bmm_behind_judgement), and an isolated node never bids BMM on a tip it can't check.
+    if (Params().NetworkIDString() == CBaseChainParams::REGTEST && evidence.nPeers == 0 && hashBetterHeader.IsNull())
         return;
     const BMMBehind behind = JudgeBMMBehind(fIBD, evidence, fHeaderBoxOpen);
     if (behind != BMMBehind::PEER)
@@ -1531,8 +1536,11 @@ UniValue rebroadcastwithdrawalbundle(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size())
         throw std::runtime_error(
             "rebroadcastwithdrawalbundle\n"
-            "\nHand the latest WithdrawalBundle to the mainchain again. The node already does this by itself,\n"
-            "on each block it connects, until one attempt succeeds.\n"
+            "\nHand the latest WithdrawalBundle to the mainchain, while it is still pending (created, neither paid\n"
+            "nor failed) and the mainchain has never seen it. The node does this by itself about once a minute, once\n"
+            "the bundle's block is buried, so this is rarely needed. Refused: a paid or failed bundle (a failed\n"
+            "bundle's withdrawals go back to their owners), a bundle not yet buried, and a bundle the mainchain\n"
+            "already has (in its vote, paid or failed there).\n"
             "With -mainchaintransport=enforcer the bundle goes to the enforcer's block producer\n"
             "(BlockProducerService/ProposeWithdrawalBundle, or WalletService/BroadcastWithdrawalBundle on\n"
             "an enforcer older than 7958cef). The enforcer stores it and proposes it (M3) in the mainchain\n"
@@ -1550,12 +1558,92 @@ UniValue rebroadcastwithdrawalbundle(const JSONRPCRequest& request)
     if (!psidechaintree->GetWithdrawalBundle(hashLatest, withdrawalBundle))
         throw JSONRPCError(RPC_MISC_ERROR, "Failed to load latest WithdrawalBundle from database");
 
+    // PG-1 (testing 11-11): the v0.2.17 rule ConnectBlock and MaybeReproposeWithdrawalBundle apply - only a pending
+    // bundle goes to the mainchain; a failed bundle's withdrawals go back to their owners.
+    if (withdrawalBundle.status != WITHDRAWAL_BUNDLE_CREATED)
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("The latest WithdrawalBundle %s is %s, not pending: only a pending "
+            "bundle is handed to the mainchain (a failed bundle's withdrawals go back to their owners)",
+            hashLatest.ToString(), withdrawalBundle.status == WITHDRAWAL_BUNDLE_FAILED ? "failed" : "already paid"));
+
+    // PG-1 (D-2026-11-13-3; security 11-12, design 11-13): the same rules as the node's own cycle. Between the L1
+    // paying or failing a bundle and its mark on this chain, the bundle is still CREATED here, and FreeBank never hands
+    // the enforcer a bundle the L1 has already seen. So: buried, the L1 asked, and sent only when the L1 has never
+    // seen it.
+    {
+        char cOutcome = 0;
+        L1Answer answer;
+        {
+            LOCK(cs_main);
+            const CBlockIndex* pindexTip = chainActive.Tip();
+            if (!pindexTip || withdrawalBundle.nHeight + Params().WithdrawalBundleSendDepth() > pindexTip->nHeight)
+                throw JSONRPCError(RPC_MISC_ERROR, strprintf("The latest WithdrawalBundle %s is not yet %d blocks deep: not sent",
+                    hashLatest.ToString(), Params().WithdrawalBundleSendDepth()));
+            answer = GetBundleOutcomeOnL1(withdrawalBundle, pindexTip, bmmCache.GetLastMainBlockHash(), cOutcome);
+        }
+        if (answer != L1Answer::YES)
+            throw JSONRPCError(RPC_MISC_ERROR, "The mainchain can't say yet what became of the latest WithdrawalBundle; try again later");
+        if (cOutcome != 0)
+            throw JSONRPCError(RPC_MISC_ERROR, strprintf("The latest WithdrawalBundle %s is %s on the mainchain: not sent",
+                hashLatest.ToString(), cOutcome == 'S' ? "already paid" : cOutcome == 'F' ? "failed" : "in its vote"));
+    }
+
     SidechainClient client;
     std::string strHex = EncodeHexTx(withdrawalBundle.tx);
     if (!client.BroadcastWithdrawalBundle(strHex))
         throw JSONRPCError(RPC_MISC_ERROR, "Failed to broadcast latest WithdrawalBundle");
+    bmmCache.StoreBroadcastedWithdrawalBundle(hashLatest);
 
     return NullUniValue;
+}
+
+UniValue getpegstatus(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size())
+        throw std::runtime_error(
+            "getpegstatus\n"
+            "\nThe withdrawal side of the peg (PG-1, D-2026-11-13-3). The pending bundle (created, neither paid nor\n"
+            "failed here) goes to the mainchain once its block is send_depth deep, and only while the mainchain has never\n"
+            "seen it. A bundle that fails on the mainchain is never sent again: its withdrawals go back to their owners.\n"
+            "shortfall_sats counts mainchain payouts from this sidechain's slot that were not the pending bundle's own\n"
+            "payment: any value above 0 means the treasury paid out more than the sidechain owed.\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"height\": n,          (numeric) the tip\n"
+            "  \"send_depth\": n,      (numeric) blocks a bundle's block must be buried before it is sent (node policy)\n"
+            "  \"pending\": [ { \"hash\": \"hex\", \"m6id\": \"hex\", \"height\": n, \"withdrawals\": n, \"sent_after\": n } ],\n"
+            "  \"shortfall_sats\": n, \"shortfall_events\": n\n"
+            "}\n"
+            + HelpExampleCli("getpegstatus", "")
+        );
+
+    LOCK(cs_main);
+    const int nDepth = Params().WithdrawalBundleSendDepth();
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("height", chainActive.Height());
+    result.pushKV("send_depth", nDepth);
+    UniValue pending(UniValue::VARR);
+    if (psidechaintree) {
+        uint256 hashLatest;
+        SidechainWithdrawalBundle b;
+        if (psidechaintree->GetLastWithdrawalBundleHash(hashLatest) && !hashLatest.IsNull() &&
+                psidechaintree->GetWithdrawalBundle(hashLatest, b) && b.status == WITHDRAWAL_BUNDLE_CREATED) {
+            UniValue o(UniValue::VOBJ);
+            o.pushKV("hash", b.tx.GetHash().ToString());
+            o.pushKV("m6id", BundleM6id(b.tx).ToString());
+            o.pushKV("height", b.nHeight);
+            o.pushKV("withdrawals", (int64_t)b.vWithdrawalID.size());
+            o.pushKV("sent_after", b.nHeight + nDepth);
+            pending.push_back(o);
+        }
+    }
+    result.pushKV("pending", pending);
+    CAmount nShortfall = 0;
+    int64_t nEvents = 0;
+    if (psidechaintree)
+        psidechaintree->GetShortfallTotal(nShortfall, nEvents);
+    result.pushKV("shortfall_sats", nShortfall);
+    result.pushKV("shortfall_events", nEvents);
+    return result;
 }
 
 UniValue getwithdrawalbundle(const JSONRPCRequest& request)
@@ -2015,12 +2103,13 @@ static UniValue HouseToJSON(const CHouse& house)
             obj.pushKV("cure_left", (uint64_t)house.nCureLeft);
         if (house.nNoCureHeight != 0)
             obj.pushKV("no_cure_height", (uint64_t)house.nNoCureHeight);
-        // One cure per 180 days, counted from the end of the last episode: the first height a new protest gets a cure.
-        {
-            const uint32_t nRef = std::max(house.nProtestHeight, house.nDeferEndedHeight);
-            if (nRef != 0)
-                obj.pushKV("next_cure_height",
-                           (uint64_t)ClockDeadlineHeight(nRef, HOUSE_CURE_SPACING_BLOCKS, nTipHeight + 1));
+        // One cure per 180 days, counted from the end of the last episode (UR-ext-12 precision 2: nEpisodeEndHeight, the
+        // last protest paid with the house not suspended, or the recovery after it): the first height a new protest
+        // gets a cure. Neither shown while an episode runs or before the first one ends.
+        if (house.nEpisodeEndHeight != 0) {
+            obj.pushKV("episode_end_height", (uint64_t)house.nEpisodeEndHeight);
+            obj.pushKV("next_cure_height", (uint64_t)ClockDeadlineHeight(house.nEpisodeEndHeight,
+                                                                         HOUSE_CURE_SPACING_BLOCKS, nTipHeight + 1));
         }
         obj.pushKV("attest_deadline", (uint64_t)nDeadline);
         obj.pushKV("lastattestheight", (uint64_t)house.nLastAttestHeight);
@@ -2033,7 +2122,9 @@ static UniValue HouseToJSON(const CHouse& house)
             obj.pushKV("insolventheight", (uint64_t)house.nInsolventHeight);
             obj.pushKV("insolventunits", house.nInsolventUnits);
             obj.pushKV("insolvent_sats_per_gram", house.nInsolventSatsPerGram);   // the snapshot's price (R2-int-10)
-            obj.pushKV("insolvent_gold_mg", house.nInsolventGoldMg);              // the snapshot's gold
+            // Always 0 since Gold B (a failed house's pot holds no gold); kept so existing readers, the explorer's
+            // among them, still find it (FB-2d).
+            obj.pushKV("insolvent_gold_mg", house.nInsolventGoldMg);
             obj.pushKV("insolventpot", ValueFromAmount(house.amountInsolventPot));
         }
         obj.pushKV("escrowchangeoutputs", (uint64_t)house.vOutEscrowChange.size());
@@ -2131,8 +2222,10 @@ UniValue gethouse(const JSONRPCRequest& request)
             "  \"cure_insolvent_height\"  (numeric) the first height the stressed house is insolvent unless it pays\n"
             "  \"cure_left\"              (numeric) the raw record: the clock blocks a re-armed cure continues with\n"
             "  \"no_cure_height\"         (numeric) a protest found no cure (within 180 days): insolvent from here\n"
-            "  \"next_cure_height\"       (numeric) the first height a new protest gets a cure (180 days from the end of\n"
-            "                           the last episode, if it ended now)\n"
+            "  \"episode_end_height\"     (numeric) the height the last protest episode ended: its last protest paid with\n"
+            "                           the house not suspended, or the recovery that ended the suspension it was paid in\n"
+            "  \"next_cure_height\"       (numeric) the first height a new protest gets a cure: 180 days from\n"
+            "                           episode_end_height (both absent until an episode has ended)\n"
             "\nExamples:\n"
             + HelpExampleCli("gethouse", "1")
             + HelpExampleRpc("gethouse", "1")
@@ -2344,10 +2437,147 @@ UniValue getpool(const JSONRPCRequest& request)
     return PoolToJSON(pool);
 }
 
+/** FB-6 (testing's harness, regtest only): byte-exact state for the reorg-exactness check. */
+UniValue getsidedbhashes(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "getsidedbhashes\n"
+            "\nRegtest only (a test hook): SHA256 over every record of each side database at the tip - the key raw, the\n"
+            "value de-obfuscated, in key order, the obfuscation key's own record left out - and over the UTXO set's full\n"
+            "coin records (FreeBank tags included). Two nodes at the same state give the same hashes.\n"
+            "\nResult: {\"height\", \"bestblock\", \"house\": {\"hash\", \"records\"}, \"pool\", \"bill\", \"units\",\n"
+            "         \"asset\", \"sidechain\", \"utxo\": {\"hash\", \"records\"}}\n");
+    if (Params().NetworkIDString() != CBaseChainParams::REGTEST)
+        throw JSONRPCError(RPC_MISC_ERROR, "getsidedbhashes is a regtest-only test hook");
+    LOCK(cs_main);   // before the flush: side DBs and the UTXO set from one tip (security 11-11)
+    FlushStateToDisk();
+    UniValue o(UniValue::VOBJ);
+    o.pushKV("height", chainActive.Height());
+    o.pushKV("bestblock", chainActive.Tip()->GetBlockHash().GetHex());
+    const auto add = [&o](const char* name, CDBWrapper* db) {
+        UniValue d(UniValue::VOBJ);
+        if (db) {
+            size_t n = 0;
+            d.pushKV("hash", db->HashAllRecords(n).GetHex());
+            d.pushKV("records", (uint64_t)n);
+        }
+        o.pushKV(name, d);
+    };
+    add("house", phousetree.get());
+    add("pool", ppooltree.get());
+    add("bill", pbilltree.get());
+    add("units", punitsdb.get());
+    add("asset", passettree.get());
+    add("sidechain", psidechaintree.get());
+    {
+        std::unique_ptr<CCoinsViewCursor> pcursor(pcoinsdbview->Cursor());
+        CSHA256 hasher;
+        uint64_t n = 0;
+        for (; pcursor->Valid(); pcursor->Next()) {
+            COutPoint key;
+            Coin coin;
+            if (!pcursor->GetKey(key) || !pcursor->GetValue(coin))
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "unreadable UTXO record");
+            CDataStream ss(SER_DISK, CLIENT_VERSION);
+            ss << key << coin;
+            hasher.Write((const unsigned char*)ss.data(), ss.size());
+            n++;
+        }
+        uint256 h;
+        hasher.Finalize(h.begin());
+        UniValue d(UniValue::VOBJ);
+        d.pushKV("hash", h.GetHex());
+        d.pushKV("records", n);
+        o.pushKV("utxo", d);
+    }
+    return o;
+}
+
+/** FB-6 (testing's harness, regtest only): chain-wide per-house sums, for a conservation check without a closed world. */
+UniValue getcreditaudit(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 0)
+        throw std::runtime_error(
+            "getcreditaudit\n"
+            "\nRegtest only (a test hook): per house, what its records say (minted units, deposit units) beside what the\n"
+            "UTXO set holds (note units in note coins, demanded among them; escrow coins' value; deposit receipts'\n"
+            "principal), and per pool its escrow coins' value. Read from the flushed UTXO set at the tip.\n"
+            "\nResult: {\"height\", \"houses\": [{\"id\", \"minted_units\", \"deposit_units\", \"note_units_utxo\",\n"
+            "         \"demanded_units_utxo\", \"escrow_sats\", \"deposit_principal_utxo\"}], \"pool_escrow_sats\": n,\n"
+            "         \"pools\": [{\"id\", \"lp_units_utxo\", \"lp_supply\", \"lp_min_locked\", \"escrow_sats\"}]}\n");
+    if (Params().NetworkIDString() != CBaseChainParams::REGTEST)
+        throw JSONRPCError(RPC_MISC_ERROR, "getcreditaudit is a regtest-only test hook");
+    LOCK(cs_main);   // before the flush: side DBs and the UTXO set from one tip (security 11-11)
+    FlushStateToDisk();
+    struct Sums { uint64_t nNotes = 0, nDemanded = 0, nDeposit = 0; CAmount nEscrow = 0; };
+    std::map<uint32_t, Sums> mapSums;
+    CAmount nPoolEscrow = 0;
+    struct PoolSums { uint64_t nLpUnits = 0; CAmount nEscrow = 0; };
+    std::map<uint32_t, PoolSums> mapPool;   // pool id (== its house id, pool.h) -> LP units and escrow in the UTXO set
+    {
+        std::unique_ptr<CCoinsViewCursor> pcursor(pcoinsdbview->Cursor());
+        for (; pcursor->Valid(); pcursor->Next()) {
+            Coin coin;
+            if (!pcursor->GetValue(coin))
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "unreadable UTXO record");
+            if (coin.fNote) {
+                mapSums[coin.nHouseID].nNotes += coin.nNoteUnits;
+                if (coin.nDemandHeight != 0)
+                    mapSums[coin.nHouseID].nDemanded += coin.nNoteUnits;
+            }
+            if (coin.fHouseEscrow)
+                mapSums[coin.nHouseID].nEscrow += coin.out.nValue;
+            if (coin.fDeposit)
+                mapSums[coin.nHouseID].nDeposit += coin.nDepositPrincipal;
+            if (coin.fPoolEscrow) {
+                nPoolEscrow += coin.out.nValue;
+                mapPool[coin.nHouseID].nEscrow += coin.out.nValue;
+            }
+            if (coin.fLpShare)
+                mapPool[coin.nHouseID].nLpUnits += coin.nLpUnits;
+        }
+    }
+    UniValue arr(UniValue::VARR);
+    for (const CHouse& house : phousetree->GetHouses()) {
+        const Sums& s = mapSums[house.nHouseID];
+        UniValue h(UniValue::VOBJ);
+        h.pushKV("id", (uint64_t)house.nHouseID);
+        h.pushKV("minted_units", (uint64_t)house.nMintedUnits);
+        h.pushKV("deposit_units", (uint64_t)house.nDepositUnits);
+        h.pushKV("note_units_utxo", s.nNotes);
+        h.pushKV("demanded_units_utxo", s.nDemanded);
+        h.pushKV("escrow_sats", s.nEscrow);
+        h.pushKV("deposit_principal_utxo", s.nDeposit);
+        arr.push_back(h);
+    }
+    UniValue o(UniValue::VOBJ);
+    o.pushKV("height", chainActive.Height());
+    o.pushKV("houses", arr);
+    o.pushKV("pool_escrow_sats", nPoolEscrow);
+    // Per pool: the LP units the UTXO set holds beside the record's supply - which includes POOL_MIN_LIQUIDITY, locked
+    // for good in no coin, so lp_units_utxo + lp_min_locked == lp_supply - and the escrow value.
+    UniValue pools(UniValue::VARR);
+    for (const CPool& pool : ppooltree->GetPools()) {
+        const PoolSums& p = mapPool[pool.nPoolID];
+        UniValue q(UniValue::VOBJ);
+        q.pushKV("id", (uint64_t)pool.nPoolID);
+        q.pushKV("lp_units_utxo", p.nLpUnits);
+        q.pushKV("lp_supply", (uint64_t)pool.nLpSupply);
+        q.pushKV("lp_min_locked", (uint64_t)POOL_MIN_LIQUIDITY);
+        q.pushKV("escrow_sats", p.nEscrow);
+        pools.push_back(q);
+    }
+    o.pushKV("pools", pools);
+    return o;
+}
+
 static const CRPCCommand commands[] =
 { //  category              name                        actor (function)           argNames
   //  --------------------- ------------------------    -----------------------    ----------
     { "control",            "getmemoryinfo",            &getmemoryinfo,            {"mode"} },
+    { "hidden",             "getsidedbhashes",          &getsidedbhashes,          {} },
+    { "hidden",             "getcreditaudit",           &getcreditaudit,           {} },
     { "control",            "logging",                  &logging,                  {"include", "exclude"}},
     { "util",               "validateaddress",          &validateaddress,          {"address"} }, /* uses wallet if enabled */
     { "util",               "createmultisig",           &createmultisig,           {"nrequired","keys"} },
@@ -2375,6 +2605,7 @@ static const CRPCCommand commands[] =
     { "sidechain",          "updatemainblockcache",         &updatemainblockcache,          {}},
     { "sidechain",          "listmywithdrawals",            &listmywithdrawals,             {}},
     { "sidechain",          "rebroadcastwithdrawalbundle",  &rebroadcastwithdrawalbundle,   {}},
+    { "sidechain",          "getpegstatus",                 &getpegstatus,                  {}},
     { "sidechain",          "getwithdrawal",                &getwithdrawal,                 {"id"}},
     { "sidechain",          "formatdepositaddress",         &formatdepositaddress,          {"address"}},
 

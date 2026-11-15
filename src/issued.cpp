@@ -167,6 +167,7 @@ uint256 IssuedSigHash(const CTransaction& tx)
         hPrevouts << in.prevout;
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBank issued token op v1");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << tx.nIssuedOp;
     ss << IssuedPayloadSigForm(tx);
     ss << hPrevouts.GetHash();

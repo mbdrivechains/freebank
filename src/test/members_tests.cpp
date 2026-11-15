@@ -143,7 +143,8 @@ BOOST_AUTO_TEST_CASE(members_chouse_v10_and_v9)
     v[0] = 9;
     v.resize(v.size() - (1 + sizeof(uint64_t) + 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t)   // + the v12 claim totals
                          + 2 * sizeof(uint64_t) + sizeof(uint32_t)                              // + the v13 fields
-                         + sizeof(uint32_t) + 1 + sizeof(uint32_t)));                           // + v14 no-cure, tranches, cure left
+                         + sizeof(uint32_t) + 1 + sizeof(uint32_t)                              // + v14 no-cure, tranches, cure left
+                         + 3 * sizeof(uint32_t) + 2));                                          // + v15 episode counters + end height
     CDataStream ss9(v, SER_DISK, CLIENT_VERSION);
     CHouse old;
     ss9 >> old;

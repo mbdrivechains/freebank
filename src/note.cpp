@@ -58,6 +58,7 @@ uint256 NoteMintSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/mint");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vUnits;
     ss << hashPrevouts;   // tx-unique -> a mint's approver sigs are not replayable
@@ -69,6 +70,7 @@ uint256 NoteTransferSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUni
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/transfer");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vUnits;
     ss << hashOutputs;
@@ -79,6 +81,7 @@ uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint25
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/redeem");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << nUnitsBurned;
     ss << hashOutputs;
@@ -89,6 +92,7 @@ uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/claim");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << nUnitsBurned;
     ss << hashOutputs;   // binds payout + escrow change exactly
@@ -116,6 +120,7 @@ uint256 NoteSwapSigHash(const NoteSwap& swap, const CTransaction& tx)
     unsigned_.vchHolderSig.clear();
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/swap");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << unsigned_;
     ss << NoteHashPrevouts(tx);
     ss << BillHashOutputs(tx);
@@ -126,6 +131,7 @@ uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/demand");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vUnits;
     ss << hashOutputs;
@@ -137,6 +143,7 @@ uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/preauth");   // domain-separated: NOT the demand digest
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vUnits;
     ss << vchPayoutScript;
@@ -147,6 +154,7 @@ uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/protest");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vUnits;
     ss << hashOutputs;
@@ -158,6 +166,7 @@ uint256 NoteLockSigHash(uint32_t nHouseID, uint64_t nUnits, const std::vector<ui
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/lock");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << nUnits;
     ss << vChangeUnits;
@@ -171,6 +180,7 @@ uint256 NoteUnlockSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/unlock");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vUnits;
     ss << hashPrevouts;   // tx-unique -> an unlock's approvals are not replayable
@@ -322,19 +332,6 @@ CAmount SeniorSatsReserved(uint64_t nSeniorMg, uint64_t nGoldMg, const CAmount& 
     return need < (unsigned __int128)amountPot ? (CAmount)need : amountPot;
 }
 
-CAmount NoteClaimEntitlement(uint64_t nUnits, const CAmount& amountPot, uint64_t nSnapshotUnits)
-{
-    if (nSnapshotUnits == 0 || amountPot <= 0 || nUnits == 0)
-        return 0;
-    // nUnits <= 3*MAX_MONEY and amountPot <= MAX_MONEY: the product needs
-    // ~104 bits - 128-bit intermediate, then the min() caps at par.
-    const unsigned __int128 prorata =
-        (unsigned __int128)nUnits * (unsigned __int128)amountPot / (unsigned __int128)nSnapshotUnits;
-    const unsigned __int128 par = (unsigned __int128)nUnits;
-    const unsigned __int128 take = prorata < par ? prorata : par;
-    return (CAmount)take;
-}
-
 CAmount HouseResidualShare(const CAmount& amountPledge, const CAmount& amountResidual, const CAmount& amountPledgeSum)
 {
     if (amountPledgeSum <= 0 || amountResidual <= 0 || amountPledge <= 0)
@@ -391,8 +388,23 @@ template bool DecodeNotePayload<NoteSwapDone>(const std::vector<unsigned char>&,
 template bool DecodeNotePayload<NoteSwapPay>(const std::vector<unsigned char>&, NoteSwapPay&);
 template bool DecodeNotePayload<NoteSwapProtest>(const std::vector<unsigned char>&, NoteSwapProtest&);
 template bool DecodeNotePayload<NoteSwapExpire>(const std::vector<unsigned char>&, NoteSwapExpire&);
+template bool DecodeNotePayload<NoteSwapClaim>(const std::vector<unsigned char>&, NoteSwapClaim&);   // UR1-4: validation.cpp, issued_connect.cpp
 
-void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight)
+/** MM-2: the op's payload, decoded once per transaction when the caller passes a cache (AddCoins: one call per output),
+ *  else decoded into `local` as before. Null if it doesn't decode. */
+template <typename T>
+static const T* NoteTagPayload(const CTransaction& tx, NoteTagCache* pCache, T NoteTagCache::*pField, T& local)
+{
+    if (!pCache)
+        return DecodeNotePayload(tx.vchNotePayload, local) ? &local : nullptr;
+    if (!pCache->fTried) {
+        pCache->fOk = DecodeNotePayload(tx.vchNotePayload, pCache->*pField);
+        pCache->fTried = true;
+    }
+    return pCache->fOk ? &(pCache->*pField) : nullptr;
+}
+
+void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fConnected, uint32_t nHeight, NoteTagCache* pCache)
 {
     if (tx.nVersion != TRANSACTION_NOTE_VERSION)
         return;
@@ -401,16 +413,18 @@ void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fCon
     // no threaded id and connect == rollforward == mempool. MINT, TRANSFER,
     // DEMAND and PROTEST create note outputs at vout[0..vUnits-1].
     if (tx.nNoteOp == NOTE_OP_MINT) {
-        NoteMint m;
-        if (DecodeNotePayload(tx.vchNotePayload, m) && m.nHouseID != 0 && n < m.vUnits.size())
-            coin.SetNote(m.nHouseID, m.vUnits[n], 0);
+        NoteMint mLocal;
+        const NoteMint* m = NoteTagPayload(tx, pCache, &NoteTagCache::m, mLocal);
+        if (m && m->nHouseID != 0 && n < m->vUnits.size())
+            coin.SetNote(m->nHouseID, m->vUnits[n], 0);
     } else if (tx.nNoteOp == NOTE_OP_TRANSFER) {
         // Carries the payload's demand height forward (tx_verify has forced it
         // to equal the spent notes'), so a demanded note keeps its interest
         // clock when it changes hands.
-        NoteTransfer x;
-        if (DecodeNotePayload(tx.vchNotePayload, x) && x.nHouseID != 0 && n < x.vUnits.size())
-            coin.SetNote(x.nHouseID, x.vUnits[n], x.nDemandHeight);
+        NoteTransfer xLocal;
+        const NoteTransfer* x = NoteTagPayload(tx, pCache, &NoteTagCache::x, xLocal);
+        if (x && x->nHouseID != 0 && n < x->vUnits.size())
+            coin.SetNote(x->nHouseID, x->vUnits[n], x->nDemandHeight);
     } else if (tx.nNoteOp == NOTE_OP_DEMAND) {
         // B3: a fresh demand stamps the height it confirms at; the delta-1b
         // upgrade re-stamps the PRIOR height (tx_verify has forced it to equal
@@ -418,32 +432,36 @@ void ApplyNoteCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, bool fCon
         // pre-auth bit rides in the same field - see NOTE_DEMAND_PREAUTH_BIT
         // (D-i: no Coin format change, so no fleet -reindex). Unconfirmed, a
         // fresh demand's stamp is unknown: tag 0, and spending it is refused.
-        NoteDemand d;
-        if (DecodeNotePayload(tx.vchNotePayload, d) && d.nHouseID != 0 && n < d.vUnits.size()) {
+        NoteDemand dLocal;
+        const NoteDemand* d = NoteTagPayload(tx, pCache, &NoteTagCache::d, dLocal);
+        if (d && d->nHouseID != 0 && n < d->vUnits.size()) {
             uint32_t nTag = 0;
-            if (d.nPriorDemandHeight != 0)
-                nTag = NoteDemandTag(d.nPriorDemandHeight, d.fPreAuth);
+            if (d->nPriorDemandHeight != 0)
+                nTag = NoteDemandTag(d->nPriorDemandHeight, d->fPreAuth);
             else if (fConnected)
-                nTag = NoteDemandTag(nHeight, d.fPreAuth);
-            coin.SetNote(d.nHouseID, d.vUnits[n], nTag);
+                nTag = NoteDemandTag(nHeight, d->fPreAuth);
+            coin.SetNote(d->nHouseID, d->vUnits[n], nTag);
         }
     } else if (tx.nNoteOp == NOTE_OP_PROTEST) {
         // Re-issued UNCHANGED: same units, same tag. A protest asserts a claim;
         // it must not alter it.
-        NoteProtest pro;
-        if (DecodeNotePayload(tx.vchNotePayload, pro) && pro.nHouseID != 0 && n < pro.vUnits.size())
-            coin.SetNote(pro.nHouseID, pro.vUnits[n], pro.nDemandTag);
+        NoteProtest proLocal;
+        const NoteProtest* pro = NoteTagPayload(tx, pCache, &NoteTagCache::pro, proLocal);
+        if (pro && pro->nHouseID != 0 && n < pro->vUnits.size())
+            coin.SetNote(pro->nHouseID, pro->vUnits[n], pro->nDemandTag);
     } else if (tx.nNoteOp == NOTE_OP_LOCK) {
         // v0.2.20: a lock's change notes go back to the holder, undemanded
         // (only undemanded notes can be locked).
-        NoteLock l;
-        if (DecodeNotePayload(tx.vchNotePayload, l) && l.nHouseID != 0 && n < l.vChangeUnits.size())
-            coin.SetNote(l.nHouseID, l.vChangeUnits[n], 0);
+        NoteLock lLocal;
+        const NoteLock* l = NoteTagPayload(tx, pCache, &NoteTagCache::l, lLocal);
+        if (l && l->nHouseID != 0 && n < l->vChangeUnits.size())
+            coin.SetNote(l->nHouseID, l->vChangeUnits[n], 0);
     } else if (tx.nNoteOp == NOTE_OP_UNLOCK) {
         // v0.2.20: released backing becomes ordinary undemanded notes.
-        NoteUnlock u;
-        if (DecodeNotePayload(tx.vchNotePayload, u) && u.nHouseID != 0 && n < u.vUnits.size())
-            coin.SetNote(u.nHouseID, u.vUnits[n], 0);
+        NoteUnlock uLocal;
+        const NoteUnlock* u = NoteTagPayload(tx, pCache, &NoteTagCache::u, uLocal);
+        if (u && u->nHouseID != 0 && n < u->vUnits.size())
+            coin.SetNote(u->nHouseID, u->vUnits[n], 0);
     } else if (tx.nNoteOp == NOTE_OP_REDEEM && n == 1) {
         // The dynamic-brassage spread (3.5) is an escrow output at vout[1].
         NoteRedeem r;
@@ -503,7 +521,9 @@ static bool CheckNoteOutputs(const CTransaction& tx, size_t nUnits, CValidationS
  * partner set and the ECDSA are contextual (VerifyHouseApprovers). */
 static bool CheckNoteApproverShape(const std::vector<uint32_t>& vIndex, const std::vector<std::vector<unsigned char>>& vSig)
 {
-    if (vIndex.empty() || vIndex.size() != vSig.size())
+    // UR1-7 (switch-on, Michael 2026-11-10): no more approvers than a house can have partners, as the house, bill and
+    // settle copies already bound it (the contextual check caught it; now the shape does too).
+    if (vIndex.empty() || vIndex.size() != vSig.size() || vIndex.size() > MAX_HOUSE_PARTNERS)
         return false;
     for (size_t i = 0; i < vIndex.size(); i++) {
         if (i > 0 && vIndex[i] <= vIndex[i - 1])
@@ -584,7 +604,8 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
 
         // Approver arrays: non-empty, ascending, sized, sanely bounded. Index
         // ranges vs the current partner set are contextual; ECDSA is contextual.
-        if (mint.vApproverIndex.empty() || mint.vApproverIndex.size() != mint.vApproverSig.size())
+        if (mint.vApproverIndex.empty() || mint.vApproverIndex.size() != mint.vApproverSig.size() ||
+                mint.vApproverIndex.size() > MAX_HOUSE_PARTNERS)   // UR1-7
             return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-approvers");
         for (size_t i = 0; i < mint.vApproverIndex.size(); i++) {
             if (i > 0 && mint.vApproverIndex[i] <= mint.vApproverIndex[i - 1])

@@ -4042,7 +4042,9 @@ UniValue issuebill(const JSONRPCRequest& request)
             "1. \"body\"            (string, required) hex of the encrypted bill body\n"
             "2. \"face_mg\"         (numeric, required) the face in mg of gold, a whole number (v1.1.1; v1.1.0 read\n"
             "                     an 8-decimal amount here, x1e8)\n"
-            "3. \"escrow\"          (numeric or string, required) escrow bond in sECX\n"
+            "3. \"escrow\"          (numeric or string, required) escrow bond in sECX. It is also the least the drawee\n"
+            "                     repays: retiring pays the holder the face at the reference's 30-day high ask or the\n"
+            "                     bond, whichever is more, so a bond above the face is not returned (D-2026-11-11-2)\n"
             "4. \"maturityheight\"  (numeric, required) sidechain height the bill matures at\n"
             "5. \"graceblocks\"     (numeric, optional) grace period, default 1008\n"
             "6. \"fee\"             (numeric or string, optional) default 0.001\n"
@@ -7072,6 +7074,17 @@ UniValue closehouse(const JSONRPCRequest& request)
     return response;
 }
 
+/** SA-W6: the optional margin_bps argument of a bill repayment (0-2500, default 50). */
+static uint32_t ParseBillMarginBps(const JSONRPCRequest& request, size_t nIndex)
+{
+    if (request.params.size() <= nIndex || request.params[nIndex].isNull())
+        return DEFAULT_BILL_RATE_MARGIN_BPS;
+    const int64_t n = request.params[nIndex].get_int64();
+    if (n < 0 || n > (int64_t)MAX_BILL_RATE_MARGIN_BPS)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("margin_bps must be 0..%u", MAX_BILL_RATE_MARGIN_BPS));
+    return (uint32_t)n;
+}
+
 UniValue retirebill(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -7079,7 +7092,7 @@ UniValue retirebill(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)
         throw std::runtime_error(
             "retirebill\n"
             "\nArguments:\n"
@@ -7090,6 +7103,10 @@ UniValue retirebill(const JSONRPCRequest& request)
             "             burned at par (1 unit = 1 mg of face); the rest is paid in\n"
             "             sECX at the 30-day highest ask of the house (or reference house). Whole plain (undemanded) note coins are burned, the\n"
             "             largest that still fit, never more than face.\n"
+            "4. \"margin_bps\" (numeric, optional, 0-2500) default 50. The sECX part is paid at the ask\n"
+            "             plus this margin (50 = 0.5%), rounded up, so an ask raised before the\n"
+            "             repayment confirms doesn't strand it; the margin goes to the holder.\n"
+            "             0 names the ask exactly.\n"
             "\nRetire a bill: the drawee (acceptor) pays face to the current\n"
             "holder and reclaims the escrow bond.\n"
             "\nIf a discount house holds the bill this dispatches to the house-held\n"
@@ -7127,6 +7144,7 @@ UniValue retirebill(const JSONRPCRequest& request)
             throw JSONRPCError(RPC_INVALID_PARAMETER, "notes must be 0..MAX_MONEY units");
         nNoteUnits = (uint64_t)n;
     }
+    const uint32_t nMarginBps = ParseBillMarginBps(request, 3);   // SA-W6
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -7136,7 +7154,7 @@ UniValue retirebill(const JSONRPCRequest& request)
     uint256 txid;
     uint64_t nBurned = 0;
     std::string strFail = "";
-    if (!pwallet->RetireBill(strFail, txid, nBillID, nFee, nNoteUnits, &nBurned)) {
+    if (!pwallet->RetireBill(strFail, txid, nBillID, nFee, nNoteUnits, &nBurned, nMarginBps)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -7396,12 +7414,14 @@ UniValue recoursebill(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
             "recoursebill\n"
             "\nArguments:\n"
             "1. \"id\"   (numeric, required) the dishonoured bill\n"
             "2. \"fee\"  (numeric or string, optional) default 0.001\n"
+            "3. \"margin_bps\" (numeric, optional, 0-2500) default 50: the face is valued at the ask plus this\n"
+            "             margin, rounded up, so an ask raised before it confirms doesn't strand it\n"
             "\nTake recourse on a dishonoured bill: a liable party pays the current\n"
             "holder at or above its best alternative and takes the position by\n"
             "subrogation. No title spend and no holder signature are involved, which is\n"
@@ -7422,14 +7442,15 @@ UniValue recoursebill(const JSONRPCRequest& request)
     ObserveSafeMode();
     const uint32_t nBillID = request.params[0].get_int();
     CAmount nFee = 100000;
-    if (request.params.size() >= 2) nFee = AmountFromValue(request.params[1]);
+    if (request.params.size() >= 2 && !request.params[1].isNull()) nFee = AmountFromValue(request.params[1]);
+    const uint32_t nMarginBps = ParseBillMarginBps(request, 2);   // SA-W6
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
 
     uint256 txid;
     std::string strFail;
-    if (!pwallet->RecourseBill(strFail, txid, nBillID, nFee)) {
+    if (!pwallet->RecourseBill(strFail, txid, nBillID, nFee, nMarginBps)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -8147,12 +8168,12 @@ static const CRPCCommand commands[] =
 
     { "bills",              "issuebill",                        &issuebill,                     {"body", "face_mg", "escrow", "maturityheight", "graceblocks", "fee", "ref_house"} },
     { "bills",              "endorsebill",                      &endorsebill,                   {"id", "topubkey", "fee"} },
-    { "bills",              "retirebill",                       &retirebill,                    {"id", "fee", "notes"} },
+    { "bills",              "retirebill",                       &retirebill,                    {"id", "fee", "notes", "margin_bps"} },
     { "bills",              "claimbillescrow",                  &claimbillescrow,               {"id", "fee"} },
     { "bills",              "proposediscount",                  &proposediscount,               {"id", "houseid", "price_mg", "expiryblocks"} },
     { "bills",              "signdiscount",                     &signdiscount,                  {"proposal", "fee"} },
     { "bills",              "completediscount",                 &completediscount,              {"hex"} },
-    { "bills",              "recoursebill",                     &recoursebill,                  {"id", "fee"} },
+    { "bills",              "recoursebill",                     &recoursebill,                  {"id", "fee", "margin_bps"} },
     { "bills",              "listmybills",                      &listmybills,                   {} },
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
     { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee", "address"} },

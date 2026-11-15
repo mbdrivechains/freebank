@@ -41,6 +41,7 @@ uint256 DepositOriginateSigHash(uint32_t nHouseID, const std::vector<uint64_t>& 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/originate");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << vPrincipal;
     ss << vRateBps;
@@ -55,6 +56,7 @@ uint256 DepositTransferSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/transfer");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << nPrincipal;
     ss << nRateBps;
@@ -69,6 +71,7 @@ uint256 DepositWithdrawSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/withdraw");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << nPrincipal;
     ss << nMaturityHeight;
@@ -81,6 +84,7 @@ uint256 DepositClaimSigHash(uint32_t nHouseID, uint64_t nPrincipal, const uint25
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/claim");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
     ss << nPrincipal;
     ss << hashOutputs;   // binds payout + escrow change exactly
@@ -92,6 +96,7 @@ uint256 DepositPreAuthSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t n
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/preauth");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID << nPrincipal << nRateBps << nMaturityHeight << nOriginationHeight;
     ss << vchPayoutScript;
     return ss.GetHash();
@@ -102,6 +107,7 @@ uint256 DepositProtestSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t n
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/protest");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID << nPrincipal << nOriginationHeight << nDemandTag;
     ss << hashOutputs;
     return ss.GetHash();
@@ -124,19 +130,6 @@ CAmount DepositMaturityInterest(uint64_t nPrincipal, uint32_t nBlocks, uint32_t 
     return (CAmount)interest;
 }
 
-CAmount DepositClaimEntitlement(uint64_t nPrincipal, const CAmount& amountDepositPot, uint64_t nSnapshotPrincipal)
-{
-    if (nSnapshotPrincipal == 0 || amountDepositPot <= 0 || nPrincipal == 0)
-        return 0;
-    // nPrincipal <= MAX_MONEY and amountDepositPot <= MAX_MONEY: 128-bit product,
-    // then the min() caps the junior take at par (accrued interest does not
-    // survive materialization, symmetric with the note waterfall).
-    const unsigned __int128 prorata =
-        (unsigned __int128)nPrincipal * (unsigned __int128)amountDepositPot / (unsigned __int128)nSnapshotPrincipal;
-    const unsigned __int128 par = (unsigned __int128)nPrincipal;
-    const unsigned __int128 take = prorata < par ? prorata : par;
-    return (CAmount)take;
-}
 
 bool SumDepositPrincipal(const std::vector<uint64_t>& vPrincipal, uint64_t& total)
 {

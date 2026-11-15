@@ -16,6 +16,11 @@
 #include <string>
 #include <vector>
 
+class CHashWriter;
+/** UR-ext-13: put the network (its genesis hash) into a payload signature hash, right after the domain string. Every
+ *  payload sighash calls it (house.cpp). */
+void HashNetworkTag(CHashWriter& ss);
+
 class CValidationState;
 
 //
@@ -84,7 +89,8 @@ static const uint8_t HOUSE_RATE_SETKEY = 1;
 static const uint8_t HOUSE_RELATED_UNDECLARED = 0;
 static const uint8_t HOUSE_RELATED_NO         = 1;
 static const uint8_t HOUSE_RELATED_YES        = 2;
-static const size_t MAX_EQUITY_OVERDUE_BILLS = 1000;
+/** The most bills HouseOverdueBills lists (RPCs and the explorer only; no consensus rule reads the list). */
+static const size_t MAX_OVERDUE_BILLS_LISTED = 1000;
 
 // House-type flags, fixed at registration (spec 4.0). REDEEM_ONLY only together with MEMBERS_ONLY.
 static const uint8_t HOUSE_FLAG_MEMBERS_ONLY = 1;
@@ -143,6 +149,8 @@ static const CAmount HOUSE_MIN_PLEDGE = 10000000;
 // partners in 1820; v1 caps the set to keep register txs and threshold
 // verification bounded.)
 static const size_t MAX_HOUSE_PARTNERS = 64;
+/** UR1-3 (switch-on): the most approvers a house may require; two houses' approval sets must fit one settle payload. */
+static const uint32_t MAX_HOUSE_THRESHOLD = 24;
 
 // Pledge outpoints per partner. PROVISIONAL (H-3). Bounds the RECLAIM input
 // scan and the on-disk CHouse record size against a top-up flood; a partner
@@ -261,7 +269,7 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // (NOTE_OP_LOCK was reserved inert).
 // v12 (token holders' claim at a failed house, gateway docs/freebank/TOKEN_CLAIM_DESIGN.md draft 3): the claim
 // totals. A v11 record reads as 0: no claim op existed.
-static const uint8_t HOUSE_SER_VERSION = 14;   // 14 = Gold B: one cure per 180 days (nNoCureHeight, D-2026-11-07-3)
+static const uint8_t HOUSE_SER_VERSION = 15;   // 14 = Gold B: one cure per 180 days (nNoCureHeight, D-2026-11-07-3); 15 = UR-ext-12 episode counters
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
 struct HousePartner {
@@ -484,6 +492,20 @@ struct CHouse {
     // running when the suspension began, with the clock blocks it had left (floored at a day): the window from the
     // re-arm (nDeferEndedHeight). 0 = no re-arm recorded (a fresh cure's full HOUSE_STRESSED_WINDOW).
     uint32_t nCureLeft;
+    // v15 (UR-ext-12, switch-on, Michael 2026-11-10): one trouble episode per unpaid protest. An episode starts with a
+    // fresh protest (nProtestHeight is its start) and lasts while a protest is live or the house is suspended. Within
+    // it the cure's 144-block floor applies once and suspended time is summed and capped at nSuspensionCap, however
+    // many times the house defers and recovers. The counters belong to the episode whose start is nEpisodeAnchor; a
+    // later fresh protest moves nProtestHeight, so a stale anchor reads as a fresh episode (no write at the protest).
+    uint32_t nEpisodeAnchor;       // nProtestHeight of the episode the counters count (0 = none)
+    uint32_t nEpisodeDeferBlocks;  // clock blocks suspended so far in that episode
+    uint8_t fEpisodeFloorUsed;     // its cure re-arm has used the 144-block floor
+    uint8_t fDeferInEpisode;       // the live suspension began inside an episode (a protest was live at DEFER)
+    // UR-ext-12 precision 2 (design 2026-11-10): the height the last episode ENDED - its protests all paid AND the house
+    // not suspended, whichever came last. The 180-day cure spacing counts from it; 0 = no earlier episode. Written by a
+    // discharge that takes nProtestOpen to 0 while not suspended, or the recovery ATTEST that ends a suspension inside
+    // an episode with no protest left. Undone from HouseDB's per-block record (option B), not from payload priors.
+    uint32_t nEpisodeEndHeight;
 
     CHouse() : nHouseID(0), nTier(0), nThresholdM(1), nDenomMgGold(0),
                status(HOUSE_STATUS_OPEN), nRegisteredHeight(0), nMintedUnits(0),
@@ -497,7 +519,9 @@ struct CHouse {
                nProtestOpen(0), nProtestHeight(0), nProtestDemandHeight(0), nFlags(0), nTokenUnits(0),
                nTokenClaimed(0), nTokenClaims(0), nTokenCollected(0), nTokenBase(0), nTokenBaseHeight(0),
                nTokenPaid(0), nTokenWriteOff(0), nTokenWriteOffHeight(0), nInsolventSatsPerGram(0),
-               nInsolventGoldMg(0), nEquityNegativeHeight(0), nNoCureHeight(0), nCureLeft(0) {}
+               nInsolventGoldMg(0), nEquityNegativeHeight(0), nNoCureHeight(0), nCureLeft(0),
+               nEpisodeAnchor(0), nEpisodeDeferBlocks(0), fEpisodeFloorUsed(0), fDeferInEpisode(0),
+               nEpisodeEndHeight(0) {}
 
     bool IsMembersOnly() const { return (nFlags & HOUSE_FLAG_MEMBERS_ONLY) != 0; }
     bool IsRedeemOnly() const { return (nFlags & HOUSE_FLAG_REDEEM_ONLY) != 0; }
@@ -650,6 +674,14 @@ struct CHouse {
             READWRITE(nNoCureHeight);
             READWRITE(vEscrowTranche);
             READWRITE(nCureLeft);
+        }
+        // v15: the episode counters (UR-ext-12). A v14 record predates them: 0 (main has no houses; easynet resets).
+        if (nSerVersion >= 15) {
+            READWRITE(nEpisodeAnchor);
+            READWRITE(nEpisodeDeferBlocks);
+            READWRITE(fEpisodeFloorUsed);
+            READWRITE(fDeferInEpisode);
+            READWRITE(nEpisodeEndHeight);
         }
     }
 
@@ -835,6 +867,9 @@ struct HouseAttest {
     uint32_t nPrevDeferCumBlocks;
     uint32_t nPrevDeferEndedHeight;
     uint32_t nPrevCureLeft;                // Gold B: undo prior of CHouse::nCureLeft (a recovery sets it)
+    uint32_t nPrevEpisodeDeferBlocks;      // UR-ext-12: undo priors of the episode counters a recovery moves
+    uint8_t nPrevEpisodeFloorUsed;
+    uint8_t nPrevDeferInEpisode;
     CAmount amountReserves;                // must equal the sum of proof coin values
     std::vector<AttestProof> vProofs;      // <= MAX_ATTEST_PROOFS, unique outpoints
     std::vector<uint32_t> vApproverIndex;  // strictly ascending, M-of-N
@@ -844,7 +879,8 @@ struct HouseAttest {
                     nPrevLastAttestHeight(0), nPrevStressSince(0),
                     amountPrevReserves(0), nPrevDeferInvokedHeight(0),
                     nPrevDeferRenewals(0), nPrevDeferCumBlocks(0),
-                    nPrevDeferEndedHeight(0), nPrevCureLeft(0), amountReserves(0) {}
+                    nPrevDeferEndedHeight(0), nPrevCureLeft(0), nPrevEpisodeDeferBlocks(0),
+                    nPrevEpisodeFloorUsed(0), nPrevDeferInEpisode(0), amountReserves(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -861,6 +897,9 @@ struct HouseAttest {
         READWRITE(nPrevDeferCumBlocks);
         READWRITE(nPrevDeferEndedHeight);
         READWRITE(nPrevCureLeft);
+        READWRITE(nPrevEpisodeDeferBlocks);
+        READWRITE(nPrevEpisodeFloorUsed);
+        READWRITE(nPrevDeferInEpisode);
         READWRITE(amountReserves);
         READWRITE(vProofs);
         READWRITE(vApproverIndex);
@@ -885,6 +924,10 @@ struct HouseAttest {
 struct HouseDefer {
     uint32_t nHouseID;                     // leading - mempool-guard convention
     uint32_t nPrevLastActivation;          // undo prior (must match DB at connect)
+    uint32_t nPrevEpisodeAnchor;           // UR-ext-12: undo priors of the episode counters a DEFER sets
+    uint32_t nPrevEpisodeDeferBlocks;
+    uint8_t nPrevEpisodeFloorUsed;
+    uint8_t nPrevDeferInEpisode;
     // vout[0] MUST lock the house's attested till into consensus custody:
     // an escrow-script output worth at least amountLastAttestReserves, on a
     // FRESH attestation (D11). A house that attested reserves it no longer
@@ -893,7 +936,8 @@ struct HouseDefer {
     std::vector<uint32_t> vApproverIndex;
     std::vector<std::vector<unsigned char>> vApproverSig;
 
-    HouseDefer() : nHouseID(0), nPrevLastActivation(0) {}
+    HouseDefer() : nHouseID(0), nPrevLastActivation(0), nPrevEpisodeAnchor(0), nPrevEpisodeDeferBlocks(0),
+                   nPrevEpisodeFloorUsed(0), nPrevDeferInEpisode(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -901,6 +945,10 @@ struct HouseDefer {
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nHouseID);
         READWRITE(nPrevLastActivation);
+        READWRITE(nPrevEpisodeAnchor);
+        READWRITE(nPrevEpisodeDeferBlocks);
+        READWRITE(nPrevEpisodeFloorUsed);
+        READWRITE(nPrevDeferInEpisode);
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
     }
@@ -1165,6 +1213,11 @@ uint256 HouseDeclarationDigest(const HouseRegister& reg, uint8_t nFlags = 0);
 inline bool IsHouseRegisterOp(uint8_t nHouseOp) { return nHouseOp == HOUSE_OP_REGISTER || nHouseOp == HOUSE_OP_REGISTER_MO; }
 /** v0.2.19: a member-list op (MEMBER_ADD / REMOVE / PURGE). They take the member slot, not the house slot. */
 inline bool IsHouseMemberOp(uint8_t nHouseOp) { return nHouseOp >= HOUSE_OP_MEMBER_ADD && nHouseOp <= HOUSE_OP_MEMBER_PURGE; }
+/** D-2026-11-11-3 (R121-R2): a rate op (POST, SETKEY). It changes no house record, so it takes the rate slot (one per
+ *  house per block), not the house slot. */
+inline bool IsHouseRateOp(uint8_t nHouseOp) { return nHouseOp == HOUSE_OP_RATE; }
+/** The ops that take a house's one-op-per-block slot: every house op but REGISTER, the member ops and the rate ops. */
+inline bool IsHouseSlotOp(uint8_t nHouseOp) { return !IsHouseRegisterOp(nHouseOp) && !IsHouseMemberOp(nHouseOp) && !IsHouseRateOp(nHouseOp); }
 /** v0.2.19: a member record after one member op (nHouseOp) at height nH, from its state before (cur). False, with the
  * reject reason, if the op cannot apply to that record. Shared by the contextual check and the undo's own check. The
  * house's own keys and the count are the caller's. */
@@ -1277,6 +1330,21 @@ uint32_t HouseDeferSilenceInsolventHeight(const CHouse& house, int nNow = -1);
 /** v0.2.28: nDeferInvokedHeight + nSuspensionCap, saturated; 0 if not suspended. */
 uint32_t HouseDeferCapInsolventHeight(const CHouse& house, int nNow = -1);
 
+/** UR-ext-12: do the episode counters count the episode now running (nEpisodeAnchor == nProtestHeight != 0)? */
+inline bool HouseEpisodeCountersCurrent(const CHouse& house)
+{
+    return house.nEpisodeAnchor != 0 && house.nEpisodeAnchor == house.nProtestHeight;
+}
+
+/** UR-ext-12 precision 2: a discharge that took nProtestOpen to 0 ends the episode here, unless the house is suspended -
+ *  then the recovery ATTEST ends it (design 2026-11-10: whichever comes last). Insolvency never ends one: it is
+ *  absorbing, and no protest (the only reader of nEpisodeEndHeight) is accepted at an insolvent house. */
+inline void HouseDischargeMaybeEndsEpisode(CHouse& house, uint32_t nHeight)
+{
+    if (house.nProtestOpen == 0 && house.nDeferInvokedHeight == 0)
+        house.nEpisodeEndHeight = nHeight;
+}
+
 /** v0.2.28: the height a suspended house turns Insolvent = min(silence, cap); 0 if not suspended. Gold B: each span is
  *  clock time (ClockDeadlineHeight), searched up to nNow (the height being judged; -1: estimate from the start). */
 uint32_t HouseDeferInsolventHeight(const CHouse& house, int nNow = -1);
@@ -1305,8 +1373,9 @@ uint32_t TermDeadlineHeight(uint32_t nStart, uint32_t nTarget, uint64_t nAfter, 
 uint32_t HouseInsolventSince(const CHouse& house, int nHeight);
 
 /** Gold B (D-2026-11-07-2/-3): a protest op starting a FRESH episode (nProtestOpen was 0) calls this before it writes
- * the protest heights. Within HOUSE_CURE_SPACING_BLOCKS of the last episode's start there is no cure: nNoCureHeight =
- * nHeight, insolvent from this block. Otherwise the episode is the house's cure (Stressed for HOUSE_STRESSED_WINDOW). */
+ * the protest heights. Within HOUSE_CURE_SPACING_BLOCKS of the last episode's END (nEpisodeEndHeight, UR-ext-12
+ * precision 2; 0 = none) there is no cure: nNoCureHeight = nHeight, insolvent from this block. Otherwise the episode is
+ * the house's cure (Stressed for HOUSE_STRESSED_WINDOW). */
 void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight);
 /** The cure window from stress origin nStress: a re-armed protest's time left (CHouse::nCureLeft), else
  *  HOUSE_STRESSED_WINDOW. */

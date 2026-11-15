@@ -535,6 +535,16 @@ private:
     std::map<uint256 /* txid */, uint256 /* hash lock */> mapSwapTxLock;
     std::map<uint256 /* hash lock */, uint32_t /* pooled swap ops */> mapSwapLockCount;
 
+    // UR-ext-9 (plain v1.2.2): the withdrawal ids each pooled tx creates, kept on add and remove, so ATMP's
+    // withdrawal-not-new guard is a lookup instead of a scan of every pooled tx. A multimap: a reorg can return two.
+    std::map<uint256 /* txid */, std::vector<uint256> /* withdrawal ids */> mapTxWithdrawalIDs;
+    std::multimap<uint256 /* withdrawal id */, uint256 /* txid */> mapWithdrawalTx;
+
+    // UR-ext-8 (plain v1.2.2): the coins each pooled FREEZE/UNFREEZE targets, so ATMP keeps a pooled FREEZE and a
+    // pooled spend of one of its targets apart (ordered in one template, one fails, and enough of them emptied blocks).
+    std::map<uint256 /* txid */, std::vector<COutPoint> /* targets */> mapTxFreezeTargets;
+    std::map<COutPoint /* target */, uint32_t /* pooled FREEZE/UNFREEZE ops */> mapFreezeTargetCount;
+
 public:
     indirectmap<COutPoint, const CTransaction*> mapNextTx;
     std::map<uint256, CAmount> mapDeltas;
@@ -678,6 +688,24 @@ public:
     {
         LOCK(cs);
         return setAssetTx.count(hash);
+    }
+
+    /** UR-ext-8: does a pooled FREEZE or UNFREEZE target this coin? */
+    bool HaveFreezeTarget(const COutPoint& out) const
+    {
+        LOCK(cs);
+        return mapFreezeTargetCount.count(out);
+    }
+
+    /** UR-ext-9: the pooled txs that create withdrawal id wid. */
+    std::vector<uint256> GetWithdrawalTxs(const uint256& wid) const
+    {
+        LOCK(cs);
+        std::vector<uint256> v;
+        const auto range = mapWithdrawalTx.equal_range(wid);
+        for (auto it = range.first; it != range.second; ++it)
+            v.push_back(it->second);
+        return v;
     }
 
     /** Gold B N1: does the pool hold a swap op with this hash lock? */

@@ -13,10 +13,15 @@
 #include <deposit.h>         // MAX_DEPOSIT_TERM_BLOCKS (B1 max-magnitude vectors)
 #include <key.h>
 #include <note.h>
+#include <token.h>           // TokenClaimSigHash (UR-ext-13)
+#include <pool.h>            // Pool*SigHash (UR-ext-13 case 3)
 #include <script/standard.h>
+#include <settle.h>          // SettleExchange, MAX_SETTLE_PAYLOAD (UR1-3: the EXCHANGE carries both approver sets)
 #include <streams.h>
 #include <test/sidechain_test_util.h>   // SideDBScope (the equity proof reads the bill DB)
 #include <test/test_bitcoin.h>
+#include <txdb.h>              // HouseDB (UR-ext-10)
+#include <policy/policy.h>     // IsStandardTx (MM-1)
 #include <utilstrencodings.h>
 #include <validation.h>        // HouseOverdueBills, pbilltree
 #include <version.h>
@@ -1586,9 +1591,10 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
     // BOTH this pin and the addendum arithmetic together, or the synthesis
     // silently builds a malformed record and the migration it claims to prove
     // proves nothing.
-    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 14);   // fired again at v9 -> v10 (members-only flags, 1 byte),
-                                                // v10 -> v11 (token backing, 1 u64), v12 -> v13 (gram snapshot)
-                                                // and v13 -> v14 (Gold B no-cure height u32 + tranche list)
+    BOOST_CHECK_EQUAL(HOUSE_SER_VERSION, 15);   // fired again at v9 -> v10 (members-only flags, 1 byte),
+                                                // v10 -> v11 (token backing, 1 u64), v12 -> v13 (gram snapshot),
+                                                // v13 -> v14 (Gold B no-cure height u32 + tranche list)
+                                                // and v14 -> v15 (UR-ext-12 episode counters: 2 u32 + 2 u8)
 
     CHouse back;
     CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
@@ -1628,8 +1634,9 @@ BOOST_AUTO_TEST_CASE(house_ser_v8_loan_book_migration)
         static const size_t V12_ADDENDUM = 4 * sizeof(uint64_t) + 4 * sizeof(uint32_t);   // the token claim totals
         static const size_t V13_ADDENDUM = 2 * sizeof(uint64_t) + sizeof(uint32_t);       // the gram snapshot + equity
         static const size_t V14_ADDENDUM = sizeof(uint32_t) + 1 + sizeof(uint32_t);   // no-cure height, tranches, cure left
+        static const size_t V15_ADDENDUM = 3 * sizeof(uint32_t) + 2 * sizeof(uint8_t);  // UR-ext-12 episode counters + end height
         b.resize(b.size() - (V8_ADDENDUM + V9_ADDENDUM + V10_ADDENDUM + V11_ADDENDUM + V12_ADDENDUM + V13_ADDENDUM +
-                             V14_ADDENDUM));
+                             V14_ADDENDUM + V15_ADDENDUM));
         CDataStream ssV7(b, SER_NETWORK, PROTOCOL_VERSION);
         CHouse h7;
         ssV7 >> h7;                                   // must not throw
@@ -1799,7 +1806,8 @@ BOOST_AUTO_TEST_CASE(mutual_fund_output_is_locked)
 
 // Gold B (D-2026-11-07-2/-3): a house closes only when it doesn't pay a demand. A protest starts a cure (Stressed for
 // the window, then insolvent unless the demand is paid); one cure per 180 days - a fresh protest episode within
-// HOUSE_CURE_SPACING_BLOCKS of the last one's start finds none, and the house is insolvent from that block.
+// HOUSE_CURE_SPACING_BLOCKS of the last one's END (UR-ext-12 precision 2) finds none, and the house is insolvent from
+// that block.
 BOOST_AUTO_TEST_CASE(house_one_cure_per_180_days)
 {
     CHouse house = MakeGuardHouse();
@@ -1814,24 +1822,33 @@ BOOST_AUTO_TEST_CASE(house_one_cure_per_180_days)
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1 + HOUSE_STRESSED_WINDOW - 1), HOUSE_STATUS_STRESSED);
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_INSOLVENT);
     BOOST_CHECK_EQUAL(HouseInsolventSince(house, nH1 + HOUSE_STRESSED_WINDOW + 5), nH1 + HOUSE_STRESSED_WINDOW);
-    // Cured: the demand paid takes the counter to zero; the heights stay as inert leftovers.
+    // Cured: the demand paid takes the counter to zero and ends the episode; the heights stay as inert leftovers.
+    const uint32_t nPaid = nH1 + 100;
     house.nProtestOpen = 0;
+    HouseDischargeMaybeEndsEpisode(house, nPaid);
+    BOOST_CHECK_EQUAL(house.nEpisodeEndHeight, nPaid);
     BOOST_CHECK_EQUAL(HouseEffectiveStatus(house, nH1 + HOUSE_STRESSED_WINDOW), HOUSE_STATUS_OPEN);
 
-    // A second unpaid demand protested within 180 days of the cure's start: no cure, insolvent from that block.
+    // A second unpaid demand protested within 180 days of the episode's end: no cure, insolvent from that block.
     {
         CHouse h = house;
-        const uint32_t nH2 = nH1 + HOUSE_CURE_SPACING_BLOCKS - 1;
+        const uint32_t nH2 = nPaid + HOUSE_CURE_SPACING_BLOCKS - 1;
         HouseProtestEpisodeStart(h, nH2);
         BOOST_CHECK_EQUAL(h.nNoCureHeight, nH2);
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2 - 1), HOUSE_STATUS_OPEN);
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2), HOUSE_STATUS_INSOLVENT);
         BOOST_CHECK_EQUAL(HouseInsolventSince(h, nH2 + 10), nH2);
     }
-    // 180 days after the cure's start, a protest is a fresh cure.
+    // 180 days after the START but not the end: still no cure (precision 2).
     {
         CHouse h = house;
         HouseProtestEpisodeStart(h, nH1 + HOUSE_CURE_SPACING_BLOCKS);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, nH1 + HOUSE_CURE_SPACING_BLOCKS);
+    }
+    // 180 days after the episode's end, a protest is a fresh cure.
+    {
+        CHouse h = house;
+        HouseProtestEpisodeStart(h, nPaid + HOUSE_CURE_SPACING_BLOCKS);
         BOOST_CHECK_EQUAL(h.nNoCureHeight, 0u);
     }
 
@@ -1889,8 +1906,9 @@ BOOST_AUTO_TEST_CASE(clock_windows_count_time)
     BOOST_CHECK_EQUAL(HouseInsolventSince(house, 2400), 2336u);
     BOOST_CHECK_EQUAL(HouseInsolventSince(house, 9999), 2336u);   // E never moves
 
-    // One cure per 180 days counts time: 25920 clock blocks = 8640 of these blocks.
+    // One cure per 180 days counts time: 25920 clock blocks = 8640 of these blocks (from the episode's end: paid at 2000).
     house.nProtestOpen = 0;
+    house.nEpisodeEndHeight = 2000;
     {
         CHouse h = house;
         HouseProtestEpisodeStart(h, 2000 + 8639);
@@ -1981,14 +1999,17 @@ BOOST_AUTO_TEST_CASE(cure_continues_after_recovery)
     CHouse f = h;
     f.nDeferEndedHeight = 0;
     BOOST_CHECK_EQUAL(HouseCureWindow(f, 100), (uint64_t)HOUSE_STRESSED_WINDOW);
-    // The spacing counts from the recovery (the episode's end), not the protest's start.
+    // The spacing counts from the episode's end - here the payment at 320, after the recovery re-armed the protest -
+    // not the protest's start or the recovery (UR-ext-12 precision 2).
     CHouse g = h;
     g.nProtestOpen = 0;
-    HouseProtestEpisodeStart(g, 300 + HOUSE_CURE_SPACING_BLOCKS - 1);
-    BOOST_CHECK_EQUAL(g.nNoCureHeight, 300u + HOUSE_CURE_SPACING_BLOCKS - 1);
+    HouseDischargeMaybeEndsEpisode(g, 320);
+    HouseProtestEpisodeStart(g, 320 + HOUSE_CURE_SPACING_BLOCKS - 1);
+    BOOST_CHECK_EQUAL(g.nNoCureHeight, 320u + HOUSE_CURE_SPACING_BLOCKS - 1);
     CHouse g2 = h;
     g2.nProtestOpen = 0;
-    HouseProtestEpisodeStart(g2, 300 + HOUSE_CURE_SPACING_BLOCKS);
+    HouseDischargeMaybeEndsEpisode(g2, 320);
+    HouseProtestEpisodeStart(g2, 320 + HOUSE_CURE_SPACING_BLOCKS);
     BOOST_CHECK_EQUAL(g2.nNoCureHeight, 0u);
 }
 
@@ -2011,6 +2032,1013 @@ BOOST_AUTO_TEST_CASE(house_overdue_bills_seen)
     BOOST_REQUIRE(pbilltree->WriteBills({bill, other}));
     BOOST_CHECK(HouseOverdueBills(house, 2000) == std::vector<uint32_t>{1});
     BOOST_CHECK(HouseOverdueBills(house, 1432).empty());
+}
+
+// testing (2026-11-10), ultra s3 UR3-3. Six contextual checks reject an op whose undo PRIORS are stale (a block just
+// changed the house or bill record) at DoS 100 even in the mempool. Stale state is the honest relayer's case: a peer one
+// block behind, or a block from another miner. The file's own rule (the ATTEST as-of checks: fMempool ? 0 : 100) says a
+// mempool reject of something a block could have made stale must not ban. Represented by HOUSE_OP_DEFER's prior (the
+// same pattern as ATTEST and bill DISCOUNT/RETIRE/HRETIRE_NOTES/RECOURSE). The block-context score must stay 100.
+// FAILS on v1.2.1 (the mempool score is 100).
+BOOST_AUTO_TEST_CASE(testing_ur3_3_stale_prior_does_not_ban_in_mempool)
+{
+    CKey keyPartner;
+    keyPartner.MakeNewKey(true);
+    const CPubKey pubPartner = keyPartner.GetPubKey();
+    CHouse house = MakeGuardHouse();
+    house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
+    house.nLastAttestHeight = 2000;
+    house.nStressSinceHeight = 2000;
+    house.nDeferActivations = 3;
+    house.nDeferLastActivation = 1990;   // the record NOW, after a block moved it
+    house.nDeferCumBlocks = 38880;
+    house.nDeferEndedHeight = 1995;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, 2000), HOUSE_STATUS_STRESSED);
+
+    // Built and signed correctly against the record as it stood before that block (last activation 1980).
+    HouseDefer def;
+    def.nHouseID = house.nHouseID;
+    def.nPrevLastActivation = 1980;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+    mtx.nHouseOp = HOUSE_OP_DEFER;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    mtx.vout.push_back(CTxOut(house.amountLastAttestReserves, HouseEscrowScript(house.houseID)));   // the till lock
+    mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
+    def.vApproverIndex.push_back(0);
+    std::vector<unsigned char> vchSig;
+    BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, BillHashOutputs(mtx)), vchSig));
+    def.vApproverSig.push_back(vchSig);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << def;
+    mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+
+    // In a block it is invalid: refused at DoS 100.
+    {
+        CValidationState state;
+        CHouse houseOut;
+        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 2000, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut, false));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-defer-priors");
+        int nDoS = -1;
+        BOOST_CHECK(state.IsInvalid(nDoS) && nDoS == 100);
+    }
+    // In the mempool it is refused too, but the relaying peer did nothing wrong: DoS 0.
+    {
+        CValidationState state;
+        CHouse houseOut;
+        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, 2000, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut, true));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-defer-priors");
+        int nDoS = -1;
+        BOOST_CHECK_MESSAGE(state.IsInvalid(nDoS) && nDoS == 0,
+                            "a stale-prior DEFER in the mempool scored DoS " << nDoS << " - an honest relayer one block behind is banned (UR3-3)");
+    }
+
+    // The same class at the ATTEST monotone check (the 7th site, freebankd 11-10): a block confirmed another ATTEST for
+    // the house (last attest now 1999), and a peer relays one built before it with as-of 1999 - valid when built.
+    CHouse h2 = MakeGuardHouse();
+    h2.nLastAttestHeight = 1999;
+    const int nEff = HouseEffectiveStatus(h2, 2000);
+    BOOST_REQUIRE(nEff == HOUSE_STATUS_OPEN || nEff == HOUSE_STATUS_STRESSED);
+    HouseAttest att;
+    att.nHouseID = h2.nHouseID;
+    att.nSchemaVersion = 1;
+    att.nAsOfHeight = 1999;   // not in the future, not stale - only no longer above the last attest
+    auto fnGetH2 = [&](uint32_t id, CHouse& out) { if (id == h2.nHouseID) { out = h2; return true; } return false; };
+    for (const bool fMempool : {false, true}) {
+        CValidationState state;
+        CHouse houseOut;
+        BOOST_CHECK(!CheckHouseOperation(CTransaction(MakeAttestTx(att)), state, 2000, fnGetH2, GuardNoHash, GuardNoClass, fnNoCoin, GuardNoBlock, houseOut, fMempool));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-attest-monotone");
+        int nDoS = -1;
+        BOOST_CHECK_MESSAGE(state.IsInvalid(nDoS) && nDoS == (fMempool ? 0 : 100),
+                            "ATTEST monotone in " << (fMempool ? "the mempool" : "a block") << " scored DoS " << nDoS
+                            << ", want " << (fMempool ? 0 : 100) << " (UR3-3, 7th site)");
+    }
+}
+
+// The same declaration as a REGISTER_MO (members-only): the house id, and so the escrow outputs, bind the flags. The
+// shape check verifies no founding signature (that is contextual), so the REGISTER's signatures can stay.
+static CMutableTransaction AsRegisterMoTx(const CMutableTransaction& mtxReg, const HouseRegister& reg)
+{
+    CMutableTransaction mtx(mtxReg);
+    HouseRegisterMO mo;
+    mo.reg = reg;
+    mo.nFlags = HOUSE_FLAG_MEMBERS_ONLY;
+    mtx.nHouseOp = HOUSE_OP_REGISTER_MO;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << mo;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    const CScript escrow = HouseEscrowScript(HouseIDFromDeclaration(reg, mo.nFlags));
+    for (CTxOut& o : mtx.vout)
+        o.scriptPubKey = escrow;
+    return mtx;
+}
+
+// testing (2026-11-10), ultra s1 UR1-3. The shape check gives every bill op past DISCOUNT the tight MAX_BILL_OP_PAYLOAD
+// cap (4096) on the stated grounds that those ops "carry neither" an approver set nor a proof set - but BILL_OP_HCLAIM
+// carries the house's full M-of-N approver set. So a house can register with a threshold whose approvals can't fit an
+// HCLAIM, and its bills' escrow can then never be claimed. Whatever the fix (raise the cap, or refuse such a threshold
+// at REGISTER and REGISTER_MO), the largest threshold either register op accepts must have its HCLAIM fit - and its
+// settle EXCHANGE, which carries BOTH houses' approver sets in one MAX_SETTLE_PAYLOAD (4096) payload (freebankd
+// 2026-11-10: that is what makes 24 the limit; NET has no payload cap of its own). Real shape checks throughout; only
+// coinbase and op-range run before the bill size cap, and this HCLAIM passes both. FAILS on v1.2.1.
+BOOST_AUTO_TEST_CASE(testing_ur1_3_registrable_threshold_fits_hclaim)
+{
+    // The largest threshold each multi-partner register op's shape check accepts (one partner per approver).
+    uint32_t nLargestReg = 0, nLargestMo = 0;
+    for (uint32_t M = MAX_HOUSE_PARTNERS; M >= 2 && (nLargestReg == 0 || nLargestMo == 0); M--) {
+        HouseRegister reg;
+        std::vector<CKey> vKey;
+        const CMutableTransaction mtxReg = MakeRegisterTx(reg, vKey, HOUSE_TIER_MULTI_PARTNER, M, M, "ur13m" + std::to_string(M));
+        CValidationState stateReg, stateMo;
+        if (nLargestReg == 0 && CheckHouseTransactionShape(CTransaction(mtxReg), stateReg))
+            nLargestReg = M;
+        if (nLargestMo == 0 && CheckHouseTransactionShape(CTransaction(AsRegisterMoTx(mtxReg, reg)), stateMo))
+            nLargestMo = M;
+    }
+    BOOST_REQUIRE_MESSAGE(nLargestReg >= 2, "no multi-partner REGISTER was accepted at all");
+    BOOST_REQUIRE_MESSAGE(nLargestMo >= 2, "no multi-partner REGISTER_MO was accepted at all");
+    BOOST_TEST_MESSAGE("largest threshold accepted: REGISTER " << nLargestReg << ", REGISTER_MO " << nLargestMo);
+    const uint32_t nLargest = std::max(nLargestReg, nLargestMo);
+
+    // A settle EXCHANGE between two such houses, every signature at the DER maximum (72 bytes).
+    {
+        SettleExchange x;
+        x.nHouseA = 1;
+        x.nHouseB = 2;
+        x.nMode = 1;
+        x.nUnitsANotes = 2;
+        x.nUnitsBNotes = 1;
+        x.nCountANotes = 1;
+        x.nCountBNotes = 1;
+        x.vchPresentKeyOfANotes.assign(33, 0x02);
+        x.vchPresentKeyOfBNotes.assign(33, 0x03);
+        x.amountResidual = SETTLE_MIN_RESIDUAL_SATS;
+        x.vchPresentSigOfANotes.assign(72, 0x30);
+        x.vchPresentSigOfBNotes.assign(72, 0x30);
+        for (uint32_t i = 0; i < nLargest; i++) {
+            x.vApproverIndexA.push_back(i);
+            x.vApproverSigA.push_back(std::vector<unsigned char>(72, 0x30));
+            x.vApproverIndexB.push_back(i);
+            x.vApproverSigB.push_back(std::vector<unsigned char>(72, 0x30));
+        }
+        CMutableTransaction mtxS;
+        mtxS.nVersion = TRANSACTION_SETTLE_VERSION;
+        mtxS.nSettleOp = SETTLE_OP_EXCHANGE;
+        CDataStream ssS(SER_NETWORK, PROTOCOL_VERSION);
+        ssS << x;
+        mtxS.vchSettlePayload.assign(ssS.begin(), ssS.end());
+        mtxS.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtxS.vin.push_back(CTxIn(COutPoint(uint256S("02"), 0)));
+        mtxS.vout.push_back(CTxOut(SETTLE_MIN_RESIDUAL_SATS, CScript() << OP_TRUE));
+        CValidationState stateS;
+        CheckSettleTransactionShape(CTransaction(mtxS), stateS);   // only the size matters here
+        BOOST_CHECK_MESSAGE(stateS.GetRejectReason() != "bad-settle-payload-size",
+                            "two houses can register with threshold " << nLargest << " but their settle EXCHANGE ("
+                            << mtxS.vchSettlePayload.size() << " bytes) exceeds the " << MAX_SETTLE_PAYLOAD
+                            << "-byte cap: they can never settle bilaterally (UR1-3)");
+    }
+
+    // An HCLAIM carrying that many approvals, each a maximum-size DER signature (72 bytes).
+    BillHClaim c;
+    c.nBillID = 1;
+    c.nOwnerHouseID = 1;
+    c.amountFace = COIN;
+    c.nBillMaturityHeight = 1000;
+    for (uint32_t i = 0; i < nLargest; i++) {
+        c.vApproverIndex.push_back(i);
+        c.vApproverSig.push_back(std::vector<unsigned char>(72, 0x30));
+    }
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_BILL_VERSION;
+    mtx.nBillOp = BILL_OP_HCLAIM;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << c;
+    mtx.vchBillPayload.assign(ss.begin(), ss.end());
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));   // not a coinbase
+    mtx.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
+    CValidationState state;
+    CheckBillTransactionShape(CTransaction(mtx), state);   // may fail later for other reasons: only the size matters here
+    BOOST_CHECK_MESSAGE(state.GetRejectReason() != "bad-bill-payload-oversize",
+                        "a house can register with threshold " << nLargest << " but an HCLAIM carrying that many approvals ("
+                        << mtx.vchBillPayload.size() << " bytes) exceeds the " << MAX_BILL_OP_PAYLOAD
+                        << "-byte cap: that house's bill escrow can never be claimed (UR1-3)");
+}
+
+// ===========================================================================
+// testing (2026-11-10): UR-ext-12 (GPT-6.1, external s3 round 2; security: Medium). Defer/recover cycles keep an unpaid
+// protest alive for ever: each recovery re-arms the cure with max(time left, 144) and each suspension gets its own
+// 12-month cap, so a house that suspends, recovers, and suspends again a block later never reaches Insolvent. Michael
+// signed off item 1 on 2026-11-10 (freebank docs-local/CONSENSUS_SIGNOFF_2026-11-10.md): one trouble episode lasts until
+// every protest in it is paid; per episode one 7-day cure, one 24-hour floor and at most 12 months suspended in total.
+// The bound under test: an unpaid demand reaches payment or Insolvent within 7 days of cure + 12 months suspended +
+// 1 day of its protest, however many defer/recover cycles - here HOUSE_STRESSED_WINDOW + nSuspensionCap + 144 blocks
+// (unit tests count windows in blocks).
+// The house plays the attacker with real signed ops through CheckHouseOperation, one op per block: it lets each cure
+// run to its last block, DEFERs there (attesting first when its last attestation is too old), then recovers with a
+// zero-reserve ATTEST (every note in pending swaps, so the recovery floor is 0: GPT's cheap case) on the last block
+// before its suspension would end. The protest is never paid. FAILS on master a00fb05 (still not Insolvent past the
+// bound). If the fix adds undo priors to ATTEST or DEFER, set them in URX12Attest / URX12Defer: a refusal of either for
+// priors, payload or signatures fails this test as a setup fault rather than passing it.
+// ===========================================================================
+namespace {
+std::vector<unsigned char> URX12Sign(const CKey& key, const uint256& hash)
+{
+    std::vector<unsigned char> vchSig;
+    BOOST_REQUIRE(key.Sign(hash, vchSig));
+    return vchSig;
+}
+
+CMutableTransaction URX12Attest(const CHouse& house, uint32_t nHeight, const CKey& key)
+{
+    HouseAttest att;
+    att.nHouseID = house.nHouseID;
+    att.nSchemaVersion = 1;
+    att.nAsOfHeight = nHeight - 1;
+    att.nPrevLastAttestHeight = house.nLastAttestHeight;
+    att.nPrevStressSince = house.nStressSinceHeight;
+    att.amountPrevReserves = house.amountLastAttestReserves;
+    att.nPrevDeferInvokedHeight = house.nDeferInvokedHeight;
+    att.nPrevDeferRenewals = house.nDeferRenewals;
+    att.nPrevDeferCumBlocks = house.nDeferCumBlocks;
+    att.nPrevDeferEndedHeight = house.nDeferEndedHeight;
+    att.nPrevCureLeft = house.nCureLeft;
+    att.nPrevEpisodeDeferBlocks = house.nEpisodeDeferBlocks;   // UR-ext-12 fix: the new undo priors
+    att.nPrevEpisodeFloorUsed = house.fEpisodeFloorUsed;
+    att.nPrevDeferInEpisode = house.fDeferInEpisode;
+    att.amountReserves = 0;   // zero reserves: the floor is 0 when nothing is minted
+    CMutableTransaction mtx = MakeAttestTx(att);
+    att.vApproverIndex.push_back(0);
+    att.vApproverSig.push_back(URX12Sign(key, HouseAttestSigHash(house.houseID, att.nAsOfHeight, att.amountReserves,
+                                                                 HouseAttestProofSetHash(att.vProofs),
+                                                                 BillHashOutputs(mtx))));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << att;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+
+CMutableTransaction URX12Defer(const CHouse& house, const CKey& key)
+{
+    HouseDefer def;
+    def.nHouseID = house.nHouseID;
+    def.nPrevLastActivation = house.nDeferLastActivation;
+    def.nPrevEpisodeAnchor = house.nEpisodeAnchor;             // UR-ext-12 fix: the new undo priors
+    def.nPrevEpisodeDeferBlocks = house.nEpisodeDeferBlocks;
+    def.nPrevEpisodeFloorUsed = house.fEpisodeFloorUsed;
+    def.nPrevDeferInEpisode = house.fDeferInEpisode;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+    mtx.nHouseOp = HOUSE_OP_DEFER;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("12"), house.nDeferActivations)));
+    mtx.vout.push_back(CTxOut(std::max<CAmount>(house.amountLastAttestReserves, 1000), HouseEscrowScript(house.houseID)));
+    mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
+    def.vApproverIndex.push_back(0);
+    def.vApproverSig.push_back(URX12Sign(key, HouseDeferSigHash(house.houseID, def.nPrevLastActivation,
+                                                                BillHashOutputs(mtx))));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << def;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+
+// Runs one house op at nHeight against `house`; on accept, `house` becomes the result. Returns "" or the reason.
+std::string URX12Run(CHouse& house, const CMutableTransaction& mtx, uint32_t nHeight)
+{
+    const CHouse h = house;
+    auto fnGetHouse = [h](uint32_t id, CHouse& out) { if (id != h.nHouseID) return false; out = h; return true; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    auto fnBlock = [](uint32_t, uint256& hash) { hash = uint256S("b12"); return true; };
+    CValidationState state;
+    CHouse houseOut;
+    if (!CheckHouseOperation(CTransaction(mtx), state, (int)nHeight, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin,
+                             fnBlock, houseOut))
+        return state.GetRejectReason().empty() ? std::string("(refused, no reason)") : state.GetRejectReason();
+    house = houseOut;
+    return std::string();
+}
+
+// The first height at or after nFrom whose effective status is not chStatus (scanning at most nMax blocks; 0 if none).
+uint32_t URX12StatusEnds(const CHouse& house, uint32_t nFrom, char chStatus, uint32_t nMax)
+{
+    for (uint32_t h = nFrom; h < nFrom + nMax; h++)
+        if (HouseEffectiveStatus(house, (int)h) != chStatus)
+            return h;
+    return 0;
+}
+
+bool URX12SetupFault(const std::string& strReason)
+{
+    return strReason.find("priors") != std::string::npos || strReason.find("payload") != std::string::npos ||
+           strReason.find("approver") != std::string::npos || strReason.find("sig") != std::string::npos ||
+           strReason.find("monotone") != std::string::npos || strReason.find("future") != std::string::npos ||
+           strReason.find("stale") != std::string::npos || strReason.find("lock") != std::string::npos;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(ur_ext_12_defer_recover_cycles_cannot_outrun_the_bound)
+{
+    CKey keyPartner;
+    keyPartner.MakeNewKey(true);
+    const CPubKey pubPartner = keyPartner.GetPubKey();
+    CHouse house = MakeGuardHouse();
+    house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
+    house.nMintedUnits = 0;               // every note sits in pending swaps: the recovery floor is 0
+    house.amountLastAttestReserves = 0;
+
+    // A demand protested at P0 and never paid; the house attested at P0.
+    const uint32_t P0 = 2000;
+    house.nProtestOpen = 1;
+    house.nProtestHeight = P0;
+    house.nProtestDemandHeight = P0 - 10;
+    house.nLastAttestHeight = P0;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, P0 + 1), HOUSE_STATUS_STRESSED);
+
+    const Consensus::Params& cp = Params().GetConsensus();
+    const uint32_t nSpan = HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1 + cp.nDeferSilenceWindow;
+    const uint32_t nBound = P0 + HOUSE_STRESSED_WINDOW + cp.nSuspensionCap + 144;
+    const uint32_t nScan = cp.nSuspensionCap + nSpan + HOUSE_STRESSED_WINDOW + 1000;
+
+    uint32_t h = P0 + 1;          // the next height to consider
+    uint32_t nLastOp = P0;        // one op per house per block
+    uint32_t nInsolvent = 0;      // the first height the house is effectively Insolvent
+    int nDefers = 0, nRecoveries = 0;
+    uint64_t nSuspended = 0;
+    std::string strStop;
+
+    for (int nGuard = 0; nGuard < 400 && h <= nBound + 1; nGuard++) {
+        const char chStatus = HouseEffectiveStatus(house, (int)h);
+        if (chStatus == HOUSE_STATUS_INSOLVENT) {
+            nInsolvent = h;
+            break;
+        }
+        if (chStatus == HOUSE_STATUS_STRESSED) {
+            const uint32_t nEnd = URX12StatusEnds(house, h, HOUSE_STATUS_STRESSED, nScan);
+            BOOST_REQUIRE_MESSAGE(nEnd != 0, "UR-ext-12 setup: the cure never ends");
+            const uint32_t nDeferAt = nEnd - 1;   // the cure's last block
+            if (nDeferAt < h || nDeferAt <= nLastOp) {
+                h = nEnd;                         // no block left to suspend in
+                continue;
+            }
+            if (nDeferAt < house.nLastAttestHeight ||
+                    nDeferAt - house.nLastAttestHeight > HOUSE_ATTEST_CADENCE) {
+                // DEFER needs a fresh attestation: attest on the block before.
+                if (nDeferAt - 1 <= nLastOp || nDeferAt - 2 <= house.nLastAttestHeight) {   // as-of must be newer
+                    h = nEnd;
+                    continue;
+                }
+                const std::string strA = URX12Run(house, URX12Attest(house, nDeferAt - 1, keyPartner), nDeferAt - 1);
+                BOOST_REQUIRE_MESSAGE(strA.empty(), "UR-ext-12 setup: the stressed house's ATTEST at " +
+                                      std::to_string(nDeferAt - 1) + " was refused: " + strA);
+                nLastOp = nDeferAt - 1;
+            }
+            const std::string strD = URX12Run(house, URX12Defer(house, keyPartner), nDeferAt);
+            if (!strD.empty()) {
+                BOOST_REQUIRE_MESSAGE(!URX12SetupFault(strD), "UR-ext-12 setup: DEFER at " + std::to_string(nDeferAt) +
+                                      " refused for a builder reason: " + strD);
+                strStop = "DEFER refused at " + std::to_string(nDeferAt) + ": " + strD;
+                h = nEnd;
+                continue;
+            }
+            nDefers++;
+            nLastOp = nDeferAt;
+            h = nDeferAt + 1;
+            continue;
+        }
+        if (chStatus == HOUSE_STATUS_DEFERRED) {
+            const uint32_t nEnd = URX12StatusEnds(house, h, HOUSE_STATUS_DEFERRED, nScan);
+            BOOST_REQUIRE_MESSAGE(nEnd != 0, "UR-ext-12 setup: the suspension never ends");
+            const uint32_t nRecoverAt = nEnd - 1;   // the suspension's last block
+            if (nRecoverAt < h || nRecoverAt <= nLastOp || nRecoverAt - 1 <= house.nLastAttestHeight) {
+                h = nEnd;
+                continue;
+            }
+            const uint32_t nInvoked = house.nDeferInvokedHeight;
+            const std::string strA = URX12Run(house, URX12Attest(house, nRecoverAt, keyPartner), nRecoverAt);
+            BOOST_REQUIRE_MESSAGE(strA.empty(), "UR-ext-12 setup: the recovery ATTEST at " +
+                                  std::to_string(nRecoverAt) + " was refused: " + strA);
+            nLastOp = nRecoverAt;
+            if (house.nDeferInvokedHeight == 0) {
+                nRecoveries++;
+                nSuspended += nRecoverAt - nInvoked;
+            }
+            h = nRecoverAt + 1;
+            continue;
+        }
+        strStop = std::string("unexpected status '") + chStatus + "' at " + std::to_string(h);
+        break;
+    }
+
+    // The attack must at least run: one suspension and one recovery, whatever the rule.
+    BOOST_CHECK_MESSAGE(nDefers >= 1 && nRecoveries >= 1, "UR-ext-12 setup: the cycle never ran (defers " +
+                        std::to_string(nDefers) + ", recoveries " + std::to_string(nRecoveries) + "; " + strStop + ")");
+    BOOST_CHECK_MESSAGE(nInsolvent != 0 && nInsolvent <= nBound,
+                        "UR-ext-12: a demand protested at " + std::to_string(P0) + " and never paid left the house " +
+                        (nInsolvent ? "Insolvent only at " + std::to_string(nInsolvent)
+                                    : std::string("not Insolvent at ") + std::to_string(h)) +
+                        "; the bound is " + std::to_string(nBound) + " (7 days + 12 months + 1 day). " +
+                        std::to_string(nDefers) + " DEFERs, " + std::to_string(nRecoveries) + " recoveries, " +
+                        std::to_string(nSuspended) + " blocks suspended in all" +
+                        (strStop.empty() ? std::string() : "; last stop: " + strStop));
+}
+
+// ===========================================================================
+// testing (2026-11-10): UR-ext-13 (GPT-6.1, external s3 round 2). A payload signature carries no network: one made on
+// easynet (or beta, or regtest) verifies on main whenever the same keys and objects exist there. Michael signed off
+// item 9 on 2026-11-10 (freebank docs-local/CONSENSUS_SIGNOFF_2026-11-10.md): "put the network's genesis hash in every
+// house-op signature hash". testing found the same gap in 16 more payload digests that bind neither the network nor
+// the tx's prevouts, Bill ISSUE the clearest (security: Medium, 2026-11-10); widening item 9 to them waits on Michael.
+// The fix (freebankd 2026-11-10): one shared helper appends Params()'s genesis hash inside each SigHash function, so
+// each digest is computed here under main, easynet, beta and regtest and all four must differ.
+// FAILS on master a00fb05 (every digest is identical on all four). Case 1 is item 9 as signed off; case 2 is the
+// widening - if Michael says no to it, drop case 2.
+// ===========================================================================
+namespace {
+// BillRetireSigHash gains nRateNamed with UR1-6 (agreed 2026-11-10); call whichever form this tree has.
+template <typename B, typename R, typename H>
+auto URX13RetireImpl(int, const B& billID, const R& nRate, const H& hashOutputs)
+    -> decltype(BillRetireSigHash(billID, nRate, hashOutputs))
+{
+    return BillRetireSigHash(billID, nRate, hashOutputs);
+}
+template <typename B, typename R, typename H>
+uint256 URX13RetireImpl(long, const B& billID, const R&, const H& hashOutputs)
+{
+    return BillRetireSigHash(billID, hashOutputs);
+}
+
+typedef std::vector<std::pair<std::string, std::function<uint256()>>> URX13Set;
+
+const uint256 URX13_ID = uint256S("ab13");
+const uint256 URX13_HP = uint256S("1313");
+const uint256 URX13_HO = uint256S("3131");
+const std::vector<unsigned char> URX13_PUB(33, 0x02);
+const std::vector<unsigned char> URX13_PUB2(33, 0x03);
+const std::vector<unsigned char> URX13_SCRIPT = {0x76, 0xa9, 0x14, 0x13, 0x88, 0xac};
+
+URX13Set URX13HouseDigests()
+{
+    const CTransaction tx{CMutableTransaction()};
+    URX13Set v;
+    v.push_back({"HouseRegisterSigHash", [] { return HouseRegisterSigHash(URX13_ID, 0, 100000); }});
+    v.push_back({"HouseTopupSigHash", [] { return HouseTopupSigHash(URX13_ID, 0, URX13_HO); }});
+    v.push_back({"HouseAdmitSigHash", [] { return HouseAdmitSigHash(URX13_ID, URX13_PUB, 100000); }});
+    v.push_back({"HouseExitSigHash", [] { return HouseExitSigHash(URX13_ID, 0, URX13_HO); }});
+    v.push_back({"HouseWinddownSigHash", [] { return HouseWinddownSigHash(URX13_ID, URX13_HO); }});
+    v.push_back({"HouseReclaimSigHash", [] { return HouseReclaimSigHash(URX13_ID, 0, URX13_HO); }});
+    v.push_back({"HouseDeferSigHash", [] { return HouseDeferSigHash(URX13_ID, 0, URX13_HO); }});
+    v.push_back({"HouseRenewSigHash", [] { return HouseRenewSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseReleaseSigHash", [] { return HouseReleaseSigHash(URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseMemberSigHash",
+                 [] { return HouseMemberSigHash(URX13_ID, HOUSE_OP_MEMBER_ADD, HouseMemberOp(), URX13_HP); }});
+    v.push_back({"HouseRateSigHash", [tx] { return HouseRateSigHash(1, tx, HouseRate()); }});
+    v.push_back({"HouseCharterSigHash", [tx] { return HouseCharterSigHash(1, tx, HouseCharter()); }});
+    v.push_back({"HouseAttestSigHash", [] { return HouseAttestSigHash(URX13_ID, 100, 100000, URX13_HP, URX13_HO); }});
+    return v;
+}
+
+URX13Set URX13OtherDigests()
+{
+    const std::vector<uint64_t> vUnits{100};
+    URX13Set v;
+    v.push_back({"BillIssueSigHash", [] {
+        return BillIssueSigHash(URX13_ID, 10000, 546, 8000, 144, URX13_PUB, URX13_PUB2, URX13_PUB, 5); }});
+    v.push_back({"BillEndorseSigHash", [] { return BillEndorseSigHash(URX13_ID, URX13_PUB, 100); }});
+    v.push_back({"BillRetireSigHash", [] { return URX13RetireImpl(0, URX13_ID, (uint64_t)1000, URX13_HO); }});
+    v.push_back({"BillClaimSigHash", [] { return BillClaimSigHash(URX13_ID, URX13_HO); }});
+    v.push_back({"DepositTransferSigHash", [] { return DepositTransferSigHash(1, 100000, 500, 8000, 100, URX13_HO); }});
+    v.push_back({"DepositWithdrawSigHash", [] { return DepositWithdrawSigHash(1, 100000, 8000, 100, URX13_HO); }});
+    v.push_back({"DepositClaimSigHash", [] { return DepositClaimSigHash(1, 100000, URX13_HO); }});
+    v.push_back({"DepositPreAuthSigHash",
+                 [] { return DepositPreAuthSigHash(1, 100000, 500, 8000, 100, URX13_SCRIPT); }});
+    v.push_back({"DepositProtestSigHash", [] { return DepositProtestSigHash(1, 100000, 100, 0, URX13_HO); }});
+    v.push_back({"NoteTransferSigHash", [vUnits] { return NoteTransferSigHash(1, vUnits, URX13_HO); }});
+    v.push_back({"NoteRedeemSigHash", [] { return NoteRedeemSigHash(1, 100, URX13_HO); }});
+    v.push_back({"NoteClaimSigHash", [] { return NoteClaimSigHash(1, 100, URX13_HO); }});
+    v.push_back({"NoteDemandSigHash", [vUnits] { return NoteDemandSigHash(1, vUnits, URX13_HO); }});
+    v.push_back({"NotePreAuthSigHash", [vUnits] { return NotePreAuthSigHash(1, vUnits, URX13_SCRIPT); }});
+    v.push_back({"NoteProtestSigHash", [vUnits] { return NoteProtestSigHash(1, vUnits, URX13_HO); }});
+    v.push_back({"TokenClaimSigHash", [] {
+        return TokenClaimSigHash(1, uint256S("7713"), URX13_SCRIPT, 10, URX13_SCRIPT); }});
+    return v;
+}
+
+// Case 3 (security's suggestion 2026-11-10, defence in depth): the payload digests that already bind the tx's prevouts
+// (or the tx itself), so they don't replay across networks today; the shared genesis helper covers them too.
+URX13Set URX13BoundDigests()
+{
+    const CTransaction tx{CMutableTransaction()};
+    const std::vector<uint64_t> vUnits{100};
+    URX13Set v;
+    v.push_back({"BillDiscountSigHash", [] { return BillDiscountSigHash(BillDiscount(), URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"BillRecourseSigHash", [] { return BillRecourseSigHash(BillRecourse(), URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"BillHRetireNotesSigHash",
+                 [] { return BillHRetireNotesSigHash(BillHRetireNotes(), URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"BillHRetireEscrowSigHash",
+                 [] { return BillHRetireEscrowSigHash(BillHRetireNotes(), URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"DepositOriginateSigHash",
+                 [] { return DepositOriginateSigHash(1, {100000}, {500}, {8000}, URX13_HP, URX13_HO); }});
+    v.push_back({"NoteMintSigHash", [vUnits] { return NoteMintSigHash(1, vUnits, URX13_HP, URX13_HO); }});
+    v.push_back({"NoteLockSigHash", [] { return NoteLockSigHash(1, 100, {}, URX13_HP, URX13_HO); }});
+    v.push_back({"NoteUnlockSigHash", [vUnits] { return NoteUnlockSigHash(1, vUnits, URX13_HP, URX13_HO); }});
+    v.push_back({"NoteSwapSigHash", [tx] { return NoteSwapSigHash(NoteSwap(), tx); }});
+    v.push_back({"PoolCreateSigHash", [] { return PoolCreateSigHash(1, 30, 1000, 1000, 0, URX13_HP, URX13_HO); }});
+    v.push_back({"PoolAddLiqSigHash", [] { return PoolAddLiqSigHash(PoolAddLiq(), URX13_HP, URX13_HO); }});
+    v.push_back({"PoolRemoveLiqSigHash", [] { return PoolRemoveLiqSigHash(PoolRemoveLiq(), URX13_HP, URX13_HO); }});
+    v.push_back({"PoolSwapSigHash", [] { return PoolSwapSigHash(PoolSwap(), URX13_HP, URX13_HO); }});
+    v.push_back({"PoolRetireSigHash", [] { return PoolRetireSigHash(PoolRetire(), URX13_HP, URX13_HO); }});
+    v.push_back({"SettleExchangeSigHash", [] { return SettleExchangeSigHash(SettleExchange(), URX13_HP, URX13_HO); }});
+    v.push_back({"SettleNetSigHash", [] { return SettleNetSigHash(SettleNet(), URX13_HP, URX13_HO); }});
+    v.push_back({"TokenKeysetSigHash", [] { return TokenKeysetSigHash(NoteTokenKeyset(), URX13_HP); }});
+    v.push_back({"TokenPostSigHash", [] { return TokenPostSigHash(NoteTokenPost(), URX13_HP); }});
+    v.push_back({"IssuedSigHash", [tx] { return IssuedSigHash(tx); }});
+    return v;
+}
+
+const std::vector<std::string>& URX13Networks()
+{
+    static const std::vector<std::string> v = {CBaseChainParams::MAIN, CBaseChainParams::EASYNET,
+                                               CBaseChainParams::BETA, CBaseChainParams::REGTEST};
+    return v;
+}
+
+void URX13Check(const URX13Set& vSet, const std::string& strWhich)
+{
+    const std::string strWas = Params().NetworkIDString();
+    const std::vector<std::string>& vNet = URX13Networks();
+    std::vector<uint256> vGenesis;
+    std::vector<std::vector<uint256>> vDigest;   // [network][digest]
+    for (const std::string& strNet : vNet) {
+        SelectParams(strNet);
+        vGenesis.push_back(Params().GetConsensus().hashGenesisBlock);
+        std::vector<uint256> d;
+        for (const auto& e : vSet)
+            d.push_back(e.second());
+        vDigest.push_back(d);
+    }
+    SelectParams(strWas);
+
+    // The fix can only work if the four genesis hashes differ (chainparams.cpp asserts each one).
+    for (size_t a = 0; a < vNet.size(); a++)
+        for (size_t b = a + 1; b < vNet.size(); b++)
+            BOOST_REQUIRE_MESSAGE(vGenesis[a] != vGenesis[b], "UR-ext-13 setup: " + vNet[a] + " and " + vNet[b] +
+                                  " share a genesis hash, so a genesis tag can't tell them apart");
+
+    for (size_t i = 0; i < vSet.size(); i++) {
+        std::string strSame;
+        for (size_t a = 0; a < vNet.size(); a++)
+            for (size_t b = a + 1; b < vNet.size(); b++)
+                if (vDigest[a][i] == vDigest[b][i])
+                    strSame += " " + vNet[a] + "=" + vNet[b];
+        BOOST_CHECK_MESSAGE(strSame.empty(), "UR-ext-13 (" + strWhich + "): " + vSet[i].first +
+                            " is the same digest on" + strSame + " - a signature made on one verifies on the other");
+    }
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(ur_ext_13_house_sighashes_bind_the_network)
+{
+    URX13Check(URX13HouseDigests(), "a house op, item 9 as signed off");
+}
+
+BOOST_AUTO_TEST_CASE(ur_ext_13_other_payload_sighashes_bind_the_network)
+{
+    URX13Check(URX13OtherDigests(), "the widening, Michael's yes 2026-11-11");
+}
+
+BOOST_AUTO_TEST_CASE(ur_ext_13_prevout_bound_sighashes_bind_the_network)
+{
+    URX13Check(URX13BoundDigests(), "prevout-bound, defence in depth, with the widening");
+}
+
+// ===========================================================================
+// testing (2026-11-11): UR-ext-10 (GPT-6.1, external s3 round 2; security: Medium). DisconnectBlock wrote each HouseDB
+// record as it went and stepped the marker back afterwards, so a crash in between restarted with the marker still on
+// the block and re-ran the undo over half-undone records (EscrowChangeBeforeOp re-appends prevouts, counters invert
+// twice; RemoveHouse of a gone house fails the disconnect for good). freebankd's fix stages the undo
+// (StagedDBWrapper) and commits it with the marker in one batch. Modelled on billdb_block_effects_atomic_undo, over an
+// in-memory HouseDB: block B2 changes house 1, registers house 2, adds a member and token records; its undo is then
+//   - staged and ABORTED (the crash before the commit): every record and the marker byte-identical to after B2;
+//   - staged and COMMITTED: byte-identical to after B1, as one clean undo;
+//   - committed again on an empty stage: still the same (a repeat is a no-op).
+// Inside a stage, reads see the staged writes (two undo steps on one house in one block), and a write then an erase of
+// one key leaves it absent. Needs the staged API, so it builds only with the fix.
+// ===========================================================================
+namespace {
+template <typename T>
+std::string URX10Bytes(bool fHave, const T& rec)
+{
+    if (!fHave)
+        return "-";
+    CDataStream ss(SER_DISK, CLIENT_VERSION);
+    ss << rec;
+    return HexStr(ss.begin(), ss.end());
+}
+
+const uint160 URX10_KEY = uint160(std::vector<unsigned char>(20, 0x10));
+const std::vector<unsigned char> URX10_B(33, 0x02);
+const uint256 URX10_Y = uint256S("10e7");
+
+// Every record B2 or its undo touches, serialized; "-" for an absent one.
+std::string URX10Snapshot(HouseDB& db, const CHouse& h1, const CHouse& h2)
+{
+    std::string s;
+    for (const CHouse* p : {&h1, &h2}) {
+        CHouse h;
+        uint32_t nID = 0;
+        s += URX10Bytes(db.GetHouse(p->nHouseID, h), h) + "|";
+        s += URX10Bytes(db.GetHouseIDByHash(p->houseID, nID), nID) + "|";
+        s += URX10Bytes(db.GetHouseIDByClassID(p->strClassID, nID), nID) + "|";
+    }
+    CHouseMember m;
+    s += URX10Bytes(db.GetHouseMember(h1.nHouseID, URX10_KEY, m), m) + "|";
+    s += std::to_string(db.GetHouseMemberCount(h1.nHouseID)) + "|";
+    CTokenMark mark;
+    s += URX10Bytes(db.GetTokenIssued(h1.nHouseID, URX10_B, mark), mark) + "|";
+    s += URX10Bytes(db.GetTokenSpent(h1.nHouseID, URX10_Y, mark), mark) + "|";
+    CTokenClaim claim;
+    s += URX10Bytes(db.GetTokenClaim(h1.nHouseID, URX10_Y, claim), claim) + "|";
+    uint32_t nLast = 0;
+    s += URX10Bytes(db.GetLastHouseID(nLast), nLast) + "|";
+    uint256 hashBest;
+    s += URX10Bytes(db.GetBestBlock(hashBest), hashBest);
+    return s;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(testing_ur_ext_10_house_undo_is_staged_and_atomic)
+{
+    LOCK(cs_main);   // a stage is opened only under cs_main (UR-ext-10 hardening)
+    HouseDB db(1 << 20, true, true);   // in-memory
+    const uint256 hashB1 = uint256S("b1"), hashB2 = uint256S("b2");
+
+    CHouse h1 = MakeGuardHouse();      // house 7
+    h1.nHouseID = 1;
+    h1.houseID = uint256S("10a1");
+    h1.strClassID = "urx10-a";
+    CHouse h2 = h1;
+    h2.nHouseID = 2;
+    h2.houseID = uint256S("10a2");
+    h2.strClassID = "urx10-b";
+
+    // B1: house 1 alone.
+    const uint32_t nLast1 = 1;
+    BOOST_REQUIRE(db.WriteBlockEffects({h1}, &nLast1, hashB1));
+    const std::string strAfterB1 = URX10Snapshot(db, h1, h2);
+
+    // B2: house 1 changes (twice in the block: an ATTEST, then a TOPUP's escrow change), house 2 registers, a member
+    // and the token records land.
+    CHouse h1a = h1;
+    h1a.nLastAttestHeight = 1500;
+    CHouse h1b = h1a;
+    h1b.vOutEscrowChange.push_back(COutPoint(uint256S("ec"), 1));
+    HouseMemberEffects mem;
+    HouseMemberPrior added;
+    added.fPresent = 1;
+    added.rec = CHouseMember(1500, 0);
+    mem.mapRecord[std::make_pair(h1.nHouseID, URX10_KEY)] = added;
+    mem.mapCount[h1.nHouseID] = 1;
+    TokenEffects tok;
+    CTokenMark mark;
+    mark.nHeight = 1500;
+    mark.txid = uint256S("70");
+    tok.mapIssued[std::make_pair(h1.nHouseID, URX10_B)] = mark;
+    tok.mapSpent[std::make_pair(h1.nHouseID, URX10_Y)] = mark;
+    CTokenClaim claim;
+    claim.nAmount = 5;
+    claim.nHeight = 1500;
+    tok.mapClaim[std::make_pair(h1.nHouseID, URX10_Y)] = claim;
+    const uint32_t nLast2 = 2;
+    BOOST_REQUIRE(db.WriteBlockEffects({h1b, h2}, &nLast2, hashB2, &mem, &tok));
+    const std::string strAfterB2 = URX10Snapshot(db, h1, h2);
+    BOOST_REQUIRE(strAfterB2 != strAfterB1);
+
+    // B2's undo, the way DisconnectBlock walks it (later op first): every write lands in the open stage.
+    auto fnUndoB2 = [&]() {
+        BOOST_REQUIRE(db.WriteHouse(h1a));                       // the TOPUP's escrow change undone
+        CHouse got;
+        BOOST_REQUIRE(db.GetHouse(h1.nHouseID, got));            // the next step reads the staged record
+        BOOST_CHECK_MESSAGE(got.vOutEscrowChange.empty() && got.nLastAttestHeight == 1500,
+                            "UR-ext-10: a read inside the stage didn't see the stage's own write");
+        BOOST_REQUIRE(db.WriteHouse(h1));                        // then the ATTEST undone
+        BOOST_REQUIRE(db.RemoveHouse(h2.nHouseID));              // the REGISTER undone
+        BOOST_REQUIRE(db.WriteLastHouseID(nLast1));
+        HouseMemberPrior absent;
+        BOOST_REQUIRE(db.WriteHouseMember(h1.nHouseID, URX10_KEY, absent));
+        BOOST_REQUIRE(db.WriteHouseMemberCount(h1.nHouseID, 0));
+        BOOST_REQUIRE(db.EraseTokenMarks(h1.nHouseID, {URX10_B}, {URX10_Y}));
+        BOOST_REQUIRE(db.EraseTokenClaim(h1.nHouseID, URX10_Y));
+    };
+
+    // The crash before the commit: nothing reached the DB, the marker is still on B2.
+    db.BeginStage();
+    fnUndoB2();
+    const auto fnNoMarker = [](const std::string& x) { return x.substr(0, x.rfind('|')); };   // the marker isn't staged
+    BOOST_CHECK_MESSAGE(fnNoMarker(URX10Snapshot(db, h1, h2)) == fnNoMarker(strAfterB1),
+                        "UR-ext-10: inside the stage the undo doesn't read as done");
+    db.AbortStage();
+    BOOST_CHECK_MESSAGE(URX10Snapshot(db, h1, h2) == strAfterB2,
+                        "UR-ext-10: an aborted (crashed) undo stage changed HouseDB - a replay would undo twice");
+
+    // The replayed undo, this time committed with the marker: exactly one clean undo.
+    db.BeginStage();
+    fnUndoB2();
+    BOOST_REQUIRE(db.CommitUndoStage(hashB1, true));
+    BOOST_CHECK_MESSAGE(URX10Snapshot(db, h1, h2) == strAfterB1,
+                        "UR-ext-10: the committed undo is not byte-identical to the state before B2");
+    BOOST_CHECK(!db.Staged());
+
+    // A repeat of the commit (an empty stage) is a no-op with the same marker.
+    db.BeginStage();
+    BOOST_REQUIRE(db.CommitUndoStage(hashB1, true));
+    BOOST_CHECK_MESSAGE(URX10Snapshot(db, h1, h2) == strAfterB1, "UR-ext-10: an empty repeated commit changed HouseDB");
+
+    // A write then an erase of one key inside a stage leaves it absent, staged and committed.
+    const uint256 y2 = uint256S("10e8");
+    db.BeginStage();
+    BOOST_REQUIRE(db.WriteTokenClaim(h1.nHouseID, y2, claim));
+    BOOST_REQUIRE(db.EraseTokenClaim(h1.nHouseID, y2));
+    CTokenClaim gone;
+    BOOST_CHECK(!db.GetTokenClaim(h1.nHouseID, y2, gone));
+    BOOST_REQUIRE(db.CommitUndoStage(hashB1, true));
+    BOOST_CHECK(!db.GetTokenClaim(h1.nHouseID, y2, gone));
+    BOOST_CHECK_MESSAGE(URX10Snapshot(db, h1, h2) == strAfterB1, "UR-ext-10: the write-then-erase stage left a trace");
+}
+
+// UR-ext-12 precision 2 (design 2026-11-10, security's conditions 4-5): an episode ends when its last protest is paid
+// with the house not suspended, or at the recovery that ends the suspension it was paid in, whichever comes last. The
+// 180-day spacing counts from that end; 0 = no earlier episode, so no spacing check (not "height 0").
+BOOST_AUTO_TEST_CASE(ur_ext_12_precision2_spacing_from_the_end)
+{
+    CHouse house = MakeGuardHouse();
+    BOOST_CHECK_EQUAL(house.nEpisodeEndHeight, 0u);
+
+    // Condition 4: no earlier episode, no check - even a protest at block 1, or after old protests and recoveries whose
+    // heights are leftovers (they are not ends).
+    {
+        CHouse h = house;
+        HouseProtestEpisodeStart(h, 1);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, 0u);
+        CHouse h2 = house;
+        h2.nProtestHeight = 500;
+        h2.nDeferEndedHeight = 600;
+        HouseProtestEpisodeStart(h2, 700);
+        BOOST_CHECK_EQUAL(h2.nNoCureHeight, 0u);
+    }
+
+    // A discharge that leaves a protest open does not end the episode.
+    {
+        CHouse h = house;
+        h.nProtestOpen = 1;
+        HouseDischargeMaybeEndsEpisode(h, 900);
+        BOOST_CHECK_EQUAL(h.nEpisodeEndHeight, 0u);
+    }
+    // The last one, with the house not suspended, does.
+    {
+        CHouse h = house;
+        h.nProtestOpen = 0;
+        HouseDischargeMaybeEndsEpisode(h, 900);
+        BOOST_CHECK_EQUAL(h.nEpisodeEndHeight, 900u);
+        // A later episode's end replaces it.
+        HouseDischargeMaybeEndsEpisode(h, 40000);
+        BOOST_CHECK_EQUAL(h.nEpisodeEndHeight, 40000u);
+    }
+    // Paid while suspended: the episode is not over (queued demands can't protest a suspended house). The recovery
+    // ATTEST ends it (validation.cpp; covered by the gate).
+    {
+        CHouse h = house;
+        h.nProtestOpen = 0;
+        h.nDeferInvokedHeight = 850;
+        HouseDischargeMaybeEndsEpisode(h, 900);
+        BOOST_CHECK_EQUAL(h.nEpisodeEndHeight, 0u);
+    }
+
+    // The end, not the start: an episode that started at 1000 and ended at 2000 gives no cure to a protest 180 days
+    // after the start, and one to a protest 180 days after the end.
+    {
+        CHouse h = house;
+        h.nProtestHeight = 1000;
+        h.nEpisodeEndHeight = 2000;
+        CHouse a = h;
+        HouseProtestEpisodeStart(a, 1000 + HOUSE_CURE_SPACING_BLOCKS);
+        BOOST_CHECK_EQUAL(a.nNoCureHeight, 1000u + HOUSE_CURE_SPACING_BLOCKS);
+        CHouse b = h;
+        HouseProtestEpisodeStart(b, 2000 + HOUSE_CURE_SPACING_BLOCKS - 1);
+        BOOST_CHECK_EQUAL(b.nNoCureHeight, 2000u + HOUSE_CURE_SPACING_BLOCKS - 1);
+        CHouse c = h;
+        HouseProtestEpisodeStart(c, 2000 + HOUSE_CURE_SPACING_BLOCKS);
+        BOOST_CHECK_EQUAL(c.nNoCureHeight, 0u);
+    }
+
+    // The field round-trips, last in the v15 tail.
+    {
+        CHouse h = house;
+        h.nEpisodeEndHeight = 0x01020304;
+        CDataStream ss(SER_DISK, CLIENT_VERSION);
+        ss << h;
+        BOOST_REQUIRE(ss.size() >= 4);
+        BOOST_CHECK_EQUAL((uint8_t)ss[ss.size() - 4], 0x04);   // little-endian, the record's last four bytes
+        BOOST_CHECK_EQUAL((uint8_t)ss[ss.size() - 1], 0x01);
+        CHouse back;
+        ss >> back;
+        BOOST_CHECK_EQUAL(back.nEpisodeEndHeight, 0x01020304u);
+    }
+}
+
+// UR-ext-12 precision 2, option B (security's conditions 1-3): HouseDB keeps one episode-end record per connected block
+// (block hash -> [(house id, pre-block nEpisodeEndHeight)]), written in the block's own batch even when empty, and the
+// staged undo reads and erases it. An aborted stage leaves it; a committed one removes it with the marker step-back.
+BOOST_AUTO_TEST_CASE(ur_ext_12_episode_end_undo_record)
+{
+    LOCK(cs_main);   // a stage is opened only under cs_main (UR-ext-10 hardening)
+    HouseDB db(1 << 20, true, true);   // in-memory
+    CHouse h1 = MakeGuardHouse();
+    h1.nHouseID = 1;
+    const uint32_t nLast1 = 1;
+    const uint256 hashB1 = uint256S("e1"), hashB2 = uint256S("e2");
+    const std::vector<std::pair<uint32_t, uint32_t>> vNone;
+    BOOST_REQUIRE(db.WriteBlockEffects({h1}, &nLast1, hashB1, nullptr, nullptr, &vNone));
+    // B2 ends house 1's episode at 900 (it was 0 before).
+    CHouse h1b = h1;
+    h1b.nEpisodeEndHeight = 900;
+    const std::vector<std::pair<uint32_t, uint32_t>> vB2{{1u, 0u}};
+    BOOST_REQUIRE(db.WriteBlockEffects({h1b}, nullptr, hashB2, nullptr, nullptr, &vB2));
+
+    // An empty record is still a record: the undo can tell "no change" from "lost".
+    std::vector<std::pair<uint32_t, uint32_t>> v;
+    BOOST_CHECK(db.GetEpisodeEndUndo(hashB1, v));
+    BOOST_CHECK(v.empty());
+    BOOST_REQUIRE(db.GetEpisodeEndUndo(hashB2, v));
+    BOOST_REQUIRE_EQUAL(v.size(), 1u);
+    BOOST_CHECK_EQUAL(v[0].first, 1u);
+    BOOST_CHECK_EQUAL(v[0].second, 0u);
+    BOOST_CHECK(!db.GetEpisodeEndUndo(uint256S("e3"), v));   // never connected: absent
+
+    // The undo as DisconnectBlock runs it, aborted (a crash before the commit): record and house untouched.
+    db.BeginStage();
+    {
+        CHouse h;
+        BOOST_REQUIRE(db.GetHouse(1, h));
+        h.nEpisodeEndHeight = v[0].second;
+        BOOST_REQUIRE(db.WriteHouse(h));
+        BOOST_REQUIRE(db.EraseEpisodeEndUndo(hashB2));
+        BOOST_CHECK(!db.GetEpisodeEndUndo(hashB2, v));   // the stage sees its own erase
+    }
+    db.AbortStage();
+    BOOST_CHECK(db.GetEpisodeEndUndo(hashB2, v));
+    {
+        CHouse h;
+        BOOST_REQUIRE(db.GetHouse(1, h));
+        BOOST_CHECK_EQUAL(h.nEpisodeEndHeight, 900u);
+    }
+
+    // Committed: house 1 back to its pre-B2 bytes, the record gone, the marker at B1.
+    db.BeginStage();
+    {
+        CHouse h;
+        BOOST_REQUIRE(db.GetHouse(1, h));
+        h.nEpisodeEndHeight = 0;
+        BOOST_REQUIRE(db.WriteHouse(h));
+        BOOST_REQUIRE(db.EraseEpisodeEndUndo(hashB2));
+    }
+    BOOST_REQUIRE(db.CommitUndoStage(hashB1, true));
+    BOOST_CHECK(!db.GetEpisodeEndUndo(hashB2, v));
+    BOOST_CHECK(db.GetEpisodeEndUndo(hashB1, v));
+    CHouse back;
+    BOOST_REQUIRE(db.GetHouse(1, back));
+    CDataStream a(SER_DISK, CLIENT_VERSION), b(SER_DISK, CLIENT_VERSION);
+    a << back;
+    b << h1;
+    BOOST_CHECK(a.str() == b.str());
+    uint256 hashBest;
+    BOOST_CHECK(db.GetBestBlock(hashBest) && hashBest == hashB1);
+}
+
+// MM-1 switch-on (security 11-11): the public networks require standard transactions, whichever one a build runs (one
+// public network per build, so a gate on a build sees only its own: this covers all four). Regtest stays non-strict for
+// the gates (FB_STD=1 runs them strict); beta is dead for our stack and keeps BitAssets' setting.
+BOOST_AUTO_TEST_CASE(mm1_public_networks_require_standard)
+{
+    BOOST_CHECK(CreateChainParams(CBaseChainParams::MAIN)->RequireStandard());
+    BOOST_CHECK(CreateChainParams(CBaseChainParams::EASYNET)->RequireStandard());
+    BOOST_CHECK(!CreateChainParams(CBaseChainParams::REGTEST)->RequireStandard());
+    BOOST_CHECK(!CreateChainParams(CBaseChainParams::BETA)->RequireStandard());
+}
+
+// MM-1 (security 11-11): a FreeBank family-script output is standard only where consensus tags it. The escrow script is
+// <house id> OP_DROP OP_TRUE: untagged, it is an anyone-can-spend coin the payer may take for escrow (SA-N4's trap).
+BOOST_AUTO_TEST_CASE(mm1_untagged_family_output_is_nonstandard)
+{
+    const uint256 houseID = uint256S("aa11");
+    const CScript scriptEscrow = HouseEscrowScript(houseID);
+    const CScript scriptPlain = GetScriptForDestination(CKeyID(uint160(std::vector<unsigned char>(20, 0x11))));
+    std::string reason;
+
+    // TOPUP posts its escrow at vout[0], which consensus tags: standard.
+    CMutableTransaction topup;
+    topup.nVersion = TRANSACTION_HOUSE_VERSION;
+    topup.nHouseOp = HOUSE_OP_TOPUP;
+    topup.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    topup.vout.push_back(CTxOut(COIN, scriptEscrow));
+    topup.vout.push_back(CTxOut(COIN, scriptPlain));
+    BOOST_CHECK_MESSAGE(IsStandardTx(CTransaction(topup), reason, true), "TOPUP refused: " + reason);
+    BOOST_CHECK_MESSAGE(AreFreeBankOutputsStandard(CTransaction(topup), reason), "a tagged TOPUP escrow was refused: " + reason);
+
+    // The same script at a position consensus doesn't tag: refused (after the inputs are known, MM1-R1).
+    CMutableTransaction stray = topup;
+    std::swap(stray.vout[0], stray.vout[1]);
+    BOOST_CHECK(!AreFreeBankOutputsStandard(CTransaction(stray), reason));
+    BOOST_CHECK_EQUAL(reason, "freebank-untagged-family-output");
+
+    // In a plain tx: refused.
+    CMutableTransaction plain;
+    plain.nVersion = 2;
+    plain.vin.push_back(CTxIn(COutPoint(uint256S("02"), 0)));
+    plain.vout.push_back(CTxOut(COIN, scriptEscrow));
+    BOOST_CHECK(!AreFreeBankOutputsStandard(CTransaction(plain), reason));
+    BOOST_CHECK_EQUAL(reason, "freebank-untagged-family-output");
+
+    // MM1-R2: a family script must carry its OWN family's tag - B3 custody (a note script) or a token pool script where
+    // consensus tags house escrow is refused.
+    CMutableTransaction wrong = topup;
+    wrong.vout[0].scriptPubKey = NotePreAuthScript(std::vector<unsigned char>(33, 0x02));
+    BOOST_CHECK(!AreFreeBankOutputsStandard(CTransaction(wrong), reason));
+    BOOST_CHECK_EQUAL(reason, "freebank-untagged-family-output");
+    wrong.vout[0].scriptPubKey = TokenPoolScript(uint256S("bb22"));
+    BOOST_CHECK(!AreFreeBankOutputsStandard(CTransaction(wrong), reason));
+    BOOST_CHECK_EQUAL(reason, "freebank-untagged-family-output");
+    // House, bill and pool escrow are one shape, told apart by tag only: a pool-escrow script where consensus tags
+    // house escrow is that shape with an escrow tag, so standard (consensus governs which escrow it is).
+    wrong.vout[0].scriptPubKey = PoolEscrowScript(7);
+    BOOST_CHECK_MESSAGE(AreFreeBankOutputsStandard(CTransaction(wrong), reason), "escrow shape with an escrow tag: " + reason);
+
+    // Data outputs: one, or two only when one is a withdrawal's sidechain object (multi-op-return otherwise).
+    CMutableTransaction data = plain;
+    data.vout.clear();
+    data.vout.push_back(CTxOut(0, CScript() << OP_RETURN << std::vector<unsigned char>(10, 0x01)));
+    data.vout.push_back(CTxOut(0, CScript() << OP_RETURN << std::vector<unsigned char>(10, 0x02)));
+    data.vout.push_back(CTxOut(COIN, scriptPlain));
+    BOOST_CHECK(!IsStandardTx(CTransaction(data), reason, true));
+    BOOST_CHECK_EQUAL(reason, "multi-op-return");
+}
+
+// MM1-R1 (security 11-11): the worst case of the tag step - a bill op with a large payload and thousands of outputs.
+// It runs only after the inputs exist (ATMP), so this measures what a tx with real inputs can cost; logged, not asserted.
+BOOST_AUTO_TEST_CASE(mm1_tag_step_worst_case_time)
+{
+    // IsStandardTx refuses a FreeBank tx with more than MAX_STANDARD_FREEBANK_OUTPUTS outputs before the tag step runs.
+    const CScript scriptPlain = GetScriptForDestination(CKeyID(uint160(std::vector<unsigned char>(20, 0x12))));
+    {
+        CMutableTransaction m;
+        m.nVersion = TRANSACTION_NOTE_VERSION;
+        m.nNoteOp = NOTE_OP_TRANSFER;
+        m.vin.push_back(CTxIn(COutPoint(uint256S("04"), 0)));
+        for (unsigned int i = 0; i <= MAX_STANDARD_FREEBANK_OUTPUTS; i++)
+            m.vout.push_back(CTxOut(1000, scriptPlain));
+        std::string reason;
+        BOOST_CHECK(!IsStandardTx(CTransaction(m), reason, true));
+        BOOST_CHECK_EQUAL(reason, "freebank-too-many-outputs");
+        m.vout.pop_back();
+        BOOST_CHECK_MESSAGE(IsStandardTx(CTransaction(m), reason, true), "at the cap: " + reason);
+    }
+
+    // The worst a standard tx can cost: a bill DISCOUNT at the output cap whose payload decodes in full each time (100
+    // units, 64 reserve proofs, 64 approver sigs), then the same at 9,000 outputs (over both caps) to show the growth.
+    BillDiscount d;
+    d.nBillID = 1; d.nHouseID = 1; d.amountPrice = 100; d.amountFace = 100; d.nNoteOutputs = 100;
+    d.vUnits.assign(100, 1);
+    d.vchCustodyPubKey.assign(33, 0x02);
+    for (int i = 0; i < (int)MAX_ATTEST_PROOFS; i++) {
+        AttestProof pr;
+        pr.outpoint = COutPoint(uint256S("05"), i);
+        pr.vchPubKey.assign(33, 0x02);
+        pr.vchSig.assign(72, 0x30);
+        d.vReserveProofs.push_back(pr);
+        d.vApproverIndex.push_back(i);
+        d.vApproverSig.push_back(std::vector<unsigned char>(72, 0x30));
+    }
+    d.vchSellerSig.assign(72, 0x30);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << d;
+    for (const unsigned int nOut : {MAX_STANDARD_FREEBANK_OUTPUTS, 9000u}) {
+        CMutableTransaction m;
+        m.nVersion = TRANSACTION_BILL_VERSION;
+        m.nBillOp = BILL_OP_DISCOUNT;
+        m.vchBillPayload.assign(ss.begin(), ss.end());
+        m.vin.push_back(CTxIn(COutPoint(uint256S("03"), 0)));
+        for (unsigned int i = 0; i < nOut; i++)
+            m.vout.push_back(CTxOut(1000, scriptPlain));
+        const CTransaction tx(m);
+        std::string reason;
+        const int64_t t0 = GetTimeMicros();
+        AreFreeBankOutputsStandard(tx, reason);
+        const int64_t dt = GetTimeMicros() - t0;
+        BOOST_TEST_MESSAGE("MM1-R1: the tag step on " << tx.vout.size() << " outputs and a " << ss.size()
+                           << "-byte DISCOUNT payload (" << GetTransactionWeight(tx) / 4 << " vbytes) took " << dt << " us");
+        BOOST_CHECK(dt >= 0);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -1844,4 +1844,79 @@ BOOST_FIXTURE_TEST_CASE(later_rule_on_median_time, TestingSetup)
     BOOST_CHECK_EQUAL(Consensus::LATER_RULES_TIME_MAIN, 1824940800);
 }
 
+// testing (2026-11-11): UR-ext-10, the PoolDB half (house_tests has the HouseDB half and the reasons). Block B2 changes
+// pool 3 and creates pool 4; its undo is staged and aborted (the crash before the commit: PoolDB and its marker
+// byte-identical to after B2), then staged and committed (byte-identical to after B1), then committed again on an empty
+// stage (no change). A read inside the stage sees the stage. Needs the staged API, so it builds only with the fix.
+namespace {
+std::string URX10PoolSnapshot(PoolDB& db)
+{
+    std::string s;
+    for (const uint32_t nID : {3u, 4u}) {
+        CPool p;
+        if (db.GetPool(nID, p)) {
+            CDataStream ss(SER_DISK, CLIENT_VERSION);
+            ss << p;
+            s += HexStr(ss.begin(), ss.end());
+        } else {
+            s += "-";
+        }
+        s += "|";
+    }
+    uint256 hashBest;
+    s += db.GetBestBlock(hashBest) ? hashBest.GetHex() : std::string("-");
+    return s;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(testing_ur_ext_10_pool_undo_is_staged_and_atomic)
+{
+    LOCK(cs_main);   // a stage is opened only under cs_main (UR-ext-10 hardening)
+    PoolDB db(1 << 20, true, true);   // in-memory
+    const uint256 hashB1 = uint256S("b1"), hashB2 = uint256S("b2");
+    CPool p3;
+    p3.nPoolID = 3;
+    p3.nFeeBps = 30;
+    p3.nNoteReserve = 5000;
+    p3.amountBtxReserve = 9000;
+    p3.nLpSupply = 6000;
+    p3.nCreateHeight = 10;
+    BOOST_REQUIRE(db.WriteBlockEffects({p3}, {}, hashB1));
+    const std::string strAfterB1 = URX10PoolSnapshot(db);
+
+    CPool p3b = p3;
+    p3b.nNoteReserve = 6000;
+    p3b.amountBtxReserve = 7600;
+    CPool p4 = p3;
+    p4.nPoolID = 4;
+    p4.nCreateHeight = 20;
+    BOOST_REQUIRE(db.WriteBlockEffects({p3b, p4}, {}, hashB2));
+    const std::string strAfterB2 = URX10PoolSnapshot(db);
+    BOOST_REQUIRE(strAfterB2 != strAfterB1);
+
+    auto fnUndoB2 = [&]() {
+        BOOST_REQUIRE(db.RemovePool(4));
+        BOOST_REQUIRE(db.WritePool(p3));
+        CPool got;
+        BOOST_CHECK(db.GetPool(3, got) && got.nNoteReserve == 5000);   // the stage's own write
+        BOOST_CHECK(!db.GetPool(4, got));                              // and its own erase
+    };
+
+    db.BeginStage();
+    fnUndoB2();
+    db.AbortStage();
+    BOOST_CHECK_MESSAGE(URX10PoolSnapshot(db) == strAfterB2,
+                        "UR-ext-10: an aborted (crashed) undo stage changed PoolDB - a replay would undo twice");
+
+    db.BeginStage();
+    fnUndoB2();
+    BOOST_REQUIRE(db.CommitUndoStage(hashB1, true));
+    BOOST_CHECK_MESSAGE(URX10PoolSnapshot(db) == strAfterB1,
+                        "UR-ext-10: the committed pool undo is not byte-identical to the state before B2");
+
+    db.BeginStage();
+    BOOST_REQUIRE(db.CommitUndoStage(hashB1, true));
+    BOOST_CHECK_MESSAGE(URX10PoolSnapshot(db) == strAfterB1, "UR-ext-10: an empty repeated commit changed PoolDB");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

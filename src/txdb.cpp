@@ -17,6 +17,8 @@
 #include <util.h>
 #include <ui_interface.h>
 #include <init.h>
+#include <sync.h>
+#include <validation.h>   // cs_main: the lock every staged undo and its readers hold
 
 #include <stdint.h>
 
@@ -52,6 +54,9 @@ static const char DB_LAST_SIDECHAIN_WITHDRAWAL_BUNDLE = 'w';
 // v1.0.1 (DEPOSITS_664_SPEC R3): L1 treasury outpoint -> deposit record ID,
 // rebuilt from the rows at every startup (BuildDepositOutpointIndex)
 static const char DB_SIDECHAIN_DEPOSIT_OUTPOINT = 'o';
+static const char DB_SIDECHAIN_SHORTFALL = 'k';           // PG-1: (m6id, L1 block) of a counted unexpected payout -> sats
+static const char DB_SIDECHAIN_SHORTFALL_TOTAL = 'y';     // PG-1: (sats, events) counted so far
+static const char DB_SIDECHAIN_BUNDLE_PAID_L1 = 'p';      // PG-1 (R3): bundle tx hash -> the L1 block of the 'S' its paid mark recorded
 
 // v0.2.18: asset records keyed by genesis txid ('A' / 'I' were the counter-era keys).
 static const char DB_ASSET_GENESIS = 'G';
@@ -78,6 +83,7 @@ static const char DB_TOKEN_CLAIM = 'L';
 // the DB, written ATOMICALLY with those effects (Phase 3.4 review - ties the
 // side DBs to the chainstate lifecycle; see HouseDB::WriteBlockEffects).
 static const char DB_SIDE_BEST_BLOCK = 'Z';
+static const char DB_EPISODE_END_UNDO = 'N';   // HouseDB, UR-ext-12 precision 2: block hash -> [(house id, pre-block end height)]
 
 // HouseDB keys 'g', 'q', 'k' and 'j' held the retired gold oracle (Gold B); never reuse them.
 
@@ -421,9 +427,27 @@ bool CSidechainTreeDB::WriteSidechainIndex(const std::vector<std::pair<uint256, 
 bool CSidechainTreeDB::WriteBlockEffects(const std::vector<SidechainWithdrawal>& vWithdrawalUpdate,
                                          const std::vector<SidechainWithdrawalBundle>& vBundleMark,
                                          const std::vector<std::pair<uint256, const SidechainObj *> >& vObject,
-                                         const uint256& hashBlock)
+                                         const uint256& hashBlock,
+                                         const std::vector<Shortfall>& vShortfall,
+                                         const std::vector<std::pair<uint256, uint256>>& vPaidL1)
 {
     CDBBatch batch(*this);
+
+    for (const auto& paid : vPaidL1)   // PG-1 (R3): where each newly paid bundle was paid
+        batch.Write(std::make_pair(DB_SIDECHAIN_BUNDLE_PAID_L1, paid.first), paid.second);
+
+    // PG-1: the block's counted unexpected payouts, and the running total
+    if (!vShortfall.empty()) {
+        CAmount total = 0;
+        int64_t nEvents = 0;
+        GetShortfallTotal(total, nEvents);
+        for (const Shortfall& sf : vShortfall) {
+            batch.Write(std::make_pair(DB_SIDECHAIN_SHORTFALL, std::make_pair(sf.m6id, sf.hashL1Block)), sf.amount);
+            total += sf.amount;   // each amount is in MoneyRange; the sum is exact so the undo is too
+            nEvents++;
+        }
+        batch.Write(DB_SIDECHAIN_SHORTFALL_TOTAL, std::make_pair((int64_t)total, nEvents));
+    }
 
     for (const SidechainWithdrawal& wt : vWithdrawalUpdate)
         batch.Write(std::make_pair(wt.sidechainop, wt.GetID()), wt);
@@ -483,6 +507,7 @@ bool CSidechainTreeDB::WriteBlockUndo(const BlockUndo& undo)
     for (const SidechainWithdrawalBundle& bundle : undo.vMarkUndo) {
         batch.Write(std::make_pair(bundle.sidechainop, bundle.GetID()), bundle);
         batch.Write(std::make_pair(DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP, bundle.tx.GetHash()), bundle);
+        batch.Erase(std::make_pair(DB_SIDECHAIN_BUNDLE_PAID_L1, bundle.tx.GetHash()));   // PG-1: no longer paid
         for (const uint256& id : bundle.vWithdrawalID) {
             SidechainWithdrawal withdrawal;
             if (!GetWithdrawal(id, withdrawal)) {
@@ -529,6 +554,19 @@ bool CSidechainTreeDB::WriteBlockUndo(const BlockUndo& undo)
             batch.Erase(DB_LAST_SIDECHAIN_DEPOSIT);
         else
             batch.Write(DB_LAST_SIDECHAIN_DEPOSIT, undo.hashPrevLastDeposit);
+    }
+
+    // PG-1: the block's counted unexpected payouts come off the total
+    if (!undo.vShortfallErase.empty()) {
+        CAmount total = 0;
+        int64_t nEvents = 0;
+        GetShortfallTotal(total, nEvents);
+        for (const Shortfall& sf : undo.vShortfallErase) {
+            batch.Erase(std::make_pair(DB_SIDECHAIN_SHORTFALL, std::make_pair(sf.m6id, sf.hashL1Block)));
+            total -= sf.amount;
+            nEvents = nEvents > 0 ? nEvents - 1 : 0;
+        }
+        batch.Write(DB_SIDECHAIN_SHORTFALL_TOTAL, std::make_pair((int64_t)total, nEvents));
     }
 
     // C6-A: the block's new withdrawals
@@ -813,6 +851,25 @@ bool CSidechainTreeDB::GetLastDepositID(uint256& hashID)
     return Read(DB_LAST_SIDECHAIN_DEPOSIT, hashID);
 }
 
+bool CSidechainTreeDB::GetBundlePaidL1(const uint256& hashBundle, uint256& hashL1Block) const
+{
+    return Read(std::make_pair(DB_SIDECHAIN_BUNDLE_PAID_L1, hashBundle), hashL1Block);
+}
+
+bool CSidechainTreeDB::HaveShortfall(const uint256& m6id, const uint256& hashL1Block) const
+{
+    return Exists(std::make_pair(DB_SIDECHAIN_SHORTFALL, std::make_pair(m6id, hashL1Block)));
+}
+
+void CSidechainTreeDB::GetShortfallTotal(CAmount& amount, int64_t& nEvents) const
+{
+    std::pair<int64_t, int64_t> v(0, 0);
+    if (!Read(DB_SIDECHAIN_SHORTFALL_TOTAL, v))
+        v = std::make_pair(0, 0);
+    amount = (CAmount)v.first;
+    nEvents = v.second;
+}
+
 bool CSidechainTreeDB::GetLastWithdrawalBundleHash(uint256& hash)
 {
     // Look up the last deposit non amount hash
@@ -875,10 +932,16 @@ bool BitAssetDB::GetAsset(const uint256& txid, BitAsset& asset)
 
 
 HouseDB::HouseDB(size_t nCacheSize, bool fMemory, bool fWipe)
-    : CDBWrapper(GetDataDir() / "blocks" / "Houses", nCacheSize, fMemory, fWipe) { }
+    : StagedDBWrapper(GetDataDir() / "blocks" / "Houses", nCacheSize, fMemory, fWipe) { }
 
 bool HouseDB::WriteHouse(const CHouse& house)
 {
+    if (Staged()) {   // UR-ext-10: inside a disconnect's stage, committed later with the marker
+        SWrite(std::make_pair(DB_HOUSE, house.nHouseID), house);
+        SWrite(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
+        SWrite(std::make_pair(DB_HOUSE_CLASS, house.strClassID), house.nHouseID);
+        return true;
+    }
     CDBBatch batch(*this);
     batch.Write(std::make_pair(DB_HOUSE, house.nHouseID), house);
     batch.Write(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
@@ -886,11 +949,19 @@ bool HouseDB::WriteHouse(const CHouse& house)
     return WriteBatch(batch, true);
 }
 
+bool HouseDB::CommitUndoStage(const uint256& hashBestBlock, bool fMarker)
+{
+    return fMarker ? CommitStage(DB_SIDE_BEST_BLOCK, hashBestBlock) : CommitStageNoMarker();
+}
+
 bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock,
                                 const HouseMemberEffects* pMembers,
-                                const TokenEffects* pTokens)
+                                const TokenEffects* pTokens,
+                                const std::vector<std::pair<uint32_t, uint32_t>>* pEpisodeEndUndo)
 {
     CDBBatch batch(*this);
+    if (pEpisodeEndUndo)
+        batch.Write(std::make_pair(DB_EPISODE_END_UNDO, hashBestBlock), *pEpisodeEndUndo);
     for (const CHouse& house : vHouse) {
         batch.Write(std::make_pair(DB_HOUSE, house.nHouseID), house);
         batch.Write(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
@@ -929,31 +1000,38 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
 
 bool HouseDB::GetTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID, CTokenKeyset& rec)
 {
-    return Read(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, nKeysetID)), rec);
+    return SRead(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, nKeysetID)), rec);
 }
 
 bool HouseDB::GetTokenIssued(uint32_t nHouseID, const std::vector<unsigned char>& vchB, CTokenMark& rec)
 {
-    return Read(std::make_pair(DB_TOKEN_ISSUED, std::make_pair(nHouseID, vchB)), rec);
+    return SRead(std::make_pair(DB_TOKEN_ISSUED, std::make_pair(nHouseID, vchB)), rec);
 }
 
 bool HouseDB::GetTokenSpent(uint32_t nHouseID, const uint256& y, CTokenMark& rec)
 {
-    return Read(std::make_pair(DB_TOKEN_SPENT, std::make_pair(nHouseID, y)), rec);
+    return SRead(std::make_pair(DB_TOKEN_SPENT, std::make_pair(nHouseID, y)), rec);
 }
 
 bool HouseDB::GetTokenClaim(uint32_t nHouseID, const uint256& y, CTokenClaim& rec)
 {
-    return Read(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), rec);
+    return SRead(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), rec);
 }
 
 bool HouseDB::EraseTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID)
 {
-    return Erase(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, nKeysetID)), true);
+    return SErase(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, nKeysetID)), true);
 }
 
 bool HouseDB::EraseTokenMarks(uint32_t nHouseID, const std::vector<std::vector<unsigned char>>& vB, const std::vector<uint256>& vY)
 {
+    if (Staged()) {
+        for (const std::vector<unsigned char>& b : vB)
+            SErase(std::make_pair(DB_TOKEN_ISSUED, std::make_pair(nHouseID, b)));
+        for (const uint256& y : vY)
+            SErase(std::make_pair(DB_TOKEN_SPENT, std::make_pair(nHouseID, y)));
+        return true;
+    }
     CDBBatch batch(*this);
     for (const std::vector<unsigned char>& b : vB)
         batch.Erase(std::make_pair(DB_TOKEN_ISSUED, std::make_pair(nHouseID, b)));
@@ -964,16 +1042,17 @@ bool HouseDB::EraseTokenMarks(uint32_t nHouseID, const std::vector<std::vector<u
 
 bool HouseDB::WriteTokenClaim(uint32_t nHouseID, const uint256& y, const CTokenClaim& rec)
 {
-    return Write(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), rec, true);
+    return SWrite(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), rec, true);
 }
 
 bool HouseDB::EraseTokenClaim(uint32_t nHouseID, const uint256& y)
 {
-    return Erase(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), true);
+    return SErase(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, y)), true);
 }
 
 std::vector<std::pair<uint64_t, CTokenKeyset>> HouseDB::ListTokenKeysets(uint32_t nHouseID)
 {
+    AssertNoStageForCursor();   // a cursor would miss the stage (UR-ext-10 hardening)
     std::vector<std::pair<uint64_t, CTokenKeyset>> v;
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
     pcursor->Seek(std::make_pair(DB_TOKEN_KEYSET, std::make_pair(nHouseID, (uint64_t)0)));
@@ -991,6 +1070,7 @@ std::vector<std::pair<uint64_t, CTokenKeyset>> HouseDB::ListTokenKeysets(uint32_
 
 std::vector<std::pair<uint256, CTokenClaim>> HouseDB::ListTokenClaims(uint32_t nHouseID, const uint256& start, size_t nMax)
 {
+    AssertNoStageForCursor();   // a cursor would miss the stage (UR-ext-10 hardening)
     std::vector<std::pair<uint256, CTokenClaim>> v;
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
     pcursor->Seek(std::make_pair(DB_TOKEN_CLAIM, std::make_pair(nHouseID, start)));
@@ -1008,30 +1088,31 @@ std::vector<std::pair<uint256, CTokenClaim>> HouseDB::ListTokenClaims(uint32_t n
 
 bool HouseDB::GetHouseMember(uint32_t nHouseID, const uint160& keyid, CHouseMember& rec)
 {
-    return Read(std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, keyid)), rec);
+    return SRead(std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, keyid)), rec);
 }
 
 uint32_t HouseDB::GetHouseMemberCount(uint32_t nHouseID)
 {
     uint32_t n = 0;
-    Read(std::make_pair(DB_HOUSE_MEMBER_COUNT, nHouseID), n);
+    SRead(std::make_pair(DB_HOUSE_MEMBER_COUNT, nHouseID), n);
     return n;
 }
 
 bool HouseDB::WriteHouseMember(uint32_t nHouseID, const uint160& keyid, const HouseMemberPrior& prior)
 {
     const auto key = std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, keyid));
-    return prior.fPresent ? Write(key, prior.rec) : Erase(key);
+    return prior.fPresent ? SWrite(key, prior.rec) : SErase(key);
 }
 
 bool HouseDB::WriteHouseMemberCount(uint32_t nHouseID, uint32_t nCount)
 {
     const auto key = std::make_pair(DB_HOUSE_MEMBER_COUNT, nHouseID);
-    return nCount ? Write(key, nCount) : Erase(key);
+    return nCount ? SWrite(key, nCount) : SErase(key);
 }
 
 std::vector<std::pair<uint160, CHouseMember>> HouseDB::ListHouseMembers(uint32_t nHouseID, const uint160& start, size_t nMax)
 {
+    AssertNoStageForCursor();   // a cursor would miss the stage (UR-ext-10 hardening)
     std::vector<std::pair<uint160, CHouseMember>> v;
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
     pcursor->Seek(std::make_pair(DB_HOUSE_MEMBER, std::make_pair(nHouseID, start)));
@@ -1047,18 +1128,29 @@ std::vector<std::pair<uint160, CHouseMember>> HouseDB::ListHouseMembers(uint32_t
     return v;
 }
 
+bool HouseDB::GetEpisodeEndUndo(const uint256& hashBlock, std::vector<std::pair<uint32_t, uint32_t>>& vUndo)
+{
+    return SRead(std::make_pair(DB_EPISODE_END_UNDO, hashBlock), vUndo);
+}
+
+bool HouseDB::EraseEpisodeEndUndo(const uint256& hashBlock)
+{
+    return SErase(std::make_pair(DB_EPISODE_END_UNDO, hashBlock));
+}
+
 bool HouseDB::GetBestBlock(uint256& hashBlock)
 {
-    return Read(DB_SIDE_BEST_BLOCK, hashBlock);
+    return SRead(DB_SIDE_BEST_BLOCK, hashBlock);
 }
 
 bool HouseDB::WriteBestBlock(const uint256& hashBlock)
 {
-    return Write(DB_SIDE_BEST_BLOCK, hashBlock, true);
+    return SWrite(DB_SIDE_BEST_BLOCK, hashBlock, true);
 }
 
 std::vector<CHouse> HouseDB::GetHouses()
 {
+    AssertNoStageForCursor();   // a cursor would miss the stage (UR-ext-10 hardening)
     std::ostringstream ss;
     ::Serialize(ss, std::make_pair(DB_HOUSE, 0));
 
@@ -1085,37 +1177,42 @@ std::vector<CHouse> HouseDB::GetHouses()
 
 bool HouseDB::GetLastHouseID(uint32_t& nID)
 {
-    return Read(DB_HOUSE_LAST_ID, nID);
+    return SRead(DB_HOUSE_LAST_ID, nID);
 }
 
 bool HouseDB::WriteLastHouseID(const uint32_t nID)
 {
-    return Write(DB_HOUSE_LAST_ID, nID);
+    return SWrite(DB_HOUSE_LAST_ID, nID);
+}
+
+void HouseDB::AssertStageLock() const
+{
+    AssertLockHeld(cs_main);
 }
 
 bool HouseDB::GetHouse(const uint32_t nID, CHouse& house)
 {
-    return Read(std::make_pair(DB_HOUSE, nID), house);
+    return SRead(std::make_pair(DB_HOUSE, nID), house);
 }
 
 bool HouseDB::GetHouseIDByHash(const uint256& houseID, uint32_t& nID)
 {
-    return Read(std::make_pair(DB_HOUSE_HASH, houseID), nID);
+    return SRead(std::make_pair(DB_HOUSE_HASH, houseID), nID);
 }
 
 bool HouseDB::HaveHouseHash(const uint256& houseID)
 {
-    return Exists(std::make_pair(DB_HOUSE_HASH, houseID));
+    return SExists(std::make_pair(DB_HOUSE_HASH, houseID));
 }
 
 bool HouseDB::HaveClassID(const std::string& strClassID)
 {
-    return Exists(std::make_pair(DB_HOUSE_CLASS, strClassID));
+    return SExists(std::make_pair(DB_HOUSE_CLASS, strClassID));
 }
 
 bool HouseDB::GetHouseIDByClassID(const std::string& strClassID, uint32_t& nID)
 {
-    return Read(std::make_pair(DB_HOUSE_CLASS, strClassID), nID);
+    return SRead(std::make_pair(DB_HOUSE_CLASS, strClassID), nID);
 }
 
 bool HouseDB::RemoveHouse(const uint32_t nID)
@@ -1124,6 +1221,12 @@ bool HouseDB::RemoveHouse(const uint32_t nID)
     if (!GetHouse(nID, house))
         return false;
 
+    if (Staged()) {
+        SErase(std::make_pair(DB_HOUSE, nID));
+        SErase(std::make_pair(DB_HOUSE_HASH, house.houseID));
+        SErase(std::make_pair(DB_HOUSE_CLASS, house.strClassID));
+        return true;
+    }
     CDBBatch batch(*this);
     batch.Erase(std::make_pair(DB_HOUSE, nID));
     batch.Erase(std::make_pair(DB_HOUSE_HASH, house.houseID));
@@ -1251,11 +1354,11 @@ bool BillDB::RemoveBill(const uint32_t nID)
 }
 
 PoolDB::PoolDB(size_t nCacheSize, bool fMemory, bool fWipe)
-    : CDBWrapper(GetDataDir() / "blocks" / "Pools", nCacheSize, fMemory, fWipe) { }
+    : StagedDBWrapper(GetDataDir() / "blocks" / "Pools", nCacheSize, fMemory, fWipe) { }
 
 bool PoolDB::WritePool(const CPool& pool)
 {
-    return Write(std::make_pair(DB_POOL, pool.nPoolID), pool, true);
+    return SWrite(std::make_pair(DB_POOL, pool.nPoolID), pool, true);
 }
 
 bool PoolDB::WriteBlockEffects(const std::vector<CPool>& vPool, const std::vector<uint32_t>& vRemove, const uint256& hashBestBlock)
@@ -1269,18 +1372,29 @@ bool PoolDB::WriteBlockEffects(const std::vector<CPool>& vPool, const std::vecto
     return WriteBatch(batch, true);
 }
 
+bool PoolDB::CommitUndoStage(const uint256& hashBestBlock, bool fMarker)
+{
+    return fMarker ? CommitStage(DB_SIDE_BEST_BLOCK, hashBestBlock) : CommitStageNoMarker();
+}
+
 bool PoolDB::GetBestBlock(uint256& hashBlock)
 {
-    return Read(DB_SIDE_BEST_BLOCK, hashBlock);
+    return SRead(DB_SIDE_BEST_BLOCK, hashBlock);
 }
 
 bool PoolDB::WriteBestBlock(const uint256& hashBlock)
 {
-    return Write(DB_SIDE_BEST_BLOCK, hashBlock, true);
+    return SWrite(DB_SIDE_BEST_BLOCK, hashBlock, true);
+}
+
+void PoolDB::AssertStageLock() const
+{
+    AssertLockHeld(cs_main);
 }
 
 std::vector<CPool> PoolDB::GetPools()
 {
+    AssertNoStageForCursor();   // a cursor would miss the stage (UR-ext-10 hardening)
     std::ostringstream ss;
     ::Serialize(ss, std::make_pair(DB_POOL, 0));
 
@@ -1305,17 +1419,17 @@ std::vector<CPool> PoolDB::GetPools()
 
 bool PoolDB::GetPool(const uint32_t nID, CPool& pool)
 {
-    return Read(std::make_pair(DB_POOL, nID), pool);
+    return SRead(std::make_pair(DB_POOL, nID), pool);
 }
 
 bool PoolDB::HavePool(const uint32_t nID)
 {
-    return Exists(std::make_pair(DB_POOL, nID));
+    return SExists(std::make_pair(DB_POOL, nID));
 }
 
 bool PoolDB::RemovePool(const uint32_t nID)
 {
-    return Erase(std::make_pair(DB_POOL, nID), true);
+    return SErase(std::make_pair(DB_POOL, nID), true);
 }
 
 namespace {

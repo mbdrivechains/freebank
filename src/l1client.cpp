@@ -65,6 +65,7 @@ public:
     std::vector<SidechainDeposit> UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex) override;
     bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx) override;
     bool VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime) override;
+    L1Answer VerifyBMMAnswer(const uint256& hashMainBlock, const uint256& hashBMM) override;
     uint256 SendBMMRequest(const uint256& hashBMM, const uint256& hashBlockMain, int nHeight, CAmount amount, bool& fNotSent) override;
     bool GetCTIP(std::pair<uint256, uint32_t>& ctip) override;
     bool GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFees) override;
@@ -77,12 +78,18 @@ public:
     bool GetAncestorHashes(const uint256& hashBlock, int nHeight, uint32_t nMax, std::vector<uint256>& vHash) override;
     bool HaveSpentWithdrawalBundle(const uint256& hash) override;
     bool HaveFailedWithdrawalBundle(const uint256& hash) override;
+    /** UR5-11: the deposits of the window [hashStart, hashEnd] from BitcoinX's own RPCs (BuildJsonRpcDepositEvents); no
+     *  withdrawal events (BitcoinX payouts aren't supported, docs-local/UR5_11.md). */
+    L1Answer GetPegEvents(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events) override;
 
 private:
     /*
      * Send json request to local node
      */
-    bool SendRequestToMainchain(const std::string& json, boost::property_tree::ptree& ptree);
+    bool SendRequestToMainchain(const std::string& json, boost::property_tree::ptree& ptree, std::string* pstrRpcError = nullptr,
+                                std::string* pstrBody = nullptr);
+    /** UR5-11: one call, its "result" as UniValue (the ptree drops JSON types). */
+    bool CallMainchain(const std::string& strMethod, const UniValue& params, UniValue& result);
 };
 
 //
@@ -240,6 +247,28 @@ std::string ConsensusHexFromUint256(const uint256& hash)
 }
 
 /** Read a {"hex": "..."} wrapper (ReverseHex / ConsensusHex / Hex). */
+// L1F-1 (testing, 2026-11-13): read a JSON number as int32 / int64 without throwing. UniValue's get_int / get_int64
+// throw on a value outside the type, a fraction or an exponent. proto3 JSON never sends those for these fields, but a
+// broken or hostile answer can, and a throw skips the caller's "can't read" handling (on the import thread behind
+// CheckBlockBMM, or the scheduler's L1 cycles, it ends the node). Anything not a plain integer of the type reads false.
+static bool JsonInt32(const UniValue& v, int& n)
+{
+    int32_t x;
+    if (!v.isNum() || !ParseInt32(v.getValStr(), &x))
+        return false;
+    n = x;
+    return true;
+}
+
+static bool JsonInt64(const UniValue& v, int64_t& n)
+{
+    int64_t x;
+    if (!v.isNum() || !ParseInt64(v.getValStr(), &x))
+        return false;
+    n = x;
+    return true;
+}
+
 static bool GetHexField(const UniValue& obj, std::string& strHex)
 {
     if (!obj.isObject())
@@ -272,7 +301,14 @@ static bool ParseHeaderObject(const UniValue& obj, L1BlockHeader& header)
 
     // Absent height / timestamp = proto3 zero default (genesis / unset)
     const UniValue& height = find_value(obj, "height");
-    header.nHeight = height.isNum() ? height.get_int() : 0;
+    if (height.isNull()) {
+        header.nHeight = 0;
+    } else {
+        int nHeight;
+        if (!JsonInt32(height, nHeight) || nHeight < 0)
+            return false;
+        header.nHeight = nHeight;
+    }
 
     const UniValue& timestamp = find_value(obj, "timestamp");
     if (timestamp.isNull())
@@ -313,6 +349,24 @@ bool ParseEnforcerHeaderInfos(const UniValue& response, std::vector<L1BlockHeade
     return !vHeader.empty();
 }
 
+// One commitment field (UR5-10: the single-block and batched reads share it, so they can't drift apart on one L1
+// block): absent is "none" (proto3 JSON omits the field); present but unreadable is "can't tell" (false), never "no"
+// (layer-B review BMM L2: a "no" marks the side block invalid for good). BlockInfo.bmm_commitment is ConsensusHex
+// (internal byte order).
+static bool ReadCommitmentField(const UniValue& field, bool& fHave, uint256& hash)
+{
+    fHave = false;
+    hash.SetNull();
+    if (field.isNull())
+        return true;
+    std::string strHex;
+    if (!GetHexField(field, strHex) || strHex.size() != 64)
+        return false;
+    hash = Uint256FromConsensusHex(strHex);
+    fHave = !hash.IsNull();
+    return true;
+}
+
 bool ParseEnforcerBmmCommitment(const UniValue& response, bool& fBlockFound, bool& fHaveCommitment, uint256& hashCommitment)
 {
     fBlockFound = false;
@@ -330,40 +384,8 @@ bool ParseEnforcerBmmCommitment(const UniValue& response, bool& fBlockFound, boo
         return false;
 
     fBlockFound = true;
-
-    // Block known, but no h* committed for this sidechain: proto3 JSON omits
-    // the field.
-    const UniValue& field = find_value(commitment, "commitment");
-    if (field.isNull())
-        return true;
-
-    // Present but unreadable is "can't tell", never "no" (layer-B review BMM
-    // L2): a "no" marks the side block invalid for good.
-    std::string strHex;
-    if (!GetHexField(field, strHex) || strHex.size() != 64)
-        return false;
-
-    // BlockInfo.bmm_commitment is ConsensusHex (internal byte order)
-    hashCommitment = Uint256FromConsensusHex(strHex);
-    fHaveCommitment = !hashCommitment.IsNull();
-
-    return true;
-}
-
-// One commitment field, as ParseEnforcerBmmCommitment reads it: absent is
-// "none"; present but unreadable is "can't tell" (false).
-static bool ReadCommitmentField(const UniValue& field, bool& fHave, uint256& hash)
-{
-    fHave = false;
-    hash.SetNull();
-    if (field.isNull())
-        return true;
-    std::string strHex;
-    if (!GetHexField(field, strHex) || strHex.size() != 64)
-        return false;
-    hash = Uint256FromConsensusHex(strHex);
-    fHave = !hash.IsNull();
-    return true;
+    // Block known; no h* committed for this sidechain is "none" (UR5-10: the batched read's own field reader).
+    return ReadCommitmentField(find_value(commitment, "commitment"), fHaveCommitment, hashCommitment);
 }
 
 bool ParseEnforcerBmmCommitments(const UniValue& response, std::vector<std::pair<bool, uint256>>& vCommitment)
@@ -444,7 +466,14 @@ bool ParseEnforcerCtip(const UniValue& response, uint256& txid, uint32_t& n)
 
     // Absent vout = proto3 zero default
     const UniValue& vout = find_value(ctip, "vout");
-    n = vout.isNum() ? (uint32_t)vout.get_int() : 0;
+    if (vout.isNull()) {
+        n = 0;
+    } else {
+        int64_t nVout;
+        if (!JsonInt64(vout, nVout) || nVout < 0 || nVout > std::numeric_limits<uint32_t>::max())
+            return false;
+        n = (uint32_t)nVout;
+    }
 
     return true;
 }
@@ -767,9 +796,13 @@ L1TxFetch ClassifyRawTxBody(std::string body, CMutableTransaction& tx)
 // EnforcerL1Client
 //
 
+std::function<void(const std::string&, int)> g_fnEnforcerCallSpyForTest;
+
 int EnforcerL1Client::RunEnforcerCall(const std::string& strService, const std::string& strMethod, const std::string& strRequest, bool fStderr, std::string& strOutput,
                                       bool fRetrySafe, int nTimeoutSecs)
 {
+    if (g_fnEnforcerCallSpyForTest)
+        g_fnEnforcerCallSpyForTest(strMethod, nTimeoutSecs);
     if (GetEnforcerTransport() == EnforcerTransport::GRPCURL)
         return RunGrpcurl(strService, strMethod, strRequest, fStderr, strOutput, nTimeoutSecs);
 
@@ -1039,12 +1072,26 @@ bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
     if (strHostPort.empty())
         return false;
 
+    // UR5-6 (plain v1.2.2): the same split as enforcerconnect::SplitHostPort, which -mainchainrest's checks already
+    // accept: "[v6addr]:port" (brackets stripped for the resolver), "host:port", or a bare host.
     std::string strHost = strHostPort;
     std::string strPort = "8332";
-    size_t colon = strHostPort.rfind(':');
-    if (colon != std::string::npos) {
-        strHost = strHostPort.substr(0, colon);
-        strPort = strHostPort.substr(colon + 1);
+    if (!strHostPort.empty() && strHostPort[0] == '[') {
+        const size_t close = strHostPort.find(']');
+        if (close == std::string::npos)
+            return false;
+        strHost = strHostPort.substr(1, close - 1);
+        if (close + 1 < strHostPort.size()) {
+            if (strHostPort[close + 1] != ':')
+                return false;
+            strPort = strHostPort.substr(close + 2);
+        }
+    } else {
+        size_t colon = strHostPort.rfind(':');
+        if (colon != std::string::npos) {
+            strHost = strHostPort.substr(0, colon);
+            strPort = strHostPort.substr(colon + 1);
+        }
     }
 
     try {
@@ -1121,7 +1168,7 @@ bool EnforcerL1Client::RestGet(const std::string& strPath, std::string& strBody)
         boost::asio::streambuf output;
         std::ostream os(&output);
         os << "GET " << strPath << " HTTP/1.0\r\n";
-        os << "Host: " << strHost << "\r\n";
+        os << "Host: " << (strHost.find(':') != std::string::npos ? "[" + strHost + "]" : strHost) << "\r\n";   // a v6 literal keeps its brackets here
         os << "Connection: close\r\n\r\n";
         boost::asio::write(socket, output);
 
@@ -1268,7 +1315,7 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
     // the discriminator (for alphanet, the fork block itself). A node still
     // syncing below the pinned height is NOT a mismatch - report not-ready and
     // let init's retry window run.
-    const std::string strWantPin = gArgs.GetArg("-mainchainblockpin", "");
+    const std::string strWantPin = MainchainBlockPinArg();
     if (!strWantPin.empty()) {
         int nPinHeight = 0;
         uint256 hashPin;
@@ -1279,10 +1326,16 @@ bool ProbeMainchainRest(std::string& strError, bool* pfIdentityMismatch)
             return false;
         }
         const UniValue& blocks = find_value(info, "blocks");
-        if (blocks.isNum() && blocks.get_int() < nPinHeight) {
+        int nBlocks = 0;
+        if (blocks.isNum() && !JsonInt32(blocks, nBlocks)) {
+            strError = strprintf("mainchain %s reports an unreadable block height (%s)",
+                                 gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST), blocks.getValStr());
+            return false;
+        }
+        if (blocks.isNum() && nBlocks < nPinHeight) {
             strError = strprintf("mainchain %s is at height %d, below the pinned height %d - still syncing",
                                  gArgs.GetArg("-mainchainrest", DEFAULT_MAINCHAIN_REST),
-                                 blocks.get_int(), nPinHeight);
+                                 nBlocks, nPinHeight);
             return false;
         }
         std::string strHashBody;
@@ -1315,11 +1368,12 @@ std::string ChainNameFromEnforcerChainInfo(const UniValue& response)
         return "";
     const UniValue& network = find_value(response, "network");
     std::string strName;
+    int nNetwork = 0;
     if (network.isStr()) {
         strName = network.get_str();
-    } else if (network.isNum()) {
+    } else if (JsonInt32(network, nNetwork)) {
         // proto enum Network (cusf/mainchain/v1/validator.proto)
-        switch (network.get_int()) {
+        switch (nNetwork) {
         case 2: strName = "NETWORK_MAINNET"; break;
         case 3: strName = "NETWORK_REGTEST"; break;
         case 4: strName = "NETWORK_SIGNET"; break;
@@ -1366,7 +1420,7 @@ bool ProbeMainchainEnforcerOnly(std::string& strError, bool* pfIdentityMismatch)
         return false;
     }
 
-    const std::string strWantPin = gArgs.GetArg("-mainchainblockpin", "");
+    const std::string strWantPin = MainchainBlockPinArg();
     if (!strWantPin.empty()) {
         int nPinHeight = 0;
         uint256 hashPin;
@@ -1446,9 +1500,10 @@ bool ParseEnforcerChainInfo(const UniValue& response, EnforcerSettings& settings
         const UniValue& v = find_value(c, f.first);
         if (v.isNull())
             continue; // proto3: zero
-        if (!v.isNum() || v.get_int64() < 0 || v.get_int64() > std::numeric_limits<uint32_t>::max())
+        int64_t nValue;
+        if (!JsonInt64(v, nValue) || nValue < 0 || nValue > std::numeric_limits<uint32_t>::max())
             return false;
-        *f.second = (uint32_t)v.get_int64();
+        *f.second = (uint32_t)nValue;
     }
     return true;
 }
@@ -1587,10 +1642,8 @@ EnforcerIdentity ProbeEnforcerIdentity(std::string& strError, bool* pfStale)
         UniValue info;
         if (info.read(strBody) && info.isObject()) {
             const UniValue& blocks = find_value(info, "blocks");
-            if (blocks.isNum()) {
-                nRestTip = blocks.get_int();
+            if (JsonInt32(blocks, nRestTip))
                 fRestOK = true;
-            }
         }
     }
 
@@ -1683,6 +1736,72 @@ bool EnforcerL1Client::RestGetBlockTxids(const uint256& hashBlock, std::vector<u
 // merges, which no record holds, so the delta cannot be computed here.
 // hashLastDeposit / nLastBurnIndex are not used: records no longer form a
 // chain (R2), so "everything after the last record" is not "everything new".
+TreasuryScan ScanTreasuryChanges(const L1PegEvents& events, int nLastRecordedPos,
+                                 const std::function<int(const uint256&)>& fnMainchainPos,
+                                 const std::function<bool(const uint256&)>& fnBelowDepositStart,
+                                 std::vector<TreasuryChange>& vOut)
+{
+    // v0.2.17 A9 + D7: every change to the treasury in running-number order, deposits and bundle payouts together
+    // (they share the counter; since #664 the deposits of one L1 block share a number, so the sort is stable:
+    // deposits before payouts, each in the enforcer's order). A payout's M6 is the tx the enforcer sends with its
+    // "paid" event. A6: a deposit with an empty address is kept (recorded and paid to no one).
+    // Ultra s5 #3 (UR5-3): a paid event that can't be used - no running number, no M6, or an M6 that won't decode -
+    // used to fail the whole batch before the below-start skip and the recorded check ran, so one old payout stopped
+    // every new deposit for good. Now one below the deposit start (the chain before's), or at or before the newest
+    // recorded change (history already processed), is skipped; only a NEW one fails closed.
+    vOut.clear();
+    const auto Processed = [&](const uint256& hashBlock) {
+        const int nPos = fnMainchainPos(hashBlock);
+        return nPos >= 0 && nLastRecordedPos >= 0 && nPos <= nLastRecordedPos;
+    };
+    for (const L1DepositEvent& ev : events.vDeposit) {
+        TreasuryChange c;
+        c.nSequence = ev.nSequence;
+        c.pDeposit = &ev;
+        c.txid = ev.outpoint.hash;
+        vOut.push_back(c);
+    }
+    for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
+        if (ev.status != 'S')
+            continue;
+        if (fnBelowDepositStart(ev.hashMainBlock))
+            continue;
+        if (!ev.fHaveSequence || ev.vchTx.empty()) {
+            if (Processed(ev.hashMainBlock)) {
+                LogPrintf("Enforcer client: a \"paid\" event for m6id %s without its running number or M6, in an L1 "
+                          "block at or before the newest recorded treasury change: already processed, skipped\n",
+                          ev.m6id.ToString());
+                continue;
+            }
+            LogPrintf("ERROR Enforcer client: a \"paid\" event for m6id %s without its running number or M6 (batch failed closed)\n",
+                      ev.m6id.ToString());
+            vOut.clear();
+            return TreasuryScan::FAIL_CLOSED;
+        }
+        L1MutableTransaction mtxM6;
+        try {
+            CDataStream ss(ev.vchTx, SER_NETWORK, PROTOCOL_VERSION);
+            ss >> mtxM6;
+        } catch (const std::exception&) {
+            if (Processed(ev.hashMainBlock)) {
+                LogPrintf("Enforcer client: the M6 of m6id %s does not decode, in an L1 block at or before the newest "
+                          "recorded treasury change: already processed, skipped\n", ev.m6id.ToString());
+                continue;
+            }
+            LogPrintf("ERROR Enforcer client: the M6 of m6id %s does not decode (batch failed closed)\n", ev.m6id.ToString());
+            vOut.clear();
+            return TreasuryScan::FAIL_CLOSED;
+        }
+        TreasuryChange c;
+        c.nSequence = ev.nSequence;
+        c.pPaid = &ev;
+        c.txid = mtxM6.GetHash();
+        vOut.push_back(c);
+    }
+    std::stable_sort(vOut.begin(), vOut.end(), [](const TreasuryChange& a, const TreasuryChange& b) { return a.nSequence < b.nSequence; });
+    return TreasuryScan::OK;
+}
+
 std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& hashLastDeposit, const uint32_t nLastBurnIndex)
 {
     std::vector<SidechainDeposit> incoming;
@@ -1714,52 +1833,37 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     // address is kept (the parser used to drop it, leaving a gap in the
     // treasury chain that stopped every later deposit); it is recorded and paid
     // to no one.
-    struct Change {
-        uint64_t nSequence;
-        const L1DepositEvent* pDeposit;
-        const L1WithdrawalEvent* pPaid;
-    };
-    std::vector<Change> vChange;
-    for (const L1DepositEvent& ev : events.vDeposit)
-        vChange.push_back({ev.nSequence, &ev, nullptr});
-    for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
-        if (ev.status != 'S')
-            continue;
-        if (!ev.fHaveSequence || ev.vchTx.empty()) {
-            LogPrintf("ERROR Enforcer client: a \"paid\" event for m6id %s without its running number or M6 (batch failed closed)\n",
-                      ev.m6id.ToString());
-            return incoming;
-        }
-        vChange.push_back({ev.nSequence, nullptr, &ev});
+    // UR5-3: the decision (which changes, which skipped, when to fail closed) is ScanTreasuryChanges, a pure function
+    // Peg map 13 (testing 11-11): the newest recorded change is the HIGHEST L1 position of any recorded deposit, not
+    // the last one written. A deposit recorded out of L1 order (an older one included after newer ones) moved the
+    // point back, and old malformed paid events then failed the batch closed again (UR5-3's kind): deposits stalled.
+    int nLastRecordedPos = -1;
+    if (psidechaintree) {
+        for (const SidechainDeposit& d : psidechaintree->GetDeposits(THIS_SIDECHAIN))
+            nLastRecordedPos = std::max(nLastRecordedPos, bmmCache.GetMainchainBlockHeight(d.hashMainchainBlock));
     }
-    std::stable_sort(vChange.begin(), vChange.end(), [](const Change& a, const Change& b) { return a.nSequence < b.nSequence; });
+    std::vector<TreasuryChange> vChange;
+    if (ScanTreasuryChanges(events, nLastRecordedPos,
+                            [](const uint256& h) { return bmmCache.GetMainchainBlockHeight(h); },
+                            [](const uint256& h) { return L1BlockBelowDepositStart(h); }, vChange) != TreasuryScan::OK)
+        return incoming;
 
-    // Each change as a record (without its tx yet): the outpoint from the
-    // event, a payout's txid from the M6 the event carries
+    // Each change as a record (without its tx yet)
     std::vector<SidechainDeposit> vRecord;
     std::vector<uint256> vTxid;
-    for (const Change& c : vChange) {
+    for (const TreasuryChange& c : vChange) {
         SidechainDeposit deposit;
         deposit.nSidechain = THIS_SIDECHAIN;
         if (c.pDeposit) {
             deposit.strDest = std::string(c.pDeposit->vchAddress.begin(), c.pDeposit->vchAddress.end());
             deposit.nBurnIndex = c.pDeposit->outpoint.n;
             deposit.hashMainchainBlock = c.pDeposit->hashMainBlock;
-            vTxid.push_back(c.pDeposit->outpoint.hash);
         } else {
-            L1MutableTransaction mtxM6;
-            try {
-                CDataStream ss(c.pPaid->vchTx, SER_NETWORK, PROTOCOL_VERSION);
-                ss >> mtxM6;
-            } catch (const std::exception&) {
-                LogPrintf("ERROR Enforcer client: the M6 of m6id %s does not decode (batch failed closed)\n", c.pPaid->m6id.ToString());
-                return incoming;
-            }
             deposit.strDest = SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST;
             deposit.nBurnIndex = 0; // into_m6 puts the treasury change at vout[0]
             deposit.hashMainchainBlock = c.pPaid->hashMainBlock;
-            vTxid.push_back(mtxM6.GetHash());
         }
+        vTxid.push_back(c.txid);
         vRecord.push_back(deposit);
     }
 
@@ -2214,7 +2318,7 @@ L1Answer EnforcerL1Client::GetPegEvents(const uint256& hashStart, const uint256&
         ", \"end_block_hash\": {\"hex\": \"" + hashEnd.ToString() + "\"}}";
 
     std::string strOutput;
-    const int nTimeout = hashStart.IsNull() ? 60 : enforcerconnect::DEFAULT_CALL_TIMEOUT; // null: the whole history
+    const int nTimeout = hashStart.IsNull() ? ENFORCER_WHOLE_HISTORY_TIMEOUT : enforcerconnect::DEFAULT_CALL_TIMEOUT; // null: the whole history
     if (RunEnforcerCall("cusf.mainchain.v1.ValidatorService", "GetTwoWayPegData", strRequest, true, strOutput,
                         true /* fRetrySafe */, nTimeout) != 0) {
         const L1Answer answer = ClassifyPegEventsError(strOutput);
@@ -2237,7 +2341,8 @@ EnforcerSettingsCheck CheckEnforcerSettings(std::string& strError)
 {
     int nForkHeight = 0;
     uint256 hashPin;
-    if (!ParseMainchainBlockPin(gArgs.GetArg("-mainchainblockpin", ""), nForkHeight, hashPin))
+    // FB-14: the pin in force, built-in included (an explicit -mainchainblockpin still wins)
+    if (!ParseMainchainBlockPin(MainchainBlockPinArg(), nForkHeight, hashPin))
         return EnforcerSettingsCheck::OK;
     EnforcerL1Client client;
     UniValue result(UniValue::VOBJ);
@@ -2262,10 +2367,11 @@ bool EnforcerL1Client::IsBehindItsNode(std::string& strWhy)
     if (!RestGet("/rest/chaininfo.json", strBody) || !info.read(strBody) || !info.isObject())
         return false;
     const UniValue& blocks = find_value(info, "blocks");
-    if (!blocks.isNum() || blocks.get_int() <= (int)tip.nHeight)
+    int nBlocks;
+    if (!JsonInt32(blocks, nBlocks) || nBlocks <= (int)tip.nHeight)
         return false;
     strWhy = strprintf("the enforcer's eCash tip (%d) is behind its eCash node's (%d); no bid until it catches up",
-                       tip.nHeight, blocks.get_int());
+                       tip.nHeight, nBlocks);
     return true;
 }
 
@@ -2278,10 +2384,19 @@ bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEv
     std::string strRequest = "{\"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) +
         ", \"end_block_hash\": {\"hex\": \"" + tip.hashBlock.ToString() + "\"}}";
 
-    UniValue result(UniValue::VOBJ);
-    if (!CallValidator("GetTwoWayPegData", strRequest, result))
+    // Ultra s5 #2 (UR5-2): the same whole-history GetTwoWayPegData call as UpdateDeposits' (GetPegEvents), which
+    // gets 60 s, went through CallValidator at the 15 s default, so on a long L1 history it timed out and bundles were
+    // never proposed (or stayed CREATED once paid or failed). Same timeout now. The withdrawal-status parser stays the
+    // lenient one on purpose: it must not drop a whole reply over a deposit field the status track doesn't use.
+    std::string strOutput;
+    if (RunEnforcerCall("cusf.mainchain.v1.ValidatorService", "GetTwoWayPegData", strRequest, false, strOutput,
+                        true /* fRetrySafe */, ENFORCER_WHOLE_HISTORY_TIMEOUT) != 0)
         return false;
-
+    UniValue result(UniValue::VOBJ);
+    if (!result.read(strOutput)) {
+        LogPrintf("ERROR Enforcer client GetTwoWayPegData returned unparseable JSON\n");
+        return false;
+    }
     return ParseEnforcerWithdrawalEvents(result, vEvents);
 }
 
@@ -2561,6 +2676,16 @@ bool GrpcurlBMMRequestNotSent(int nExit, const std::string& strError)
     return false;
 }
 
+std::string MainchainBlockPinArg()
+{
+    const std::string strPin = gArgs.GetArg("-mainchainblockpin", "");
+    if (!strPin.empty())
+        return strPin;
+    if (!gArgs.GetArg("-mainchainchallenge", "").empty())
+        return std::string();
+    return Params().DefaultMainchainBlockPin();
+}
+
 bool GrpcurlBMMRequestOwnNodeConflict(int nExit, const std::string& strError)
 {
     if (nExit != 66 || strError.find("failed to broadcast BMM request tx via RPC") == std::string::npos)
@@ -2635,10 +2760,8 @@ public:
         case L1Client::Commitment::NOT_FOUND: return L1Answer::UNKNOWN;
         case L1Client::Commitment::UNKNOWN: break;
         }
-        // The JSON-RPC mainchain has no reader: its verifybmm, true = yes
-        uint256 txid;
-        uint32_t nTime = 0;
-        return GetL1Client().VerifyBMM(hashMainBlock, hashBMM, txid, nTime) ? L1Answer::YES : L1Answer::UNKNOWN;
+        // The JSON-RPC mainchain has no reader: its verifybmm, three-way (UR5-1: a definite miss is NO)
+        return GetL1Client().VerifyBMMAnswer(hashMainBlock, hashBMM);
     }
     L1Answer BmmBlockTime(const uint256& hashMainBlock, const uint256& hashBMM, uint32_t& nTime) override
     {
@@ -2844,6 +2967,175 @@ bool JsonRpcL1Client::VerifyDeposit(const uint256& hashMainBlock, const uint256&
     // Process result
     uint256 txidRet = uint256S(ptree.get("result", ""));
     return (txid == txidRet);
+}
+
+L1Answer L1Client::VerifyBMMAnswer(const uint256& hashMainBlock, const uint256& hashBMM)
+{
+    uint256 txid;
+    uint32_t nTime = 0;
+    return VerifyBMM(hashMainBlock, hashBMM, txid, nTime) ? L1Answer::YES : L1Answer::UNKNOWN;
+}
+
+bool JsonRpcL1Client::CallMainchain(const std::string& strMethod, const UniValue& params, UniValue& result)
+{
+    const std::string json = "{\"jsonrpc\": \"1.0\", \"id\":\"SidechainClient\", \"method\": \"" + strMethod +
+                             "\", \"params\": " + params.write() + " }";
+    boost::property_tree::ptree ptree;
+    std::string strBody, strError;
+    if (!SendRequestToMainchain(json, ptree, &strError, &strBody)) {
+        if (!strError.empty())
+            LogPrint(BCLog::NET, "L1 JSON-RPC %s: %s\n", strMethod, strError);
+        return false;
+    }
+    UniValue reply;
+    if (!reply.read(strBody) || !reply.isObject())
+        return false;
+    result = find_value(reply, "result");
+    return !result.isNull();
+}
+
+bool BuildJsonRpcDepositEvents(const UniValue& deposits, const std::function<bool(const uint256&, int&)>& fnHeight,
+                               int nStartHeight, std::vector<L1DepositEvent>& vOut)
+{
+    vOut.clear();
+    if (!deposits.isArray())
+        return false;
+    std::vector<L1DepositEvent> v;   // handed over only when every entry reads: never a partial answer
+    bool fHaveTreasury = false;
+    COutPoint outTreasury;
+    CAmount nTreasury = 0;
+    for (size_t i = 0; i < deposits.size(); i++) {
+        const UniValue& d = deposits[i];
+        if (!d.isObject())
+            return false;
+        const UniValue& side = find_value(d, "nsidechain");
+        const UniValue& hex = find_value(d, "txhex");
+        const UniValue& burn = find_value(d, "nburnindex");
+        const UniValue& ntx = find_value(d, "ntx");
+        const UniValue& block = find_value(d, "hashblock");
+        const UniValue& dest = find_value(d, "strdest");
+        int nSide, nBurn, nTx;
+        if (!JsonInt32(side, nSide) || nSide != (int)THIS_SIDECHAIN || !hex.isStr() || !JsonInt32(burn, nBurn) ||
+                !JsonInt32(ntx, nTx) || !block.isStr() || !dest.isStr())
+            return false;
+        L1MutableTransaction tx;
+        try {
+            CDataStream ss(ParseHex(hex.get_str()), SER_NETWORK, PROTOCOL_VERSION);
+            ss >> tx;
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (nBurn < 0 || (size_t)nBurn >= tx.vout.size() || nTx < 0 || nTx >= (1 << 20) || !IsHex(block.get_str()))
+            return false;
+        const uint256 hashBlock = uint256S(block.get_str());
+        int nHeight = -1;
+        if (!fnHeight(hashBlock, nHeight) || nHeight < 0)
+            return false;
+        const CAmount nOut = tx.vout[nBurn].nValue;
+        // L1F-2 (testing, 2026-11-13): the treasury output must be a valid amount, as ParsePegEvents requires of the
+        // enforcer's valueSats. Unchecked, a negative or over-MAX_MONEY first output became a deposit of that value
+        // (and a negative one let the next delta overflow).
+        if (!MoneyRange(nOut))
+            return false;
+        CAmount nAdded = nOut;
+        if (fHaveTreasury) {
+            bool fSpends = false;
+            for (const CTxIn& in : tx.vin)
+                fSpends = fSpends || in.prevout == outTreasury;
+            if (!fSpends || nOut <= nTreasury)
+                return false;   // a payout in between, or not a deposit at all: can't tell
+            nAdded = nOut - nTreasury;
+        }
+        outTreasury = COutPoint(tx.GetHash(), (uint32_t)nBurn);
+        nTreasury = nOut;
+        fHaveTreasury = true;
+        if (nStartHeight >= 0 && nHeight < nStartHeight)
+            continue;
+        L1DepositEvent ev;
+        ev.hashMainBlock = hashBlock;
+        ev.outpoint = outTreasury;
+        ev.nSequence = ((uint64_t)nHeight << 20) | (uint64_t)nTx;
+        ev.nValue = nAdded;
+        const std::string& strDest = dest.get_str();
+        ev.vchAddress.assign(strDest.begin(), strDest.end());
+        v.push_back(ev);
+    }
+    vOut.swap(v);
+    return true;
+}
+
+L1Answer JsonRpcL1Client::GetPegEvents(const uint256& hashStart, const uint256& hashEnd, L1PegEvents& events)
+{
+    events = L1PegEvents();
+    // BitcoinX lists its active chain only: the end block must be on it.
+    int nEnd = -1;
+    uint256 hashAt;
+    if (!GetBlockHeight(hashEnd, nEnd) || !GetBlockHash(nEnd, hashAt) || hashAt != hashEnd)
+        return L1Answer::UNKNOWN;
+    // The start block, inclusive (the deposit check asks [d, d]); not on the end block's chain is a definite NO, as the
+    // enforcer answers it.
+    int nStart = -1;
+    if (!hashStart.IsNull()) {
+        if (!GetBlockHeight(hashStart, nStart))
+            return L1Answer::UNKNOWN;
+        if (nStart > nEnd)
+            return L1Answer::NO;
+        if (!GetBlockHash(nStart, hashAt))
+            return L1Answer::UNKNOWN;
+        if (hashAt != hashStart)
+            return L1Answer::NO;
+    }
+    UniValue params(UniValue::VARR);
+    params.push_back((int)THIS_SIDECHAIN);
+    params.push_back(hashEnd.GetHex());
+    UniValue deposits;
+    if (!CallMainchain("listsidechaindepositsbyblock", params, deposits) || !deposits.isArray())
+        return L1Answer::UNKNOWN;
+    std::map<uint256, int> mapHeight;
+    const auto fnHeight = [this, &mapHeight](const uint256& hash, int& n) {
+        const auto it = mapHeight.find(hash);
+        if (it != mapHeight.end()) { n = it->second; return true; }
+        if (!GetBlockHeight(hash, n))
+            return false;
+        mapHeight[hash] = n;
+        return true;
+    };
+    if (!BuildJsonRpcDepositEvents(deposits, fnHeight, nStart, events.vDeposit)) {
+        events = L1PegEvents();
+        LogPrintf("L1 JSON-RPC: the deposits up to %s can't be read as a treasury chain (can't tell)\n", hashEnd.ToString());
+        return L1Answer::UNKNOWN;
+    }
+    return L1Answer::YES;
+}
+
+/** UR5-1 (plain v1.2.2): the JSON-RPC transport had no way to say NO, so RefreshBMM's check that the last bid missed
+ *  (C3) returned early forever and the sidechain bid once and stopped (ultra s5 #1; regtest's default transport).
+ *  BitcoinX's verifybmm answers a block it knows with either the commitment or "h* not found in block": that is a
+ *  definite NO. Anything else (no reply, block unknown, sidechain inactive, a read error) stays UNKNOWN. */
+L1Answer JsonRpcL1Client::VerifyBMMAnswer(const uint256& hashMainBlock, const uint256& hashBMM)
+{
+    std::string json;
+    json.append("{\"jsonrpc\": \"1.0\", \"id\":\"SidechainClient\", ");
+    json.append("\"method\": \"verifybmm\", \"params\": ");
+    json.append("[\"");
+    json.append(hashMainBlock.ToString());
+    json.append("\",\"");
+    json.append(hashBMM.ToString());
+    json.append("\",");
+    json.append(UniValue((int)THIS_SIDECHAIN).write());
+    json.append("] }");
+
+    boost::property_tree::ptree ptree;
+    std::string strRpcError;
+    if (SendRequestToMainchain(json, ptree, &strRpcError)) {
+        // verifybmm's result nests the proof one level down ({"<key>": {"txid": ..., "time": ...}}), as VerifyBMM reads it
+        for (const auto& value : ptree.get_child("result")) {
+            if (value.second.get_child_optional("txid") && !value.second.get<std::string>("txid", "").empty())
+                return L1Answer::YES;
+        }
+        return L1Answer::UNKNOWN;
+    }
+    return strRpcError == "h* not found in block" ? L1Answer::NO : L1Answer::UNKNOWN;
 }
 
 bool JsonRpcL1Client::VerifyBMM(const uint256& hashMainBlock, const uint256& hashBMM, uint256& txid, uint32_t& nTime)
@@ -3262,8 +3554,99 @@ bool JsonRpcL1Client::HaveFailedWithdrawalBundle(const uint256& hash)
     return fFailed;
 }
 
-bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::property_tree::ptree &ptree)
+/** UR5-4 (plain v1.2.2): the JSON-RPC transport gets RestGet's bounds (v0.2.18, layer-B review wallet M3): one deadline
+ *  for connect and read together, and a reply size cap. Its calls run under cs_main too, so a wedged local L1 that
+ *  accepted the connection and stopped answering held the lock for hours (ultra s5 #4). The transport stays (Michael
+ *  2026-11-09: "must keep the old json"). */
+static const int64_t L1_JSONRPC_TIMEOUT_MS = 60 * 1000;
+static const size_t L1_JSONRPC_MAX_REPLY = 64 * 1024 * 1024;
+
+/** Connect to the first endpoint that answers before nDeadline (GetTimeMillis). The system call, not socket.connect():
+ *  boost 1.64's sync connect ignores the non-blocking flag and waits in poll(-1) itself. Leaves the socket non-blocking. */
+static boost::system::error_code ConnectByDeadline(tcp::socket& socket, tcp::resolver::iterator it, int64_t nDeadline)
 {
+    const tcp::resolver::iterator end;
+    boost::system::error_code error = boost::asio::error::host_not_found;
+    while (error && it != end) {
+        socket.close();
+        const tcp::endpoint ep = *it++;
+        socket.open(ep.protocol(), error);
+        if (error)
+            continue;
+        socket.non_blocking(true, error);
+        if (error)
+            continue;
+        if (::connect(socket.native_handle(), ep.data(), ep.size()) == 0)
+            return boost::system::error_code();
+        if (errno != EINPROGRESS && errno != EINTR) {
+            error = boost::system::error_code(errno, boost::system::system_category());
+            continue;
+        }
+        for (;;) {
+            const int64_t nLeft = nDeadline - GetTimeMillis();
+            if (nLeft <= 0)
+                return boost::asio::error::timed_out;
+            struct pollfd pfd;
+            pfd.fd = socket.native_handle();
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            const int r = ::poll(&pfd, 1, (int)std::min<int64_t>(nLeft, 1000));
+            if (r < 0) {
+                if (errno == EINTR)
+                    continue;
+                error = boost::system::error_code(errno, boost::system::system_category());
+                break;
+            }
+            if (r == 0)
+                continue;
+            int nSoError = 0;
+            socklen_t nLen = sizeof(nSoError);
+            if (::getsockopt(socket.native_handle(), SOL_SOCKET, SO_ERROR, &nSoError, &nLen) < 0)
+                nSoError = errno;
+            error = nSoError ? boost::system::error_code(nSoError, boost::system::system_category())
+                             : boost::system::error_code();
+            break;
+        }
+    }
+    return error;
+}
+
+/** Read a non-blocking socket to EOF, by nDeadline, at most nMax bytes, with our own poll() (boost's blocking read_some
+ *  waits forever whatever SO_RCVTIMEO says). 1: EOF reached. 0: the deadline passed. -1: over nMax. Throws on a socket
+ *  error. */
+static int ReadAllByDeadline(tcp::socket& socket, int64_t nDeadline, size_t nMax, std::string& data)
+{
+    for (;;) {
+        boost::array<char, 8192> buf;
+        boost::system::error_code e;
+        size_t sz = socket.read_some(boost::asio::buffer(buf), e);
+        if (e == boost::asio::error::would_block || e == boost::asio::error::try_again) {
+            const int64_t nLeft = nDeadline - GetTimeMillis();
+            if (nLeft <= 0)
+                return 0;
+            struct pollfd pfd;
+            pfd.fd = socket.native_handle();
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (::poll(&pfd, 1, (int)std::min<int64_t>(nLeft, 1000)) < 0 && errno != EINTR)
+                throw boost::system::system_error(boost::system::error_code(errno, boost::system::system_category()));
+            continue;
+        }
+        data.insert(data.size(), buf.data(), sz);
+        if (data.size() > nMax)
+            return -1;
+        if (e == boost::asio::error::eof)
+            return 1;
+        if (e)
+            throw boost::system::system_error(e);
+    }
+}
+
+bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::property_tree::ptree &ptree, std::string* pstrRpcError,
+                                             std::string* pstrBody)
+{
+    if (pstrRpcError)
+        pstrRpcError->clear();
     // Format user:pass for authentication
     std::string auth = gArgs.GetArg("-rpcuser", "") + ":" + gArgs.GetArg("-rpcpassword", "");
     if (auth == ":")
@@ -3282,19 +3665,19 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
         tcp::resolver resolver(io_service);
         tcp::resolver::query query("127.0.0.1", std::to_string(port));
         tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
-        tcp::resolver::iterator end;
 
+        // UR5-4: connect and read share one deadline.
+        const int64_t nDeadline = GetTimeMillis() + L1_JSONRPC_TIMEOUT_MS;
         tcp::socket socket(io_service);
-        boost::system::error_code error = boost::asio::error::host_not_found;
-
-        // Try to connect
-        while (error && endpoint_iterator != end)
-        {
-          socket.close();
-          socket.connect(*endpoint_iterator++, error);
+        boost::system::error_code error = ConnectByDeadline(socket, endpoint_iterator, nDeadline);
+        if (error) {
+            if (error == boost::asio::error::timed_out)
+                LogPrintf("L1 JSON-RPC: no connection within %ds; treating the L1 as unreachable\n",
+                          L1_JSONRPC_TIMEOUT_MS / 1000);
+            throw boost::system::system_error(error);
         }
-
-        if (error) throw boost::system::system_error(error);
+        // The request is small: write it blocking, then read non-blocking by the deadline.
+        socket.non_blocking(false);
 
         // HTTP request (package the json for sending). HTTP/1.0 + Connection:
         // close, same rationale as RestGet: a 1.0 client must not be sent a
@@ -3314,22 +3697,18 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
         // Send the request
         boost::asio::write(socket, output);
 
-        // Read the reponse
+        // Read the reponse: to EOF, by the deadline, under the cap (UR5-4)
+        socket.non_blocking(true);
         std::string data;
-        for (;;)
-        {
-            boost::array<char, 4096> buf;
-
-            // Read until end of file (socket closed)
-            boost::system::error_code e;
-            size_t sz = socket.read_some(boost::asio::buffer(buf), e);
-
-            data.insert(data.size(), buf.data(), sz);
-
-            if (e == boost::asio::error::eof)
-                break; // socket closed
-            else if (e)
-                throw boost::system::system_error(e);
+        const int nRead = ReadAllByDeadline(socket, nDeadline, L1_JSONRPC_MAX_REPLY, data);
+        if (nRead == 0) {
+            LogPrintf("L1 JSON-RPC: no complete reply within %ds; treating the L1 as unreachable\n",
+                      L1_JSONRPC_TIMEOUT_MS / 1000);
+            return false;
+        }
+        if (nRead < 0) {
+            LogPrintf("L1 JSON-RPC: reply over %u bytes; refused\n", (unsigned)L1_JSONRPC_MAX_REPLY);
+            return false;
         }
 
         // Structural response parse. The old positional parse (skip 5 CRs,
@@ -3359,7 +3738,10 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
         if (sp == std::string::npos)
             return false;
         int code = atoi(headers.substr(sp + 1, 4).c_str());
-        if (code != 200)
+        // UR5-1 (plain v1.2.2): a non-200 reply still carries the RPC error as JSON (BitcoinX answers an RPC error
+        // with HTTP 500): parse it below, so a caller can tell a definite answer ("h* not found in block") from none.
+        const bool fHttpOk = code == 200;
+        if (!fHttpOk && (code < 400 || code > 599))
             return false;
 
         // Case-insensitive scan for the framing headers.
@@ -3411,6 +3793,8 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
             }
         }
 
+        if (pstrBody)
+            *pstrBody = body;
         std::stringstream jss;
         jss << body;
         boost::property_tree::json_parser::read_json(jss, ptree);
@@ -3423,10 +3807,13 @@ bool JsonRpcL1Client::SendRequestToMainchain(const std::string& json, boost::pro
         // error message crashed read_json first: the truncation bug was
         // doubling as the error handler. Handle it explicitly - and now the
         // actual error message reaches the log instead of being destroyed.
-        if (!ptree.get_child_optional("result")) {
+        if (!fHttpOk || !ptree.get_child_optional("result")) {
             boost::optional<boost::property_tree::ptree&> err = ptree.get_child_optional("error");
-            LogPrintf("ERROR Sidechain client (sendRequestToMainchain): mainchain RPC error: %s\n",
-                      err ? err->get<std::string>("message", "(no message)") : "(no result node)");
+            const std::string strMessage = err ? err->get<std::string>("message", "(no message)") : "(no result node)";
+            if (pstrRpcError)
+                *pstrRpcError = strMessage;
+            else
+                LogPrintf("ERROR Sidechain client (sendRequestToMainchain): mainchain RPC error: %s\n", strMessage);
             return false;
         }
     } catch (std::exception &exception) {

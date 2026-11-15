@@ -7,6 +7,11 @@
 #include <arith_uint256.h>
 #include <house.h>
 #include <note.h>
+#include <bill.h>
+#include <deposit.h>
+#include <pool.h>
+#include <settle.h>
+#include <token.h>
 #include <streams.h>
 #include <validation.h>
 #include <util.h>
@@ -15,6 +20,7 @@
 
 #include <boost/test/unit_test.hpp>
 #include <list>
+#include <set>
 #include <vector>
 
 BOOST_FIXTURE_TEST_SUITE(mempool_tests, TestingSetup)
@@ -664,6 +670,128 @@ BOOST_AUTO_TEST_CASE(house_rate_post_tx)
     m.nVersion = TRANSACTION_HOUSE_VERSION;
     m.vchHousePayload.resize(4);
     BOOST_CHECK(!IsHouseRatePostTx(CTransaction(m)));                                 // too short to hold a kind
+}
+
+// UR3-8 (ultra s3 #8): the one helper every ATMP house-slot scan uses. The table below is the consensus side, checked
+// 2026-11-13: SLOT = the ops whose Check*Operation sets fHouseChanged (ConnectBlock's one-house-change-per-block set),
+// READER = the ops that take no slot but read the STAGED house status at connect. An op that starts doing either must be
+// added here and to GetHouseSlotIDs / GetHouseStatusReaderID together.
+namespace {
+CTransaction HouseOpTx(int nVersion, uint8_t nOp, uint32_t nHouse, uint32_t nHouse2 = 0)
+{
+    CMutableTransaction m;
+    m.nVersion = nVersion;
+    std::vector<unsigned char> p(8, 0);
+    const uint32_t nBillID = 99;
+    switch (nVersion) {
+    case TRANSACTION_BILL_VERSION:   // the bill id leads, the house follows
+        memcpy(p.data(), &nBillID, 4);
+        memcpy(p.data() + 4, &nHouse, 4);
+        m.nBillOp = nOp; m.vchBillPayload = p; break;
+    case TRANSACTION_HOUSE_VERSION: memcpy(p.data(), &nHouse, 4); m.nHouseOp = nOp; m.vchHousePayload = p; break;
+    case TRANSACTION_NOTE_VERSION: memcpy(p.data(), &nHouse, 4); m.nNoteOp = nOp; m.vchNotePayload = p; break;
+    case TRANSACTION_DEPOSIT_VERSION: memcpy(p.data(), &nHouse, 4); m.nDepositOp = nOp; m.vchDepositPayload = p; break;
+    case TRANSACTION_POOL_VERSION: memcpy(p.data(), &nHouse, 4); m.nPoolOp = nOp; m.vchPoolPayload = p; break;
+    case TRANSACTION_SETTLE_VERSION:
+        m.nSettleOp = nOp;
+        if (nOp == SETTLE_OP_EXCHANGE) {
+            memcpy(p.data(), &nHouse, 4);
+            memcpy(p.data() + 4, &nHouse2, 4);
+        } else {   // NET: a compact size, then the ids
+            p.assign(9, 0);
+            p[0] = 2;
+            memcpy(p.data() + 1, &nHouse, 4);
+            memcpy(p.data() + 5, &nHouse2, 4);
+        }
+        m.vchSettlePayload = p; break;
+    }
+    return CTransaction(m);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(house_state_keys_ur3_8)
+{
+    const uint32_t H = 7, H2 = 8;
+    const std::set<std::pair<int, uint8_t>> setSlot = {
+        {TRANSACTION_BILL_VERSION, BILL_OP_DISCOUNT}, {TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE},
+        {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM}, {TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_NOTES},
+        {TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_ESCROW}, {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW},
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_MINT}, {TRANSACTION_NOTE_VERSION, NOTE_OP_REDEEM},
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_CLAIM}, {TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST},
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_LOCK}, {TRANSACTION_NOTE_VERSION, NOTE_OP_UNLOCK},
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_TOKEN_COLLECT}, {TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP},
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PAY}, {TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PROTEST},
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_CLAIM},
+        {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE}, {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_WITHDRAW},
+        {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_CLAIM}, {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_PROTEST},
+        {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DISCHARGE},
+        {TRANSACTION_POOL_VERSION, POOL_OP_RETIRE},
+    };
+    const std::set<std::pair<int, uint8_t>> setReader = {
+        {TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND}, {TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND},
+        {TRANSACTION_POOL_VERSION, POOL_OP_CREATE},
+    };
+
+    // Every op code of every single-house family (house ops: every op but REGISTER, the member ops and RATE is a slot op)
+    for (int v = TRANSACTION_BILL_VERSION; v <= TRANSACTION_POOL_VERSION; v++) {
+        for (int op = 1; op <= 20; op++) {
+            const CTransaction tx = HouseOpTx(v, (uint8_t)op, H);
+            const HouseStateKeys k = GetHouseStateKeys(tx);
+            bool fSlot = setSlot.count({v, (uint8_t)op}) > 0;
+            if (v == TRANSACTION_HOUSE_VERSION)
+                fSlot = IsHouseSlotOp((uint8_t)op);
+            const bool fReader = setReader.count({v, (uint8_t)op}) > 0;
+            BOOST_CHECK_MESSAGE(k.vSlot == (fSlot ? std::vector<uint32_t>{H} : std::vector<uint32_t>{}),
+                                "slot set, version " << v << " op " << op);
+            BOOST_CHECK_MESSAGE(k.nStatusReader == (fReader ? H : 0), "status reader, version " << v << " op " << op);
+            uint32_t nR = 0;
+            BOOST_CHECK_EQUAL(GetHouseStatusReaderID(tx, nR), fReader);
+        }
+    }
+    for (const uint8_t op : {HOUSE_OP_REGISTER, HOUSE_OP_REGISTER_MO, HOUSE_OP_MEMBER_ADD, HOUSE_OP_MEMBER_REMOVE,
+                             HOUSE_OP_MEMBER_PURGE, HOUSE_OP_RATE})
+        BOOST_CHECK(!GetHouseStateKeys(HouseOpTx(TRANSACTION_HOUSE_VERSION, op, H)).Any());
+    // Settles take every named house's slot
+    BOOST_CHECK(GetHouseStateKeys(HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE, H, H2)).vSlot ==
+                (std::vector<uint32_t>{H, H2}));
+    BOOST_CHECK(GetHouseStateKeys(HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_NET, H, H2)).vSlot ==
+                (std::vector<uint32_t>{H, H2}));
+    // A house id of 0 is no key (GetHouseSlotIDs' rule), and a short payload is none either
+    BOOST_CHECK(!GetHouseStateKeys(HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, 0)).Any());
+    CMutableTransaction mShort(HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, H));
+    mShort.vchNotePayload.resize(3);
+    BOOST_CHECK(!GetHouseStateKeys(CTransaction(mShort)).Any());
+
+    auto K = [](const CTransaction& tx) { return GetHouseStateKeys(tx); };
+    const CTransaction demand = HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, H);
+    // The pairs the old DEMAND loop let through (it saw pooled house ops only): every slot op on the house
+    for (const CTransaction& s : {HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST, H),
+                                  HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PROTEST, H),
+                                  HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_PROTEST, H),
+                                  HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DISCHARGE, H),
+                                  HouseOpTx(TRANSACTION_POOL_VERSION, POOL_OP_RETIRE, H),
+                                  HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_DISCOUNT, H),
+                                  HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_ATTEST, H),
+                                  HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE, H2, H)}) {
+        BOOST_CHECK(HouseStateKeysConflict(K(demand), K(s)));
+        BOOST_CHECK(HouseStateKeysConflict(K(s), K(demand)));
+    }
+    // ...and the reverse ones the slot loops let through: a slot op against a pooled deposit DEMAND or pool CREATE
+    const CTransaction protest = HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST, H);
+    BOOST_CHECK(HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND, H))));
+    BOOST_CHECK(HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_POOL_VERSION, POOL_OP_CREATE, H))));
+    // Readers never conflict with readers; another house never conflicts; ops with no key never conflict
+    BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, H))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND, H))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_POOL_VERSION, POOL_OP_CREATE, H))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST, H2))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_NET, H2, 9))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_TRANSFER, H))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_RATE, H))));
+    // Slot vs slot: the same house conflicts, a settle on either of its houses too
+    BOOST_CHECK(HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE, H))));
+    BOOST_CHECK(HouseStateKeysConflict(K(HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_NET, 9, H)), K(protest)));
+    BOOST_CHECK(!HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE, H2))));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

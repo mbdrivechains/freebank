@@ -558,8 +558,12 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-depositstartheight=<n>", "Credit only slot-130 treasury changes in L1 blocks at or above this L1 height, as a chain restarted on an L1 with a treasury history does (regtest-only; default: 0, all)");
         strUsage += HelpMessageOpt("-housepooltime=<t>", "Median time from which house note pools are open (regtest-only; 0 = from genesis; default: never)");
         strUsage += HelpMessageOpt("-dollarpooltime=<t>", "Median time from which dollar-token pools are open (regtest-only; 0 = from genesis; default: never)");
+        strUsage += HelpMessageOpt("-realclock", "Count Gold B's windows (swap deadlines, cures, 30/90-day highs, ramps) on the real chain clock - 600 s of active time per clock block, from block median times - as public networks do, instead of in blocks (regtest-only test hook; move time with setmocktime)");
+        strUsage += HelpMessageOpt("-maxmempoolbytes=<n>", "Keep the transaction memory pool below <n> bytes, overriding -maxmempool (regtest-only test hook)");
+        strUsage += HelpMessageOpt("-testcrashpoint=<name>", "Exit at once, without flushing, right after the named side-DB commit: disconnect-after-<db> or connect-after-<db>, <db> one of sidechain, units, pool, house, bill (regtest-only test hook)");
         strUsage += HelpMessageOpt("-dormant=<0|1>", "Run the chain dormant (no block after genesis), as FreeBank mainnet ships (regtest-only)");
         strUsage += HelpMessageOpt("-memberopguard=0", "Let a second member op for a house into the mempool, to test the block rule (regtest-only)");
+        strUsage += HelpMessageOpt("-rateopguard=0", "Let a second rate op for a house into the mempool and the block template, to test the block rule (regtest-only)");
     }
     strUsage += HelpMessageOpt("-debug=<category>", strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
         _("If <category> is not supplied or if <category> = 1, output all debugging information.") + " " + _("<category> can be:") + " " + ListLogCategories() + ".");
@@ -637,7 +641,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-mainchainrest=<addr:port>", _("Mainchain node REST endpoint (needs bitcoind -rest -txindex) for enforcer-transport deposit crediting; probed at startup (default: 127.0.0.1:38332)"));
     strUsage += HelpMessageOpt("-mainchainchain=<name>", _("L1 IDENTITY PIN: refuse to start unless the mainchain reports this chain name (main/test/signet/regtest). Reachability is not identity - a second node taking the default -mainchainrest will happily follow SOMEONE ELSE'S mainchain."));
     strUsage += HelpMessageOpt("-mainchainchallenge=<hex>", _("L1 IDENTITY PIN for signet: refuse to start unless the mainchain reports this signet_challenge. Required to tell two custom signets apart - they share a chain name AND a genesis hash (Core's signet genesis is hardcoded, not derived from the challenge)."));
-    strUsage += HelpMessageOpt("-mainchainblockpin=<height>:<blockhash>", _("L1 IDENTITY PIN for a mainnet-family L1 (a forknet such as eCash alphanet, or mainnet): refuse to start unless the mainchain's active chain carries this block hash at this height. A forknet has no signet_challenge and is byte-identical to Bitcoin below its fork height, so pin the fork block. Outside regtest the enforcer transport requires -mainchainchallenge OR -mainchainblockpin."));
+    strUsage += HelpMessageOpt("-mainchainblockpin=<height>:<blockhash>", _("L1 IDENTITY PIN for a mainnet-family L1 (a forknet such as eCash alphanet, or mainnet): refuse to start unless the mainchain's active chain carries this block hash at this height. A forknet has no signet_challenge and is byte-identical to Bitcoin below its fork height, so pin the fork block. Outside regtest the enforcer transport requires -mainchainchallenge OR a block pin; mainnet and easynet have their own built in (mainnet 973728, easynet the L1 genesis), and an explicit pin wins."));
     strUsage += HelpMessageOpt("-replaycachewait=<n>", strprintf(_("Before a block replay (-reindex, -reindex-chainstate, -loadblock, bootstrap.dat) the mainchain block cache is filled from the mainchain first. Give up and refuse to start after <n> seconds without progress; a pending -reindex resumes on the next start (0 = wait until shutdown, default: %d)"), DEFAULT_REPLAY_CACHE_WAIT));
     strUsage += HelpMessageOpt("-cusfbundleformat", _("Regtest only: build withdrawal bundles in the CUSF enforcer BlindedM6 layout (bench testing; on public networks the layout is fixed by network consensus)"));
     strUsage += HelpMessageOpt("-minwithdrawal=<n>", strprintf(_("Minimum number of pending withdrawals before this node forms a withdrawal bundle (policy, not consensus; default: %u). Set 1 to bundle a lone withdrawal."), DEFAULT_MIN_WITHDRAWAL_CREATE_BUNDLE));
@@ -1092,6 +1096,11 @@ bool AppInitParameterInteraction()
     const std::string strMainchainTransport = gArgs.GetArg("-mainchaintransport", DefaultMainchainTransport());
     if (!IsValidL1Transport(strMainchainTransport))
         return InitError(strprintf(_("Unknown -mainchaintransport value '%s' (expected: jsonrpc or enforcer)"), strMainchainTransport));
+    // UR5-11 (Michael 2026-11-11 "yes", security's question): the JSON-RPC transport (BitcoinX's RPCs) is kept, for
+    // regtest only. On a public network it would be a second, separately built reader of consensus L1 data (deposits,
+    // payouts, BMM) beside the enforcer's, and two readers can credit differently and split the chain.
+    if (strMainchainTransport == "jsonrpc" && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-mainchaintransport=jsonrpc may only be set on regtest (public networks read the L1 through the enforcer)."));
     const std::string strEnforcerTransport = gArgs.GetArg("-enforcertransport", DEFAULT_ENFORCER_TRANSPORT);
     if (!IsValidEnforcerTransport(strEnforcerTransport))
         return InitError(strprintf(_("Unknown -enforcertransport value '%s' (expected: connect or grpcurl)"), strEnforcerTransport));
@@ -1117,7 +1126,10 @@ bool AppInitParameterInteraction()
                       "this node adds no deposits to the blocks it builds\n");
         std::string strProbeError;
         bool fRestUp = false, fWrongL1 = false;
-        for (int i = 0; i < 12 && !fRestUp && !fWrongL1; i++) {
+        // UR5-9 (plain v1.2.2): one 60 s budget for all the retries, so the "after 60s of retries" below is true. Each
+        // probe can itself wait up to 60 s on a black-holed endpoint, so twelve fixed retries could block ~13 min.
+        const int64_t nProbeDeadline = GetTimeMillis() + 60 * 1000;
+        for (int i = 0; !fRestUp && !fWrongL1 && (i == 0 || GetTimeMillis() + 5000 < nProbeDeadline); i++) {
             if (i > 0) MilliSleep(5000);
             fRestUp = fNoRest ? ProbeMainchainEnforcerOnly(strProbeError, &fWrongL1)
                               : ProbeMainchainRest(strProbeError, &fWrongL1);
@@ -1147,7 +1159,7 @@ bool AppInitParameterInteraction()
         // (Regtest runs the local bench and is exempt.)
         if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST &&
                 gArgs.GetArg("-mainchainchallenge", "").empty() &&
-                gArgs.GetArg("-mainchainblockpin", "").empty())
+                MainchainBlockPinArg().empty())
             return InitError(_("-mainchaintransport=enforcer requires an L1 identity pin outside regtest: "
                                "-mainchainchallenge=<hex> for a signet L1 (its signet_challenge), or "
                                "-mainchainblockpin=<height>:<blockhash> for a mainnet-family L1 such as a "
@@ -1366,7 +1378,7 @@ bool AppInitParameterInteraction()
     // mempool limits
     int64_t nMempoolSizeMax = gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;
     int64_t nMempoolSizeMin = gArgs.GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000 * 40;
-    if (nMempoolSizeMax < 0 || nMempoolSizeMax < nMempoolSizeMin)
+    if (!gArgs.IsArgSet("-maxmempoolbytes") && (nMempoolSizeMax < 0 || nMempoolSizeMax < nMempoolSizeMin))
         return InitError(strprintf(_("-maxmempool must be at least %d MB"), std::ceil(nMempoolSizeMin / 1000000.0)));
     // incremental relay fee sets the minimum feerate increase necessary for BIP 125 replacement in the mempool
     // and the amount the mempool min fee increases above the feerate of txs evicted due to mempool limiting.
@@ -1483,6 +1495,10 @@ bool AppInitParameterInteraction()
     // refuse it. Regtest only.
     if (gArgs.IsArgSet("-memberopguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-memberopguard is a regtest-only test override."));
+    // D-2026-11-11-3: -rateopguard=0 lets a second rate op for a house into the mempool and the template, so a gate can
+    // show the block rule (bad-house-rate-multiple-ops) refuse it.
+    if (gArgs.IsArgSet("-rateopguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-rateopguard may only be set on regtest."));
 
     // v0.2.19 (genesis M1): -dormant=0|1 is a regtest-only gate knob. On
     // mainnet the dormancy is consensus, cleared only by a later release.
@@ -1498,13 +1514,41 @@ bool AppInitParameterInteraction()
 
     if (gArgs.IsArgSet("-depositstartheight")) {
         // Gram-notes release (scope 7h): the gate for a chain restarted on an L1 whose treasury has a history.
-        if (!chainparams.MineBlocksOnDemand())
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)   // SA-V2: by network
             return InitError("-depositstartheight may only be set on regtest.");
         const int64_t n = gArgs.GetArg("-depositstartheight", (int64_t)0);
         if (n < 0 || n > std::numeric_limits<int>::max())
             return InitError("-depositstartheight out of range");
         UpdateDepositStartL1Height((int)n);
         LogPrintf("Deposits count from L1 height %d (regtest)\n", (int)n);
+    }
+
+    // Regtest-only test hooks (invariant J: inert on every public network, refused there).
+    if (gArgs.IsArgSet("-realclock")) {   // SA-H4: run the real active-time code in gates (FB-3)
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+            return InitError("-realclock may only be set on regtest.");
+        if (gArgs.GetBoolArg("-realclock", false)) {
+            UpdateClockIsHeight(false);
+            LogPrintf("Gold B windows count the real chain clock (regtest -realclock)\n");
+        }
+    }
+    if (gArgs.IsArgSet("-maxmempoolbytes")) {
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+            return InitError("-maxmempoolbytes may only be set on regtest.");
+        const int64_t n = gArgs.GetArg("-maxmempoolbytes", (int64_t)0);
+        if (n <= 0)
+            return InitError("-maxmempoolbytes must be positive");
+        g_nMaxMempoolBytesOverride = n;
+        LogPrintf("Mempool limit %d bytes (regtest -maxmempoolbytes)\n", n);
+    }
+    if (gArgs.IsArgSet("-testcrashpoint")) {
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+            return InitError("-testcrashpoint may only be set on regtest.");
+        const std::string strPoint = gArgs.GetArg("-testcrashpoint", "");
+        if (!IsKnownTestCrashPoint(strPoint))
+            return InitError(strprintf("Unknown -testcrashpoint '%s'", strPoint));
+        g_strTestCrashPoint = strPoint;
+        LogPrintf("Test crash point armed: %s (regtest)\n", strPoint);
     }
 
     if (gArgs.IsArgSet("-housepoolheight"))
@@ -1514,7 +1558,7 @@ bool AppInitParameterInteraction()
     if (gArgs.IsArgSet("-housepooltime") || gArgs.IsArgSet("-dollarpooltime")) {
         // No forks (D-2026-11-05-3): every public network switches the later rules on at one time. Regtest may set
         // each alone so the gates exercise the code before and after.
-        if (!chainparams.MineBlocksOnDemand())
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)   // SA-V2: by network
             return InitError("-housepooltime and -dollarpooltime may only be set on regtest.");
         const Consensus::Params& cp = chainparams.GetConsensus();
         int64_t v[2] = {cp.nNotePoolTime, cp.nDollarPoolTime};
@@ -1531,7 +1575,7 @@ bool AppInitParameterInteraction()
 
     if (gArgs.IsArgSet("-vbparams")) {
         // Allow overriding version bits parameters for testing
-        if (!chainparams.MineBlocksOnDemand()) {
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST) {   // SA-V2: by network
             return InitError("Version bits parameters may only be overridden on regtest.");
         }
         for (const std::string& strDeployment : gArgs.GetArgs("-vbparams")) {
@@ -1848,7 +1892,7 @@ bool AppInitMain()
     nCoinDBCache = std::min(nCoinDBCache, nMaxCoinsDBCache << 20); // cap total coins db cache
     nTotalCache -= nCoinDBCache;
     nCoinCacheUsage = nTotalCache; // the rest goes to in-memory cache
-    int64_t nMempoolSizeMax = gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;
+    int64_t nMempoolSizeMax = MaxMempoolBytes();
     LogPrintf("Cache configuration:\n");
     LogPrintf("* Using %.1fMiB for block index database\n", nBlockTreeDBCache * (1.0 / 1024 / 1024));
     LogPrintf("* Using %.1fMiB for chain state database\n", nCoinDBCache * (1.0 / 1024 / 1024));
@@ -2025,6 +2069,31 @@ bool AppInitMain()
                         break;
                     }
                     assert(chainActive.Tip() != nullptr);
+
+                    // SW-3 (security 11-11): every block this release connects writes HouseDB's episode-end record
+                    // ('N', UR-ext-12 precision 2) with the marker, and a disconnect without one fails. A marker block
+                    // with no record was connected by an older release (v14 houses, the old CHouseRate layout): its
+                    // first reorg would stop the node. Say so now, with the remedy.
+                    {
+                        uint256 hashHouseMarker;
+                        std::vector<std::pair<uint32_t, uint32_t>> vEndUndo;
+                        // SW-5 (security 11-11): genesis never runs ConnectBlock's writes, so it has no record; the
+                        // marker sits there after block 1 is disconnected (a competing block 1, invalidateblock, SW-2).
+                        if (phousetree->GetBestBlock(hashHouseMarker) && !hashHouseMarker.IsNull() &&
+                                hashHouseMarker != chainparams.GetConsensus().hashGenesisBlock &&
+                                !phousetree->GetEpisodeEndUndo(hashHouseMarker, vEndUndo)) {
+                            strLoadError = _("This data directory was written by an older FreeBank release, before the "
+                                             "switch-on rules. Restart with -reindex, or start this network's data afresh.");
+                            break;
+                        }
+                    }
+
+                    // SW-2: a disconnect a crash interrupted after some side DBs committed (they sit at the tip's
+                    // parent) is finished here, so the marker check below sees every DB at the new tip.
+                    if (!FinishInterruptedSideDBDisconnect(chainparams)) {
+                        strLoadError = _("Unable to finish an interrupted block disconnect. Restart with -reindex to rebuild the block database.");
+                        break;
+                    }
 
                     // Side-DB lifecycle (3.4 review): the House/Bill DBs carry
                     // a best-block marker written atomically with each block's

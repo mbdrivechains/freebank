@@ -248,8 +248,11 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
                     bmmCache.MarkBidResend(vHashMainBlock.back(), hashResendRoot);
                 else
                     bmmCache.ClearBidResend();
+                // Ultra s5 nit (UR5-7): a definitely refused RESEND leaves this tip claimed (its first bid may still
+                // be out), so say so instead of BidFailureText's "the next call bids again"
                 if (txid.IsNull())
-                    strError = BidFailureText(fNotSent, fConflict);
+                    strError = fNotSent ? "BMM resend refused, no bid sent; no new bid on this mainchain tip"
+                                        : BidFailureText(fNotSent, fConflict);
             }
         } else if (fCreateNew) {
             strError = "Can't create new BMM request - already created for mainchain tip!";

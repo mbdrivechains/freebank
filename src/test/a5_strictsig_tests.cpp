@@ -19,9 +19,12 @@
 
 #include <key.h>
 #include <pubkey.h>
+#include <script/sigcache.h>
+#include <validation.h>
 #include <test/strictsig_util.h>
 #include <test/test_bitcoin.h>
 #include <uint256.h>
+#include <utiltime.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -93,6 +96,76 @@ BOOST_AUTO_TEST_CASE(a5_bounds)
     // A wrong-key strict-canonical sig still fails on the verify axis.
     const CKey other = DetKey(43);
     BOOST_CHECK(!other.GetPubKey().VerifyStrict(hash, sig));
+}
+
+// UR3-4 (ultra s3 #4): FbVerifyStrict is every payload site's check. Outside an FbSigCacheScope it is VerifyStrict;
+// inside one (ATMP, the mempool sweeps) it gives the same answer for every input, the encoding axes are checked before
+// the cache is read (so a high-S or padded form can't ride a cached entry, even one planted directly), and only a
+// signature that verified is cached.
+BOOST_AUTO_TEST_CASE(ur3_4_fbverifystrict_matches_verifystrict)
+{
+    BOOST_CHECK(!FbSigCacheScopeOpen());
+    for (unsigned char i = 101; i <= 106; i++) {
+        const CKey key = DetKey(i);
+        const CPubKey pub = key.GetPubKey();
+        const CPubKey other = DetKey(i + 50).GetPubKey();
+        uint256 hash, hash2;
+        *hash.begin() = i;
+        *hash2.begin() = i + 1;
+        std::vector<unsigned char> sig;
+        BOOST_REQUIRE(key.Sign(hash, sig));
+        const std::vector<unsigned char> flip = A5HighSFlip(sig), pad = A5DerPad(sig), empty;
+        struct Case { const CPubKey* pk; const uint256* h; const std::vector<unsigned char>* s; };
+        const Case cases[] = {{&pub, &hash, &sig}, {&pub, &hash, &flip}, {&pub, &hash, &pad}, {&pub, &hash, &empty},
+                              {&other, &hash, &sig}, {&pub, &hash2, &sig}};
+
+        // Outside a scope: the plain check, and nothing is cached
+        for (const Case& c : cases)
+            BOOST_CHECK_EQUAL(FbVerifyStrict(*c.pk, *c.h, *c.s), c.pk->VerifyStrict(*c.h, *c.s));
+        BOOST_CHECK(!SignatureCacheHas(hash, sig, pub));
+        {
+            FbSigCacheScope scope;
+            BOOST_CHECK(FbSigCacheScopeOpen());
+            {
+                FbSigCacheScope nested;   // nests
+            }
+            BOOST_CHECK(FbSigCacheScopeOpen());
+            // Twice: the first verifies and caches the good one, the second reads the cache
+            for (int pass = 0; pass < 2; pass++)
+                for (const Case& c : cases)
+                    BOOST_CHECK_EQUAL(FbVerifyStrict(*c.pk, *c.h, *c.s), c.pk->VerifyStrict(*c.h, *c.s));
+            BOOST_CHECK(SignatureCacheHas(hash, sig, pub));      // the valid one is cached
+            BOOST_CHECK(!SignatureCacheHas(hash, sig, other));   // a failure never is
+            BOOST_CHECK(!SignatureCacheHas(hash2, sig, pub));
+            // Even a planted entry for a malleated form can't pass: the encoding axes run first
+            SignatureCacheAdd(hash, flip, pub);
+            SignatureCacheAdd(hash, pad, pub);
+            BOOST_CHECK(!FbVerifyStrict(pub, hash, flip));
+            BOOST_CHECK(!FbVerifyStrict(pub, hash, pad));
+        }
+        BOOST_CHECK(!FbSigCacheScopeOpen());
+    }
+
+    // The cost the sweep pays per signature, plain vs cached (logged, not asserted: machine-dependent)
+    const CKey key = DetKey(120);
+    const CPubKey pub = key.GetPubKey();
+    uint256 hash;
+    *hash.begin() = 120;
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(hash, sig));
+    const int N = 500;
+    int64_t t0 = GetTimeMicros();
+    for (int n = 0; n < N; n++) BOOST_REQUIRE(FbVerifyStrict(pub, hash, sig));
+    const int64_t nPlain = GetTimeMicros() - t0;
+    int64_t nCached = 0;
+    {
+        FbSigCacheScope scope;
+        BOOST_REQUIRE(FbVerifyStrict(pub, hash, sig));   // admission: verified once and cached
+        const int64_t t1 = GetTimeMicros();
+        for (int n = 0; n < N; n++) BOOST_REQUIRE(FbVerifyStrict(pub, hash, sig));
+        nCached = GetTimeMicros() - t1;
+    }
+    BOOST_TEST_MESSAGE("ur3_4: " << N << " payload signature checks: plain " << nPlain << " us, cached " << nCached << " us");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

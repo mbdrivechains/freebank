@@ -43,7 +43,6 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 // The J2 displacement whitelist (validation.cpp) - pinned structurally below.
-bool IsAttestDisplaceable(const CTransaction& mtx);
 
 BOOST_FIXTURE_TEST_SUITE(b3_contextual_tests, BasicTestingSetup)
 
@@ -819,39 +818,8 @@ BOOST_AUTO_TEST_CASE(b4_stress_origin_derivation_table)
     }
 }
 
-// -------------------------------------------- T-b6 DISPLACEMENT WHITELIST
-// Sheet 4c: PROTEST is third-party and re-issuable - it MEETS the J2 party
-// test for displaceability - and must be non-displaceable anyway, because
-// there the eviction is the attack (attest every block = perpetual-eviction
-// defence). The whitelist is by VERSION; this pin fails if v13 ever enters
-// it, or if the two legitimate families ever silently leave it.
-BOOST_AUTO_TEST_CASE(b6_attest_displacement_whitelist)
-{
-    CMutableTransaction mtx;
-
-    mtx.nVersion = TRANSACTION_NOTE_VERSION;      // v13: PROTEST/REDEEM/MINT/CLAIM
-    mtx.nNoteOp = NOTE_OP_PROTEST;
-    BOOST_CHECK(!IsAttestDisplaceable(CTransaction(mtx)));
-    mtx.nNoteOp = NOTE_OP_REDEEM;                 // a pooled discharge: house's own work
-    BOOST_CHECK(!IsAttestDisplaceable(CTransaction(mtx)));
-
-    CMutableTransaction mtxHouse;
-    mtxHouse.nVersion = TRANSACTION_HOUSE_VERSION;    // WINDDOWN etc: house's own work
-    BOOST_CHECK(!IsAttestDisplaceable(CTransaction(mtxHouse)));
-    CMutableTransaction mtxDeposit;
-    mtxDeposit.nVersion = TRANSACTION_DEPOSIT_VERSION;
-    BOOST_CHECK(!IsAttestDisplaceable(CTransaction(mtxDeposit)));
-    CMutableTransaction mtxPool;
-    mtxPool.nVersion = TRANSACTION_POOL_VERSION;
-    BOOST_CHECK(!IsAttestDisplaceable(CTransaction(mtxPool)));
-
-    CMutableTransaction mtxSettle;
-    mtxSettle.nVersion = TRANSACTION_SETTLE_VERSION;  // counterparty-signed: the J2 rule
-    BOOST_CHECK(IsAttestDisplaceable(CTransaction(mtxSettle)));
-    CMutableTransaction mtxBill;
-    mtxBill.nVersion = TRANSACTION_BILL_VERSION;      // drawee-built HRETIRE: forced
-    BOOST_CHECK(IsAttestDisplaceable(CTransaction(mtxBill)));
-}
+// T-b6 DISPLACEMENT WHITELIST: retired in plain v1.2.2 with J2 itself (UR-ext-2). House-slot conflicts are settled by
+// fee now; no op type is displaceable for free. The slot gates (slot_fee_priority, mempool_slot_matrix) pin the rule.
 
 // ------------------------------------------- v0.2.18 SUSPENSION (Q6/Q7/Q8)
 // A suspended house may pay DEMANDED notes (from new money; the till stays

@@ -168,10 +168,23 @@ public:
      *  marker = hashBlock. After a crash before the chainstate flush, the
      *  marker shows which blocks' effects are already here (ConnectBlock skips
      *  them instead of re-checking them against the DB they already changed). */
+    /** PG-1: an L1 payout from slot 130 FreeBank did not expect, counted once per (m6id, L1 block). */
+    struct Shortfall {
+        uint256 m6id;
+        uint256 hashL1Block;
+        CAmount amount = 0;
+    };
     bool WriteBlockEffects(const std::vector<SidechainWithdrawal>& vWithdrawalUpdate,
                            const std::vector<SidechainWithdrawalBundle>& vBundleMark,
                            const std::vector<std::pair<uint256, const SidechainObj *> >& vObject,
-                           const uint256& hashBlock);
+                           const uint256& hashBlock,
+                           const std::vector<Shortfall>& vShortfall = std::vector<Shortfall>(),
+                           const std::vector<std::pair<uint256, uint256>>& vPaidL1 = std::vector<std::pair<uint256, uint256>>());
+    /** PG-1 (security's R3): the L1 block of the 'S' a bundle's paid mark recorded (by bundle tx hash). */
+    bool GetBundlePaidL1(const uint256& hashBundle, uint256& hashL1Block) const;
+    /** PG-1: has this (m6id, L1 block) payout been counted; the shortfall so far (sats, events). */
+    bool HaveShortfall(const uint256& m6id, const uint256& hashL1Block) const;
+    void GetShortfallTotal(CAmount& amount, int64_t& nEvents) const;
     bool GetBestBlock(uint256& hashBlock);
     bool WriteBestBlock(const uint256& hashBlock);
 
@@ -194,6 +207,7 @@ public:
         std::vector<COutPoint> vDepositOutpointErase; //!< the L1 outpoint of each vDepositErase row, same order
         uint256 hashPrevLastDeposit;
         std::vector<uint256> vWithdrawalErase;
+        std::vector<Shortfall> vShortfallErase;   //!< PG-1: the block's counted unexpected payouts
         uint256 hashBest;
     };
     bool WriteBlockUndo(const BlockUndo& undo);
@@ -253,10 +267,17 @@ public:
 #include <house.h>   // v0.2.19: CHouseMember, HouseMemberPrior, HouseMemberEffects
 #include <token.h>   // v0.2.21: the token claim records
 
-class HouseDB : public CDBWrapper
+class HouseDB : public StagedDBWrapper
 {
+protected:
+    void AssertStageLock() const override;   // cs_main (UR-ext-10 hardening)
+
 public:
     HouseDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+
+    /** UR-ext-10: close a disconnect's stage - every staged undo write plus the best-block marker (fMarker: the
+     *  datadir had one) in one atomic batch. */
+    bool CommitUndoStage(const uint256& hashBestBlock, bool fMarker);
 
     bool WriteHouse(const CHouse& house);
 
@@ -267,7 +288,14 @@ public:
      * priors check would turn into a permanent canonical-chain rejection). */
     bool WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock,
                            const HouseMemberEffects* pMembers = nullptr,
-                           const TokenEffects* pTokens = nullptr);
+                           const TokenEffects* pTokens = nullptr,
+                           const std::vector<std::pair<uint32_t, uint32_t>>* pEpisodeEndUndo = nullptr);
+
+    /** UR-ext-12 precision 2 (option B, security's six conditions): the block's record of every house whose
+     *  nEpisodeEndHeight it changed, with the pre-block value. Written in the block's own batch (one per connected
+     *  block, possibly empty), read and erased by the block's staged undo. */
+    bool GetEpisodeEndUndo(const uint256& hashBlock, std::vector<std::pair<uint32_t, uint32_t>>& vUndo);
+    bool EraseEpisodeEndUndo(const uint256& hashBlock);
 
     /** v0.2.21 token claim records (token.h). Undo erases what the disconnected block wrote, or resets a collect. */
     bool GetTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID, CTokenKeyset& rec);
@@ -310,10 +338,16 @@ public:
 
 /** Access to the pool database (blocks/Pools/). nPoolID == nHouseID (one pool
  * per house), so there is NO dense-id assignment and no hash index. */
-class PoolDB : public CDBWrapper
+class PoolDB : public StagedDBWrapper
 {
+protected:
+    void AssertStageLock() const override;   // cs_main (UR-ext-10 hardening)
+
 public:
     PoolDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+
+    /** UR-ext-10: as HouseDB::CommitUndoStage. */
+    bool CommitUndoStage(const uint256& hashBestBlock, bool fMarker);
 
     bool WritePool(const CPool& pool);
 

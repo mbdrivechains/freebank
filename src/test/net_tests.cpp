@@ -255,6 +255,13 @@ BOOST_AUTO_TEST_CASE(bmm_behind_judgement)
     // IBD only because the whole network stalled for longer than -maxtipage:
     // peers, none ahead. Refusing would stop every restarted engine node.
     BOOST_CHECK(JudgeBMMBehind(true, none, false) == BMMBehind::NO);
+
+    // SW-4 (security 11-11): the switch-on start. A public network's first block comes from a seed peered with a second
+    // node of ours, both at genesis (IBD: the tip is old). Peer heights count only above our tip, so that peer reports
+    // -1s and the seed is not behind. The lone-node shortcut (no peers at all) is regtest-only.
+    PeerTipEvidence seed;
+    seed.nPeers = 1;
+    BOOST_CHECK(JudgeBMMBehind(true, seed, false) == BMMBehind::NO);
 }
 
 BOOST_AUTO_TEST_CASE(invalid_header_backoff_schedule)

@@ -316,6 +316,15 @@ bool CWallet::BurnIssued(std::string& strFail, uint256& txidOut, const uint256& 
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
+    {
+        // UR2-1 (switch-on): consensus refuses a BURN of a token pool's LP shares; say so here, and point at REMOVE.
+        CIssuedToken token;
+        CUnitsView view(punitsdb.get());
+        if (view.Get(IssuedTokenKey(tokenID), token) && token.nKind == ISSUED_KIND_POOL_LP) {
+            strFail = "LP shares can't be burned; take your share out of the pool with a remove instead";
+            return false;
+        }
+    }
     std::vector<CIssuedWalletCoin> vCoins, vPick;
     ListIssuedCoins(tokenID, vCoins);
     uint64_t nUnitsIn = 0, nFrozenIn = 0;
@@ -708,6 +717,17 @@ static bool WalletHouseCharter(CWallet* pwallet, std::string& strFail, uint256& 
     AssertLockHeld(pwallet->cs_wallet);
     CHouse house;
     if (!phousetree->GetHouse(op.nHouseID, house)) { strFail = "Unknown house"; return false; }
+    if (op.nKind == HOUSE_CHARTER_REMOVE || op.nKind == HOUSE_CHARTER_RELATED) {
+        // UR1-1 (switch-on): name the token at the index, so the signed op can't land on another one if an ADD
+        // renumbers the list first (consensus refuses the mismatch).
+        CHouseCharter charter;
+        CUnitsView view(punitsdb.get());
+        if (!view.Get(HouseCharterKey(op.nHouseID), charter) || op.nIndex >= charter.vToken.size()) {
+            strFail = "No charter entry at that index"; return false;
+        }
+        op.nChainID = charter.vToken[op.nIndex].nChainID;
+        op.vchContract = charter.vToken[op.nIndex].vchContract;
+    }
     std::vector<uint32_t> vIdx;
     std::vector<CKey> vKey;
     if (!WalletHouseApproved(pwallet, strFail, house, vIdx, vKey)) return false;
@@ -810,8 +830,10 @@ UniValue createissuedtoken(const JSONRPCRequest& request)
             + HelpExampleCli("createissuedtoken", "usd_cents USDA 0xdac17f958d2ee523a2206206994597c13d831ec7 0x1111111111111111111111111111111111111111 tether"));
     IssuedCreate create;
     const std::string strKind = request.params[0].get_str();
+    // FB-2c (plain v1.2.2): consensus refuses a gold_mg token under Gold B, so refuse it here instead of building a tx
+    // the node will reject.
     if (strKind == "gold_mg")
-        create.nKind = ISSUED_KIND_GOLD_MG;
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "gold_mg tokens are retired under Gold B; kind must be usd_cents");
     else if (strKind == "usd_cents")
         create.nKind = ISSUED_KIND_USD_CENTS;
     else
@@ -1035,7 +1057,7 @@ UniValue gethousecapital(const JSONRPCRequest& request)
             o.pushKV("rate_posted_time", rate.nPostTime);
             o.pushKV("rate_fresh_until", rate.nPostTime + (int64_t)gp.nRateRefreshSecs);
         }
-        o.pushKV("rate_fresh", HouseRateFreshForChecks(nHouseID, (int64_t)gp.nRateRefreshSecs));
+        o.pushKV("rate_fresh", HouseRateFreshForChecks(nHouseID, nNext, (int64_t)gp.nRateRefreshSecs));   // for the next block (RS-1)
     }
     o.pushKV("ask_30d_high", HouseRateMaxForChecks(nHouseID, nNext, 30, nUnused, nAsk30) ? UniValue(nAsk30) : NullUniValue);
     o.pushKV("bid_90d_high", HouseRateMaxForChecks(nHouseID, nNext, 90, nBid90, nUnused) ? UniValue(nBid90) : NullUniValue);
@@ -1300,13 +1322,18 @@ UniValue swapnotes(const JSONRPCRequest& request)
         return NullUniValue;
     if (request.fHelp || request.params.size() < 7 || request.params.size() > 8)
         throw std::runtime_error(
-            "swapnotes houseid units chain_id \"contract\" \"eth_address\" \"hash_lock\" \"payout_address\" ( fee )\n"
+            "swapnotes houseid units chain_id \"contract\" \"eth_address\" ( \"hash_lock\" ) \"payout_address\" ( fee )\n"
             "\nDemand units mg (at least 10 g) of the house's notes in a gold token on its charter (GOLD_B.md §4). The notes\n"
             "leave circulation. The house locks the tokens for eth_address under hash_lock = sha256(s); revealing s claims\n"
             "them and settles the swap (swapdone). Unsettled after 72 hours of chain time, the house owes it in sECX at the\n"
             "lower of its bid at the demand and its highest bid in the day before the deadline, paid to payout_address\n"
             "(swappay); unpaid a day later it can be\n"
-            "protested (swapprotest). One holder's plain coins summing to exactly units are handed in.\n");
+            "protested (swapprotest). One holder's plain coins summing to exactly units are handed in.\n"
+            "\nOnly the holder may know s. Anyone else who knows it - the house included - can settle the swap as delivered\n"
+            "(swapdone) without delivering, and the notes are gone. So leave hash_lock out (null, or \"\" by position): this\n"
+            "wallet then makes s from one of its own keys and returns the hash; getswapsecret shows s when you claim the\n"
+            "tokens. A hash_lock given here is refused unless this wallet made it.\n"
+            "\nResult: {\"txid\", \"hash_lock\"}\n");
     const uint32_t nHouseID = request.params[0].get_int();
     const uint64_t nUnits = ParseUnits(request.params[1]);
     const int64_t nChain = request.params[2].get_int64();
@@ -1314,7 +1341,8 @@ UniValue swapnotes(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_INVALID_PARAMETER, "chain_id must be positive");
     const std::vector<unsigned char> vchContract = ParseBytes20(request.params[3], "contract");
     const std::vector<unsigned char> vchEth = ParseBytes20(request.params[4], "eth_address");
-    const uint256 hashLock = ParseHashLock(request.params[5]);
+    const bool fMakeLock = request.params[5].isNull() || request.params[5].get_str().empty();
+    uint256 hashLock = fMakeLock ? uint256() : ParseHashLock(request.params[5]);
     const CTxDestination dest = DecodeDestination(request.params[6].get_str());
     if (!IsValidDestination(dest))
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid payout address");
@@ -1322,10 +1350,46 @@ UniValue swapnotes(const JSONRPCRequest& request)
     EnsureWalletIsUnlocked(pwallet);
     uint256 txid;
     std::string strFail;
+    // SA-W5: only the holder may know s.
+    if (fMakeLock) {
+        if (!pwallet->NewSwapLock(strFail, hashLock))
+            throw JSONRPCError(RPC_WALLET_ERROR, strFail);
+    } else {
+        std::vector<unsigned char> vchS;
+        if (!pwallet->GetSwapSecret(hashLock, vchS))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "This wallet doesn't hold the preimage of hash_lock: only the holder "
+                               "may know s (anyone who knows it can settle the swap without delivering). Leave hash_lock "
+                               "out and the wallet makes one.");
+    }
     if (!pwallet->SwapNotesInKind(strFail, txid, nHouseID, nUnits, (uint64_t)nChain, vchContract, vchEth, hashLock,
                                   GetScriptForDestination(dest), nFee))
         throw JSONRPCError(RPC_WALLET_ERROR, strFail);
-    return TxidResult(txid);
+    UniValue o = TxidResult(txid);
+    o.pushKV("hash_lock", HashLockHex(hashLock));
+    return o;
+}
+
+UniValue getswapsecret(const JSONRPCRequest& request)
+{
+    CWallet* const pwallet = WalletOrThrow(request);
+    if (!pwallet)
+        return NullUniValue;
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "getswapsecret \"hash_lock\"\n"
+            "\nShow s (hex) for a swap whose hash lock this wallet made (swapnotes with no hash_lock): what you reveal on\n"
+            "Ethereum to claim the tokens. Only the holder may know s: give it to nobody, and claim on Ethereum before\n"
+            "anyone posts it here (swapdone).\n"
+            "\nResult: {\"hash_lock\", \"secret\"}\n");
+    const uint256 hashLock = ParseHashLock(request.params[0]);
+    EnsureWalletIsUnlocked(pwallet);
+    std::vector<unsigned char> vchS;
+    if (!pwallet->GetSwapSecret(hashLock, vchS))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "This wallet didn't make hash_lock (no secret for it here)");
+    UniValue o(UniValue::VOBJ);
+    o.pushKV("hash_lock", HashLockHex(hashLock));
+    o.pushKV("secret", HexStr(vchS.begin(), vchS.end()));
+    return o;
 }
 
 UniValue swapdone(const JSONRPCRequest& request)
@@ -1677,6 +1741,7 @@ const CRPCCommand issuedCommands[] = {
     { "house",            "removechartertoken",     &removechartertoken,     {"houseid", "index", "fee"} },
     { "house",            "setcharterrelated",      &setcharterrelated,      {"houseid", "index", "related", "fee"} },
     { "notes",            "swapnotes",              &swapnotes,              {"houseid", "units", "chain_id", "contract", "eth_address", "hash_lock", "payout_address", "fee"} },
+    { "notes",            "getswapsecret",          &getswapsecret,          {"hash_lock"} },
     { "notes",            "swapdone",               &swapdone,               {"hash_lock", "preimage", "fee", "claimed"} },
     { "notes",            "swappay",                &swappay,                {"hash_lock", "fee"} },
     { "notes",            "swapprotest",            &swapprotest,            {"hash_lock", "fee"} },

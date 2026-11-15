@@ -2623,4 +2623,99 @@ BOOST_AUTO_TEST_CASE(v101_outpoint_index_rebuilt_from_the_rows)
     BOOST_CHECK(!db.HaveDepositOutpoint(Out(d1)));
 }
 
+// ---------------------------------------------------------------------------
+// PG-1 (D-2026-11-13-3): the consensus shortfall. A mainchain payout from this slot that is not the pending bundle's is
+// counted once, checked with the L1: an m6id FreeBank never made, or a bundle that failed here (its withdrawals went
+// back to their owners). A commit for the pending bundle's m6id is refused (that is its paid mark); the undo takes it off.
+// ---------------------------------------------------------------------------
+PEGBIND_BOTH_LAYOUTS(pg1_shortfall_counted_once)
+{
+    const uint256 hashA = ArithToUint256(arith_uint256(0x5a1));
+    const uint256 hashE1 = ArithToUint256(arith_uint256(0x5e1)), hashE2 = ArithToUint256(arith_uint256(0x5e2));
+    MainCacheScope cache({ArithToUint256(arith_uint256(0x5a0)), hashA, hashE1, hashE2});
+    PegChain chain(layout, scriptCoinbase);
+    chain.Connect(chain.Block({chain.Withdrawal(COIN / 10)}), "W");
+    const SidechainWithdrawalBundle bundle = ConnectBundleBlock(chain, "B (pending)");
+
+    // A real M6's layout (security's R2): the treasury input, vout[0] the treasury's change (OP_DRIVECHAIN <slot>
+    // OP_TRUE, much more than the payout), then the payout of 0.4
+    CMutableTransaction m6;
+    m6.vin.push_back(CTxIn(COutPoint(uint256S("0x7e"), 0)));
+    m6.vout.push_back(CTxOut(250 * COIN, CScript() << OP_NOP5 << std::vector<unsigned char>{(unsigned char)THIS_SIDECHAIN} << OP_TRUE));
+    m6.vout.push_back(CTxOut(4 * COIN / 10, CScript() << OP_TRUE));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << L1MutableTransaction(m6);
+    L1WithdrawalEvent ev;
+    ev.m6id = uint256S("0xf0f0");
+    ev.status = 'S';
+    ev.hashMainBlock = hashA;
+    ev.vchTx.assign(ss.begin(), ss.end());
+    chain.oracle.eventsAnyWindow.vWithdrawal.push_back(ev);
+    chain.oracle.fAnyWindow = true;
+    const CAmount nAmt = UnexpectedPayoutAmount(ev);
+    BOOST_CHECK_EQUAL(nAmt, 4 * COIN / 10);
+    const std::set<uint256> setPending = PendingBundleM6ids();
+    BOOST_REQUIRE_EQUAL(setPending.size(), 1U);
+    BOOST_CHECK(setPending.count(BundleM6id(bundle.tx)));
+    BOOST_CHECK(IsUnexpectedPayout(ev, setPending));
+    L1WithdrawalEvent evOurs = ev;
+    evOurs.m6id = BundleM6id(bundle.tx);
+    BOOST_CHECK(!IsUnexpectedPayout(evOurs, setPending));
+
+    auto WithCommit = [&](const uint256& m6id, CAmount amount, const uint256& hashE) {
+        return OnL1(chain.Block({}, [&](CMutableTransaction& cb) {
+            cb.vout.push_back(CTxOut(0, GenerateUnexpectedPayoutCommit(m6id, hashA, amount)));
+        }, true), hashE);
+    };
+    chain.Reject(WithCommit(BundleM6id(bundle.tx), 0, hashE1), "bad-shortfall-expected", "a pending bundle's payout");
+
+    // The builder finds the payout itself (its 144-block look-back, security's R5) and commits it
+    const auto pblockCount = OnL1(chain.Block({}, nullptr, true), hashE1);
+    bool fBuilderCommitted = false;
+    for (const CTxOut& out : pblockCount->vtx[0]->vout) {
+        uint256 m6, hashL1;
+        CAmount amount = 0;
+        if (ParseUnexpectedPayoutCommit(out.scriptPubKey, m6, hashL1, amount))
+            fBuilderCommitted = m6 == ev.m6id && hashL1 == hashA && amount == nAmt;
+    }
+    BOOST_CHECK_MESSAGE(fBuilderCommitted, LayoutName(layout) << ": the builder did not commit the foreign payout");
+    chain.Connect(pblockCount, "the foreign payout, counted");
+    CAmount nTotal = 0;
+    int64_t nEvents = 0;
+    psidechaintree->GetShortfallTotal(nTotal, nEvents);
+    BOOST_CHECK_EQUAL(nTotal, nAmt);
+    BOOST_CHECK_EQUAL(nEvents, 1);
+    BOOST_CHECK(psidechaintree->HaveShortfall(ev.m6id, hashA));
+
+    chain.Reject(WithCommit(ev.m6id, nAmt, hashE2), "bad-shortfall-duplicate", "counted twice");
+
+    InvalidateForTest(TipForTest());
+    psidechaintree->GetShortfallTotal(nTotal, nEvents);
+    BOOST_CHECK_EQUAL(nTotal, 0);
+    BOOST_CHECK_EQUAL(nEvents, 0);
+    BOOST_CHECK(!psidechaintree->HaveShortfall(ev.m6id, hashA));
+}
+
+// PG-1 (D-2026-11-13-3): a bundle that failed here is never pending again, and a mainchain payout of it counts as a
+// shortfall (its withdrawals went back to their owners).
+PEGBIND_BOTH_LAYOUTS(pg1_failed_bundle_payout_is_shortfall)
+{
+    PegChain chain(layout, scriptCoinbase);
+    chain.Connect(chain.Block({chain.Withdrawal(COIN / 10)}), "W");
+    const SidechainWithdrawalBundle bundle = ConnectBundleBlock(chain, "B");
+    const uint256 hashB = bundle.tx.GetHash();
+    chain.L1BundleEvent(hashB, 'F');
+    chain.Connect(chain.Block({}, [&](CMutableTransaction& cb) { AddMark(cb, hashB, true); }), "fail commit");
+    SidechainWithdrawalBundle row;
+    BOOST_REQUIRE(psidechaintree->GetWithdrawalBundle(hashB, row));
+    BOOST_REQUIRE_EQUAL(row.status, WITHDRAWAL_BUNDLE_FAILED);
+    const std::set<uint256> setPending = PendingBundleM6ids();
+    BOOST_CHECK(setPending.empty());
+    L1WithdrawalEvent ev;
+    ev.m6id = BundleM6id(bundle.tx);
+    ev.status = 'S';
+    ev.hashMainBlock = ArithToUint256(arith_uint256(0x5a2));
+    BOOST_CHECK(IsUnexpectedPayout(ev, setPending));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

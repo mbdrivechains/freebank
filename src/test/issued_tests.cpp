@@ -545,4 +545,70 @@ BOOST_AUTO_TEST_CASE(issued_create_burns_the_fixed_fee)
     BOOST_CHECK_EQUAL(ConnectReason(mtx, in.view, units), "");
 }
 
+// testing (2026-11-10), ultra s2 UR2-1. ISSUED_OP_BURN never reads the token's kind, so a holder can burn a token
+// pool's LP shares (ISSUED_KIND_POOL_LP) through the generic burn instead of POOL_REMOVE: the LP record's supply falls
+// but CTokenPool::nLpSupply doesn't, the burner's claim becomes a burn-queue entry no issuer pays, and the reserves
+// behind those shares are stranded. Self-inflicted (security and freebankd 11-09: normal), but the counts desync.
+// The guard may sit in any layer (shape, flow or connect), so the test passes if any refuses, and checks nothing moved.
+// FAILS on v1.2.1 (all three accept it).
+BOOST_AUTO_TEST_CASE(testing_ur2_1_lp_shares_cannot_be_burned)
+{
+    UpdateLaterRuleTimes(Params().GetConsensus().nNotePoolTime, 0);   // dollar-token pools open for the test
+    CUnitsView units(nullptr);
+    CKey issuer;
+    issuer.MakeNewKey(true);
+    const uint256 token = CreateToken(units, issuer, nullptr);
+    CIssuedToken rec;
+    BOOST_REQUIRE(units.Get(IssuedTokenKey(token), rec));
+    rec.nSupply = 1000000;
+    units.Put(IssuedTokenKey(token), rec);
+
+    // A pool, so an LP record exists (the create exactly as issued_token_pool_create_and_swap).
+    uint64_t nLpOut = 0, nLpSupply = 0;
+    BOOST_REQUIRE(PoolLpMintInitial(600000, 66000000, nLpOut, nLpSupply));
+    IssuedPoolCreate pc;
+    pc.tokenID = token;
+    pc.nFeeBps = 30;
+    pc.nInitUnits = 600000;
+    pc.nInitSats = 66000000;
+    pc.nLpOut = nLpOut;
+    CMutableTransaction c = TokenTx(ISSUED_OP_POOL_CREATE, 2, 4);
+    c.vout[0] = CTxOut(ISSUED_COIN_VALUE, TokenPoolScript(token));
+    c.vout[1] = CTxOut(66000000, TokenPoolScript(token));
+    c.vIssuedOut = {Out(0, token, 600000), Out(2, LpTokenID(token), nLpOut), Out(3, token, 400000)};
+    c.vchIssuedPayload = Enc(pc);
+    Coin plain(CTxOut(COIN, CScript() << OP_TRUE), 5, false, false, false, uint256());
+    Inputs inC(c, {IssuedCoin(token, 1000000), plain});
+    BOOST_REQUIRE_EQUAL(ConnectReason(c, inC.view, units, 20), "");
+    CIssuedToken lp;
+    BOOST_REQUIRE(units.Get(IssuedTokenKey(LpTokenID(token)), lp));
+    BOOST_REQUIRE_EQUAL(lp.nKind, ISSUED_KIND_POOL_LP);
+    BOOST_REQUIRE(nLpOut > 2000);
+
+    // The LP holder burns 1,000 LP units (the burn minimum) through the generic BURN.
+    IssuedBurn burn;
+    burn.tokenID = LpTokenID(token);
+    burn.nUnits = 1000;
+    burn.vchEthDest = std::vector<unsigned char>(20, 0xcc);
+    CMutableTransaction b = TokenTx(ISSUED_OP_BURN, 1, 1);
+    b.vIssuedOut = {Out(0, LpTokenID(token), nLpOut - 1000)};
+    b.vchIssuedPayload = Enc(burn);
+    const Coin lpCoin = IssuedCoin(LpTokenID(token), nLpOut);
+    Inputs inB(b, {lpCoin});
+    const std::string strShape = ShapeReason(b);
+    const std::string strFlow = strShape.empty() ? FlowReason(b, {lpCoin}) : "";
+    const std::string strConnect = (strShape.empty() && strFlow.empty()) ? ConnectReason(b, inB.view, units, 22) : "";
+    BOOST_CHECK_MESSAGE(!strShape.empty() || !strFlow.empty() || !strConnect.empty(),
+                        "a BURN of pool LP shares passed shape, flow and connect (UR2-1): LP shares must leave via POOL_REMOVE");
+    // Nothing moved: the LP supply still matches the pool's count, and no burn was queued against the LP token.
+    BOOST_REQUIRE(units.Get(IssuedTokenKey(LpTokenID(token)), lp));
+    BOOST_CHECK_MESSAGE(lp.nSupply == nLpOut, "the LP record's supply fell to " << lp.nSupply << " while the pool still counts "
+                        << nLpSupply << " - the counts desync (UR2-1)");
+    CIssuedBurn queued;
+    BOOST_CHECK_MESSAGE(!units.Get(IssuedBurnKey(LpTokenID(token), 0), queued),
+                        "a burn-queue entry was created for LP shares, which no issuer pays (UR2-1)");
+
+    UpdateLaterRuleTimes(Params().GetConsensus().nNotePoolTime, Consensus::LATER_RULE_NEVER);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

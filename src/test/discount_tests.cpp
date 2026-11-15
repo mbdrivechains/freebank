@@ -4,7 +4,10 @@
 
 #include <bill.h>
 #include <house.h>
+#include <houserate.h>   // SwapPendingKey (UR-ext-11)
+#include <issued.h>      // UnitsCheckScope, g_fnCapitalForChecksTestOverride (UR-ext-11)
 #include <note.h>
+#include <units.h>       // CUnitsView (UR-ext-11)
 
 #include <chainparams.h>
 #include <coins.h>
@@ -32,6 +35,13 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                         CBill& billOut, CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
+// And the note-op one (UR-ext-11's MINT case).
+bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHeight, uint64_t nNoteUnitsIn,
+                        const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                        const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
+                        const std::function<bool(const COutPoint&, Coin&)>& fnGetProofCoin,
+                        const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
+                        CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(discount_tests, BasicTestingSetup)
 
@@ -635,7 +645,7 @@ static CMutableTransaction MakeHRetire(const Scene& s,
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << h;
     mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
-    BOOST_REQUIRE(s.acceptor.Sign(BillRetireSigHash(s.bill.billID,
+    BOOST_REQUIRE(s.acceptor.Sign(BillRetireSigHash(s.bill.billID, h.nRateNamed,   // UR1-6
             BillHashOutputs(CTransaction(mtx))), h.vchAcceptorSig));
     CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
     ss2 << h;
@@ -780,7 +790,7 @@ static CMutableTransaction MakeHRetireNotes(const Scene& s, uint64_t nUnits,
         pre(h, mtx);
 
     const uint256 sighash = fSignAsOp7
-        ? BillRetireSigHash(s.bill.billID, BillHashOutputs(CTransaction(mtx)))
+        ? BillRetireSigHash(s.bill.billID, h.nRateNamed, BillHashOutputs(CTransaction(mtx)))   // UR1-6
         : BillHRetireNotesSigHash(h, s.bill.billID, BillHashPrevouts(CTransaction(mtx)),
                                   BillHashOutputs(CTransaction(mtx)));
     BOOST_REQUIRE(s.acceptor.Sign(sighash, h.vchAcceptorSig));
@@ -1979,7 +1989,7 @@ BOOST_AUTO_TEST_CASE(shipped_ops_refuse_house_held_bills)
         ss << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
         BOOST_REQUIRE(const_cast<CKey&>(s.acceptor).Sign(
-                BillRetireSigHash(s.bill.billID, BillHashOutputs(CTransaction(mtx))), r.vchAcceptorSig));
+                BillRetireSigHash(s.bill.billID, r.nRateNamed, BillHashOutputs(CTransaction(mtx))), r.vchAcceptorSig));   // UR1-6
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
         ss2 << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
@@ -2317,6 +2327,137 @@ BOOST_AUTO_TEST_CASE(discount_proposal_blob_roundtrip)
         DiscountProposalV1 tail;
         in >> tail;
         BOOST_CHECK(!in.empty());
+    }
+}
+
+// ===========================================================================
+// testing (2026-11-10): UR-ext-11 (GPT-6.1, external s3 round 2; Michael signed off item 8 2026-11-10, freebank
+// docs-local/CONSENSUS_SIGNOFF_2026-11-10.md). A failed house's snapshot denominator is
+// min(minted + pending swaps + shortfalls, MAX_MONEY) (MaterializeInsolvency), but MINT and DISCOUNT bound only
+// minted + deposits by MAX_MONEY: pending swaps are subtracted from the capital and till CAPS, not from that ceiling.
+// Where the caps exceed MAX_MONEY (a house quoting ~1 sat per gram), minted + pending passes MAX_MONEY, the snapshot
+// clamps, and early claimants are paid more than their share. The fix counts pending swaps in the issuing ceiling.
+// Each case below runs the op twice with caps far above MAX_MONEY and minted + the new issue = MAX_MONEY - 1000: with
+// no pending swaps (control: not refused at the ceiling) and with 2,000 pending (minted + issue + pending =
+// MAX_MONEY + 1000: must be refused at the ceiling). FAILS on master a00fb05; passes once the fix lands.
+// ===========================================================================
+namespace {
+// Caps far above MAX_MONEY (as at ~1 sat per gram), and for one scope: nPending units pending in swaps at nHouseID, and
+// a live failed-swap shortfall of nShortfallMg recorded the block before nHeight (unit tests' clock is the height).
+struct URX11Scope {
+    std::function<void(const CHouse&, int, CHouseCapital&)> fnPrev;
+    CUnitsView units;
+    std::unique_ptr<UnitsCheckScope> pScope;
+    URX11Scope(uint32_t nHouseID, uint64_t nPending, uint64_t nShortfallMg = 0, int nHeight = 0)
+        : fnPrev(g_fnCapitalForChecksTestOverride), units(nullptr)
+    {
+        g_fnCapitalForChecksTestOverride = [](const CHouse&, int, CHouseCapital& cap) {
+            cap.nEscrowMg = cap.nTillMg = cap.nCapacityMg = 2 * (uint64_t)MAX_MONEY;
+        };
+        if (nPending)
+            units.Put(SwapPendingKey(nHouseID), nPending);
+        if (nShortfallMg) {
+            CShortfallLedger led;
+            led.vEntry.push_back(std::make_pair(ClockAtHeight(nHeight - 1), nShortfallMg));
+            units.Put(ShortfallLedgerKey(nHouseID), led);
+        }
+        pScope.reset(new UnitsCheckScope(&units));
+    }
+    ~URX11Scope()
+    {
+        pScope.reset();
+        g_fnCapitalForChecksTestOverride = fnPrev;
+    }
+};
+const uint64_t URX11_PENDING = 2000;
+} // namespace
+
+// The three runs each case makes: the control, 2,000 pending in swaps, and (freebankd 2026-11-10: the ceiling bounds the
+// snapshot's shortfall term too) a live shortfall of 2,000 mg with nothing pending.
+struct URX11Run { const char* name; uint64_t nPending; uint64_t nShortfall; };
+const URX11Run URX11_RUNS[] = {{"control", 0, 0}, {"pending swaps", URX11_PENDING, 0},
+                               {"live shortfall", 0, URX11_PENDING}};
+
+BOOST_AUTO_TEST_CASE(ur_ext_11_discount_ceiling_counts_pending_swaps)
+{
+    for (const URX11Run& run : URX11_RUNS) {
+        Scene s = MakeScene();
+        s.house.nMintedUnits = (uint64_t)MAX_MONEY - (uint64_t)PRICE - 1000;   // + PRICE = MAX_MONEY - 1000
+        s.house.amountLastAttestReserves = MAX_MONEY;
+        URX11Scope scope(HOUSE_ID, run.nPending, run.nShortfall, H);
+        BOOST_REQUIRE_EQUAL(HousePendingSwapUnitsForChecks(HOUSE_ID), run.nPending);
+        BOOST_REQUIRE_EQUAL(HouseLiveShortfallMgForChecks(HOUSE_ID, ClockAtHeight(H), 1), run.nShortfall);
+
+        BillDiscount d;
+        const CMutableTransaction mtx = MakeDiscount(s, d);
+        CValidationState state;
+        CBill billOut; CHouse houseOut; bool fChanged = false;
+        const bool fOk = RunOp(s, mtx, state, billOut, houseOut, fChanged);
+        if (run.nPending == 0 && run.nShortfall == 0) {
+            BOOST_CHECK_MESSAGE(fOk, "UR-ext-11 control: a DISCOUNT to MAX_MONEY - 1000 minted, nothing pending, was "
+                                     "refused: " + state.GetRejectReason());
+        } else {
+            BOOST_CHECK_MESSAGE(!fOk, std::string("UR-ext-11 (") + run.name + "): a DISCOUNT was accepted with minted + "
+                                      "price + " + run.name + " = MAX_MONEY + 1000 (the failure snapshot would clamp)");
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(ur_ext_11_mint_ceiling_counts_pending_swaps)
+{
+    CKey keyHolder;
+    keyHolder.MakeNewKey(true);
+    const CPubKey pubHolder = keyHolder.GetPubKey();
+    const uint64_t nMint = 100;
+
+    for (const URX11Run& run : URX11_RUNS) {
+        CHouse house;
+        house.nHouseID = 5;
+        house.houseID = uint256S("f00d");
+        house.nTier = HOUSE_TIER_MULTI_PARTNER;
+        house.nThresholdM = 1;
+        house.status = HOUSE_STATUS_OPEN;
+        house.nRegisteredHeight = 1000;
+        house.nLastAttestHeight = 1000;
+        house.amountLastAttestReserves = MAX_MONEY;
+        house.nMintedUnits = (uint64_t)MAX_MONEY - nMint - 1000;   // + nMint = MAX_MONEY - 1000
+        HousePartner p;
+        p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+        p.amountPledge = 100 * COIN;
+        p.status = HOUSE_PARTNER_ACTIVE;
+        house.vPartner.push_back(p);
+        URX11Scope scope(5, run.nPending, run.nShortfall, 1000);
+
+        NoteMint mint;
+        mint.nHouseID = 5;
+        mint.vUnits.push_back(nMint);
+        mint.vApproverIndex.push_back(0);
+        mint.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_MINT;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << mint;
+        mtx.vchNotePayload.assign(ss.begin(), ss.end());
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("11"), 0)));
+        mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
+                                  NoteScriptForPubKey(std::vector<unsigned char>(pubHolder.begin(), pubHolder.end()))));
+
+        auto fnGetHouse = [&house](uint32_t id, CHouse& out) { if (id != 5) return false; out = house; return true; };
+        auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+        auto fnBlock = [](uint32_t, uint256& h) { h = uint256S("beef"); return true; };
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        CheckNoteOperation(CTransaction(mtx), state, 1000, 0, fnGetHouse, fnNoCoin, fnNoCoin, fnBlock, houseOut, fChanged);
+        const std::string strReason = state.GetRejectReason();
+        if (run.nPending == 0 && run.nShortfall == 0) {
+            BOOST_CHECK_MESSAGE(strReason != "bad-note-mint-over-cap", "UR-ext-11 control: a MINT to MAX_MONEY - 1000 "
+                                "minted, nothing pending, was refused at the ceiling");
+        } else {
+            BOOST_CHECK_MESSAGE(strReason == "bad-note-mint-over-cap",
+                                std::string("UR-ext-11 (") + run.name + "): a MINT with minted + units + " + run.name +
+                                " = MAX_MONEY + 1000 got past the issuing ceiling (it went on to: " +
+                                (strReason.empty() ? std::string("accepted") : strReason) + ")");
+        }
     }
 }
 

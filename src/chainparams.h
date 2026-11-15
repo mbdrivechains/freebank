@@ -65,6 +65,10 @@ public:
     uint64_t PruneAfterHeight() const { return nPruneAfterHeight; }
     /** Make miner stop after a block is found. In RPC, don't return until nGenProcLimit blocks are generated */
     bool MineBlocksOnDemand() const { return fMineBlocksOnDemand; }
+    /** D-2026-11-13-3 (PG-1): a node hands a withdrawal bundle to its enforcer only once the bundle's block is this
+     *  many FreeBank blocks deep, so a side reorg can't leave two bundles holding the same withdrawals on the L1.
+     *  Node policy, not a consensus rule. */
+    int WithdrawalBundleSendDepth() const { return nWithdrawalBundleSendDepth; }
     /** Withdrawal-bundle wire format: CUSF enforcer BlindedM6 layout (fee at
      * vout[0], big-endian, no return-dest marker) instead of the legacy
      * drivechain layout. Per network - never per node - because the bundle is
@@ -72,6 +76,9 @@ public:
     bool CUSFBundleFormat() const { return fCUSFBundleFormat; }
     /** Return the BIP70 network string (main, test or regtest) */
     std::string NetworkIDString() const { return strNetworkID; }
+    /** FB-14: this network's own L1 identity pin, "<height>:<blockhash>", used when neither -mainchainblockpin nor
+     *  -mainchainchallenge is given (an explicit pin always wins). Empty: none built in, so a pin must be passed. */
+    const std::string& DefaultMainchainBlockPin() const { return strDefaultMainchainBlockPin; }
     /** Return the list of hostnames to look up for DNS seeds */
     const std::vector<std::string>& DNSSeeds() const { return vSeeds; }
     const std::vector<unsigned char>& Base58Prefix(Base58Type type) const { return base58Prefixes[type]; }
@@ -83,6 +90,9 @@ public:
     /** Regtest (-housepooltime, -dollarpooltime, -fullforfeittime) and unit tests only: when each later rule switches
      *  on (D-2026-11-05-3; Consensus::LATER_RULE_NEVER = never, 0 = from genesis). */
     void UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime);
+    /** SA-H4 (regtest -realclock): Gold B's windows count the real chain clock (600 s of active time per clock block)
+     *  instead of blocks, as on every public network. */
+    void UpdateClockIsHeight(bool fClockIsHeight) { consensus.fClockIsHeight = fClockIsHeight; }
     /** Unit tests only: the creation burn (D-2026-11-04-1, 3b) on every gram step. */
     void UpdateCreateFeeForTest(int64_t nCreateFeeSats);
     /** Regtest (-oracleunbonddelay) only: a reporter's withdraw delay on every gram step. */
@@ -100,11 +110,13 @@ protected:
     std::vector<unsigned char> base58Prefixes[MAX_BASE58_TYPES];
     std::string bech32_hrp;
     std::string strNetworkID;
+    std::string strDefaultMainchainBlockPin;
     CBlock genesis;
     std::vector<SeedSpec6> vFixedSeeds;
     bool fDefaultConsistencyChecks;
     bool fRequireStandard;
     bool fMineBlocksOnDemand;
+    int nWithdrawalBundleSendDepth = 144;
     // Legacy layout everywhere today; flips to true in the eCash-signet /
     // enforcer network params when those are locked (M1 package, S-5).
     bool fCUSFBundleFormat = false;
@@ -141,6 +153,9 @@ void UpdateChainDormantForTest(bool fDormant);
 
 /** No forks (D-2026-11-05-3): regtest and unit tests only, when each later rule switches on. */
 void UpdateLaterRuleTimes(int64_t nNotePoolTime, int64_t nDollarPoolTime);
+
+/** SA-H4: regtest only (-realclock), the real chain clock instead of block counts. */
+void UpdateClockIsHeight(bool fClockIsHeight);
 
 /** Unit tests only: the creation burn (D-2026-11-04-1, 3b) on every gram step. */
 void UpdateCreateFeeForTest(int64_t nCreateFeeSats);

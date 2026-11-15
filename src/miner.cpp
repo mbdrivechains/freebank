@@ -52,8 +52,8 @@
 
 #ifdef ENABLE_WALLET
 #include <wallet/wallet.h>
-#include <univalue.h>
 #endif
+#include <univalue.h>   // used below with or without the wallet (testing 11-11: --disable-wallet failed to build)
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -127,6 +127,7 @@ void BlockAssembler::resetBlock()
 {
     inBlock.clear();
     setBlockWithdrawalIDs.clear();
+    setBlockRateHouses.clear();
 
     // Reserve space for coinbase tx
     nBlockWeight = 4000;
@@ -317,7 +318,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
     pblock->nVersion = ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
     // -regtest only: allow overriding block.nVersion with
     // -blockversion=N to test forking scenarios
-    if (chainparams.MineBlocksOnDemand())
+    if (chainparams.NetworkIDString() == CBaseChainParams::REGTEST)   // SA-V2: by network, not MineBlocksOnDemand
         pblock->nVersion = gArgs.GetArg("-blockversion", pblock->nVersion);
 
     pblock->nTime = GetAdjustedTime();
@@ -389,6 +390,36 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
                     coinbaseTx.vout.push_back(CTxOut(0, GenerateWithdrawalBundleFailCommit(hashCurrentWithdrawalBundle)));
                 else if (cOutcome == 'S')
                     coinbaseTx.vout.push_back(CTxOut(0, GenerateWithdrawalBundleSpentCommit(hashCurrentWithdrawalBundle)));
+            }
+        }
+    }
+
+    // PG-1 (D-2026-11-13-3): count each L1 payout from slot 130 that is not the pending bundle's own payment
+    // (IsUnexpectedPayout) into the consensus shortfall. Each (m6id, L1 block) once; ConnectBlock checks each.
+    {
+        const uint256 hashMainForScan = hashMainTip.IsNull() ? bmmCache.GetLastMainBlockHash() : hashMainTip;
+        // Security's R5: a fixed look-back of 144 L1 blocks, so a payout one builder missed is added by a later one
+        // (HaveShortfall keeps each one counted once)
+        static const int SHORTFALL_LOOKBACK = 144;
+        uint256 hashScanFrom;
+        const int nScanTip = hashMainForScan.IsNull() ? -1 : bmmCache.GetMainchainBlockHeight(hashMainForScan);
+        if (nScanTip >= 0) {
+            std::vector<uint256> vFrom;
+            if (bmmCache.GetMainBlockHashesFrom(std::max(0, nScanTip - SHORTFALL_LOOKBACK), 1, vFrom) && !vFrom.empty())
+                hashScanFrom = vFrom[0];
+        }
+        L1PegEvents events;
+        if (!hashScanFrom.IsNull() &&
+                GetL1Oracle().EventsInWindow(hashScanFrom, hashMainForScan, events) == L1Answer::YES) {
+            const std::set<uint256> setPendingM6id = PendingBundleM6ids();
+            std::set<std::pair<uint256, uint256>> setAdded;
+            for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
+                if (ev.hashMainBlock.IsNull() || !IsUnexpectedPayout(ev, setPendingM6id) ||
+                        psidechaintree->HaveShortfall(ev.m6id, ev.hashMainBlock) ||
+                        !setAdded.insert(std::make_pair(ev.m6id, ev.hashMainBlock)).second)
+                    continue;
+                coinbaseTx.vout.push_back(CTxOut(0, GenerateUnexpectedPayoutCommit(ev.m6id, ev.hashMainBlock,
+                                                                                  UnexpectedPayoutAmount(ev))));
             }
         }
     }
@@ -507,7 +538,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
     //
     // Make sure we don't add too many deposit outputs
     //
-    uint64_t nAddedSize = 0;
     CAmount nFeesAdded = CAmount(0);
     // A vector of vectors of CTxOut - each vector of CTxOut contains all of the
     // outputs for one deposit. When adding / removing deposits of the coinbase
@@ -560,9 +590,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
             nFeesAdded += SIDECHAIN_DEPOSIT_FEE;
 
         // Check the block size now & remove this deposit if the block size
-        // became too large.
-        uint64_t nSize = GetVirtualTransactionSize(coinbaseTx);
-        if (nAddedSize + nSize + nBlockWeight > MAX_BLOCK_WEIGHT) {
+        // became too large. NX-38 (plain v1.2.2): in WEIGHT, the unit of
+        // MAX_BLOCK_WEIGHT and nBlockWeight. This compared the coinbase's vsize
+        // (a quarter of its weight) and added each pass's whole coinbase again
+        // through nAddedSize. The coinbase's weight already holds every deposit
+        // added so far; nBlockWeight's 4000 reserved for it is counted twice,
+        // which only errs on the safe side.
+        const uint64_t nCoinbaseWeight = GetTransactionWeight(coinbaseTx);
+        if (nCoinbaseWeight + nBlockWeight > MAX_BLOCK_WEIGHT) {
             for (size_t i = 0; i < v.size(); i++) {
                 coinbaseTx.vout.pop_back();
             }
@@ -571,7 +606,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
             break;
         }
 
-        nAddedSize += nSize;
     }
     nFees += nFeesAdded;
 
@@ -659,7 +693,26 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
     // one pooled; included, it would fail TestBlockValidity and CreateNewBlock would drop it from the pool. Skipped,
     // it waits for the binding height.
     const bool fCreditBinding = chainparams.GetConsensus().CreditBindingActive(nHeight);
+    std::set<uint32_t> setPackageRateHouses;
+    const bool fRateGuard = gArgs.GetBoolArg("-rateopguard", true);   // -rateopguard=0: regtest, the block-rule gate
     for (const CTxMemPool::txiter it : package) {
+        // D-2026-11-11-3 (R121-R2): one rate op per house per block (bad-house-rate-multiple-ops). The pool holds at
+        // most one per house, but a reorg's re-adds can leave two; then SETKEY goes first (security RS-2), so a POST
+        // waits while its house has a SETKEY pooled.
+        uint32_t nRateHouse = 0;
+        bool fRateSetKey = false;
+        if (fRateGuard && HouseRateOpOf(it->GetTx(), nRateHouse, fRateSetKey)) {
+            if (setBlockRateHouses.count(nRateHouse) || !setPackageRateHouses.insert(nRateHouse).second)
+                return false;
+            if (!fRateSetKey) {
+                for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
+                    uint32_t nTheirs = 0;
+                    bool fTheirsSetKey = false;
+                    if (HouseRateOpOf(mi->GetTx(), nTheirs, fTheirsSetKey) && fTheirsSetKey && nTheirs == nRateHouse)
+                        return false;
+                }
+            }
+        }
         if (!IsFinalTx(it->GetTx(), nHeight, nLockTimeCutoff))
             return false;
         if (!fIncludeWitness && it->GetTx().HasWitness())
@@ -694,6 +747,12 @@ void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
         std::vector<uint256> vWID;
         GetTxWithdrawalIDs(iter->GetTx(), vWID);
         setBlockWithdrawalIDs.insert(vWID.begin(), vWID.end());
+    }
+    {
+        uint32_t nRateHouse = 0;
+        bool fRateSetKey = false;
+        if (HouseRateOpOf(iter->GetTx(), nRateHouse, fRateSetKey))
+            setBlockRateHouses.insert(nRateHouse);
     }
     pblocktemplate->vTxFees.push_back(iter->GetFee());
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());

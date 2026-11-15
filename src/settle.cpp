@@ -30,6 +30,7 @@ uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevou
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankSettle/exchange");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << x.nHouseA;
     ss << x.nHouseB;
     ss << x.nMode;
@@ -65,7 +66,7 @@ bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
         return dU == 0 && amountResidual == 0;
     if (nMode != 1 || dU == 0)
         return false;
-    if ((CAmount)dU < SETTLE_MIN_RESIDUAL)
+    if (amountResidual < SETTLE_MIN_RESIDUAL_SATS)   // UR1-2 (D-2026-11-11-2): the payment, in sats
         return false;
 
     // Gold B (GOLD_B.md §3): dU is mg; the residual is sats, between |dU| at the lower bid and |dU| at the higher ask of
@@ -125,6 +126,7 @@ uint256 SettleNetSigHash(const SettleNet& n, const uint256& hashPrevouts, const 
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankSettle/net");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << n.vHouseID;
     ss << n.vReceive;
     ss << n.vPrevMintedUnits;
@@ -298,7 +300,7 @@ static bool CheckSettleNetShape(const CTransaction& tx, CValidationState& state)
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-units-range");
 
     // Payments: each net creditor in ascending house order at the front of the outputs, P2PKH, its exact amount,
-    // inside the band (which also enforces the SETTLE_MIN_RESIDUAL floor); everyone else receives nothing. The exact
+    // inside the band (which also enforces the SETTLE_MIN_RESIDUAL_SATS floor); everyone else receives nothing. The exact
     // destination (the creditor's redemption key) is contextual.
     size_t nOut = 0;
     for (size_t i = 0; i < nHouses; i++) {

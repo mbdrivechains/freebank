@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <pool.h>
+#include <house.h>   // HashNetworkTag (UR-ext-13)
 
 #include <coins.h>
 #include <consensus/validation.h>
@@ -55,6 +56,7 @@ uint256 PoolCreateSigHash(uint32_t nPoolID, uint32_t nFeeBps, uint64_t nInitNote
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankPool/create");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << nPoolID;
     ss << nFeeBps;
     ss << nInitNoteUnits;
@@ -69,6 +71,7 @@ uint256 PoolAddLiqSigHash(const PoolAddLiq& add, const uint256& hashPrevouts, co
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankPool/add");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << add.nPoolID;
     ss << add.nPriorNoteReserve;
     ss << add.amountPriorBtxReserve;
@@ -86,6 +89,7 @@ uint256 PoolRemoveLiqSigHash(const PoolRemoveLiq& rem, const uint256& hashPrevou
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankPool/remove");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << rem.nPoolID;
     ss << rem.nPriorNoteReserve;
     ss << rem.amountPriorBtxReserve;
@@ -103,6 +107,7 @@ uint256 PoolSwapSigHash(const PoolSwap& swap, const uint256& hashPrevouts, const
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankPool/swap");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << swap.nPoolID;
     ss << swap.nPriorNoteReserve;
     ss << swap.amountPriorBtxReserve;
@@ -121,6 +126,7 @@ uint256 PoolRetireSigHash(const PoolRetire& ret, const uint256& hashPrevouts, co
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankPool/retire");
+    HashNetworkTag(ss);   // UR-ext-13
     ss << ret.nPoolID;
     ss << ret.nPriorNoteReserve;
     ss << ret.amountPriorBtxReserve;
