@@ -39,6 +39,9 @@ std::string EncodeBase58(const std::vector<unsigned char>& vch);
  * return true if decoding is successful.
  * psz cannot be nullptr.
  */
+/** The longest base58 core (leading spaces and the trailing spaces it accepts not counted) DecodeBase58 will decode
+ *  (S5X-3b: the decode is quadratic in the length). */
+static const size_t MAX_BASE58_DECODE_CHARS = 256;
 bool DecodeBase58(const char* psz, std::vector<unsigned char>& vchRet);
 
 /**

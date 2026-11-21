@@ -59,6 +59,10 @@ static const CAmount DEPOSIT_DUST_VALUE = 1000;
 
 // Max receipts originated per ORIGINATE tx (bounds payload + per-tx loops).
 static const size_t MAX_DEPOSIT_OUTPUTS = 100;
+/** D-2026-11-20-1 (S2X-2, switch-on): the highest annual rate a receipt may carry at ORIGINATE, 10,000 bps (100% a
+ *  year). It throws out absurd rates, whose interest saturates at MAX_MONEY and makes the receipt unpayable; it is not a
+ *  usury cap. TRANSFER carries the terms unchanged. */
+static const uint32_t MAX_DEPOSIT_RATE_BPS = 10000;
 
 // Max term (blocks) a receipt may run: bounds the 128-bit weighted-maturity
 // accumulator magnitude and rejects absurd maturities. ~50 years at 10-min

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <house.h>
+#include <houserate.h>       // CShortfallLedger, ShortfallLedgerKey (S2X-6)
 #include <issued.h>
 
 #include <bill.h>            // MAX_BILL_TENOR_BLOCKS, LOAN_BOOK_MAX_FACE (B1)
@@ -21,6 +22,7 @@
 #include <test/sidechain_test_util.h>   // SideDBScope (the equity proof reads the bill DB)
 #include <test/test_bitcoin.h>
 #include <txdb.h>              // HouseDB (UR-ext-10)
+#include <units.h>             // CUnitsView (S2X-6)
 #include <policy/policy.h>     // IsStandardTx (MM-1)
 #include <utilstrencodings.h>
 #include <validation.h>        // HouseOverdueBills, pbilltree
@@ -2238,7 +2240,7 @@ BOOST_AUTO_TEST_CASE(testing_ur1_3_registrable_threshold_fits_hclaim)
 // (unit tests count windows in blocks).
 // The house plays the attacker with real signed ops through CheckHouseOperation, one op per block: it lets each cure
 // run to its last block, DEFERs there (attesting first when its last attestation is too old), then recovers with a
-// zero-reserve ATTEST (every note in pending swaps, so the recovery floor is 0: GPT's cheap case) on the last block
+// zero-reserve ATTEST on the last block
 // before its suspension would end. The protest is never paid. FAILS on master a00fb05 (still not Insolvent past the
 // bound). If the fix adds undo priors to ATTEST or DEFER, set them in URX12Attest / URX12Defer: a refusal of either for
 // priors, payload or signatures fails this test as a setup fault rather than passing it.
@@ -2345,7 +2347,7 @@ BOOST_AUTO_TEST_CASE(ur_ext_12_defer_recover_cycles_cannot_outrun_the_bound)
     const CPubKey pubPartner = keyPartner.GetPubKey();
     CHouse house = MakeGuardHouse();
     house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
-    house.nMintedUnits = 0;               // every note sits in pending swaps: the recovery floor is 0
+    house.nMintedUnits = 0;               // a zero-reserve ATTEST
     house.amountLastAttestReserves = 0;
 
     // A demand protested at P0 and never paid; the house attested at P0.
@@ -3038,6 +3040,88 @@ BOOST_AUTO_TEST_CASE(mm1_tag_step_worst_case_time)
         BOOST_TEST_MESSAGE("MM1-R1: the tag step on " << tx.vout.size() << " outputs and a " << ss.size()
                            << "-byte DISCOUNT payload (" << GetTransactionWeight(tx) / 4 << " vbytes) took " << dt << " us");
         BOOST_CHECK(dt >= 0);
+    }
+}
+
+
+// ===========================================================================
+// testing (2026-11-20): S2X-6 (Gemini 4 on s2 at v1.2.2; security: Medium; D-2026-11-20-2 rule 1, "A house can't wind
+// down while it owes a swap shortfall claim (one paid in the last 90 days)"). WINDDOWN checks GetHouseLiabilities
+// (minted + deposits + pending swaps), which leaves out the failed-swap shortfalls the house paid below its bid. A solo
+// house's pledge unlocks at the WINDDOWN height (no tail), so a house can pay a swap short, wind down, and take its
+// pledge before the holder's claim (which the waterfall pays only from a FAILED house) can reach it. The residual
+// settle already waits for live shortfalls (bad-house-settle-swaps-outstanding).
+// For a multi-partner house and a solo house, each with a valid partner signature: (1) control, no shortfall: WINDDOWN
+// accepted; (2) a 2,000 mg shortfall paid the block before: WINDDOWN refused; (3) the same shortfall paid just past the
+// 90-day lapse: WINDDOWN accepted (the rule bites only while the claim lives). (2) FAILS on master 457a538.
+// ===========================================================================
+BOOST_AUTO_TEST_CASE(s2x_6_winddown_refused_while_a_swap_shortfall_is_live)
+{
+    const int H = 20000;
+    const int64_t nLapse = (int64_t)Params().GetConsensus().GramAt(H).nShortfallLapseSecs / 600;   // as the settle reads it
+    BOOST_REQUIRE(nLapse > 0 && ClockAtHeight(H) - nLapse - 1 > 0);
+    struct Case { const char* name; int64_t nPaidClock; bool fRefuse; };
+    const Case cases[] = {{"control, no shortfall", -1, false},
+                          {"a shortfall paid the block before", ClockAtHeight(H - 1), true},
+                          {"a shortfall paid just past the 90-day lapse", ClockAtHeight(H) - nLapse - 1, false}};
+    for (const uint8_t nTier : {(uint8_t)HOUSE_TIER_MULTI_PARTNER, (uint8_t)HOUSE_TIER_BONDED_SOLO}) {
+        const std::string strTier = nTier == HOUSE_TIER_MULTI_PARTNER ? "multi-partner" : "solo";
+        for (const Case& c : cases) {
+            CKey keyPartner; keyPartner.MakeNewKey(true);
+            const CPubKey pubPartner = keyPartner.GetPubKey();
+            CHouse house = MakeGuardHouse();
+            house.nTier = nTier;
+            if (nTier != HOUSE_TIER_MULTI_PARTNER)
+                house.vPartner.resize(1);                                    // one issuer
+            house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
+            house.nLastAttestHeight = H;                                     // fresh: effectively Open at H
+            BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+            BOOST_REQUIRE_EQUAL(house.nMintedUnits, 0u);
+            BOOST_REQUIRE_EQUAL(house.nDepositUnits, 0u);
+
+            CUnitsView units(nullptr);
+            if (c.nPaidClock >= 0) {
+                CShortfallLedger led;
+                led.vEntry.push_back(std::make_pair(c.nPaidClock, (uint64_t)2000));
+                units.Put(ShortfallLedgerKey(house.nHouseID), led);
+            }
+            UnitsCheckScope scope(&units);
+            BOOST_REQUIRE_EQUAL(HousePendingSwapUnitsForChecks(house.nHouseID), 0u);
+            const bool fLive = HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(H), nLapse) != 0;
+            BOOST_REQUIRE_EQUAL(fLive, c.fRefuse);                          // the case is what it says
+
+            HouseWinddown wd;
+            wd.nHouseID = house.nHouseID;
+            CMutableTransaction mtx;
+            mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+            mtx.nHouseOp = HOUSE_OP_WINDDOWN;
+            mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+            mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
+            wd.vApproverIndex.push_back(0);
+            std::vector<unsigned char> vchSig;
+            BOOST_REQUIRE(keyPartner.Sign(HouseWinddownSigHash(house.houseID, BillHashOutputs(mtx)), vchSig));
+            wd.vApproverSig.push_back(vchSig);
+            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << wd;
+            mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+
+            auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+            auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+            CValidationState state; CHouse houseOut;
+            const bool fOk = CheckHouseOperation(CTransaction(mtx), state, H, fnGetHouse, GuardNoHash, GuardNoClass,
+                                                 fnNoCoin, GuardNoBlock, houseOut);
+            if (c.fRefuse) {
+                BOOST_CHECK_MESSAGE(!fOk, "S2X-6 (" + strTier + ", " + c.name + "): WINDDOWN was accepted while the house "
+                                          "owes a live swap shortfall claim (status after: " +
+                                          std::to_string((int)houseOut.status) + ")");
+                if (!fOk)
+                    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-winddown-shortfall");
+            } else {
+                BOOST_CHECK_MESSAGE(fOk, "S2X-6 control (" + strTier + ", " + c.name + "): WINDDOWN was refused: " +
+                                         state.GetRejectReason());
+                if (fOk)
+                    BOOST_CHECK_EQUAL(houseOut.status, HOUSE_STATUS_WOUNDDOWN);
+            }
+        }
     }
 }
 

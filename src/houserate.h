@@ -19,6 +19,7 @@
 #include <serialize.h>
 #include <units.h>
 
+#include <limits>
 #include <stdint.h>
 #include <string>
 
@@ -286,7 +287,7 @@ bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uin
  *  it was made at or before nActive, else the previous one if that was; with two postings since, nFallback (the swap
  *  passes its bid at demand, so re-posting twice after T_f gains the house nothing). */
 uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nActive, uint64_t nFallback,
-                         int64_t nWindowSecs);
+                         int64_t nWindowSecs, uint32_t nHeight = std::numeric_limits<uint32_t>::max());
 
 struct HouseCharter;
 /** Apply a HOUSE_OP_CHARTER (its approvers already checked) at block nHeight, clock time nNow: ADD (at most
@@ -312,9 +313,9 @@ uint64_t HouseLiveShortfallMg(const CUnitsView& units, uint32_t nHouseID, int64_
 uint64_t HouseLiveShortfallMgForChecks(uint32_t nHouseID, int64_t nClockAt, int64_t nLapseClock);
 void SwapMarkProtested(CUnitsView& units, const uint256& hashLock);
 /** Fix the swap's bid at the deadline if it isn't fixed yet: HouseBidAtActive at the deadline. */
-void SwapFixBidT(CUnitsView& units, const uint256& hashLock);
+void SwapFixBidT(CUnitsView& units, const uint256& hashLock, uint32_t nHeight);
 /** The bid at T_f a swap op at or after the deadline would fix (against the scope's view; honours the test override). */
-uint64_t SwapBidAtDeadlineForChecks(const CSwapRecord& r);
+uint64_t SwapBidAtDeadlineForChecks(const CSwapRecord& r, uint32_t nHeight);
 uint64_t HousePendingSwapUnits(const CUnitsView& units, uint32_t nHouseID);
 bool SwapRecordForChecks(const uint256& hashLock, CSwapRecord& rec);
 uint64_t HousePendingSwapUnitsForChecks(uint32_t nHouseID);

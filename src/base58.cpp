@@ -34,6 +34,14 @@ bool DecodeBase58(const char* psz, std::vector<unsigned char>& vch)
     // Skip leading spaces.
     while (*psz && isspace(*psz))
         psz++;
+    // S5X-3b: the decode below is quadratic in the length (one 520,000-character deposit destination took ~290 s,
+    // under cs_main, on every template; ConnectBlock decodes recorded deposit destinations too). The cap counts the
+    // base58 core only - up to the first space, where the decode stops - not the trailing spaces it still accepts
+    // (security 11-19: counting them refused a valid address followed by many spaces). A core over 256 characters
+    // decodes to over 180 bytes, more than any payload a caller accepts (21, 33/34 or 74 bytes plus the checksum), so
+    // refusing it changes no outcome, only the time.
+    if (strcspn(psz, " \t\n\v\f\r") > MAX_BASE58_DECODE_CHARS)
+        return false;
     // Skip and count leading '1's.
     int zeroes = 0;
     int length = 0;

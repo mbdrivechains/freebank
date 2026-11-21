@@ -241,4 +241,40 @@ BOOST_AUTO_TEST_CASE(base58_keys_invalid)
 }
 
 
+// S5X-3b: the decode is quadratic in the length, so it refuses anything longer than MAX_BASE58_DECODE_CHARS at once
+// (a 520,000-character deposit destination took ~290 s per decode). The longest real input still decodes.
+BOOST_AUTO_TEST_CASE(base58_decode_length_cap_s5x_3b)
+{
+    std::vector<unsigned char> v;
+    // 82 bytes (a BIP32 extended key plus checksum) encode to ~112 characters: well inside the cap
+    const std::vector<unsigned char> vExt(82, 0xab);
+    const std::string strExt = EncodeBase58(vExt.data(), vExt.data() + vExt.size());
+    BOOST_CHECK(strExt.size() < MAX_BASE58_DECODE_CHARS);
+    BOOST_CHECK(DecodeBase58(strExt, v) && v == vExt);
+    // exactly at the cap: decoded
+    BOOST_CHECK(DecodeBase58(std::string(MAX_BASE58_DECODE_CHARS, 'z'), v));
+    BOOST_CHECK(DecodeBase58(std::string(4, ' ') + std::string(MAX_BASE58_DECODE_CHARS, 'z'), v));   // leading spaces don't count
+    // trailing spaces don't count either (security 11-19): a valid string followed by many spaces still decodes,
+    // as it did before the cap
+    BOOST_CHECK(DecodeBase58(strExt + std::string(MAX_BASE58_DECODE_CHARS * 4, ' '), v) && v == vExt);
+    // (DecodeBase58Check is declared inline in base58.h but defined in base58.cpp, so tests can't link it; the
+    // destination decoders below go through it)
+    BOOST_CHECK(DecodeBase58(EncodeBase58Check(vExt) + std::string(1000, ' '), v) && v.size() == vExt.size() + 4);
+    CKey key;
+    key.MakeNewKey(true);
+    const CTxDestination destKey = key.GetPubKey().GetID();
+    BOOST_CHECK(DecodeDestination(EncodeDestination(destKey) + std::string(1000, ' ')) == destKey);
+    BOOST_CHECK(DecodeBase58(std::string(MAX_BASE58_DECODE_CHARS, 'z') + "\t\n " + std::string(500, ' '), v));
+    BOOST_CHECK(!DecodeBase58(std::string(MAX_BASE58_DECODE_CHARS + 1, 'z') + "   ", v));
+    // one over, and the 520,000-character case: refused, and fast
+    BOOST_CHECK(!DecodeBase58(std::string(MAX_BASE58_DECODE_CHARS + 1, 'z'), v));
+    BOOST_CHECK(!DecodeBase58(std::string(MAX_BASE58_DECODE_CHARS + 1, '1'), v));
+    const int64_t nStart = GetTimeMillis();
+    const std::string strHuge(520000, 'z');
+    BOOST_CHECK(!DecodeBase58(strHuge, v));
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(strHuge)));
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(strHuge, true /* fMainchain */)));
+    BOOST_CHECK(GetTimeMillis() - nStart < 2000);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

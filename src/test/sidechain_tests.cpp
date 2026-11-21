@@ -7,12 +7,15 @@
 #include "base58.h"
 #include "chainparams.h"
 #include "chainparamsbase.h"
+#include "consensus/consensus.h"
 #include "consensus/merkle.h"
+#include "consensus/tx_verify.h"
 #include "consensus/validation.h"
 #include "crypto/sha256.h"
 #include "key.h"
 #include "core_io.h"
 #include "mainchainaddress.h"
+#include "l1client.h"
 #include "arith_uint256.h"
 #include "consensus/params.h"
 #include <cstring>
@@ -1696,6 +1699,314 @@ BOOST_AUTO_TEST_CASE(networks_beta_and_dormant_mainnet)
     gArgs.ForceSetArg("-regtest", "0");
     gArgs.ForceSetArg("-beta", "0");
     gArgs.ForceSetArg("-mainnet", "0");
+}
+
+// testing (2026-11-19, S5X-1, external review of s5 at v1.2.2, GPT-6.1 #3; freebankd agrees on reading): a deposit
+// record's script is the serialized record written RAW after OP_RETURN AC DC F6 6F (SidechainObj::GetScript), not one
+// data push. CScript::GetSigOpCount reads past OP_RETURN, so the record's bytes are opcodes: the header's 0xAC is
+// OP_CHECKSIG, the record's first byte 'D' (0x44) pushes 68 bytes, and the rest of the depositor's address (strDest,
+// any bytes: the enforcer takes any single push) is read as opcodes. An 80-byte address of 0xAE leaves 14
+// OP_CHECKMULTISIG = 280 sigops + 1. Every new deposit's record goes into the coinbase and CheckBlock counts the
+// coinbase's legacy sigops, so about 72 such deposits put every template over MAX_BLOCK_SIGOPS_COST and the builder
+// fails each block it builds (with or without mempool transactions), while the deposits stay "new".
+//
+// The property (holds under either fix: the record as one push, or sidechain objects left out of the count): a
+// coinbase carrying 100 deposit records, whatever bytes their addresses hold, stays within the block's sigop limit.
+// FAILS on v1.2.2 / master a689ecb (the repro); passes once fixed.
+BOOST_AUTO_TEST_CASE(deposit_record_sigops_s5x_1)
+{
+    SidechainDeposit d;
+    d.nSidechain = THIS_SIDECHAIN;
+    d.strDest = std::string(80, (char)0xAE);
+    d.amtUserPayout = 0;
+    d.nBurnIndex = 0;
+    d.nTx = 1;
+    const CScript script = d.GetScript();
+    const unsigned int nPerRecord = script.GetSigOpCount(false);
+    BOOST_TEST_MESSAGE("S5X-1: one deposit record with an 80-byte 0xAE address counts as " << nPerRecord << " legacy sigops");
+
+    CMutableTransaction coinbase;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vout.push_back(CTxOut(0, CScript() << OP_TRUE));
+    for (int i = 0; i < 100; i++)
+        coinbase.vout.push_back(CTxOut(0, script));
+    const int64_t nCost = (int64_t)GetLegacySigOpCount(CTransaction(coinbase)) * WITNESS_SCALE_FACTOR;
+    BOOST_TEST_MESSAGE("S5X-1: a coinbase with 100 such records has sigop cost " << nCost << " (block limit " << MAX_BLOCK_SIGOPS_COST << ")");
+    BOOST_CHECK_MESSAGE(nCost <= MAX_BLOCK_SIGOPS_COST,
+        "S5X-1: 100 deposit records put the coinbase at sigop cost " << nCost << ", over the block limit "
+        << MAX_BLOCK_SIGOPS_COST << " (" << nPerRecord << " per record): CheckBlock refuses every such template (bad-blk-sigops)");
+}
+
+// REF-1 (D-2026-11-19-1; legal L1-L3, security S1-S5, design D1-D2): a deposit FreeBank doesn't credit becomes a
+// withdrawal row paid to an L1 script - the depositor's destination when the bundle can pay it, else the deposit
+// transaction's single other output, else none.
+namespace {
+SidechainDeposit Ref1Deposit(const std::string& strDest, CAmount amount, const std::vector<std::string>& vOtherHex)
+{
+    SidechainDeposit d;
+    d.nSidechain = THIS_SIDECHAIN;
+    d.strDest = strDest;
+    d.amtUserPayout = amount;
+    d.nBurnIndex = 0;
+    d.dtx.vout.push_back(CTxOut(amount, ScriptFromHex("b7018251")));         // the treasury output (slot 130)
+    d.dtx.vout.push_back(CTxOut(0, ScriptFromHex("6a0474657374")));           // the destination OP_RETURN
+    for (const std::string& h : vOtherHex)
+        d.dtx.vout.push_back(CTxOut(5 * COIN, ScriptFromHex(h)));
+    return d;
+}
+const std::string REF1_P2WPKH = "00140102030405060708090a0b0c0d0e0f1011121314";
+const std::string REF1_P2PKH = "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac";
+}
+
+BOOST_AUTO_TEST_CASE(ref1_make_deposit_refund_rules)
+{
+    SidechainWithdrawal r;
+
+    // Rule 1: the destination is an L1 address. The 11-04 mainnet probe's own string (0.01 ECX, slot 130).
+    const std::string strProbe = "bc1qurmk3qux4f8l95g0cakjuj0nc4pe9nmt25w6lr";
+    CScript spkProbe;
+    BOOST_REQUIRE(ParseMainchainAddressAnyFamily(strProbe, spkProbe));
+    BOOST_REQUIRE(spkProbe.size() == 22 && spkProbe[0] == OP_0);                  // P2WPKH
+    SidechainDeposit d1 = Ref1Deposit(strProbe, COIN / 100, {REF1_P2PKH});
+    CTxOut credit;
+    BOOST_REQUIRE(!GetDepositPayoutOutput(d1, credit));                            // FreeBank doesn't credit it
+    BOOST_REQUIRE(MakeDepositRefund(d1, 123, 4, r));
+    BOOST_CHECK(WithdrawalPayoutScript(r) == spkProbe);                            // paid to the address it named
+    BOOST_CHECK_EQUAL(r.amount, COIN / 100);
+    BOOST_CHECK_EQUAL(r.mainchainFee, DEPOSIT_REFUND_MAINCHAIN_FEE);
+    BOOST_CHECK(r.status == WITHDRAWAL_UNSPENT);
+    BOOST_CHECK_EQUAL(r.strRefundDestination, "refund:0000000123:000004");
+    BOOST_CHECK(IsDepositRefund(r));
+    BOOST_CHECK(!WithdrawalPayoutRefused(r));
+    std::string strReason;
+    BOOST_CHECK(CheckWithdrawalPayable(r, strReason));                             // the consensus guard agrees
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBank deposit refund") << COutPoint(d1.dtx.GetHash(), 0);
+    BOOST_CHECK(r.hashBlindTx == ss.GetHash());                                    // security S3
+    // The sentinel never decodes, so no refund request can match (design D2)
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(r.strRefundDestination)));
+
+    // Every node writes the same row whatever L1 family it probed: a P2PKH named in the main (1..) or test (m..)
+    // form, under either family, gives one stored string (prefix 0) and one id.
+    const std::vector<unsigned char> h = ParseHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    std::vector<unsigned char> vMain(1, 0), vTest(1, 111);
+    vMain.insert(vMain.end(), h.begin(), h.end());
+    vTest.insert(vTest.end(), h.begin(), h.end());
+    const bool fFamilyWas = g_fMainchainMainFamily;
+    std::set<uint256> setId;
+    std::set<std::string> setDest;
+    for (bool fMain : {true, false}) {
+        g_fMainchainMainFamily = fMain;
+        for (const std::string& strNamed : {EncodeBase58Check(vMain), EncodeBase58Check(vTest)}) {
+            BOOST_REQUIRE(MakeDepositRefund(Ref1Deposit(strNamed, COIN, {}), 50, 0, r));
+            BOOST_CHECK(WithdrawalPayoutScript(r) == ScriptFromHex(REF1_P2PKH));
+            setDest.insert(r.strDestination);
+        }
+        // and rule 2 for a P2PKH other output
+        BOOST_REQUIRE(MakeDepositRefund(Ref1Deposit("not an address", COIN, {REF1_P2PKH}), 50, 1, r));
+        setId.insert(r.GetID());
+        setDest.insert(r.strDestination);
+    }
+    g_fMainchainMainFamily = fFamilyWas;
+    BOOST_CHECK_EQUAL(setId.size(), 1U);
+    BOOST_CHECK_EQUAL(setDest.size(), 1U);
+    BOOST_CHECK(setDest.count(EncodeBase58Check(vMain)));
+
+    // Rule 2: a destination that isn't an address, and exactly one other output: paid there
+    SidechainDeposit d2 = Ref1Deposit("not an address", COIN, {REF1_P2WPKH});
+    BOOST_REQUIRE(MakeDepositRefund(d2, 123, 5, r));
+    BOOST_CHECK(WithdrawalPayoutScript(r) == ScriptFromHex(REF1_P2WPKH));
+
+    // Rule 2 needs EXACTLY one other output (design D1): two, or none, pay nobody
+    SidechainDeposit d3 = Ref1Deposit("not an address", COIN, {REF1_P2PKH, REF1_P2WPKH});
+    BOOST_CHECK(!MakeDepositRefund(d3, 123, 6, r));
+    SidechainDeposit d4 = Ref1Deposit("not an address", COIN, {});
+    BOOST_CHECK(!MakeDepositRefund(d4, 123, 7, r));
+    // ... and an OP_RETURN never counts as the other output
+    SidechainDeposit d5 = Ref1Deposit("not an address", COIN, {"6a0101"});
+    BOOST_CHECK(!MakeDepositRefund(d5, 123, 8, r));
+
+    // A deposit FreeBank credits gets no refund (security S4: GetDepositPayoutOutput is the split), including a
+    // FreeBank bech32 carrier string
+    CKey key;
+    key.MakeNewKey(true);
+    for (const std::string& strFb : {EncodeDestination(key.GetPubKey().GetID()),
+                                     EncodeMainchainCarrier(ScriptFromHex(REF1_P2WPKH))}) {
+        SidechainDeposit d6 = Ref1Deposit(strFb, COIN, {REF1_P2PKH});
+        BOOST_REQUIRE(GetDepositPayoutOutput(d6, credit));
+        BOOST_CHECK(!MakeDepositRefund(d6, 123, 9, r));
+    }
+
+    // Too little left after the fee to pay (security S1: the guard's dust test)
+    SidechainDeposit d7 = Ref1Deposit(strProbe, DEPOSIT_REFUND_MAINCHAIN_FEE + 1, {});
+    BOOST_CHECK(!MakeDepositRefund(d7, 123, 10, r));
+    SidechainDeposit d7b = Ref1Deposit(strProbe, DEPOSIT_REFUND_MAINCHAIN_FEE, {});
+    BOOST_CHECK(!MakeDepositRefund(d7b, 123, 10, r));
+
+    // A bundle's change return is never refunded; the index stays inside its 6 digits
+    SidechainDeposit d8 = Ref1Deposit(SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST, COIN, {REF1_P2PKH});
+    BOOST_CHECK(!MakeDepositRefund(d8, 123, 11, r));
+    BOOST_CHECK(!MakeDepositRefund(d1, 123, DEPOSIT_REFUND_MAX_INDEX, r));
+    BOOST_CHECK(MakeDepositRefund(d1, 123, DEPOSIT_REFUND_MAX_INDEX - 1, r));
+
+    // A pure function: the same record, height and place give the same row (DisconnectBlock erases by its id)
+    SidechainWithdrawal r2;
+    BOOST_REQUIRE(MakeDepositRefund(d1, 123, 4, r));
+    BOOST_REQUIRE(MakeDepositRefund(d1, 123, 4, r2));
+    BOOST_CHECK(r.GetID() == r2.GetID());
+}
+
+BOOST_AUTO_TEST_CASE(ref1_bundle_order_users_first_then_refunds_fifo)
+{
+    auto User = [](CAmount fee, const std::string& dest) {
+        SidechainWithdrawal w;
+        w.nSidechain = THIS_SIDECHAIN;
+        w.strDestination = dest;
+        w.strRefundDestination = "user";
+        w.amount = COIN;
+        w.mainchainFee = fee;
+        return w;
+    };
+    auto Refund = [](int nHeight, unsigned int nIndex) {
+        SidechainWithdrawal w;
+        BOOST_REQUIRE(MakeDepositRefund(Ref1Deposit("not an address", COIN + nHeight + nIndex, {REF1_P2PKH}), nHeight,
+                                        nIndex, w));
+        return w;
+    };
+    std::vector<SidechainWithdrawal> v = {Refund(200, 0), User(500, "a"), Refund(9, 3), Refund(200, 1), User(900, "b"),
+                                          Refund(10, 0)};
+    OrderWithdrawalsForBundle(v);
+    BOOST_REQUIRE_EQUAL(v.size(), 6U);
+    // Users first, highest fee first
+    BOOST_CHECK(!IsDepositRefund(v[0]) && v[0].mainchainFee == 900);
+    BOOST_CHECK(!IsDepositRefund(v[1]) && v[1].mainchainFee == 500);
+    // Then refunds, first in first out: height 9 < 10 < 200 (padded, so not "10" < "9"), then place in the block
+    BOOST_CHECK_EQUAL(v[2].strRefundDestination, "refund:0000000009:000003");
+    BOOST_CHECK_EQUAL(v[3].strRefundDestination, "refund:0000000010:000000");
+    BOOST_CHECK_EQUAL(v[4].strRefundDestination, "refund:0000000200:000000");
+    BOOST_CHECK_EQUAL(v[5].strRefundDestination, "refund:0000000200:000001");
+}
+
+// S5X-5 (security + testing 11-19): DepositNeverFitsTemplate is the builder's own test, against DepositMaxWeight
+// (-blockmaxweight, default 3,996,000) on every path - get_block_template's 300,000 cap is for mempool txs only. A
+// ~90 kB deposit fits (testing: refreshbmm recorded a 722,300-weight block); one over the limit never does.
+BOOST_AUTO_TEST_CASE(s5x_5_deposit_never_fits_template)
+{
+    SidechainDeposit d;
+    d.nSidechain = THIS_SIDECHAIN;
+    d.strDest = "not an address";
+    d.amtUserPayout = COIN;
+    d.nBurnIndex = 0;
+    d.dtx.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    BOOST_CHECK(!DepositNeverFitsTemplate(d));
+    // A ~90 kB deposit tx (a standard L1 tx can be up to 100 kB): the record carries all of it
+    d.dtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << std::vector<unsigned char>(90000, 0x01)));
+    uint64_t nWeight;
+    int64_t nSigOpsCost;
+    DepositOutputsCost(DepositCoinbaseOutputs(d), nWeight, nSigOpsCost);
+    BOOST_CHECK(nWeight + COINBASE_RESERVED_WEIGHT >= DEFAULT_BMM_BLOCK_MAX_WEIGHT);   // over get_block_template's cap
+    BOOST_CHECK_EQUAL(DepositMaxWeight(), DEFAULT_BLOCK_MAX_WEIGHT);
+    BOOST_CHECK(!DepositNeverFitsTemplate(d));                                          // but deposits aren't held to it
+    // Deposits' share is half the room after the coinbase reserve, on every path (security 11-19: deposits first must
+    // not starve packages); packages keep the other half
+    BOOST_CHECK_EQUAL(DepositCapWeight(), (DEFAULT_BLOCK_MAX_WEIGHT - COINBASE_RESERVED_WEIGHT) / 2);
+    BOOST_CHECK_EQUAL(DepositCapSigOpsCost(), (MAX_BLOCK_SIGOPS_COST - COINBASE_RESERVED_SIGOPS_COST) / 2);
+    // A smaller -blockmaxweight shrinks the share: exactly at it fits, one over never does
+    gArgs.ForceSetArg("-blockmaxweight", std::to_string(2 * nWeight + COINBASE_RESERVED_WEIGHT - 2));
+    BOOST_CHECK(DepositNeverFitsTemplate(d));
+    gArgs.ForceSetArg("-blockmaxweight", std::to_string(2 * nWeight + COINBASE_RESERVED_WEIGHT));
+    BOOST_CHECK_EQUAL(DepositCapWeight(), nWeight);
+    BOOST_CHECK(!DepositNeverFitsTemplate(d));
+    gArgs.ForceSetArg("-blockmaxweight", std::to_string(MAX_BLOCK_WEIGHT * 2));            // clamped, as the assembler does
+    BOOST_CHECK_EQUAL(DepositMaxWeight(), MAX_BLOCK_WEIGHT - 4000);
+    gArgs.ForceSetArg("-blockmaxweight", std::to_string(DEFAULT_BLOCK_MAX_WEIGHT));        // (no way to unset an arg here)
+    BOOST_CHECK_EQUAL(DepositMaxWeight(), DEFAULT_BLOCK_MAX_WEIGHT);
+}
+
+// testing (2026-11-19, S5X-2, external review of s5 at v1.2.2, GPT-6.1 #2; security rates it High): the L1 committed to
+// (L1 block, merkle root) only, so once one header for a commitment was known any peer could send copies that differ
+// in hashWithdrawalBundle or nVersion: each was cached as verified and added to the block index, at no L1 cost (repro:
+// 61 of 61 on master a689ecb). Adapted by freebankd for the fix (Michael 2026-11-19 "Yes"): the L1 now commits to
+// BMMCommitment(header), so the seeded pair is the honest header's commitment. Every variant then needs its own bid;
+// asked of the L1, it is refused. Property: one L1 commitment admits at most one header on one parent.
+BOOST_AUTO_TEST_CASE(header_variants_per_bmm_commitment_s5x_2)
+{
+    const uint256 hashL1 = GetRandHash();
+    const uint256 hashMerkle = GetRandHash();
+    uint256 hashGenesis;
+    uint32_t nTime = 0;
+    size_t nIndexBefore = 0;
+    {
+        LOCK(cs_main);
+        hashGenesis = chainActive.Genesis()->GetBlockHash();
+        nTime = (uint32_t)chainActive.Genesis()->GetBlockTime() + 600;
+        nIndexBefore = mapBlockIndex.size();
+    }
+
+    CBlockHeader header;
+    header.nVersion = 0x20000000;
+    header.hashPrevBlock = hashGenesis;
+    header.hashMerkleRoot = hashMerkle;
+    header.nTime = nTime;
+    header.hashMainchainBlock = hashL1;
+
+    bmmCache.CacheMainBlockHash(hashL1);
+    bmmCache.CacheBmmPair(hashL1, BMMCommitment(header));   // what E carries: the honest header's commitment
+    bmmCache.CacheMainBlockTime(hashL1, nTime);
+
+    // the honest header, then 50 copies differing only in hashWithdrawalBundle, then 10 differing only in nVersion
+    int nAccepted = 0;
+    std::string strFirstRefusal;
+    for (int i = 0; i < 61; i++) {
+        CBlockHeader h = header;
+        if (i >= 1 && i <= 50)
+            h.hashWithdrawalBundle = GetRandHash();
+        else if (i > 50)
+            h.nVersion = 0x20000000 + (i - 50);
+        CValidationState state;
+        if (ProcessNewBlockHeaders({h}, state, Params()))
+            nAccepted++;
+        else if (strFirstRefusal.empty())
+            strFirstRefusal = FormatStateMessage(state);
+    }
+    size_t nIndexAfter = 0;
+    {
+        LOCK(cs_main);
+        nIndexAfter = mapBlockIndex.size();
+    }
+    BOOST_TEST_MESSAGE("S5X-2: " << nAccepted << " of 61 headers accepted for ONE L1 commitment; block index grew by "
+                       << (nIndexAfter - nIndexBefore) << (strFirstRefusal.empty() ? "" : "; first refusal: " + strFirstRefusal));
+    BOOST_REQUIRE_MESSAGE(nAccepted >= 1, "the honest header was refused (" << strFirstRefusal << "): the test never reached the variants (vacuous)");
+    BOOST_CHECK_MESSAGE(nIndexAfter - nIndexBefore <= 1,
+        "S5X-2: one L1 commitment put " << (nIndexAfter - nIndexBefore) << " headers in the block index (" << nAccepted
+        << " of 61 accepted)");
+    BOOST_CHECK_EQUAL(nAccepted, 1);
+}
+
+// S5X-2: BMMCommitment covers the network and every header field the L1 block doesn't fix - nVersion, hashPrevBlock,
+// hashMerkleRoot, hashWithdrawalBundle - and leaves out the two E sets (nTime, hashMainchainBlock), so the template's
+// commitment (bid before E exists) equals the final header's.
+BOOST_AUTO_TEST_CASE(s5x_2_bmm_commitment_fields)
+{
+    CBlockHeader h;
+    h.nVersion = 0x20000000;
+    h.hashPrevBlock = GetRandHash();
+    h.hashMerkleRoot = GetRandHash();
+    h.hashWithdrawalBundle = GetRandHash();
+    const uint256 c = BMMCommitment(h);
+    BOOST_CHECK(c != h.hashMerkleRoot);
+    CBlockHeader v = h; v.nVersion++;                         BOOST_CHECK(BMMCommitment(v) != c);
+    v = h; v.hashPrevBlock = GetRandHash();                   BOOST_CHECK(BMMCommitment(v) != c);
+    v = h; v.hashMerkleRoot = GetRandHash();                  BOOST_CHECK(BMMCommitment(v) != c);
+    v = h; v.hashWithdrawalBundle = GetRandHash();            BOOST_CHECK(BMMCommitment(v) != c);
+    v = h; v.nTime = 1790000000;                              BOOST_CHECK(BMMCommitment(v) == c);
+    v = h; v.hashMainchainBlock = GetRandHash();              BOOST_CHECK(BMMCommitment(v) == c);
+    // the network: the same header on another chain's genesis commits differently
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBank BMM commitment") << uint256() << h.nVersion << h.hashPrevBlock << h.hashMerkleRoot
+       << h.hashWithdrawalBundle;
+    BOOST_CHECK(ss.GetHash() != c);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -126,7 +126,8 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
             nTxn = block.vtx.size();
             hashCreatedMerkleRoot = block.hashMerkleRoot;
             bool fNotSent = false, fConflict = false;
-            txid = SendBMMRequest(block.hashMerkleRoot, vHashMainBlock.back(), 0, amount, &fNotSent, &fConflict);
+            // S5X-2: the bid carries BMMCommitment(block), not the merkle root
+            txid = SendBMMRequest(BMMCommitment(block), vHashMainBlock.back(), 0, amount, &fNotSent, &fConflict);
             // A bid that may have gone out claims this tip, even without a
             // txid back (a timeout after the enforcer broadcast it): a second
             // bid would drop this block from the cache, and a win for it
@@ -137,7 +138,7 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
             if (!fNotSent)
                 bmmCache.StorePrevBlockBMMCreated(vHashMainBlock.back());
             if (fConflict)
-                bmmCache.MarkBidResend(vHashMainBlock.back(), block.hashMerkleRoot);
+                bmmCache.MarkBidResend(vHashMainBlock.back(), BMMCommitment(block));
             if (txid.IsNull())
                 strError = BidFailureText(fNotSent, fConflict);
             return true;
@@ -160,13 +161,13 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
         // while the enforcer did not answer was never connected (paid, no block).
         bool fUnknown = false;
         for (const CBlock& b : vBMMCache) {
-            const uint256& hashMerkleRoot = b.hashMerkleRoot;
-            const L1Answer answer = GetL1Oracle().BmmCommitment(u, hashMerkleRoot);
+            const uint256 hashCommitment = BMMCommitment(b);   // S5X-2: what our bid for b carried
+            const L1Answer answer = GetL1Oracle().BmmCommitment(u, hashCommitment);
             if (answer == L1Answer::NO)
                 continue;
             uint256 txid;
             uint32_t nTime = 0;
-            if (answer != L1Answer::YES || !VerifyBMM(u, hashMerkleRoot, txid, nTime)) {
+            if (answer != L1Answer::YES || !VerifyBMM(u, hashCommitment, txid, nTime)) {
                 fUnknown = true;
                 continue;
             }
@@ -180,7 +181,7 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
             // Submit BMM block
             if (SubmitBMMBlock(block)) {
                 hashConnected = block.GetHash();
-                hashConnectedMerkleRoot = hashMerkleRoot;
+                hashConnectedMerkleRoot = block.hashMerkleRoot;
             } else {
                 strError = "Failed to submit block with valid BMM!";
                 return false;
@@ -216,13 +217,13 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
                 nTxn = block.vtx.size();
                 hashCreatedMerkleRoot = block.hashMerkleRoot;
                 bool fNotSent = false, fConflict = false;
-                txid = SendBMMRequest(block.hashMerkleRoot, vHashMainBlock.back(), 0, amount, &fNotSent, &fConflict);
+                txid = SendBMMRequest(BMMCommitment(block), vHashMainBlock.back(), 0, amount, &fNotSent, &fConflict);
                 // See above: only a definite refusal leaves the tip open, and
                 // a conflict resends this block's bid.
                 if (!fNotSent)
                     bmmCache.StorePrevBlockBMMCreated(vHashMainBlock.back());
                 if (fConflict)
-                    bmmCache.MarkBidResend(vHashMainBlock.back(), block.hashMerkleRoot);
+                    bmmCache.MarkBidResend(vHashMainBlock.back(), BMMCommitment(block));
                 if (txid.IsNull())
                     strError = BidFailureText(fNotSent, fConflict);
             } else {
@@ -241,7 +242,7 @@ bool SidechainClient::RefreshBMM(const CAmount& amount, std::string& strError, u
                 bmmCache.GetBMMBlock(hashResendRoot, blockResend)) {
             if (MayBid()) {
                 nTxn = blockResend.vtx.size();
-                hashCreatedMerkleRoot = hashResendRoot;
+                hashCreatedMerkleRoot = blockResend.hashMerkleRoot;   // (hashResendRoot is the bid's commitment, S5X-2)
                 bool fNotSent = false, fConflict = false;
                 txid = SendBMMRequest(hashResendRoot, vHashMainBlock.back(), 0, amount, &fNotSent, &fConflict);
                 if (fConflict)

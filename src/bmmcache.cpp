@@ -1,6 +1,8 @@
 #include <bmmcache.h>
 
 #include <primitives/block.h>
+#include <chainparams.h>
+#include <hash.h>
 #include <util.h>
 
 // The main block cache (vMainBlockHash, mapMainBlock) has its own leaf mutex:
@@ -14,30 +16,41 @@ BMMCache::BMMCache()
 
 }
 
+uint256 BMMCommitment(const CBlockHeader& header)
+{
+    // S5X-2 (switch-on, from genesis): the network (its genesis hash, as UR-ext-13 names it in payload signatures) and
+    // every header field the L1 block doesn't fix. nTime and hashMainchainBlock are left out: the bid's L1 block E
+    // sets both (CheckBlockBMMTime pins nTime to E).
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBank BMM commitment") << Params().GenesisBlock().GetHash() << header.nVersion
+       << header.hashPrevBlock << header.hashMerkleRoot << header.hashWithdrawalBundle;
+    return ss.GetHash();
+}
+
 bool BMMCache::StoreBMMBlock(const CBlock& block)
 {
     LOCK_BID;
     if (!block.vtx.size())
         return false;
 
-    uint256 hashMerkleRoot = block.hashMerkleRoot;
+    const uint256 hashCommitment = BMMCommitment(block);   // S5X-2: keyed by what the bid carries
 
     // Already have block stored
-    if (mapBMMBlocks.find(hashMerkleRoot) != mapBMMBlocks.end())
+    if (mapBMMBlocks.find(hashCommitment) != mapBMMBlocks.end())
         return false;
 
-    mapBMMBlocks[hashMerkleRoot] = block;
+    mapBMMBlocks[hashCommitment] = block;
 
     return true;
 }
 
-bool BMMCache::GetBMMBlock(const uint256& hashMerkleRoot, CBlock& block)
+bool BMMCache::GetBMMBlock(const uint256& hashCommitment, CBlock& block)
 {
     LOCK_BID;
-    if (mapBMMBlocks.find(hashMerkleRoot) == mapBMMBlocks.end())
+    if (mapBMMBlocks.find(hashCommitment) == mapBMMBlocks.end())
         return false;
 
-    block = mapBMMBlocks[hashMerkleRoot];
+    block = mapBMMBlocks[hashCommitment];
 
     return true;
 }
@@ -207,6 +220,26 @@ void BMMCache::CacheMainBlockTime(const uint256& hashMainBlock, uint32_t nTime)
     if (mapMainBlockTime.size() >= MAX_MAIN_BLOCK_TIMES)
         mapMainBlockTime.clear();
     mapMainBlockTime[hashMainBlock] = nTime;
+}
+
+void BMMCache::CacheMainBlockCommitment(const uint256& hashMainBlock, bool fCommitted, const uint256& hashCommitment)
+{
+    if (hashMainBlock.IsNull())
+        return;
+    std::lock_guard<std::mutex> lock(csVerified);
+    if (mapMainBlockCommitment.size() >= MAX_MAIN_BLOCK_TIMES)
+        mapMainBlockCommitment.clear();
+    mapMainBlockCommitment[hashMainBlock] = std::make_pair(fCommitted, fCommitted ? hashCommitment : uint256());
+}
+
+bool BMMCache::GetMainBlockCommitmentAnswer(const uint256& hashMainBlock, const uint256& hashBMM, bool& fYes) const
+{
+    std::lock_guard<std::mutex> lock(csVerified);
+    const auto it = mapMainBlockCommitment.find(hashMainBlock);
+    if (it == mapMainBlockCommitment.end())
+        return false;
+    fYes = it->second.first && it->second.second == hashBMM;
+    return true;
 }
 
 bool BMMCache::HaveBmmPair(const uint256& hashMainBlock, const uint256& hashBMM) const

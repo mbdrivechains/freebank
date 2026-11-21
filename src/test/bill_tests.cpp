@@ -1785,4 +1785,123 @@ BOOST_AUTO_TEST_CASE(sa_n2_rigged_reference_house_gains_nothing)
     g_nHouseRateTestOverride = nOverridePrev;
 }
 
+// ===========================================================================
+// testing (2026-11-20): S1X-1 (external review of s1 at v1.2.2, GPT-6.1; security: Medium, a launch blocker under
+// D-2026-11-19-2). A house-held bill repays at the OWNER house's 30-day highest ask (op 7 HRETIRE),
+// and D-2026-11-11-2 rule 1's floor covers op 3 only. DISCOUNT needs the holder and the buying house's quorum, not the
+// drawee, and a house's first rate post has no rise bound. So the holder discounts the bill into its own puppet house
+// with a first ask far above the reference house's, and the drawee must pay that ask or default.
+// These cases encode freebankd's proposed rule (2026-11-20, with design; consensus, so it needs Michael's yes before it
+// is final): HRETIRE pays what op 3 pays, max(face x the REFERENCE house's 30-day highest ask, the bond). If the agreed
+// rule differs, these assertions change with it. FAIL on master 457a538 (HRETIRE at the reference price is refused
+// "bad-bill-hretire-rate"); pass once the fix lands.
+// ===========================================================================
+namespace {
+const uint32_t S1X1_REF = 5;      // the reference house the drawee named at ISSUE
+const uint32_t S1X1_PUPPET = 3;   // the holder's own house, which bought the bill at DISCOUNT
+// One op 7 HRETIRE of a 10 g bill bonded nEscrow sats, held by the puppet, naming nRate, paying the custody key nPaid.
+std::string S1X1HRetire(CAmount nEscrow, uint64_t nRate, CAmount nPaid)
+{
+    static CKey keyAcceptor, keyCustody;
+    if (!keyAcceptor.IsValid()) { keyAcceptor.MakeNewKey(true); keyCustody.MakeNewKey(true); }
+    const CAmount nFaceMg = 10000;
+    CHouse house;
+    house.nHouseID = S1X1_PUPPET;
+    house.status = HOUSE_STATUS_OPEN;
+    house.nLoanBookFace = (uint64_t)nFaceMg;
+    house.SetLoanWtMaturity((unsigned __int128)(uint64_t)nFaceMg * 8000u);
+    CBill bill;
+    bill.nBillID = 3;
+    bill.billID = uint256S("a3c1");
+    bill.amount = nFaceMg;
+    bill.amountEscrow = nEscrow;
+    bill.nIssuedHeight = 4000;
+    bill.nMaturityHeight = 8000;
+    bill.vchAcceptorPubKey = UR16Pub(keyAcceptor);
+    bill.vchHolderPubKey = UR16Pub(keyCustody);   // the custody key the discount pinned
+    bill.nRefHouseID = S1X1_REF;
+    bill.nOwnerHouseID = S1X1_PUPPET;
+    bill.status = BILL_STATUS_ACTIVE;
+    BillHRetire hr;
+    hr.nBillID = bill.nBillID;
+    hr.nOwnerHouseID = S1X1_PUPPET;
+    hr.amountFace = nFaceMg;
+    hr.nBillMaturityHeight = 8000;
+    hr.nPrevLoanBookFace = house.nLoanBookFace;
+    hr.nPrevLoanWtMatHi = house.nLoanWtMatHi;
+    hr.nPrevLoanWtMatLo = house.nLoanWtMatLo;
+    hr.nRateNamed = nRate;
+    CMutableTransaction mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
+    BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, nRate, BillHashOutputs(CTransaction(mtx))),
+                                   hr.vchAcceptorSig));
+    mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
+    return UR16Run(mtx, bill, &house);
+}
+// A units view where the reference house posts nRefRate and the puppet nPuppetRate (bid = ask, first posts).
+void S1X1Rates(CUnitsView& units, uint64_t nRefRate, uint64_t nPuppetRate)
+{
+    const int64_t T = 400 * RATE_DAY_SECONDS;
+    Consensus::GramParams gp;
+    std::string strReject;
+    AdvanceChainClock(units, UR16_HEIGHT - 20, T - 2000, gp);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, S1X1_REF, nRefRate, nRefRate, UR16_HEIGHT - 10, T - 1000, gp, strReject),
+                          "S1X-1 setup: the reference house's post was refused: " + strReject);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, S1X1_PUPPET, nPuppetRate, nPuppetRate, UR16_HEIGHT - 10, T - 1000, gp,
+                                             strReject),
+                          "S1X-1 setup: the puppet's first post was refused: " + strReject);
+    AdvanceChainClock(units, UR16_HEIGHT - 1, T, gp);
+}
+} // namespace
+
+// The attack: reference 1,000 sats per gram (the face is 10,000 sats); the puppet's first post 1,000,000 (1000x, no
+// rise bound on a first post). The drawee repays at the reference price, never at the puppet's.
+BOOST_AUTO_TEST_CASE(s1x_1_puppet_owner_house_cannot_set_the_drawee_price)
+{
+    CUnitsView units(nullptr);
+    S1X1Rates(units, 1000, 1000000);
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;   // the houses' real rates
+    {
+        UnitsCheckScope scope(&units);
+        uint64_t nBid = 0, nAsk = 0;
+        BOOST_REQUIRE(HouseRateMaxForChecks(S1X1_PUPPET, UR16_HEIGHT, 30, nBid, nAsk));
+        BOOST_REQUIRE_EQUAL(nAsk, 1000000u);   // the puppet's first post is in effect, unbounded
+        // Bond below the face's value at the reference: the face at the reference ask is what the drawee pays.
+        std::string r = S1X1HRetire(5000, 1000, 10000);
+        BOOST_CHECK_MESSAGE(r.empty(), "S1X-1: an HRETIRE paying the face at the reference house's ask (10,000 sats) on a "
+                                       "bill held by a puppet house posting 1000x was " + SAN2Said(r) +
+                                       " (the drawee must pay the puppet's ask, 10,000,000 sats, or default)");
+        r = S1X1HRetire(5000, 1000, 9999);
+        BOOST_CHECK_MESSAGE(!r.empty(), "S1X-1 control: an HRETIRE paying under the face at the reference ask was " +
+                                        SAN2Said(r));
+        // Bond above the face's value: the bond is the floor, as for op 3 (rule 1).
+        r = S1X1HRetire(50000, 1000, 50000);
+        BOOST_CHECK_MESSAGE(r.empty(), "S1X-1: an HRETIRE paying the 50,000-sat bond (above the face at the reference "
+                                       "ask) on a puppet-held bill was " + SAN2Said(r));
+        r = S1X1HRetire(50000, 1000, 49999);
+        BOOST_CHECK_MESSAGE(!r.empty(), "S1X-1 control: an HRETIRE paying under the bond was " + SAN2Said(r));
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
+}
+
+// The other direction stays shut: a drawee who rigs the REFERENCE house at 1 sat per gram still repays at least the
+// bond on a house-held bill (the owner house here is honest, 1,000).
+BOOST_AUTO_TEST_CASE(s1x_1_rigged_reference_still_pays_the_bond_on_hretire)
+{
+    CUnitsView units(nullptr);
+    S1X1Rates(units, 1, 1000);
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;
+    {
+        UnitsCheckScope scope(&units);
+        std::string r = S1X1HRetire(50000, 1, 10);
+        BOOST_CHECK_MESSAGE(!r.empty(), "S1X-1: with the reference rigged at 1 sat per gram, an HRETIRE paying 10 sats on "
+                                        "a bill bonded 50,000 was " + SAN2Said(r));
+        r = S1X1HRetire(50000, 1000, 50000);
+        BOOST_CHECK_MESSAGE(r.empty(), "S1X-1 control: an HRETIRE naming the owner's ask and paying the bond was " +
+                                       SAN2Said(r));
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
+}
+
 BOOST_AUTO_TEST_SUITE_END()

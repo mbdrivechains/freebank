@@ -123,15 +123,69 @@ BlockAssembler::Options BMMTemplateAssemblerOptions()
     return options;
 }
 
+std::vector<CTxOut> DepositCoinbaseOutputs(const SidechainDeposit& deposit)
+{
+    // The payout, if one is owed: WHETHER and of what shape belongs to GetDepositPayoutOutput and to nothing else -
+    // the validator asks the same function (two independent copies of this rule is what D-2 was). Never for a
+    // withdrawal-bundle change return ("D"): GetDepositPayoutOutput refuses it, so only its record goes in, and it is
+    // still added to the database. Then the record itself.
+    std::vector<CTxOut> vOut;
+    CTxOut depositOut;
+    if (GetDepositPayoutOutput(deposit, depositOut))
+        vOut.push_back(depositOut);
+    vOut.push_back(CTxOut(0, deposit.GetScript()));
+    return vOut;
+}
+
+void DepositOutputsCost(const std::vector<CTxOut>& vOut, uint64_t& nWeight, int64_t& nSigOpsCost)
+{
+    nWeight = 0;
+    nSigOpsCost = 0;
+    for (const CTxOut& o : vOut) {
+        nWeight += ::GetSerializeSize(o, SER_NETWORK, PROTOCOL_VERSION) * WITNESS_SCALE_FACTOR;
+        if (!o.scriptPubKey.IsUnspendable())
+            nSigOpsCost += (int64_t)o.scriptPubKey.GetSigOpCount(false) * WITNESS_SCALE_FACTOR;
+    }
+}
+
+uint64_t DepositMaxWeight()
+{
+    // The same sanity clamp the BlockAssembler constructor applies to -blockmaxweight
+    return std::max<size_t>(4000, std::min<size_t>(MAX_BLOCK_WEIGHT - 4000, DefaultOptions(Params()).nBlockMaxWeight));
+}
+
+uint64_t DepositCapWeight()
+{
+    return (DepositMaxWeight() - COINBASE_RESERVED_WEIGHT) / 2;   // DepositMaxWeight() >= 4000 (its clamp)
+}
+
+int64_t DepositCapSigOpsCost()
+{
+    return (MAX_BLOCK_SIGOPS_COST - COINBASE_RESERVED_SIGOPS_COST) / 2;
+}
+
+bool DepositNeverFitsTemplate(const SidechainDeposit& deposit)
+{
+    uint64_t nWeight;
+    int64_t nSigOpsCost;
+    DepositOutputsCost(DepositCoinbaseOutputs(deposit), nWeight, nSigOpsCost);
+    return nWeight > DepositCapWeight() || nSigOpsCost > DepositCapSigOpsCost();
+}
+
 void BlockAssembler::resetBlock()
 {
     inBlock.clear();
     setBlockWithdrawalIDs.clear();
     setBlockRateHouses.clear();
+    fDeferRateOps = false;
+    nRateReservedWeight = 0;
+    nIssuedFailed = 0;
 
     // Reserve space for coinbase tx
-    nBlockWeight = 4000;
-    nBlockSigOpsCost = 400;
+    nBlockWeight = COINBASE_RESERVED_WEIGHT;
+    nDepositReservedWeight = 0;
+    nPackageWeightLimit = nBlockMaxWeight;   // set again once deposits are reserved (CreateNewBlockOnce)
+    nBlockSigOpsCost = COINBASE_RESERVED_SIGOPS_COST;
     fIncludeWitness = false;
 
     // These counters do not include coinbase tx
@@ -347,12 +401,131 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
         fCreatedWithdrawalBundle = true;
     }
 
+    // Get list of deposits from the mainchain: every change to the treasury the
+    // L1 has, oldest first, each with what it credits (v1.0.1,
+    // DEPOSITS_664_SPEC: what a deposit added to the treasury, as the enforcer
+    // measured it; 0 for a withdrawal return).
+    SidechainClient clientDeposits;
+    std::vector<SidechainDeposit> vDeposit = clientDeposits.UpdateDeposits(uint256(), 0);
+
+    // The new ones: an L1 treasury outpoint not recorded yet (R3). Since L2L
+    // #664 the treasury is a set of outputs merged at the end of each L1 block,
+    // so records no longer chain (R2): each stands alone, and one with a
+    // problem is left out without holding back the rest (v0.2.17 A9's aim).
+    // Each is asked what the validator asks (CheckDepositWithL1, for an L1
+    // block at or before the one this block will be BMM'd in): one it would
+    // refuse, or that the L1 cannot answer for yet, waits outside this block.
+    // Before, such a record went into every template and the node refused
+    // each of its own blocks (review 2026-10-30).
+    const uint256 hashMainForDeposits = hashMainTip.IsNull() ? bmmCache.GetLastMainBlockHash() : hashMainTip;
+    std::vector<SidechainDeposit> vDepositSorted;
+    std::set<COutPoint> setNewDepositOutpoints;
+    for (const SidechainDeposit& d : vDeposit) {
+        if (d.nBurnIndex >= d.dtx.vout.size()) {
+            LogPrintf("%s: Error: new deposit has invalid burn index, left out:\n%s\n", __func__, d.ToString());
+            continue;
+        }
+        const COutPoint outpoint(d.dtx.GetHash(), d.nBurnIndex);
+        if (!setNewDepositOutpoints.insert(outpoint).second || psidechaintree->HaveDepositOutpoint(outpoint))
+            continue;
+        CAmount nCredit = 0;
+        std::string strWhy;
+        const L1Answer answer = CheckDepositWithL1(d, hashMainForDeposits, nCredit, strWhy);
+        if (answer != L1Answer::YES || nCredit != d.amtUserPayout) {
+            LogPrintf("%s: deposit %s:%u left out of this block: %s\n", __func__, outpoint.hash.ToString(), outpoint.n,
+                      answer != L1Answer::YES ? strWhy : strprintf("it credits %s, the L1 says %s",
+                                                                   FormatMoney(d.amtUserPayout), FormatMoney(nCredit)));
+            continue;
+        }
+        vDepositSorted.push_back(d);
+    }
+
+    // The sidechain's first deposit: logged per template that carries it (a
+    // rebuild before it connects logs again), never on a build without new
+    // deposits (v0.2.15 logged it on every one; v0.2.16 (e))
+    uint256 hashLastDepositID;
+    if (!vDepositSorted.empty() && !psidechaintree->GetLastDepositID(hashLastDepositID))
+        LogPrintf("%s: first deposit for this sidechain: %s (mainchain txid)\n", __func__, vDepositSorted.front().dtx.GetHash().ToString());
+
+
+    // Create deposit payout output(s)
+    //
+    // Make sure we don't add too many deposit outputs
+    //
+    CAmount nFeesAdded = CAmount(0);
+    // A vector of vectors of CTxOut - each vector of CTxOut contains all of the
+    // outputs for one deposit. When adding / removing deposits of the coinbase
+    // transaction we have to add or remove all of the outputs for a deposit.
+    std::vector<std::vector<CTxOut>> vOutPackages;
+
+    // Create the deposit outputs.
+    // We will loop through the sorted list of new deposits, double check a few
+    // things, and then create an output paying the deposit to the destination
+    // string if possible. We will also add an OP_RETURN output with the
+    // serialization of the SidechainDeposit object.
+    // (DepositCoinbaseOutputs: the payout if owed, then the record; S5X-5's window asks the same function)
+    for (const SidechainDeposit& deposit : vDepositSorted)
+        vOutPackages.push_back(DepositCoinbaseOutputs(deposit));
+
+
+    // S5X-1 / S5X-3 (switch-on; Michael 2026-11-19 "Yes, build it"; design 11-19 point 4): deposits are budgeted FIRST,
+    // before the mempool's packages, so a full mempool can't hold them off for good, and a deposit whose outputs don't
+    // fit the block's weight or sigop budget is skipped while the rest still go in (records stand alone, DEPOSITS_664
+    // R2). Before, the coinbase was filled last and one record too big for the block stopped every deposit after it.
+    std::vector<std::vector<CTxOut>> vDepositPackages;
+    uint64_t nDepositWeight = 0;
+    int64_t nDepositSigOpsCost = 0;
+    for (const auto& v : vOutPackages) {
+        uint64_t nWeight;
+        int64_t nSigOpsCost;
+        DepositOutputsCost(v, nWeight, nSigOpsCost);   // S5X-5's DepositNeverFitsTemplate counts the same way
+        // Deposits' share (DepositCapWeight / DepositCapSigOpsCost, the same on every path), not this assembler's
+        // nBlockMaxWeight: get_block_template's -bmmblockmaxweight (300,000) caps its MEMPOOL transactions only
+        // (testing 11-19: refreshbmm recorded a 722,300-weight deposit), and deposits may never take more than half the
+        // room, so cheap deposits can't keep users' transactions out of blocks (security 11-19).
+        if (nDepositWeight + nWeight > DepositCapWeight() || nDepositSigOpsCost + nSigOpsCost > DepositCapSigOpsCost()) {
+            LogPrintf("%s: a deposit left out of this block: its outputs (weight %u, sigop cost %d) don't fit\n",
+                      __func__, nWeight, nSigOpsCost);
+            continue;
+        }
+        nBlockWeight += nWeight;
+        nBlockSigOpsCost += nSigOpsCost;
+        nDepositWeight += nWeight;
+        nDepositSigOpsCost += nSigOpsCost;
+        vDepositPackages.push_back(v);
+    }
+    // What packages (clock txs included) may fill to: this path's cap on packages alone, and -blockmaxweight overall.
+    // Deposits take at most half the room after the reserve, so packages keep at least the other half (or this path's
+    // smaller cap).
+    nDepositReservedWeight = nDepositWeight;
+    nPackageWeightLimit = std::min<uint64_t>(nBlockMaxWeight + nDepositReservedWeight, DepositMaxWeight());
+
     int nPackagesSelected = 0;
     int nDescendantsUpdated = 0;
     std::vector<CTxMemPool::txiter> vRefund;
     if (!fNoMempoolTxs) {
+        // S2X-1: the template's issued ops are checked in order against the units state they build, on the tip only
+        // (these views hold the tip's state). Both views live for this pass; the pointers are cleared after it.
+        CUnitsView unitsTemplate(punitsdb.get());
+        CCoinsViewMemPool viewTemplateBase(pcoinsTip.get(), mempool);
+        CCoinsViewCache viewTemplate(&viewTemplateBase);
+        if (pindexPrev == chainActive.Tip()) {
+            pTemplateUnits = &unitsTemplate;
+            pTemplateCoins = &viewTemplate;
+        }
+        // S1X-4: rate ops (and packages holding one) wait for the last pass, which keeps a little room of its own
+        ReserveRateWeight();
+        fDeferRateOps = true;
         addClockTxs(nPackagesSelected);
         addPackageTxs(nPackagesSelected, nDescendantsUpdated, vRefund, !fCreatedWithdrawalBundle /* fIncludeRefunds */);
+        fDeferRateOps = false;
+        nPackageWeightLimit += nRateReservedWeight;
+        nRateReservedWeight = 0;
+        addRateTxs(nPackagesSelected);
+        if (nIssuedFailed > 10)
+            LogPrintf("%s: skipped %d token packages whose issued ops didn't follow the template's\n", __func__, nIssuedFailed);
+        pTemplateUnits = nullptr;
+        pTemplateCoins = nullptr;
     }
 
     int64_t nTime1 = GetTimeMicros();
@@ -366,8 +539,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
     coinbaseTx.vin[0].prevout.SetNull();
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = scriptPubKeyIn;
-
-    SidechainClient client;
 
     // Create Withdrawal Bundle status updates
     // Lookup the current Withdrawal Bundle
@@ -488,125 +659,32 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlockOnce(const CScript
         }
     }
 
-    // Get list of deposits from the mainchain: every change to the treasury the
-    // L1 has, oldest first, each with what it credits (v1.0.1,
-    // DEPOSITS_664_SPEC: what a deposit added to the treasury, as the enforcer
-    // measured it; 0 for a withdrawal return).
-    std::vector<SidechainDeposit> vDeposit = client.UpdateDeposits(uint256(), 0);
-
-    // The new ones: an L1 treasury outpoint not recorded yet (R3). Since L2L
-    // #664 the treasury is a set of outputs merged at the end of each L1 block,
-    // so records no longer chain (R2): each stands alone, and one with a
-    // problem is left out without holding back the rest (v0.2.17 A9's aim).
-    // Each is asked what the validator asks (CheckDepositWithL1, for an L1
-    // block at or before the one this block will be BMM'd in): one it would
-    // refuse, or that the L1 cannot answer for yet, waits outside this block.
-    // Before, such a record went into every template and the node refused
-    // each of its own blocks (review 2026-10-30).
-    const uint256 hashMainForDeposits = hashMainTip.IsNull() ? bmmCache.GetLastMainBlockHash() : hashMainTip;
-    std::vector<SidechainDeposit> vDepositSorted;
-    std::set<COutPoint> setNewDepositOutpoints;
-    for (const SidechainDeposit& d : vDeposit) {
-        if (d.nBurnIndex >= d.dtx.vout.size()) {
-            LogPrintf("%s: Error: new deposit has invalid burn index, left out:\n%s\n", __func__, d.ToString());
-            continue;
-        }
-        const COutPoint outpoint(d.dtx.GetHash(), d.nBurnIndex);
-        if (!setNewDepositOutpoints.insert(outpoint).second || psidechaintree->HaveDepositOutpoint(outpoint))
-            continue;
-        CAmount nCredit = 0;
-        std::string strWhy;
-        const L1Answer answer = CheckDepositWithL1(d, hashMainForDeposits, nCredit, strWhy);
-        if (answer != L1Answer::YES || nCredit != d.amtUserPayout) {
-            LogPrintf("%s: deposit %s:%u left out of this block: %s\n", __func__, outpoint.hash.ToString(), outpoint.n,
-                      answer != L1Answer::YES ? strWhy : strprintf("it credits %s, the L1 says %s",
-                                                                   FormatMoney(d.amtUserPayout), FormatMoney(nCredit)));
-            continue;
-        }
-        vDepositSorted.push_back(d);
-    }
-
-    // The sidechain's first deposit: logged per template that carries it (a
-    // rebuild before it connects logs again), never on a build without new
-    // deposits (v0.2.15 logged it on every one; v0.2.16 (e))
-    uint256 hashLastDepositID;
-    if (!vDepositSorted.empty() && !psidechaintree->GetLastDepositID(hashLastDepositID))
-        LogPrintf("%s: first deposit for this sidechain: %s (mainchain txid)\n", __func__, vDepositSorted.front().dtx.GetHash().ToString());
-
-
-    // Create deposit payout output(s)
-    //
-    // Make sure we don't add too many deposit outputs
-    //
-    CAmount nFeesAdded = CAmount(0);
-    // A vector of vectors of CTxOut - each vector of CTxOut contains all of the
-    // outputs for one deposit. When adding / removing deposits of the coinbase
-    // transaction we have to add or remove all of the outputs for a deposit.
-    std::vector<std::vector<CTxOut>> vOutPackages;
-
-    // Create the deposit outputs.
-    // We will loop through the sorted list of new deposits, double check a few
-    // things, and then create an output paying the deposit to the destination
-    // string if possible. We will also add an OP_RETURN output with the
-    // serialization of the SidechainDeposit object.
-    for (const SidechainDeposit& deposit : vDepositSorted) {
-        // Outputs created to payout this deposit - to be added to vOutPackages
-        std::vector<CTxOut> vOut;
-
-        // Special case for Withdrawal Bundle change return. We don't pay anyone this deposit
-        // but it still must be added to the database.
-        if (deposit.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST) {
-            vOut.push_back(CTxOut(0, deposit.GetScript()));
-            // Add this deposits output to the vector of deposit outputs
-            vOutPackages.push_back(vOut);
-            continue;
-        }
-
-        // Payout deposit. The decision of WHETHER a payout is owed, and of what
-        // shape, belongs to GetDepositPayoutOutput and to nothing else - the
-        // validator asks the same function. Two independent copies of this rule
-        // is what D-2 was.
-        CTxOut depositOut;
-        if (GetDepositPayoutOutput(deposit, depositOut))
-            vOut.push_back(depositOut);
-
-        // Add serialization of deposit
-        vOut.push_back(CTxOut(0, deposit.GetScript()));
-
-        // Add this deposits outputs to the vector of deposit outputs
-        vOutPackages.push_back(vOut);
-    }
-
-    if (vOutPackages.size())
-        LogPrintf("%s: Created deposit outputs for: %u deposits!\n", __func__, vOutPackages.size());
-
-    for (const auto& v : vOutPackages) {
-        // Add all of the outputs for this deposit to the coinbase tx
+    // Add the deposits budgeted before the packages (S5X-3: above). The coinbase also carries the commits, any
+    // bundle data and refunds, so check the finished coinbase once more and drop deposits from the end until it fits.
+    // nBlockWeight / nBlockSigOpsCost already hold the deposits' reservation (and 4000 / 400 for the coinbase), while
+    // the coinbase's own weight and sigops now hold the deposits: count them once.
+    for (const auto& v : vDepositPackages) {
         for (const CTxOut& o : v)
             coinbaseTx.vout.push_back(o);
-
         // If this deposit has a payout output, it had to pay a fee
         if (v.size() > 1)
             nFeesAdded += SIDECHAIN_DEPOSIT_FEE;
-
-        // Check the block size now & remove this deposit if the block size
-        // became too large. NX-38 (plain v1.2.2): in WEIGHT, the unit of
-        // MAX_BLOCK_WEIGHT and nBlockWeight. This compared the coinbase's vsize
-        // (a quarter of its weight) and added each pass's whole coinbase again
-        // through nAddedSize. The coinbase's weight already holds every deposit
-        // added so far; nBlockWeight's 4000 reserved for it is counted twice,
-        // which only errs on the safe side.
-        const uint64_t nCoinbaseWeight = GetTransactionWeight(coinbaseTx);
-        if (nCoinbaseWeight + nBlockWeight > MAX_BLOCK_WEIGHT) {
-            for (size_t i = 0; i < v.size(); i++) {
-                coinbaseTx.vout.pop_back();
-            }
-            if (v.size() > 1)
-                nFeesAdded -= SIDECHAIN_DEPOSIT_FEE;
-            break;
-        }
-
     }
+    while (!vDepositPackages.empty()) {
+        const uint64_t nCoinbaseWeight = GetTransactionWeight(coinbaseTx);
+        const int64_t nCoinbaseSigOpsCost = WITNESS_SCALE_FACTOR * (int64_t)GetLegacySigOpCount(CTransaction(coinbaseTx));
+        if (nCoinbaseWeight + nBlockWeight - nDepositWeight <= MAX_BLOCK_WEIGHT &&
+                nCoinbaseSigOpsCost + nBlockSigOpsCost - nDepositSigOpsCost <= MAX_BLOCK_SIGOPS_COST)
+            break;
+        const std::vector<CTxOut>& v = vDepositPackages.back();
+        for (size_t i = 0; i < v.size(); i++)
+            coinbaseTx.vout.pop_back();
+        if (v.size() > 1)
+            nFeesAdded -= SIDECHAIN_DEPOSIT_FEE;
+        vDepositPackages.pop_back();
+    }
+    if (vDepositPackages.size())
+        LogPrintf("%s: Created deposit outputs for: %u deposits!\n", __func__, vDepositPackages.size());
     nFees += nFeesAdded;
 
     coinbaseTx.vout[0].nValue = nFees;
@@ -660,7 +738,7 @@ void BlockAssembler::onlyUnconfirmed(CTxMemPool::setEntries& testSet)
 bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost) const
 {
     // TODO: switch to weight-based accounting for packages instead of vsize-based accounting.
-    if (nBlockWeight + WITNESS_SCALE_FACTOR * packageSize >= nBlockMaxWeight)
+    if (nBlockWeight + WITNESS_SCALE_FACTOR * packageSize >= nPackageWeightLimit)   // S5X-5: deposits' share apart
         return false;
     if (nBlockSigOpsCost + packageSigOpsCost >= MAX_BLOCK_SIGOPS_COST)
         return false;
@@ -696,6 +774,15 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
     std::set<uint32_t> setPackageRateHouses;
     const bool fRateGuard = gArgs.GetBoolArg("-rateopguard", true);   // -rateopguard=0: regtest, the block-rule gate
     for (const CTxMemPool::txiter it : package) {
+        // S1X-4: in the clock and fee-rate passes a package holding a rate op (as the tx or an ancestor) is left for
+        // addRateTxs, which adds only the rate op and its ancestors: its descendants wait for the next block, since
+        // after the post they could read the new rate where ATMP checked them against the tip's.
+        if (fDeferRateOps) {
+            uint32_t nDeferHouse = 0;
+            bool fDeferSetKey = false;
+            if (HouseRateOpOf(it->GetTx(), nDeferHouse, fDeferSetKey))
+                return false;
+        }
         // D-2026-11-11-3 (R121-R2): one rate op per house per block (bad-house-rate-multiple-ops). The pool holds at
         // most one per house, but a reorg's re-adds can leave two; then SETKEY goes first (security RS-2), so a POST
         // waits while its house has a SETKEY pooled.
@@ -737,6 +824,50 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             }
         }
     }
+    return true;
+}
+
+bool BlockAssembler::TestPackageIssued(const std::vector<CTxMemPool::txiter>& sortedEntries)
+{
+    // S2X-1 (plain; external s1/s2, High; security 11-20: "for the class"). ATMP checks an issued op against the
+    // confirmed units state only, so two pooled ops can each be valid and still not both fit one block: two MINTs past
+    // the supply cap, a FREEZE and a spend of its target, two liquidity changes on one pool (C6, UR-ext-8, S2X-1). The
+    // ATMP guards keep each known pair apart; this is the template-side half for the whole family. Each package's
+    // issued-version txs run in block order on a copy of the template's units state, which moves on only if every one
+    // passes, so a package that can't follow what the template already holds is skipped (its descendants with it),
+    // instead of failing the template and costing one eviction a try until the block is built from no pool txs.
+    if (!pTemplateUnits || !pTemplateCoins)
+        return true;
+    bool fIssued = false;
+    for (const CTxMemPool::txiter it : sortedEntries) {
+        if (it->GetTx().nVersion == TRANSACTION_TOKEN_VERSION) {
+            fIssued = true;
+            break;
+        }
+    }
+    if (!fIssued)
+        return true;
+    // No cap on failures (security 11-20): one would let a class of pair the ATMP guards miss shut every later token op
+    // out of the block. Each failure costs one ConnectIssuedTx under the signature cache - what the stale sweep already
+    // spends on every pooled token op at each tip - and the pool bounds how many there are.
+    // Applied in place under a journal and undone if any tx fails (testing 11-20: a copy of the view per package was
+    // quadratic in the keys earlier packages wrote, ~1 s for 2,000 pooled BURNs).
+    pTemplateUnits->BeginJournal();
+    FbSigCacheScope sigCache;   // UR3-4: the issuer signatures ATMP verified come from the signature cache
+    for (const CTxMemPool::txiter it : sortedEntries) {
+        const CTransaction& tx = it->GetTx();
+        if (tx.nVersion != TRANSACTION_TOKEN_VERSION)
+            continue;
+        CValidationState state;
+        if (!ConnectIssuedTx(tx, *pTemplateCoins, *pTemplateUnits, nHeight, state)) {
+            pTemplateUnits->RollBackJournal();
+            if (++nIssuedFailed <= 10)   // the first few per template; the count says the rest
+                LogPrintf("%s: skipping %s: its issued op doesn't follow the template's (%s)\n", __func__,
+                          tx.GetHash().ToString(), FormatStateMessage(state));
+            return false;
+        }
+    }
+    pTemplateUnits->CommitJournal();
     return true;
 }
 
@@ -861,7 +992,9 @@ void BlockAssembler::addClockTxs(int &nPackagesSelected)
     });
 
     // Half the block at most: the fee-rate pass keeps room for everything else.
-    const uint64_t nClockMaxWeight = nBlockWeight + (nBlockMaxWeight - nBlockWeight) / 2;
+    // (nPackageWeightLimit >= nBlockWeight here: deposits leave at least half the room; against nBlockMaxWeight this
+    // underflowed once deposits passed get_block_template's 300,000 cap)
+    const uint64_t nClockMaxWeight = nBlockWeight + (nPackageWeightLimit - nBlockWeight) / 2;
     uint64_t nNoLimit = std::numeric_limits<uint64_t>::max();
     std::string dummy;
     for (CTxMemPool::txiter iter : vClock) {
@@ -895,6 +1028,96 @@ void BlockAssembler::addClockTxs(int &nPackagesSelected)
 
         std::vector<CTxMemPool::txiter> sortedEntries;
         SortForBlock(package, iter, sortedEntries);
+        if (!TestPackageIssued(sortedEntries))   // S2X-1
+            continue;
+        for (CTxMemPool::txiter it : sortedEntries)
+            AddToBlock(it);
+        ++nPackagesSelected;
+    }
+}
+
+void BlockAssembler::ReserveRateWeight()
+{
+    // S1X-4 (security 11-20): without room of its own a house's post never lands once the other passes fill the
+    // block, whatever fee it pays, and the house goes stale - a lever the house can't outbid. Reserve the pooled rate
+    // ops' own weight, at most RATE_PASS_MAX_RESERVED_WEIGHT, out of the packages' share.
+    uint64_t nWeight = 0;
+    for (CTxMemPool::txiter it = mempool.mapTx.begin(); it != mempool.mapTx.end(); ++it) {
+        uint32_t nHouse = 0;
+        bool fSetKey = false;
+        if (HouseRateOpOf(it->GetTx(), nHouse, fSetKey))
+            nWeight += WITNESS_SCALE_FACTOR * it->GetTxSize();
+        if (nWeight >= RATE_PASS_MAX_RESERVED_WEIGHT)
+            break;
+    }
+    nRateReservedWeight = std::min<uint64_t>(nWeight, RATE_PASS_MAX_RESERVED_WEIGHT);
+    nRateReservedWeight = std::min<uint64_t>(nRateReservedWeight, nPackageWeightLimit > nBlockWeight ? (nPackageWeightLimit - nBlockWeight) / 4 : 0);
+    nPackageWeightLimit -= nRateReservedWeight;
+}
+
+void BlockAssembler::addRateTxs(int &nPackagesSelected)
+{
+    // S1X-4 (plain; external s1/s2 Gemini retry, High): a rate POST counts in its house's 30-day highest ask at its own
+    // height, so placed before a same-house ASK30 reader (a bill repaid at exactly the old ask, a MINT or DISCOUNT near
+    // the cap) it made that reader fail, though ATMP had checked it against the tip: eleven such readers emptied every
+    // block and the post itself was never mined. Rate ops (POST and SETKEY, one per house) go last, after every reader,
+    // with their unconfirmed ancestors, highest fee rate first. (D-2026-11-20-2 makes the order irrelevant at switch-on.)
+    std::vector<CTxMemPool::txiter> vRate;
+    for (CTxMemPool::txiter it = mempool.mapTx.begin(); it != mempool.mapTx.end(); ++it) {
+        uint32_t nHouse = 0;
+        bool fSetKey = false;
+        if (!inBlock.count(it) && HouseRateOpOf(it->GetTx(), nHouse, fSetKey))
+            vRate.push_back(it);
+    }
+    if (vRate.empty())
+        return;
+    std::sort(vRate.begin(), vRate.end(), [](CTxMemPool::txiter a, CTxMemPool::txiter b) {
+        // a's ancestor fee rate > b's, cross-multiplied (sizes are small; 128 bits)
+        const unsigned __int128 lhs = (unsigned __int128)std::max<CAmount>(a->GetModFeesWithAncestors(), 0) * (uint64_t)b->GetSizeWithAncestors();
+        const unsigned __int128 rhs = (unsigned __int128)std::max<CAmount>(b->GetModFeesWithAncestors(), 0) * (uint64_t)a->GetSizeWithAncestors();
+        if (lhs != rhs) return lhs > rhs;
+        return a->GetTx().GetHash() < b->GetTx().GetHash();
+    });
+
+    uint64_t nNoLimit = std::numeric_limits<uint64_t>::max();
+    std::string dummy;
+    for (CTxMemPool::txiter iter : vRate) {
+        if (inBlock.count(iter))
+            continue;
+        CTxMemPool::setEntries package;
+        mempool.CalculateMemPoolAncestors(*iter, package, nNoLimit, nNoLimit, nNoLimit, nNoLimit, dummy, false);
+        onlyUnconfirmed(package);
+        package.insert(iter);
+
+        uint64_t nSize = 0;
+        int64_t nSigOps = 0;
+        CAmount nPackageFees = 0;
+        bool fRefund = false;
+        bool fCreditAncestor = false;
+        for (CTxMemPool::txiter it : package) {
+            nSize += it->GetTxSize();
+            nSigOps += it->GetSigOpCost();
+            nPackageFees += it->GetModifiedFee();
+            fRefund |= it->IsWithdrawalRefund();
+            fCreditAncestor |= (it != iter && IsCreditBindingVersion(it->GetTx().nVersion));
+        }
+        if (fRefund)
+            continue;
+        // Security 11-20: an unconfirmed credit op under a rate op would land after posts this pass has already
+        // placed, where it could read another house's new ask; such a rate op waits for the next block.
+        if (fCreditAncestor)
+            continue;
+        if (nPackageFees < blockMinFeeRate.GetFee(nSize))
+            continue;
+        if (!TestPackage(nSize, nSigOps))
+            continue;
+        if (!TestPackageTransactions(package))
+            continue;
+
+        std::vector<CTxMemPool::txiter> sortedEntries;
+        SortForBlock(package, iter, sortedEntries);
+        if (!TestPackageIssued(sortedEntries))
+            continue;
         for (CTxMemPool::txiter it : sortedEntries)
             AddToBlock(it);
         ++nPackagesSelected;
@@ -1048,7 +1271,7 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
             ++nConsecutiveFailed;
 
             if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES && nBlockWeight >
-                    nBlockMaxWeight - 4000) {
+                    nPackageWeightLimit - 4000) {
                 // Give up if we're close to full and haven't succeeded in a while
                 break;
             }
@@ -1092,12 +1315,22 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
             continue;
         }
 
-        // This transaction will make it in; reset the failed counter.
-        nConsecutiveFailed = 0;
-
         // Package can be added. Sort the entries in a valid order.
         std::vector<CTxMemPool::txiter> sortedEntries;
         SortForBlock(ancestors, iter, sortedEntries);
+
+        // S2X-1: its issued ops must follow the template's
+        if (!TestPackageIssued(sortedEntries)) {
+            if (fUsingModified) {
+                mapModifiedTx.get<ancestor_score>().erase(modit);
+                failedTx.insert(iter);
+            }
+            ++nConsecutiveFailed;   // security 11-20 (S2X-1b): counted like a package that doesn't fit
+            continue;
+        }
+
+        // This transaction will make it in; reset the failed counter.
+        nConsecutiveFailed = 0;
 
         for (size_t i=0; i<sortedEntries.size(); ++i) {
             // Keep track of withdrawal refunds that are added

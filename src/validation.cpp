@@ -35,6 +35,7 @@
 #include <reverse_iterator.h>
 #include <script/script.h>
 #include <script/sigcache.h>
+#include <mainchainaddress.h>
 #include <script/standard.h>
 #include <bill.h>
 #include <houserate.h>
@@ -1399,6 +1400,10 @@ static void EvictStaleHouseNoteOps()
 
         auto fnGetPool = [](uint32_t nID, CPool& pool) { return ppooltree->GetPool(nID, pool); };
 
+        // S2X-7: the coins ConnectIssuedTx reads, and the live pooled MINTs per token for the room check after the scan
+        CCoinsViewCache viewIssuedStale(&viewMempool);
+        std::map<uint256, std::vector<std::tuple<int64_t, uint256, uint64_t, CTransactionRef>>> mapMints;
+
         for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
             const CTransaction& mtx = mi->GetTx();
             const bool fHouseTx = (mtx.nVersion == TRANSACTION_HOUSE_VERSION);
@@ -1414,7 +1419,8 @@ static void EvictStaleHouseNoteOps()
             // codebase's own lesson applies verbatim - do NOT enumerate
             // staleness causes; re-run the real contextual check at tip+1.
             const bool fBillTx = (mtx.nVersion == TRANSACTION_BILL_VERSION);
-            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fBillTx)
+            const bool fTokenTx = (mtx.nVersion == TRANSACTION_TOKEN_VERSION);   // S2X-7
+            if (!fHouseTx && !fNoteTx && !fDepositTx && !fPoolTx && !fSettleTx && !fBillTx && !fTokenTx)
                 continue;
 
             CValidationState stateStale;
@@ -1500,8 +1506,42 @@ static void EvictStaleHouseNoteOps()
                     fStale = true;
             }
 
+            // S2X-7 (plain; external s1/s2 Gemini retry, Medium): a token op's (v18) units-state checks, and a CHARTER's,
+            // live in ConnectIssuedTx, which none of the family checks above runs. A block from another producer or a
+            // reorg left pooled ones that no longer connect, with no input conflict (a MINT whose room a confirmed MINT
+            // took, a second POOL_CREATE, a frozen flow a FREEZE changed), and each cost a template eviction. Re-run it at
+            // tip+1 on a fresh units view, as ATMP does at admission.
+            if (!fStale && (fTokenTx || (fHouseTx && mtx.nHouseOp == HOUSE_OP_CHARTER))) {
+                CUnitsView unitsStale(punitsdb.get());
+                if (!ConnectIssuedTx(mtx, viewIssuedStale, unitsStale, nNextHeight, stateStale))
+                    fStale = true;
+            }
+            if (!fStale && fTokenTx && mtx.nIssuedOp == ISSUED_OP_MINT) {
+                IssuedMint mint;
+                if (DecodeIssuedPayload(mtx.vchIssuedPayload, mint))
+                    mapMints[mint.tokenID].emplace_back(mi->GetTime(), mtx.GetHash(), mint.nUnits, mi->GetSharedTx());
+            }
+
             if (fStale)
                 vEvict.push_back(std::make_pair(mi->GetSharedTx(), stateStale.GetRejectReason()));
+        }
+
+        // S2X-1 / S2X-7: each MINT that still connects fits alone, but a block from another producer can leave the
+        // token's pooled MINTs over its room together (ATMP's guard saw only the MINTs this node held). Keep them
+        // first-seen until the room is used up and evict the rest, so the pool holds only MINTs that fit together.
+        for (auto& p : mapMints) {
+            CIssuedToken token;
+            CUnitsView unitsRoom(punitsdb.get());
+            if (!unitsRoom.Get(IssuedTokenKey(p.first), token))
+                continue;
+            uint64_t nRoom = (uint64_t)MAX_MONEY - std::min<uint64_t>(token.nSupply, MAX_MONEY);
+            std::sort(p.second.begin(), p.second.end());   // entry time, then txid
+            for (const auto& m : p.second) {
+                if (std::get<2>(m) <= nRoom)
+                    nRoom -= std::get<2>(m);
+                else
+                    vEvict.push_back(std::make_pair(std::get<3>(m), std::string("issued-mint-supply-pending")));
+            }
         }
     }
     for (const std::pair<CTransactionRef, std::string>& e : vEvict) {
@@ -2010,6 +2050,9 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 }
                 setTxWithdrawalIDs.insert(wid);
             }
+            // REF-1: the deposit-refund sentinel is the node's own (the block rule refuses it too)
+            if (IsDepositRefund(*withdrawal))
+                return state.DoS(100, false, REJECT_INVALID, "bad-withdrawal-refund-sentinel");
             // Poison-row guard (v0.2.13): no withdrawal the mainchain
             // could never pay. Checked for the next block's height, like the
             // block rule in ConnectBlock. DoS 0: a not-yet-upgraded node may
@@ -2081,6 +2124,21 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             CUnitsView unitsCheck(punitsdb.get());
             if (!ConnectIssuedTx(tx, view, unitsCheck, GetSpendHeight(view), state))
                 return error("%s: ConnectIssuedTx: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+            // S2X-1 (plain; external s1/s2, High; the UR-ext-8 class): ConnectIssuedTx counts this MINT against the
+            // confirmed supply only, so MINTs of one token that each fit but not together all pooled, and every template
+            // failed: eleven of them emptied blocks, and the dropped ones could be resent for nothing. Now a MINT must fit
+            // with every pooled MINT of its token too (unitsCheck's supply already includes this one). First-seen, DoS 0:
+            // two nodes can pool different MINTs, and the template skips whichever no longer fits after a block.
+            // -mintpendingguard=0 (regtest only) turns this off, so a gate can show the template skip alone.
+            if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_MINT &&
+                    gArgs.GetBoolArg("-mintpendingguard", true)) {
+                IssuedMint mint;
+                CIssuedToken token;
+                if (DecodeIssuedPayload(tx.vchIssuedPayload, mint) && unitsCheck.Get(IssuedTokenKey(mint.tokenID), token) &&
+                        pool.PendingMintUnits(mint.tokenID) > (uint64_t)MAX_MONEY - std::min<uint64_t>(token.nSupply, MAX_MONEY))
+                    return state.DoS(0, false, REJECT_INVALID, "issued-mint-supply-pending", false,
+                                     "pooled mints of this token leave no room for these units; try again after the next block");
+            }
         }
         // UR-ext-8 (plain v1.2.2; external s3 v2, High): a pooled FREEZE and a pooled spend of one of its targets can't
         // share a template: whichever comes second fails, the template drops one bad tx per retry, and an issuer with
@@ -3545,6 +3603,31 @@ static int RefHouseAnchor(uint32_t nRefHouseID, int nHeight, const std::function
     return (int)HouseInsolventSince(ref, nHeight);
 }
 
+/** D-2026-11-20-1 (S1X-1, switch-on): a bill repays at one price whoever holds it. The part paid in sECX (nRestMg: the
+ *  face, or what notes burned at par leave of it) is owed at the bill's REFERENCE house's 30-day highest ask (anchored at
+ *  its failure; nRefHouseID is in the drawee-signed issue digest), and at least that part's share of the bond,
+ *  ceil(bond x rest / face) - the whole bond when it is the whole face (SA-N2, D-2026-11-11-2 rule 1). Ops 3, 7, 9 and
+ *  10. The owner house's ask counts nowhere: a holder could move a bill into a house of its own and post any first ask,
+ *  or defer that house to push the drawee onto op 10 (external s1 review, GPT-6.1; design's ops 9/10 extension). */
+static bool BillRepaymentOwed(const CBill& bill, uint64_t nRestMg, uint64_t nRateNamed, int nHeight,
+                              const std::function<bool(uint32_t, CHouse&)>& fnGetHouse, CValidationState& state,
+                              const std::string& strPrefix, CAmount& amountOwed)
+{
+    amountOwed = 0;
+    if (nRestMg == 0)
+        return true;
+    uint64_t nPrice = 0;
+    if (!BoundHouseRate(bill.nRefHouseID, nRateNamed, nHeight, HouseRateKind::ASK30, state, strPrefix, nPrice,
+                        RefHouseAnchor(bill.nRefHouseID, nHeight, fnGetHouse)))
+        return false;
+    CAmount amountBondShare = std::max<CAmount>(bill.amountEscrow, 0);
+    if (bill.amount > 0 && nRestMg < (uint64_t)bill.amount)
+        amountBondShare = (CAmount)(((unsigned __int128)(uint64_t)amountBondShare * nRestMg + (uint64_t)bill.amount - 1) /
+                                    (uint64_t)bill.amount);
+    amountOwed = std::max(MgToSats(nRestMg, nPrice), amountBondShare);
+    return true;
+}
+
 bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHeight, const CAmount& nTxFee,
                         const std::function<bool(uint32_t, CBill&)>& fnGetBill,
                         const std::function<bool(const uint256&)>& fnHaveBillHash,
@@ -3687,14 +3770,14 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // Retirement is the drawee paying face to the current holder. The face is mg, paid in sECX at the reference
         // house's highest ask of the last 30 days (Gold B, GOLD_B.md §3).
-        uint64_t nRetirePrice = 0;
-        if (!BoundHouseRate(bill.nRefHouseID, retire.nRateNamed, nHeight, HouseRateKind::ASK30, state, "bad-bill-retire",
-                            nRetirePrice, RefHouseAnchor(bill.nRefHouseID, nHeight, fnGetHouse)))
-            return false;
         // SA-N2 (D-2026-11-11-2): at least the bond too - RECOURSE's floor. A reference house the drawee controls could
         // drag its ask to nothing and let the drawee discharge for nothing AND take its bond back, which beats defaulting;
         // with the floor a drag leaves the holder the bond, exactly what a default gives. The bond is the least repaid.
-        const CAmount amountRetireFloor = std::max(MgToSats((uint64_t)bill.amount, nRetirePrice), bill.amountEscrow);
+        // D-2026-11-20-1: the same price as ops 7, 9 and 10 (BillRepaymentOwed).
+        CAmount amountRetireFloor = 0;
+        if (!BillRepaymentOwed(bill, (uint64_t)bill.amount, retire.nRateNamed, nHeight, fnGetHouse, state, "bad-bill-retire",
+                               amountRetireFloor))
+            return false;
         if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountRetireFloor)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-payment");
 
@@ -3958,17 +4041,13 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                     hr.vchAcceptorSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-sig");
             // Gram-notes release: what's left after the notes burned at par is mg, paid in sECX at the bound price.
+            // D-2026-11-20-1 (S1X-1): at the reference house's 30-day highest ask with the bond's share as a floor, as
+            // ops 3, 7 and 9. GOLD_B §6's owner ASK90 is gone: the owner's ask no longer counts, so a failing owner
+            // dragging it down changes nothing, and a failed reference house is anchored at its failure.
             const uint64_t nRestMg = (uint64_t)(hr.amountFace - (CAmount)hr.nUnitsBurned);
-            if (nRestMg > 0) {
-                uint64_t nPrice = 0;
-                // GOLD_B §6: a failed house's bills are collected at its 90-day highest ask (a suspended one's at 30).
-                const bool fFailed = HouseEffectiveStatus(house, nHeight) == HOUSE_STATUS_INSOLVENT;
-                const HouseRateKind kind = fFailed ? HouseRateKind::ASK90 : HouseRateKind::ASK30;
-                if (!BoundHouseRate(bill.nOwnerHouseID, hr.nRateNamed, nHeight, kind, state, "bad-bill-hretireescrow",
-                                    nPrice, fFailed ? (int)HouseInsolventSince(house, nHeight) : 0))
-                    return false;
-                amountOwed = MgToSats(nRestMg, nPrice);
-            }
+            if (!BillRepaymentOwed(bill, nRestMg, hr.nRateNamed, nHeight, fnGetHouse, state, "bad-bill-hretireescrow",
+                                   amountOwed))
+                return false;
         } else {
             // Anyone, but only once the drawee has defaulted (op 8's maturity gate); the whole bond goes in.
             if ((uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
@@ -4062,13 +4141,11 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // Gram-notes release: the rest is mg, paid in sECX at the bound price (no price needed when notes cover it all).
         const CAmount amountRestMg = hn.amountFace - (CAmount)hn.nUnitsBurned;
         CAmount amountRest = 0;
-        if (amountRestMg > 0) {
-            uint64_t nPrice = 0;
-            if (!BoundHouseRate(hn.nOwnerHouseID, hn.nRateNamed, nHeight, HouseRateKind::ASK30, state,
-                                "bad-bill-hretirenotes", nPrice))
-                return false;
-            amountRest = MgToSats((uint64_t)amountRestMg, nPrice);
-        }
+        // D-2026-11-20-1 (S1X-1): the reference house's price with the bond's share as a floor (BillRepaymentOwed)
+        if (amountRestMg > 0 &&
+                !BillRepaymentOwed(bill, (uint64_t)amountRestMg, hn.nRateNamed, nHeight, fnGetHouse, state,
+                                   "bad-bill-hretirenotes", amountRest))
+            return false;
         if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountRest)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-payment");
 
@@ -4156,12 +4233,13 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                     BillRetireSigHash(bill.billID, hr.nRateNamed, BillHashOutputs(tx)), hr.vchAcceptorSig))   // UR1-6
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-sig");
             // Face paid to the current holder - which check 12 pinned to the
-            // house's custody key when the discount happened. mg, paid at the house's 30-day highest ask (Gold B).
-            uint64_t nPrice = 0;
-            if (!BoundHouseRate(nOwnerHouseID, hr.nRateNamed, nHeight, HouseRateKind::ASK30, state, "bad-bill-hretire",
-                                nPrice))
+            // house's custody key when the discount happened. D-2026-11-20-1 (S1X-1): at the bill's REFERENCE house's
+            // 30-day highest ask and never less than the bond, as op 3 - not the owner house's, which the holder may run.
+            CAmount amountOwed = 0;
+            if (!BillRepaymentOwed(bill, (uint64_t)amountFace, hr.nRateNamed, nHeight, fnGetHouse, state, "bad-bill-hretire",
+                                   amountOwed))
                 return false;
-            if (BillValuePaidTo(tx, bill.vchHolderPubKey) < MgToSats((uint64_t)amountFace, nPrice))
+            if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountOwed)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-payment");
         } else {
             if ((uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
@@ -4582,6 +4660,14 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         // GetHouseLiabilities is the hook 3.2 / 5A fill.
         if (GetHouseLiabilities(house) != 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-winddown-liabilities");
+        // D-2026-11-20-2 (S2X-6, switch-on): not while the house owes a swap shortfall claim (one paid in the last
+        // nShortfallLapseSecs), solo or multi-partner. It stays Open, so if it fails within the lapse the waterfall pays
+        // the claim; once wound down nothing would reach its escrow or a tail-locked pledge. The residual settle's check.
+        {
+            const int64_t nLapse = (int64_t)Params().GetConsensus().GramAt(nHeight).nShortfallLapseSecs / 600;
+            if (HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(nHeight), nLapse) != 0)
+                return state.DoS(10, false, REJECT_INVALID, "bad-house-winddown-shortfall");   // 10: it lapses with time
+        }
 
         // Binds the output set so a leaked/dropped winddown sig is not replayable.
         const uint256 sighash = HouseWinddownSigHash(house.houseID, BillHashOutputs(tx));
@@ -5374,7 +5460,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             uint64_t nBidNow = 0;
             if (!BoundHouseRate(p.nHouseID, p.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap-pay", nBidNow))
                 return false;
-            const uint64_t nRate = SwapPayRate(r, SwapBidAtDeadlineForChecks(r), clock.nActiveTime);
+            const uint64_t nRate = SwapPayRate(r, SwapBidAtDeadlineForChecks(r, (uint32_t)nHeight), clock.nActiveTime);
             const CAmount amountOwed = MgToSats(r.nUnits, nRate);
             const CScript scriptPayout(r.vchPayoutScript.begin(), r.vchPayoutScript.end());
             CAmount amountPaid = 0;
@@ -7871,6 +7957,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
     // idempotent (no baseline pointer), so it needs no fDepositUndo-style guard -
     // just fSideDB, like every other real-disconnect side-effect.
     std::vector<uint256> vWithdrawalUndo;
+    unsigned int nDepositIndexUndo = 0;   // REF-1: a deposit record's place among the block's deposit records
 
     // B1/R-3: the bill undo STAGES its reverted records and flushes them with
     // the marker step-back in ONE atomic batch after the loop. Writing them
@@ -9342,6 +9429,15 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     return DISCONNECT_FAILED;
                 }
                 std::unique_ptr<SidechainObj> objOwner(obj);
+                // REF-1: the refund row ConnectBlock made from this deposit record (same record, height and place in
+                // the coinbase, walked in the same order). Erased by id, which is idempotent, so not behind
+                // fDepositUndo: a disconnect interrupted after the deposit rows went must still remove the refund.
+                if (obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
+                    SidechainWithdrawal refund;
+                    if (MakeDepositRefund(*(const SidechainDeposit *) obj, pindex->nHeight, nDepositIndexUndo, refund))
+                        vWithdrawalUndo.push_back(refund.GetID());
+                    nDepositIndexUndo++;
+                }
 
                 // N2: the sidechain-DB undos below run only on a real
                 // disconnect (fSideDB). VerifyDB's level 3 disconnects on a
@@ -11576,6 +11672,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
 
         // Collect & verify sidechain objects
         std::vector<std::pair<uint256, const SidechainObj *> > vSidechainObjects;
+        unsigned int nDepositIndexInBlock = 0;   // REF-1: a deposit record's place among the block's deposit records
         auto FreeSidechainObjects = [&vSidechainObjects]() {
             for (size_t i = 0; i < vSidechainObjects.size(); i++)
                 delete vSidechainObjects[i].second;
@@ -11649,6 +11746,14 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                         FreeSidechainObjects();
                         return state.DoS(90, error("%s: withdrawal without its burn", __func__),
                                          REJECT_INVALID, "bad-withdrawal-burn");
+                    }
+                    // REF-1 (security note 3): the refund sentinel is the node's own. A user withdrawal carrying it would
+                    // ride the refund queue and could never be cancelled; refused (IsDepositRefund, the builder's test).
+                    if (IsDepositRefund(*withdrawal)) {
+                        delete obj;
+                        FreeSidechainObjects();
+                        return state.DoS(100, error("%s: a withdrawal carries the deposit-refund sentinel", __func__),
+                                         REJECT_INVALID, "bad-withdrawal-refund-sentinel");
                     }
                     // Poison-row guard (v0.2.13, soft fork from
                     // nWithdrawalGuardHeight): a withdrawal the mainchain can never
@@ -11742,6 +11847,18 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     hashLastDepositInBlock = id;
                 }
                 vSidechainObjects.push_back(std::make_pair(id, obj));
+                // REF-1 (D-2026-11-19-1): a deposit FreeBank doesn't credit becomes a withdrawal row paid to an L1
+                // script (MakeDepositRefund), written with the block's other rows; DisconnectBlock erases the same row.
+                if (obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
+                    SidechainWithdrawal refund;
+                    if (MakeDepositRefund(*(const SidechainDeposit *) obj, pindex->nHeight, nDepositIndexInBlock, refund)) {
+                        SidechainWithdrawal *pRefund = new SidechainWithdrawal(refund);
+                        LogPrintf("%s: deposit %s is not credited on FreeBank: refund row %s to %s\n", __func__,
+                                  id.ToString(), pRefund->GetID().ToString(), pRefund->strDestination);
+                        vSidechainObjects.push_back(std::make_pair(pRefund->GetID(), (const SidechainObj *) pRefund));
+                    }
+                    nDepositIndexInBlock++;
+                }
             }
         }
 
@@ -12967,10 +13084,12 @@ static bool CheckBlockBMMTime(const CBlockHeader& block, CValidationState& state
 {
     uint32_t nTimeMain = 0;
     if (!bmmCache.GetMainBlockTime(block.hashMainchainBlock, nTimeMain)) {
-        L1Answer answer = GetL1Oracle().BmmBlockTime(block.hashMainchainBlock, block.hashMerkleRoot, nTimeMain);
+        // (the L1 answers with E's time only for the commitment E carries: BMMCommitment, S5X-2)
+        const uint256 hashCommitment = BMMCommitment(block);
+        L1Answer answer = GetL1Oracle().BmmBlockTime(block.hashMainchainBlock, hashCommitment, nTimeMain);
         for (int nTry = 0; fImport && answer == L1Answer::UNKNOWN && nTry < 60 && !ShutdownRequested(); nTry++) {
             MilliSleep(5000);
-            answer = GetL1Oracle().BmmBlockTime(block.hashMainchainBlock, block.hashMerkleRoot, nTimeMain);
+            answer = GetL1Oracle().BmmBlockTime(block.hashMainchainBlock, hashCommitment, nTimeMain);
         }
         if (answer != L1Answer::YES) {
             g_nLastBmmUnknown = GetTime();
@@ -13081,12 +13200,18 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state)
     }
 
     if (!bmmCache.HaveVerifiedBMM(block.GetHash())) {
-        // v0.2.19: a pair already confirmed (another copy of this header) costs no L1 call
-        L1Answer answer = bmmCache.HaveBmmPair(hashMain, block.hashMerkleRoot) ? L1Answer::YES
-                                                                                : GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
+        // S5X-2 (switch-on): the bid commits to the header (BMMCommitment), not the merkle root alone
+        const uint256 hashCommitment = BMMCommitment(block);
+        // v0.2.19: a pair already confirmed (another copy of this header) costs no L1 call; S5X-2b: nor does any
+        // header on an L1 block whose one commitment is known
+        bool fYesCached = false;
+        L1Answer answer = bmmCache.HaveBmmPair(hashMain, hashCommitment) ? L1Answer::YES
+                        : bmmCache.GetMainBlockCommitmentAnswer(hashMain, hashCommitment, fYesCached)
+                              ? (fYesCached ? L1Answer::YES : L1Answer::NO)
+                              : GetL1Oracle().BmmCommitment(hashMain, hashCommitment);
         for (int nTry = 0; fImport && answer == L1Answer::UNKNOWN && nTry < 60 && !ShutdownRequested(); nTry++) {
             MilliSleep(5000);
-            answer = GetL1Oracle().BmmCommitment(hashMain, block.hashMerkleRoot);
+            answer = GetL1Oracle().BmmCommitment(hashMain, hashCommitment);
         }
         if (answer == L1Answer::NO)
             return state.DoS(1, false, REJECT_INVALID, "bad-bmm", false,
@@ -13096,7 +13221,7 @@ bool CheckBlockBMM(const CBlock& block, CValidationState& state)
             return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet whether block %s carries this block's BMM bid",
                                          hashMain.ToString()));
         }
-        bmmCache.CacheBmmPair(hashMain, block.hashMerkleRoot);
+        bmmCache.CacheBmmPair(hashMain, hashCommitment);
     }
     const uint256 hashMainPrev = bmmCache.GetMainPrevBlockHash(hashMain);
     if (!bmmCache.HaveMainBlock(hashMain) || hashMainPrev.IsNull()) {
@@ -13696,21 +13821,31 @@ bool CChainState::AcceptBlockHeader(const CBlockHeader& block, CValidationState&
                                              block.hashMainchainBlock.ToString()));
             // v0.2.19: a pair already confirmed (another copy of this header, a
             // different parent) costs no L1 call, not even the connection check
-            const bool fPairKnown = bmmCache.HaveBmmPair(block.hashMainchainBlock, block.hashMerkleRoot);
+            // S5X-2 (switch-on): one paid bid admits one header - the L1 is asked about BMMCommitment(header),
+            // which covers every header field E doesn't fix, so a variant needs its own bid
+            const uint256 hashCommitment = BMMCommitment(block);
+            // S5X-2b (security 11-19): once E's one slot-130 commitment is known, every header naming E is answered
+            // locally - its pair known or not - with no connection check and no L1 call (at most one call per L1 block)
+            bool fYesCached = false;
+            const bool fCommitKnown = bmmCache.GetMainBlockCommitmentAnswer(block.hashMainchainBlock, hashCommitment, fYesCached);
+            if (fCommitKnown && !fYesCached)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bmm", false,
+                                 "Invalid BMM in block header! (not the commitment its L1 block carries)");
+            const bool fPairKnown = fCommitKnown || bmmCache.HaveBmmPair(block.hashMainchainBlock, hashCommitment);
             if (!fPairKnown && !CheckMainchainConnection()) {
                 DisableNetworkForMainchain("Failed to connect to mainchain when checking block header!");
                 return false;
             }
             const L1Answer answer = fPairKnown ? L1Answer::YES
-                                  : GetL1Oracle().BmmCommitment(block.hashMainchainBlock, block.hashMerkleRoot);
-            if (answer == L1Answer::NO)
-                return state.DoS(1, false, REJECT_INVALID, "bad-bmm", false, "Invalid BMM in block header!");
+                                  : GetL1Oracle().BmmCommitment(block.hashMainchainBlock, hashCommitment);
+            if (answer == L1Answer::NO)   // S5X-2b: 10, not 1 - such a header can't be honest (E's content is fixed)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bmm", false, "Invalid BMM in block header!");
             if (answer != L1Answer::YES) {
                 g_nLastBmmUnknown = GetTime();
                 return state.Error(strprintf("bmm-unknown: the L1 cannot tell yet whether block %s carries the BMM bid of header %s",
                                              block.hashMainchainBlock.ToString(), hash.ToString()));
             }
-            bmmCache.CacheBmmPair(block.hashMainchainBlock, block.hashMerkleRoot);
+            bmmCache.CacheBmmPair(block.hashMainchainBlock, hashCommitment);
         }
         // v0.2.19 (7c): outside the cache check above, which is kept on disk;
         // a header is cached as verified only once its time is right too
@@ -13755,8 +13890,12 @@ bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidatio
     // them needs a newer list, and each refresh is an L1 call.
     bool fNeedRefresh = false;
     for (const CBlockHeader& header : headers) {
+        // S5X-2b: nor when E's one commitment is known - the header is then answered locally, yes or no
+        bool fYesCached = false;
+        const uint256 hashCommitment = BMMCommitment(header);
         if (!bmmCache.HaveMainBlock(header.hashMainchainBlock) ||
-                !bmmCache.HaveBmmPair(header.hashMainchainBlock, header.hashMerkleRoot)) {
+                (!bmmCache.HaveBmmPair(header.hashMainchainBlock, hashCommitment) &&
+                 !bmmCache.GetMainBlockCommitmentAnswer(header.hashMainchainBlock, hashCommitment, fYesCached))) {
             fNeedRefresh = true;
             break;
         }
@@ -14938,6 +15077,11 @@ bool LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, CDiskB
                     CValidationState state;
                     if (g_chainstate.AcceptBlock(pblock, state, chainparams, nullptr, true, dbp, nullptr))
                         nLoaded++;
+                    else if (state.IsInvalid())
+                        // Said out loud (S5X-2, 11-19): a refused block was skipped without a word, and its
+                        // descendants then wait as out-of-order blocks, so a -reindex of an older datadir ended at
+                        // genesis with nothing in the log. One line per refused block (its descendants are not tried).
+                        LogPrintf("%s: block %s refused: %s\n", __func__, hash.ToString(), FormatStateMessage(state));
                     if (state.IsError()) {
                         // v0.2.17: the L1 could not answer the BMM check even
                         // after waiting. Skipping the rest of this file would
@@ -15355,10 +15499,13 @@ void LoadBMMCache()
     std::vector<uint256> vHashWithdrawal;
     std::vector<uint256> vHashBMM;
     std::vector<uint256> vDepositTXID;
+    bool fBmmBeforeS5X2 = false;
     try {
         int nVersionRequired, nVersionThatWrote;
         filein >> nVersionRequired;
         filein >> nVersionThatWrote;
+        // S5X-2: verified-BMM hashes from a file written before the bid committed to the header are dropped
+        fBmmBeforeS5X2 = nVersionRequired < BMM_CACHE_S5X2_MIN_VERSION;
         // LEGACY STAMP. Every cache file in existence before FREEBANK_CACHE_MIN_VERSION
         // landed says "required 160000" - Bitcoin Core 0.16's number, written
         // unconditionally by this fork's own binaries. The nVersionThatWrote field
@@ -15418,6 +15565,11 @@ void LoadBMMCache()
     for (const uint256& u : vHashWithdrawal) {
         bmmCache.StoreBroadcastedWithdrawalBundle(u);
     }
+    if (fBmmBeforeS5X2 && !vHashBMM.empty()) {
+        LogPrintf("%s: dropped %u verified-BMM entries written before S5X-2 (the bid now commits to the header): "
+                  "those blocks are checked again\n", __func__, vHashBMM.size());
+        vHashBMM.clear();
+    }
     for (const uint256& u : vHashBMM) {
         bmmCache.CacheVerifiedBMM(u);
     }
@@ -15444,8 +15596,9 @@ void DumpBMMCache()
         return;
     }
 
+    static_assert(BMM_CACHE_S5X2_MIN_VERSION <= CLIENT_VERSION, "this build must read its own bmm.dat");
     try {
-        fileout << FREEBANK_CACHE_MIN_VERSION; // minimum client version able to read this
+        fileout << BMM_CACHE_S5X2_MIN_VERSION; // minimum client version able to read this (S5X-2: its BMM entries)
         fileout << CLIENT_VERSION; // version that wrote the file
 
         // Broadcasted Withdrawal Bundle hash cache
@@ -15676,6 +15829,135 @@ void LoadWithdrawalIDCache()
 }
 
 /** Create joined Withdrawal Bundle to be sent to the mainchain */
+/** The L1 script a bundle pays for a withdrawal row. User rows: the CONSENSUS-FROZEN decode
+ *  (DecodeDestination(fMainchain=true); mainchainaddress.h carriers rely on it, do not change it). REF-1 deposit
+ *  refunds: MainchainPayoutScriptAnyFamily, because the node itself wrote the row in ConnectBlock and every node must
+ *  read it alike, whatever L1 family it probed (MainchainRefundCarrier stores P2PKH with prefix 0). */
+CScript WithdrawalPayoutScript(const SidechainWithdrawal& w)
+{
+    if (IsDepositRefund(w))
+        return MainchainPayoutScriptAnyFamily(w.strDestination);
+    return GetScriptForDestination(DecodeDestination(w.strDestination, true /* fMainchain */));
+}
+
+/** REF-1 / security S1: would a bundle pay this row? The withdrawal poison-row guard's test - no fee or nothing left after
+ *  it, a destination the bundle's own decode can't turn into a standard, non-NULL_DATA script, or a dust payout - one
+ *  copy for the guard in CreateWithdrawalBundleTx and for creating a deposit refund. */
+bool WithdrawalPayoutRefused(const SidechainWithdrawal& w)
+{
+    if (!(w.amount > w.mainchainFee && w.mainchainFee > 0))
+        return true;
+    const CScript scriptPayout = WithdrawalPayoutScript(w);
+    txnouttype whichType;
+    std::string strReasonSkip;
+    if (scriptPayout.empty() || !CoreIsStandard(scriptPayout, whichType, strReasonSkip) || whichType == TX_NULL_DATA)
+        return true;
+    return CoreIsDust(CTxOut(w.amount - w.mainchainFee, scriptPayout), CFeeRate(DUST_RELAY_TX_FEE));
+}
+
+/** REF-1 (security note 3): the one test for "this row is a deposit refund" - the consensus ban on user withdrawals
+ *  carrying the sentinel and the bundle builder's classification both use it. */
+bool IsDepositRefund(const SidechainWithdrawal& w)
+{
+    return w.strRefundDestination.compare(0, DEPOSIT_REFUND_TAG.size(), DEPOSIT_REFUND_TAG) == 0;
+}
+
+/** REF-1 (D-2026-11-19-1; legal L1-L3, security S1-S5, design D1-D2): the refund row for a deposit FreeBank does not
+ *  credit, or false for none. A pure function of the deposit record and its place (FreeBank height, index among the
+ *  block's deposit records), so ConnectBlock creates it and DisconnectBlock erases the same row.
+ *  - Only when GetDepositPayoutOutput pays nothing on FreeBank (security S4: that is the frozen split), and never for a
+ *    bundle's change return.
+ *  - Paid to (1) the L1 address the depositor named (any family: ParseMainchainAddressAnyFamily), else (2) the deposit
+ *    transaction's single other output - exactly one output that is neither the treasury output nor an OP_RETURN
+ *    (design D1); else no refund. Stored as MainchainRefundCarrier and paid by WithdrawalPayoutScript, neither of which
+ *    depends on the L1 family the node probed, so every node writes and pays the same row.
+ *  - Created only if a bundle would pay it (security S1: WithdrawalPayoutRefused), after DEPOSIT_REFUND_MAINCHAIN_FEE,
+ *    which goes to the eCash miners as the row's mainchainFee (legal L2).
+ *  - strRefundDestination is the sentinel "refund:<height>:<index>": no refund request can match it (design D2), and
+ *    its text orders refunds first in, first out (security S2). The index must stay below 10^6 for that text order.
+ *  - hashBlindTx is a tagged hash of the L1 outpoint, so the row's id never meets a user withdrawal's (security S3). */
+bool MakeDepositRefund(const SidechainDeposit& d, int nHeight, unsigned int nIndex, SidechainWithdrawal& refund)
+{
+    if (d.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST)
+        return false;
+    CTxOut credit;
+    if (GetDepositPayoutOutput(d, credit))
+        return false;   // credited on FreeBank
+    if (d.nBurnIndex >= d.dtx.vout.size() || nHeight < 0 || nIndex >= DEPOSIT_REFUND_MAX_INDEX)
+        return false;
+
+    SidechainWithdrawal w;
+    w.nSidechain = THIS_SIDECHAIN;
+    w.amount = d.amtUserPayout;
+    w.mainchainFee = DEPOSIT_REFUND_MAINCHAIN_FEE;
+    w.status = WITHDRAWAL_UNSPENT;
+    w.strRefundDestination = strprintf("%s%010d:%06u", DEPOSIT_REFUND_TAG, nHeight, nIndex);
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBank deposit refund") << COutPoint(d.dtx.GetHash(), d.nBurnIndex);
+    w.hashBlindTx = ss.GetHash();
+
+    // (1) The depositor's own destination, if it is an L1 address (any family) the bundle can pay
+    CScript spkNamed;
+    if (ParseMainchainAddressAnyFamily(d.strDest, spkNamed)) {
+        w.strDestination = MainchainRefundCarrier(spkNamed);
+        if (!w.strDestination.empty() && !WithdrawalPayoutRefused(w)) {
+            refund = w;
+            return true;
+        }
+    }
+
+    // (2) The deposit transaction's single other output
+    const CScript* pOther = nullptr;
+    size_t nOther = 0;
+    for (size_t i = 0; i < d.dtx.vout.size(); i++) {
+        if (i == d.nBurnIndex)
+            continue;
+        const CScript& spk = d.dtx.vout[i].scriptPubKey;
+        if (!spk.empty() && spk[0] == OP_RETURN)
+            continue;
+        pOther = &spk;
+        nOther++;
+    }
+    if (nOther != 1)
+        return false;
+    w.strDestination = MainchainRefundCarrier(*pOther);
+    if (w.strDestination.empty())
+        return false;
+    if (WithdrawalPayoutRefused(w))
+        return false;
+    refund = w;
+    return true;
+}
+
+/** RQ-1 (switch-on consensus; Michael 2026-11-19 "Yes, build it"; security's shape): a bundle's nLockTime comes from
+ *  the previous bundle's hash (low 64 bits mod 500,000,000, read as a height; 0 with no previous bundle). After a fail
+ *  the same rows used to rebuild a byte-identical bundle that B2 refuses for good, so a refund row - which has no owner
+ *  to refund or re-file it - waited for some unrelated withdrawal, on a quiet chain forever. Now the retry follows the
+ *  failed bundle, so it differs (a new m6id; B2 and PG-1's "a held m6id is never proposed again" are unchanged), while a
+ *  rebuild of the same bundle on another branch follows the same previous bundle and reproduces the same m6id (no second
+ *  payable copy on the L1). The enforcer keeps lock_time in the M6 and its m6id; the M6's inputs are final, so the L1
+ *  ignores it. Replication reads the latest bundle as it was before the block writes the new one. */
+uint32_t WithdrawalBundleLockTime(const uint256& hashPrevBundle)
+{
+    return hashPrevBundle.IsNull() ? 0 : (uint32_t)(hashPrevBundle.GetUint64(0) % 500000000);
+}
+
+/** The order a bundle takes rows in (consensus: replication runs it too). User withdrawals first, by mainchain fee as
+ *  before (SortWithdrawalByFee); then deposit refunds, first in first out by their sentinel's text (FreeBank height,
+ *  then place in the block) - REF-1, security S2. The cap (MAX_REFUNDS_PER_BUNDLE, refunds actually added) is applied
+ *  where the bundle is filled. */
+void OrderWithdrawalsForBundle(std::vector<SidechainWithdrawal>& vWithdrawal)
+{
+    SortWithdrawalByFee(vWithdrawal);
+    std::stable_partition(vWithdrawal.begin(), vWithdrawal.end(),
+                          [](const SidechainWithdrawal& w) { return !IsDepositRefund(w); });
+    const auto itFirstRefund = std::find_if(vWithdrawal.begin(), vWithdrawal.end(),
+                                            [](const SidechainWithdrawal& w) { return IsDepositRefund(w); });
+    std::sort(itFirstRefund, vWithdrawal.end(), [](const SidechainWithdrawal& a, const SidechainWithdrawal& b) {
+        return a.strRefundDestination < b.strRefundDestination;
+    });
+}
+
 bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, CTransactionRef& withdrawalBundleDataTx, bool fReplicationCheck, bool fCheckUnique)
 {
     unsigned int nMinWithdrawal = gArgs.GetArg("-minwithdrawal", DEFAULT_MIN_WITHDRAWAL_CREATE_BUNDLE);
@@ -15733,26 +16015,15 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
     // validators agree; a node without it (v0.2.12) would reject such a bundle,
     // hence the flag day. Decode = the bundle's own (MainchainPayoutScript).
     if (WithdrawalGuardActive(nHeight, Params().GetConsensus().nWithdrawalGuardHeight)) {
-        const CFeeRate dustGuard(DUST_RELAY_TX_FEE);
-        vWithdrawal.erase(std::remove_if(vWithdrawal.begin(), vWithdrawal.end(),
-            [&dustGuard](const SidechainWithdrawal& w) {
-                if (!(w.amount > w.mainchainFee && w.mainchainFee > 0))
-                    return true;
-                const CScript scriptPayout = GetScriptForDestination(DecodeDestination(w.strDestination, true /* fMainchain */));
-                txnouttype whichType;
-                std::string strReasonSkip;
-                if (scriptPayout.empty() || !CoreIsStandard(scriptPayout, whichType, strReasonSkip) || whichType == TX_NULL_DATA)
-                    return true;
-                return CoreIsDust(CTxOut(w.amount - w.mainchainFee, scriptPayout), dustGuard);
-            }), vWithdrawal.end());
+        vWithdrawal.erase(std::remove_if(vWithdrawal.begin(), vWithdrawal.end(), WithdrawalPayoutRefused), vWithdrawal.end());
         if (vWithdrawal.empty()) {
             LogPrintf("%s: No payable withdrawal(s) to create bundle!\n", __func__);
             return false;
         }
     }
 
-    // Sort Withdrawals by mainchain fee amount
-    SortWithdrawalByFee(vWithdrawal);
+    // Sort Withdrawals by mainchain fee amount; deposit refunds after them (REF-1, OrderWithdrawalsForBundle)
+    OrderWithdrawalsForBundle(vWithdrawal);
 
     if (!fReplicationCheck && vWithdrawal.size() < nMinWithdrawal) {
         LogPrintf("%s: Not enough Withdrawal(s) to create Withdrawal Bundle\n", __func__);
@@ -15783,19 +16054,25 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
     }
 
     wjtx.nVersion = 2;
+    wjtx.nLockTime = WithdrawalBundleLockTime(hashLatestWithdrawalBundle);   // RQ-1
     wjtx.vin.resize(1); // Dummy vin for serialization...
     wjtx.vin[0].scriptSig = CScript() << OP_0;
+    unsigned int nRefundsAdded = 0;
     for (const SidechainWithdrawal& withdrawal : vWithdrawal) {
+        // REF-1: refunds come last, so once the cap is reached nothing after it goes in
+        const bool fRefund = IsDepositRefund(withdrawal);
+        if (fRefund && nRefundsAdded >= MAX_REFUNDS_PER_BUNDLE)
+            break;
+
         CAmount amountWithdrawal = withdrawal.amount - withdrawal.mainchainFee;
 
         amountMainchainFees += withdrawal.mainchainFee;
 
-        // TODO check IsValidDestination
         // Output to mainchain keyID
         // CONSENSUS-FROZEN: stored destinations include v0.2.13 carrier strings
         // (mainchainaddress.h) that rely on this exact decode; do not change it.
-        CTxDestination dest = DecodeDestination(withdrawal.strDestination, true /* fMainchain */);
-        wjtx.vout.push_back(CTxOut(amountWithdrawal, GetScriptForDestination(dest)));
+        // REF-1: a deposit refund row reads any family (WithdrawalPayoutScript).
+        wjtx.vout.push_back(CTxOut(amountWithdrawal, WithdrawalPayoutScript(withdrawal)));
 
         // Add Withdrawal objid to Withdrawal Bundle obj
         withdrawalBundle.vWithdrawalID.push_back(withdrawal.GetID());
@@ -15811,6 +16088,8 @@ bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, 
 
             break;
         }
+        if (fRefund)
+            nRefundsAdded++;
     }
 
     // Update mainchain fee encoding output.
@@ -15951,10 +16230,10 @@ bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vecto
             // Check that every Withdrawal listed in the Withdrawal Bundle is included
             for (const SidechainWithdrawal& w : vWithdrawal) {
                 bool fFound = false;
-                // CONSENSUS-FROZEN decode (see mainchainaddress.h: carrier strings)
+                // CONSENSUS-FROZEN decode (see mainchainaddress.h: carrier strings); REF-1 refunds read any family
                 for (const CTxOut& out : withdrawalBundle->tx.vout) {
                     if (out.nValue == w.amount - w.mainchainFee &&
-                            GetScriptForDestination(DecodeDestination(w.strDestination, true)) == out.scriptPubKey) {
+                            WithdrawalPayoutScript(w) == out.scriptPubKey) {
                         fFound = true;
                         break;
                     }
@@ -16852,9 +17131,9 @@ void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
     }
 
     // Side blocks anchored in the orphaned L1 blocks: one scan of the block
-    // index (v0.2.18, layer-B review BMM H1). BMM binds only hashMerkleRoot, so
-    // one L1 block can anchor several distinct side headers (a peer can vary
-    // nTime), and the single-valued map this replaced let a copied header
+    // index (v0.2.18, layer-B review BMM H1). BMM bound only hashMerkleRoot then
+    // (S5X-2 binds the header now, but keep the scan), so one L1 block could anchor
+    // several distinct side headers (a peer could vary nTime), and the single-valued map this replaced let a copied header
     // displace the real block - which then escaped this function and split
     // the chain. The map also lost entries on reload (a parent created by its
     // child's record first). This runs rarely; a scan cannot go stale.

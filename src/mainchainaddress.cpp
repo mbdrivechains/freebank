@@ -79,10 +79,10 @@ bool IsSidechainAddress(const std::string& s)
 
 } // namespace
 
-bool ParseMainchainAddress(const std::string& str, CScript& spk, std::string& strError)
+static bool ParseMainchainAddressWith(const MainchainAddrParams& params, const std::string& str, CScript& spk,
+                                      std::string& strError)
 {
     spk.clear();
-    const MainchainAddrParams params = GetMainchainAddrParams();
 
     std::vector<unsigned char> data;
     if (DecodeBase58CheckStr(str, data)) {
@@ -147,6 +147,42 @@ bool ParseMainchainAddress(const std::string& str, CScript& spk, std::string& st
     }
     strError = "witness version " + std::to_string(nVersion) + " is not supported for withdrawals";
     return false;
+}
+
+bool ParseMainchainAddress(const std::string& str, CScript& spk, std::string& strError)
+{
+    return ParseMainchainAddressWith(GetMainchainAddrParams(), str, spk, strError);
+}
+
+bool ParseMainchainAddressAnyFamily(const std::string& str, CScript& spk)
+{
+    // Literals, not this node's probed family or chain params: consensus code calls this.
+    static const MainchainAddrParams vFamily[] = {
+        {std::vector<unsigned char>(1, 0), std::vector<unsigned char>(1, 5), "bc"},
+        {std::vector<unsigned char>(1, 111), std::vector<unsigned char>(1, 196), "tb"},
+        {std::vector<unsigned char>(1, 111), std::vector<unsigned char>(1, 196), "bcrt"},
+    };
+    std::string strError;
+    for (const MainchainAddrParams& params : vFamily)
+        if (ParseMainchainAddressWith(params, str, spk, strError))
+            return true;
+    spk.clear();
+    return false;
+}
+
+std::string MainchainRefundCarrier(const CScript& spk)
+{
+    std::string strCarrier;
+    if (IsP2PKH(spk)) {
+        std::vector<unsigned char> data(1, 0);
+        data.insert(data.end(), spk.begin() + 3, spk.begin() + 23);
+        strCarrier = EncodeBase58Check(data);
+    } else {
+        strCarrier = EncodeMainchainCarrier(spk);   // P2SH and bech32 carriers never read the family
+    }
+    if (strCarrier.empty() || MainchainPayoutScriptAnyFamily(strCarrier) != spk)
+        return "";
+    return strCarrier;
 }
 
 std::string EncodeMainchainAddress(const CScript& spk)

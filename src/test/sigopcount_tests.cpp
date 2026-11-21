@@ -229,4 +229,37 @@ BOOST_AUTO_TEST_CASE(GetTxSigOpCost)
     }
 }
 
+// S5X-1 (switch-on consensus, from genesis; Michael 2026-11-19): an unspendable output carries no signature checks, so
+// GetLegacySigOpCount leaves it out - whatever bytes follow the OP_RETURN. A spendable output still counts as before,
+// and so does every scriptSig.
+BOOST_AUTO_TEST_CASE(s5x_1_unspendable_outputs_count_no_sigops)
+{
+    CMutableTransaction m;
+    m.vin.resize(1);
+    m.vin[0].scriptSig = CScript() << OP_CHECKSIG;                               // scriptSigs still count: 1
+    // Data after OP_RETURN that reads as 3 x CHECKMULTISIG (60) + CHECKSIG (1) if parsed as opcodes
+    CScript data;
+    data << OP_RETURN;
+    data.push_back(OP_CHECKMULTISIG); data.push_back(OP_CHECKMULTISIG); data.push_back(OP_CHECKMULTISIG);
+    data.push_back(OP_CHECKSIG);
+    BOOST_CHECK_EQUAL(data.GetSigOpCount(false), 61U);                            // what it used to count
+    m.vout.push_back(CTxOut(0, data));
+    // A sidechain-object style header (OP_RETURN AC DC F6 6F): the 0xAC is OP_CHECKSIG if parsed
+    CScript obj;
+    obj.resize(5);
+    obj[0] = OP_RETURN; obj[1] = 0xAC; obj[2] = 0xDC; obj[3] = 0xF6; obj[4] = 0x6F;
+    m.vout.push_back(CTxOut(0, obj));
+    // A spendable P2PKH output still counts its CHECKSIG
+    CKey key;
+    key.MakeNewKey(true);
+    m.vout.push_back(CTxOut(1000, GetScriptForDestination(key.GetPubKey().GetID())));
+    BOOST_CHECK_EQUAL(GetLegacySigOpCount(CTransaction(m)), 2U);                 // scriptSig 1 + P2PKH 1; OP_RETURNs 0
+    // An oversized script is unspendable too
+    const std::vector<unsigned char> vBig(MAX_SCRIPT_SIZE + 1, OP_CHECKSIG);
+    CScript big(vBig.begin(), vBig.end());
+    BOOST_CHECK(big.IsUnspendable());
+    m.vout.push_back(CTxOut(0, big));
+    BOOST_CHECK_EQUAL(GetLegacySigOpCount(CTransaction(m)), 2U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

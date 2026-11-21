@@ -314,8 +314,10 @@ public:
  * never mixes with beta or mainnet and can run beside a beta node. Fixed seed
  * 163.47.9.132:28455, no DNS seed. An easynet build (configure --with-easynet) runs
  * it with no flag. Each new FreeBank-easynet chain takes the next magic last byte (03 for L1 resets 3 and 4, 05 for
- * the v1.1.0 restart on reset 4, 06 for the Gold B v1.2.0 restart, 07 for v1.2.2): it no longer follows the L1's
- * reset number.
+ * the v1.1.0 restart on reset 4, 06 for the Gold B v1.2.0 restart, 07 for v1.2.2, 08 for the S5X-2 + RQ-1 restart, 09
+ * for the s1/s2 review fixes):
+ * it no longer follows the L1's reset number. Since D-2026-11-19-3 easynet runs the latest master and restarts fresh
+ * when a change needs it.
  */
 /** No forks (D-2026-11-05-3): easynet's switch time for the later rules. Set at the release that carries them (rel.sh
  *  release-draft refuses LATER_RULE_NEVER here). */
@@ -329,7 +331,12 @@ public:
         // FB-14: the easynet L1's genesis (easynet-4), the pin FreeBank-easynet's seed and the app pass today.
         strDefaultMainchainBlockPin = "0:000000018a449eb24e2c55744a19ad02db5928fa89296f87cbb2059784b2b211";
 
-        // Its own network. v1.2.2 restarts it fresh (the switch-on rules from genesis, among them UR-ext-13's network tag
+        // Its own network. The s1/s2 review fixes (master b1cb08b, D-2026-11-19-3) restart it fresh: D-2026-11-20-1 and -2
+        // change the repayment price, the rate window, WINDDOWN and ORIGINATE, so a mixed network would split; magic 09,
+        // genesis 6, deposits from L1 2,935.
+        // S5X-2 + RQ-1 (master, D-2026-11-19-3) restarted it fresh: the bid commits to the header, so no
+        // block of the v1.2.2 chain verifies; magic 08, genesis 5, deposits from L1 2,730.
+        // v1.2.2 restarted it fresh (the switch-on rules from genesis, among them UR-ext-13's network tag
         // in every payload signature hash, so the v1.2.0 chain's signatures no longer verify): magic 07, genesis 4,
         // deposits from L1 2,058. Gold B (v1.2.0) restarted it too: magic 06, genesis 3, deposits from L1 1,676.
         // Gram-notes release (v1.1.0, scope 7h): FreeBank-easynet restarts as a fresh chain on the same
@@ -339,20 +346,21 @@ public:
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;
-        pchMessageStart[3] = 0x07;   // v1.2.2: a fresh chain again (the switch-on rules from genesis, a new units DB)
+        pchMessageStart[3] = 0x09;   // s1/s2 review fixes (D-2026-11-19-3): a fresh chain again (08: S5X-2 + RQ-1)
         nDefaultPort = 28455;
 
-        genesis = CreateGenesisBlock("FreeBank easynet genesis 4: switch-on rules (v1.2.2), easynet slot 130, 2026-11-13",
+        genesis = CreateGenesisBlock("FreeBank easynet genesis 6: s1/s2 review fixes (master), easynet slot 130, 2026-11-20",
                                      CScript() << OP_RETURN,
-                                     1794528000, 1, 0);   // 2026-11-13 00:00Z: before every L1 block it will use
+                                     1795132800, 1, 0);   // 2026-11-20 00:00Z: before every L1 block it will use
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0x8b1db1c4912cb8459107a195007248f486d7103d99e5d7d05db29b548e290eed"));
+        assert(consensus.hashGenesisBlock == uint256S("0xa831f32fb91fbbe3307dbefe1d78db89b91e6ca8335cb0d6859d2683d06ad29c"));
         // The fresh chain binds credit signatures from genesis.
         consensus.nCreditBindingHeight = 0;
-        // ...and credits only treasury changes from L1 block 2,058 (v1.2.2 restart): the 123.29792050 ECX in the treasury
-        // at L1 2,057 (sequence 9, no bundle pending or in vote; easynet 2026-11-15 03:45Z, after the fire) stays the old
-        // chains'. Each later deposit credits what it added (DEPOSITS_664_SPEC). (v1.2.0's chain: 1,676; v1.1.0's: 1,100.)
-        consensus.nDepositStartL1Height = 2058;
+        // ...and credits only treasury changes from L1 block 2,935 (s1/s2 review fixes restart): the 223.29792050 ECX in
+        // the treasury at L1 2,930 (CTIP 2aa22156..:0, sequence 11, unchanged since L1 2,752; no bundle pending or in vote;
+        // easynet's enforcer, 2026-11-20 07:05Z) stays the old chains'. Each later deposit credits what it added
+        // (DEPOSITS_664_SPEC). (S5X-2 + RQ-1's chain: 2,730; v1.2.2's: 2,058; v1.2.0's: 1,676; v1.1.0's: 1,100.)
+        consensus.nDepositStartL1Height = 2935;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
         // No forks (D-2026-11-05-3): easynet switches the later rules on days after the release that carries them, so
         // they can be seen working before mainnet's date. EASYNET_LATER_RULES_TIME: set at that release.

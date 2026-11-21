@@ -298,6 +298,29 @@ static int WalletRefAnchor(uint32_t nRefHouseID)
         return 0;
     return (int)HouseInsolventSince(ref, nNext);
 }
+/** D-2026-11-20-1 (S1X-1, switch-on): what the sECX part of a repayment owes, as consensus's BillRepaymentOwed prices
+ *  it for ops 3, 7, 9 and 10 alike: amountRestMg at the bill's reference house's 30-day highest ask (with the margin,
+ *  SA-W6), and at least that part's share of the bond, ceil(bond x rest / face). nPriceOut is the rate the payload
+ *  names. The owner house's ask counts nowhere. */
+static CAmount WalletMgToSats(uint64_t nMg, uint64_t nPrice);
+static bool WalletBillRepayment(const CBill& bill, CAmount amountRestMg, uint32_t nMarginBps, uint64_t& nPriceOut,
+                                CAmount& amountOut, std::string& strFail)
+{
+    nPriceOut = 0;
+    amountOut = 0;
+    if (amountRestMg <= 0)
+        return true;
+    if (!WalletHouseRate(bill.nRefHouseID, true, nPriceOut, strFail, 30, WalletRefAnchor(bill.nRefHouseID)))
+        return false;
+    nPriceOut = WalletRateWithMargin(nPriceOut, nMarginBps);
+    CAmount amountBondShare = std::max<CAmount>(bill.amountEscrow, 0);
+    if (bill.amount > 0 && amountRestMg < bill.amount)
+        amountBondShare = (CAmount)(((unsigned __int128)(uint64_t)amountBondShare * (uint64_t)amountRestMg +
+                                     (uint64_t)bill.amount - 1) / (uint64_t)bill.amount);
+    amountOut = std::max(WalletMgToSats((uint64_t)amountRestMg, nPriceOut), amountBondShare);
+    return true;
+}
+
 static bool WalletSettleRate(const std::vector<uint32_t>& vHouseID, uint64_t& nRate, std::string& strFail)
 {
     const int nNext = chainActive.Height() + 1;
@@ -9821,12 +9844,11 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
         return false;
     }
 
-    // Gram-notes release: the face is mg, paid in sECX at the tip's payout price.
+    // D-2026-11-20-1 (S1X-1): the reference house's price, never less than the bond - as op 3 (WalletBillRepayment).
     uint64_t nPrice = 0;
-    if (!WalletHouseRate(bill.nOwnerHouseID, true, nPrice, strFail))
+    CAmount amountFaceSats = 0;
+    if (!WalletBillRepayment(bill, bill.amount, nMarginBps, nPrice, amountFaceSats, strFail))
         return false;
-    nPrice = WalletRateWithMargin(nPrice, nMarginBps);   // SA-W6
-    const CAmount amountFaceSats = WalletMgToSats((uint64_t)bill.amount, nPrice);
     const CAmount nNeeded = amountFaceSats + nFee;
     const CAmount nTargetFunding = nNeeded > bill.amountEscrow ? nNeeded - bill.amountEscrow : CAmount(0);
     std::set<CInputCoin> setCoins;
@@ -9989,16 +10011,12 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     const CScript scriptPay = fIntoEscrow ? HouseEscrowScript(house.houseID) : scriptHolder;
     // Gram-notes release: what the notes don't cover is mg, paid in sECX at the tip's payout price.
     const CAmount amountRestMg = bill.amount - (CAmount)nUnitsBurned;
+    // D-2026-11-20-1 (S1X-1): the reference house's price with the bond's share as a floor, into an escrow or not
+    // (GOLD_B §6's owner ASK90 is gone with the owner's ask).
     uint64_t nPrice = 0;
-    // GOLD_B §6: into a failed house's escrow at its 90-day highest ask; a suspended house's at 30.
-    const bool fFailedHouse = fIntoEscrow && HouseEffectiveStatus(house, chainActive.Height() + 1) == HOUSE_STATUS_INSOLVENT;
-    if (amountRestMg > 0 && !WalletHouseRate(bill.nOwnerHouseID, true, nPrice, strFail, fFailedHouse ? 90 : 30,
-                                             fFailedHouse ? (int)HouseInsolventSince(house, chainActive.Height() + 1) : 0))
+    CAmount amountRest = 0;
+    if (!WalletBillRepayment(bill, amountRestMg, nMarginBps, nPrice, amountRest, strFail))
         return false;
-    // SA-W6: a margin over a live ask; a failed house's 90-day ask is anchored at its failure and can't move.
-    if (amountRestMg > 0 && !fFailedHouse)
-        nPrice = WalletRateWithMargin(nPrice, nMarginBps);
-    CAmount amountRest = amountRestMg > 0 ? WalletMgToSats((uint64_t)amountRestMg, nPrice) : amountRestMg;
     if (fIntoEscrow && amountRest <= 0)
         amountRest = 1;   // op 10's vout[0] is always the escrow; raised to the dust line below
     if (amountRest > 0) {
@@ -13971,7 +13989,7 @@ bool CWallet::SwapPay(std::string& strFail, uint256& txidOut, const uint256& has
     if (!HouseRateForChecks(r.nHouseID, chainActive.Height() + 1, nBid, nAsk) || nBid == 0) { strFail = "The house has no rate in effect"; return false; }
     CChainClock clock;
     if (!ChainClockForChecks(clock)) { strFail = "No chain clock"; return false; }
-    const uint64_t nRate = SwapPayRate(r, SwapBidAtDeadlineForChecks(r), clock.nActiveTime);
+    const uint64_t nRate = SwapPayRate(r, SwapBidAtDeadlineForChecks(r, (uint32_t)chainActive.Height() + 1), clock.nActiveTime);
     amountPaidOut = (CAmount)std::min<unsigned __int128>(((unsigned __int128)r.nUnits * nRate + 999) / 1000, (unsigned __int128)MAX_MONEY);
     NoteSwapPay p;
     p.nHouseID = r.nHouseID;

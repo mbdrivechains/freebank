@@ -174,4 +174,42 @@ BOOST_AUTO_TEST_CASE(units_block_undo_record_roundtrip)
     BOOST_CHECK(back.vBefore[1].first == K(2) && !back.vBefore[1].second);
 }
 
+// S2X-1 (testing 11-20): the template's per-package check writes in place under a journal. A rollback puts the view back
+// exactly - values, the keys it holds, and the before-images the undo record is built from; a commit keeps the writes.
+BOOST_AUTO_TEST_CASE(s2x_1_journal_rolls_back_and_commits)
+{
+    CUnitsView view(nullptr);
+    view.Put(K(1), (uint32_t)10);
+    view.Put(K(2), (uint32_t)20);
+    std::map<UnitsKey, UnitsSlot> mapChange0, mapBefore0;
+    view.GetChanges(mapChange0, mapBefore0);
+
+    view.BeginJournal();
+    view.Put(K(1), (uint32_t)11);   // an existing key, rewritten
+    view.Put(K(1), (uint32_t)12);   // and again
+    view.Erase(K(2));               // an existing key, erased
+    view.Put(K(3), (uint32_t)30);   // a fresh key
+    BOOST_CHECK_EQUAL(ValueOf(view, 1), 12u);
+    BOOST_CHECK(!view.Have(K(2)));
+    BOOST_CHECK_EQUAL(ValueOf(view, 3), 30u);
+    view.RollBackJournal();
+
+    BOOST_CHECK_EQUAL(ValueOf(view, 1), 10u);
+    BOOST_CHECK_EQUAL(ValueOf(view, 2), 20u);
+    BOOST_CHECK(!view.Have(K(3)));
+    std::map<UnitsKey, UnitsSlot> mapChange1, mapBefore1;
+    view.GetChanges(mapChange1, mapBefore1);
+    BOOST_CHECK(mapChange1 == mapChange0);
+    BOOST_CHECK(mapBefore1 == mapBefore0);
+
+    // Writes after a rollback aren't journalled until the next BeginJournal; a commit keeps them.
+    view.BeginJournal();
+    view.Put(K(3), (uint32_t)31);
+    view.CommitJournal();
+    view.RollBackJournal();   // nothing journalled: a no-op
+    BOOST_CHECK_EQUAL(ValueOf(view, 3), 31u);
+    BOOST_CHECK_EQUAL(ValueOf(view, 1), 10u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
+

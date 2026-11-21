@@ -840,4 +840,60 @@ BOOST_AUTO_TEST_CASE(testing_sa_h3_missing_past_clock_record_fails_closed)
     g_fClockIsHeightForTests = fClockWas;
 }
 
+// D-2026-11-20-2 (S1X-4; security 11-20 on 39f2ffd): the swap's bid at the deadline, read at height h, takes the posting
+// before a post made at h; from h+1 the new one. Where the dropped posting could matter, the fallback stands.
+BOOST_AUTO_TEST_CASE(s1x_4_bid_at_deadline_skips_a_post_at_the_height_read)
+{
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t A = 1000;   // active time of the first posting
+    BOOST_REQUIRE(ApplyHouseRatePost(units, 2, 100000, 100000, 1, 10 * DAY, gp, strReject, A));
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 2, 120000, 120000, 50, 15 * DAY, gp, strReject, A + 5 * DAY),
+                          "setup: the second post was refused: " + strReject);
+    const int64_t nActive = A + 6 * DAY + 1;   // the new posting has been in effect for the whole day before
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, nActive, 7, DAY, 51), 120000u);   // h+1: the new posting
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, nActive, 7, DAY), 120000u);       // no height: the new posting
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, nActive, 7, DAY, 50), 100000u);   // h: the posting before it
+    // At h with T_f inside the day after the earlier posting, the posting before that isn't kept: the fallback.
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + DAY / 2, 7, DAY, 50), 7u);
+}
+
+// Security 11-20 (freebankd's audit, a spot covered only by an equality): RETIRE, RECOURSE and ops 7, 9 and 10 read the
+// reference house's in-block status (RefHouseAnchor), so a no-cure PROTEST that fails it at h moves the price to the
+// window anchored at h. That must price exactly as the plain window at h, or a repayment priced at the tip fails after
+// the PROTEST in the same block. Neither counts a post made at h (D-2026-11-20-2); from h+1 it counts.
+BOOST_AUTO_TEST_CASE(refhouse_anchor_at_h_prices_as_the_plain_window)
+{
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t T = 400 * DAY;
+    const uint32_t H = 500;
+    AdvanceChainClock(units, H - 20, T - 3 * DAY, gp);
+    BOOST_REQUIRE(ApplyHouseRatePost(units, 4, 100000, 101000, H - 20, T - 3 * DAY, gp, strReject));
+    AdvanceChainClock(units, H - 10, T - DAY, gp);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 4, 110000, 111100, H - 10, T - DAY, gp, strReject),
+                          "setup: the second post was refused: " + strReject);
+    AdvanceChainClock(units, H - 1, T, gp);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 4, 120000, 121200, H, T, gp, strReject),
+                          "setup: the post at H was refused: " + strReject);
+    const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+    g_nHouseRateTestOverride = 0;
+    {
+        UnitsCheckScope scope(&units);
+        uint64_t nBidPlain = 0, nAskPlain = 0, nBidAnchored = 0, nAskAnchored = 0;
+        BOOST_REQUIRE(HouseRateMaxForChecks(4, H, 30, nBidPlain, nAskPlain));
+        BOOST_REQUIRE(HouseRateMaxAtForChecks(4, H, 30, nBidAnchored, nAskAnchored));
+        BOOST_CHECK_EQUAL(nAskAnchored, nAskPlain);
+        BOOST_CHECK_EQUAL(nBidAnchored, nBidPlain);
+        BOOST_CHECK_EQUAL(nAskPlain, 111100u);   // the post at H counts in neither
+        uint64_t nBidNext = 0, nAskNext = 0;
+        BOOST_REQUIRE(HouseRateMaxForChecks(4, H + 1, 30, nBidNext, nAskNext));
+        BOOST_CHECK_EQUAL(nAskNext, 121200u);    // from H+1 it does
+    }
+    g_nHouseRateTestOverride = nOverridePrev;
+}
+
 BOOST_AUTO_TEST_SUITE_END()
+

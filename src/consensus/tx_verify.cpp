@@ -125,6 +125,12 @@ unsigned int GetLegacySigOpCount(const CTransaction& tx)
     }
     for (const auto& txout : tx.vout)
     {
+        // S5X-1 (switch-on consensus, from genesis; Michael 2026-11-19 "Yes, build it"): an unspendable output
+        // (OP_RETURN first, or over MAX_SCRIPT_SIZE) is never executed, so it carries no signature checks. Counting the
+        // bytes of data carried after an OP_RETURN as opcodes let a data output weigh against the block's sigop limit.
+        // One rule here, so CheckBlock, ConnectBlock and the mempool (GetTransactionSigOpCost) and the builder agree.
+        if (txout.scriptPubKey.IsUnspendable())
+            continue;
         nSigOps += txout.scriptPubKey.GetSigOpCount(false);
     }
     return nSigOps;

@@ -494,8 +494,8 @@ static UniValue getinfo_deprecated(const JSONRPCRequest& request)
 // gateway/docs/distribution/FREEBANKD_BMM_RPC_SPEC.md as amended by freebank's
 // reply of 2026-09-26 (inbox/distribution/2026-09-26-from-freebank-bmm-spec.md).
 //
-// Byte orders: critical_hash is h* = hashMerkleRoot as ConsensusHex (internal
-// byte order, what the M8 carries). Every other hash is display order. All hex
+// Byte orders: critical_hash is h* = BMMCommitment(header) (S5X-2, switch-on; it was
+// hashMerkleRoot) as ConsensusHex (internal byte order, what the M8 carries). Every other hash is display order. All hex
 // is lowercase.
 //
 // Money rule: connect_block answers false only on a definite rejection. Every
@@ -730,7 +730,7 @@ static bool BMMOnActiveChain(const uint256& hashCritical)
     AssertLockHeld(cs_main);
     const CBlockIndex* pindex = chainActive.Tip();
     for (int i = 0; pindex && i < BMM_RESEND_DEPTH; i++, pindex = pindex->pprev) {
-        if (pindex->hashMerkleRoot == hashCritical)
+        if (BMMCommitment(pindex->GetBlockHeader()) == hashCritical)   // S5X-2: h* is the header's commitment
             return true;
     }
     return false;
@@ -742,7 +742,7 @@ static bool BMMHaveFailedBlock(const uint256& hashCritical)
     AssertLockHeld(cs_main);
     for (const auto& entry : mapBlockIndex) {
         const CBlockIndex* pindex = entry.second;
-        if (pindex->hashMerkleRoot == hashCritical && (pindex->nStatus & BLOCK_FAILED_MASK))
+        if ((pindex->nStatus & BLOCK_FAILED_MASK) && BMMCommitment(pindex->GetBlockHeader()) == hashCritical)
             return true;
     }
     return false;
@@ -761,7 +761,7 @@ static UniValue BMMTemplateToJSON(const BMMTemplatePin& pin)
     block.pushKV("hex", HexStr(ss.begin(), ss.end()));
 
     UniValue result(UniValue::VOBJ);
-    result.pushKV("critical_hash", ConsensusHexFromUint256(pin.block.hashMerkleRoot));
+    result.pushKV("critical_hash", ConsensusHexFromUint256(BMMCommitment(pin.block)));
     result.pushKV("block", block);
     result.pushKV("fees_sats", (int64_t)pin.nFees);
     return result;
@@ -783,7 +783,9 @@ UniValue get_block_template(const JSONRPCRequest& request)
             "its own refreshbmm never bids against the engine.\n"
             "\nResult:\n"
             "{\n"
-            "  \"critical_hash\": \"hex\",   (string) h* = hashMerkleRoot, internal byte order (as the M8 carries it)\n"
+            "  \"critical_hash\": \"hex\",   (string) h*, the block's BMM commitment (a tagged hash of the network and\n"
+            "                              the header fields the L1 block doesn't fix), internal byte order (as the M8\n"
+            "                              carries it). Bid for exactly this; it is not the merkle root\n"
             "  \"block\": {\n"
             "    \"prev_main_hash\": \"hex\", (string) T, display order\n"
             "    \"prev_side_hash\": \"hex\", (string) hashPrevBlock, display order\n"
@@ -885,9 +887,10 @@ UniValue get_block_template(const JSONRPCRequest& request)
     pBMMTemplatePin->nFees = nFees;
     pBMMTemplatePin->nHeight = nHeight;
 
-    if (!mapBMMTemplateMainTip.count(block.hashMerkleRoot)) {
-        mapBMMTemplateMainTip[block.hashMerkleRoot] = hashMainTip;
-        deqBMMTemplate.push_back(block.hashMerkleRoot);
+    const uint256 hashCriticalT = BMMCommitment(block);   // S5X-2
+    if (!mapBMMTemplateMainTip.count(hashCriticalT)) {
+        mapBMMTemplateMainTip[hashCriticalT] = hashMainTip;
+        deqBMMTemplate.push_back(hashCriticalT);
         while (deqBMMTemplate.size() > BMM_TEMPLATES_REMEMBERED) {
             mapBMMTemplateMainTip.erase(deqBMMTemplate.front());
             deqBMMTemplate.pop_front();
@@ -895,7 +898,7 @@ UniValue get_block_template(const JSONRPCRequest& request)
     }
 
     LogPrintf("%s: template h* %s at side height %d on eCash tip %s\n", __func__,
-              ConsensusHexFromUint256(block.hashMerkleRoot), nHeight, hashMainTip.ToString());
+              ConsensusHexFromUint256(hashCriticalT), nHeight, hashMainTip.ToString());
 
     return BMMTemplateToJSON(*pBMMTemplatePin);
 }
@@ -986,7 +989,7 @@ UniValue connect_block(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "block's coinbase has no PrevBlockCommit");
 
     const uint256 hashMain = ParseHashV(request.params[1], "main_block_hash");
-    const uint256 hashCritical = block.hashMerkleRoot;
+    const uint256 hashCritical = BMMCommitment(block);   // S5X-2
 
     BMMRefuseWhileDormant(strMethod);
     BMMRequireEnforcer(strMethod);
@@ -1594,6 +1597,57 @@ UniValue rebroadcastwithdrawalbundle(const JSONRPCRequest& request)
     bmmCache.StoreBroadcastedWithdrawalBundle(hashLatest);
 
     return NullUniValue;
+}
+
+UniValue listdepositrefunds(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size())
+        throw std::runtime_error(
+            "listdepositrefunds\n"
+            "\nRead only. A deposit to FreeBank that names no valid FreeBank address isn't credited on FreeBank.\n"
+            "FreeBank's rules send its value back on eCash, less a fixed fee, through the normal withdrawal process,\n"
+            "which takes at least about six weeks of eCash miners' votes. It goes to the eCash address the deposit\n"
+            "named or, if it named none, to the deposit transaction's single other output. If the deposit was sent from\n"
+            "an exchange or another service, that output may be the service's or someone else's, not yours. If neither\n"
+            "applies, or too little is left after the fee, it stays locked in FreeBank's treasury for good. This is a\n"
+            "rule of the software: FreeBank's developers can't send, stop or speed up a refund. This lists the rows the\n"
+            "rule has made, oldest first.\n"
+            "\nResult:\n"
+            "[\n"
+            "  {\n"
+            "    \"id\": \"hex\",            (string) the withdrawal row's id\n"
+            "    \"destination\": \"str\",   (string) the eCash destination it pays\n"
+            "    \"amount\": n,              (numeric) the deposit's value\n"
+            "    \"mainchain_fee\": n,       (numeric) the fixed fee, to the eCash miners\n"
+            "    \"status\": \"str\",        (string) the row's withdrawal status\n"
+            "    \"order\": \"str\"          (string) FreeBank height and place of the deposit record (the queue order)\n"
+            "  }, ...\n"
+            "]\n"
+            "\nExamples:\n"
+            + HelpExampleCli("listdepositrefunds", "")
+            + HelpExampleRpc("listdepositrefunds", ""));
+
+    LOCK(cs_main);
+    std::vector<SidechainWithdrawal> vRefund;
+    for (const SidechainWithdrawal& w : psidechaintree->GetWithdrawals(THIS_SIDECHAIN))
+        if (IsDepositRefund(w))
+            vRefund.push_back(w);
+    std::sort(vRefund.begin(), vRefund.end(), [](const SidechainWithdrawal& a, const SidechainWithdrawal& b) {
+        return a.strRefundDestination < b.strRefundDestination;
+    });
+    UniValue arr(UniValue::VARR);
+    for (const SidechainWithdrawal& w : vRefund) {
+        UniValue o(UniValue::VOBJ);
+        o.pushKV("id", w.GetID().ToString());
+        const std::string strL1 = EncodeMainchainAddress(WithdrawalPayoutScript(w));
+        o.pushKV("destination", strL1.empty() ? w.strDestination : strL1);
+        o.pushKV("amount", ValueFromAmount(w.amount));
+        o.pushKV("mainchain_fee", ValueFromAmount(w.mainchainFee));
+        o.pushKV("status", w.GetStatusStr());
+        o.pushKV("order", w.strRefundDestination.substr(DEPOSIT_REFUND_TAG.size()));
+        arr.push_back(o);
+    }
+    return arr;
 }
 
 UniValue getpegstatus(const JSONRPCRequest& request)
@@ -2606,6 +2660,7 @@ static const CRPCCommand commands[] =
     { "sidechain",          "listmywithdrawals",            &listmywithdrawals,             {}},
     { "sidechain",          "rebroadcastwithdrawalbundle",  &rebroadcastwithdrawalbundle,   {}},
     { "sidechain",          "getpegstatus",                 &getpegstatus,                  {}},
+    { "sidechain",          "listdepositrefunds",           &listdepositrefunds,            {}},
     { "sidechain",          "getwithdrawal",                &getwithdrawal,                 {"id"}},
     { "sidechain",          "formatdepositaddress",         &formatdepositaddress,          {"address"}},
 

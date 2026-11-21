@@ -22,14 +22,17 @@
 #include "base58.h"
 #include "bmmcache.h"
 #include "chainparams.h"
+#include "clientversion.h"
 #include "consensus/merkle.h"
 #include "consensus/validation.h"
 #include "key.h"
 #include "l1client.h"
 #include "miner.h"
+#include "random.h"
 #include "script/standard.h"
 #include "sidechain.h"
 #include "sidechainclient.h"
+#include "streams.h"
 #include "txdb.h"
 #include "uint256.h"
 #include "util.h"
@@ -1143,19 +1146,52 @@ PEGBIND_BOTH_LAYOUTS(b2_bundle_must_be_new)
         chain.Connect(pblock, "fail wait");
     }
 
-    // X again, made the way a block maker without the builder's check would
-    CTransactionRef txAgain, txAgainData;
-    BOOST_REQUIRE(CreateWithdrawalBundleTx(TipForTest()->nHeight + 1, txAgain, txAgainData,
-                                           true /* fReplicationCheck */, false /* fCheckUnique */));
-    BOOST_REQUIRE(txAgain->GetHash() == bundle.tx.GetHash());
+    // X again, its own record carried by a block maker without the builder's check: still not new (B2)
+    SidechainWithdrawalBundle again = bundle;
+    again.status = WITHDRAWAL_BUNDLE_CREATED;
     chain.Reject(chain.Block({}, [&](CMutableTransaction& cb) {
-        for (const CTxOut& out : txAgainData->vout)
-            cb.vout.push_back(out);
+        cb.vout.push_back(CTxOut(0, again.GetScript()));
     }), "bad-bundle-not-new", "X again");
     SidechainWithdrawalBundle row;
     BOOST_REQUIRE(HaveBundleRow(bundle, &row));
     BOOST_CHECK_EQUAL(row.status, WITHDRAWAL_BUNDLE_FAILED);
     BOOST_CHECK_EQUAL(WithdrawalStatus(wt), WITHDRAWAL_UNSPENT);
+
+    // RQ-1: the same rows now rebuild a DIFFERENT bundle - its nLockTime follows the failed X - so the retry is new,
+    // and the block that carries it connects (before RQ-1 it was byte-identical to X and refused for good)
+    CTransactionRef txRetry, txRetryData;
+    BOOST_REQUIRE(CreateWithdrawalBundleTx(TipForTest()->nHeight + 1, txRetry, txRetryData,
+                                           true /* fReplicationCheck */, true /* fCheckUnique */));
+    BOOST_CHECK(txRetry->GetHash() != bundle.tx.GetHash());
+    BOOST_CHECK_EQUAL(txRetry->nLockTime, WithdrawalBundleLockTime(bundle.tx.GetHash()));
+    BOOST_CHECK(txRetry->vout == bundle.tx.vout);   // same rows, same outputs: only the nLockTime differs
+    // the same retry rebuilt at another height after the same previous bundle is the same bundle (a reorg rebuild
+    // reproduces the m6id already on the L1)
+    CTransactionRef txRetry2, txRetry2Data;
+    BOOST_REQUIRE(CreateWithdrawalBundleTx(TipForTest()->nHeight + 7, txRetry2, txRetry2Data,
+                                           true /* fReplicationCheck */, true /* fCheckUnique */));
+    BOOST_CHECK(txRetry2->GetHash() == txRetry->GetHash());
+    // ... and the builder now makes it by itself (before RQ-1 it refused it as not unique and waited for good)
+    const auto pblockRetry = chain.Block();
+    SidechainWithdrawalBundle retry;
+    BOOST_REQUIRE(BundleOf(*pblockRetry, retry));
+    BOOST_CHECK(retry.tx.GetHash() == txRetry->GetHash());
+    chain.Connect(pblockRetry, "RQ-1 retry");
+    BOOST_CHECK(LastBundleHash() == txRetry->GetHash());
+    BOOST_CHECK_EQUAL(WithdrawalStatus(wt), WITHDRAWAL_IN_BUNDLE);
+}
+
+// RQ-1: the lock time is a function of the previous bundle only - 0 with none, below 500,000,000 (a height) always
+BOOST_AUTO_TEST_CASE(rq1_bundle_lock_time)
+{
+    BOOST_CHECK_EQUAL(WithdrawalBundleLockTime(uint256()), 0U);
+    for (int i = 0; i < 100; i++) {
+        const uint256 h = GetRandHash();
+        BOOST_CHECK(WithdrawalBundleLockTime(h) < 500000000U);
+        BOOST_CHECK_EQUAL(WithdrawalBundleLockTime(h), WithdrawalBundleLockTime(h));
+    }
+    const uint256 a = uint256S("0000000000000000000000000000000000000000000000000000000000000001");
+    BOOST_CHECK_EQUAL(WithdrawalBundleLockTime(a), 1U);
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,27 +1363,27 @@ BOOST_AUTO_TEST_CASE(c1_bmm_three_answers)
 
     // Yes
     CBlock block = Block(hashE, hashP);
-    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::YES;
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(block))] = L1Answer::YES;
     BOOST_CHECK_EQUAL(BmmVerdict(block), "yes");
 
     // No: E carries no bid or another one
     block = Block(hashE, hashP);
-    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::NO;
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(block))] = L1Answer::NO;
     BOOST_CHECK_EQUAL(BmmVerdict(block), "no:bad-bmm:1");
 
     // No: the coinbase names another parent of E
     block = Block(hashE, hashG);
-    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::YES;
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(block))] = L1Answer::YES;
     BOOST_CHECK_EQUAL(BmmVerdict(block), "no:bad-mc-prev:25");
 
     // Can't tell: the enforcer has not processed E, or does not answer
     block = Block(hashE, hashP);
-    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::UNKNOWN;
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(block))] = L1Answer::UNKNOWN;
     BOOST_CHECK_EQUAL(BmmVerdict(block), "cant-tell");
 
     // Can't tell: E carries the bid but is not in our list yet
     block = Block(hashE2, hashE);
-    oracle.mapBmm[std::make_pair(hashE2, block.hashMerkleRoot)] = L1Answer::YES;
+    oracle.mapBmm[std::make_pair(hashE2, BMMCommitment(block))] = L1Answer::YES;
     BOOST_CHECK_EQUAL(BmmVerdict(block), "cant-tell");
     // ... and passes once the list has it
     bmmCache.ReplaceMainBlockCache({hashG, hashP, hashE, hashE2});
@@ -1355,7 +1391,7 @@ BOOST_AUTO_TEST_CASE(c1_bmm_three_answers)
 
     // No: the prevBlock commit is missing (wrong in itself)
     block = Block(hashE, hashP);
-    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::YES;
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(block))] = L1Answer::YES;
     {
         CMutableTransaction cb(*block.vtx[0]);
         cb.vout.clear();
@@ -1407,7 +1443,7 @@ BOOST_AUTO_TEST_CASE(c7c_block_time_is_its_l1_blocks)
         cb.vin[0].prevout.SetNull();
         cb.vout.push_back(CTxOut(0, GeneratePrevBlockCommit(hashPrevMain, block.hashPrevBlock)));
         block.vtx.push_back(MakeTransactionRef(std::move(cb)));
-        oracle.mapBmm[std::make_pair(hashMain, block.hashMerkleRoot)] = L1Answer::YES;
+        oracle.mapBmm[std::make_pair(hashMain, BMMCommitment(block))] = L1Answer::YES;
         return block;
     };
 
@@ -1440,13 +1476,17 @@ BOOST_AUTO_TEST_CASE(c7c_block_time_is_its_l1_blocks)
     BOOST_CHECK_EQUAL(BmmVerdict(Block(hashE, hashP, nTimeE + 5)), "no:bad-bmm-time:10");
     BOOST_CHECK_EQUAL(oracle.nTimeCalls, nCalls);
 
-    // A copy with another parent (the one header field 7c leaves free) asks the
-    // L1 nothing - its (E, h*) pair is known - and the coinbase still refuses it
+    // A copy with another parent: before S5X-2 the one header field 7c left free, its (E, h*) pair was known and only
+    // the coinbase refused it. Now the parent is in the commitment (BMMCommitment), so the copy carries a commitment E
+    // doesn't: the L1 is asked once, answers no (E carries only the honest bid), and the copy is refused as bad-bmm
+    // before its time is asked.
     CBlock copyPrev = block;
     copyPrev.hashPrevBlock = ArithToUint256(arith_uint256(0x7d));
+    BOOST_CHECK(BMMCommitment(copyPrev) != BMMCommitment(block));
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(copyPrev))] = L1Answer::NO;
     const int nBmm = oracle.nBmmCalls, nTime = oracle.nTimeCalls;
-    BOOST_CHECK_EQUAL(BmmVerdict(copyPrev), "no:bad-sc-prev:25");
-    BOOST_CHECK_EQUAL(oracle.nBmmCalls, nBmm);
+    BOOST_CHECK_EQUAL(BmmVerdict(copyPrev), "no:bad-bmm:1");
+    BOOST_CHECK_EQUAL(oracle.nBmmCalls, nBmm + 1);
     BOOST_CHECK_EQUAL(oracle.nTimeCalls, nTime);
 }
 
@@ -1596,7 +1636,7 @@ BOOST_AUTO_TEST_CASE(c3_scan_marks_checked_only_on_an_answer)
     bid.hashMerkleRoot = ArithToUint256(arith_uint256(0xc3b));
     BOOST_REQUIRE(bmmCache.StoreBMMBlock(bid));
     bmmCache.StorePrevBlockBMMCreated(hashT);
-    oracle.mapBmm[std::make_pair(hashT, bid.hashMerkleRoot)] = L1Answer::NO;
+    oracle.mapBmm[std::make_pair(hashT, BMMCommitment(bid))] = L1Answer::NO;
 
     auto Scan = [&]() {
         SidechainClient client;
@@ -1610,18 +1650,18 @@ BOOST_AUTO_TEST_CASE(c3_scan_marks_checked_only_on_an_answer)
 
     // The L1 cannot answer about U: U is not recorded as checked, and the bid
     // block is kept for the next scan
-    oracle.mapBmm[std::make_pair(hashU, bid.hashMerkleRoot)] = L1Answer::UNKNOWN;
+    oracle.mapBmm[std::make_pair(hashU, BMMCommitment(bid))] = L1Answer::UNKNOWN;
     Scan();
     BOOST_CHECK(bmmCache.MainBlockChecked(hashT));
     BOOST_CHECK_MESSAGE(!bmmCache.MainBlockChecked(hashU), "an unanswered L1 block was recorded as checked");
     CBlock kept;
-    BOOST_CHECK_MESSAGE(bmmCache.GetBMMBlock(bid.hashMerkleRoot, kept), "the bid block was dropped before the L1 answered");
+    BOOST_CHECK_MESSAGE(bmmCache.GetBMMBlock(BMMCommitment(bid), kept), "the bid block was dropped before the L1 answered");
 
     // The L1 answers no: U is checked, and the bids made on T go
-    oracle.mapBmm[std::make_pair(hashU, bid.hashMerkleRoot)] = L1Answer::NO;
+    oracle.mapBmm[std::make_pair(hashU, BMMCommitment(bid))] = L1Answer::NO;
     Scan();
     BOOST_CHECK(bmmCache.MainBlockChecked(hashU));
-    BOOST_CHECK(!bmmCache.GetBMMBlock(bid.hashMerkleRoot, kept));
+    BOOST_CHECK(!bmmCache.GetBMMBlock(BMMCommitment(bid), kept));
     bmmCache.ClearBMMBlocks();
 }
 
@@ -1728,7 +1768,7 @@ BOOST_AUTO_TEST_CASE(replay_l1_behind_or_side_branch)
         cb.vout.push_back(CTxOut(0, GeneratePrevBlockCommit(hashP, block.hashPrevBlock)));
         block.vtx.push_back(MakeTransactionRef(std::move(cb)));
     }
-    oracle.mapBmm[std::make_pair(hashE, block.hashMerkleRoot)] = L1Answer::YES;   // the enforcer keeps old answers
+    oracle.mapBmm[std::make_pair(hashE, BMMCommitment(block))] = L1Answer::YES;   // the enforcer keeps old answers
     const bool fReindexSaved = fReindex;
     const int nTriesSaved = g_nImportL1WaitTries;
     fReindex = true;
@@ -1896,25 +1936,25 @@ BOOST_AUTO_TEST_CASE(bid_conflict_resends_same_block)
     bid.hashMerkleRoot = ArithToUint256(arith_uint256(0xb416b));
     BOOST_REQUIRE(bmmCache.StoreBMMBlock(bid));
     bmmCache.StorePrevBlockBMMCreated(hashTip);
-    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    bmmCache.MarkBidResend(hashTip, BMMCommitment(bid));
     uint256 txid;
 
     // Refused again: resent with the same h* on the same tip, still due
     l1.fConflictNext = true;
     std::string strError = Refresh(txid);
     BOOST_REQUIRE_EQUAL(l1.nBids, 1);
-    BOOST_CHECK(l1.vBids[0] == std::make_pair(bid.hashMerkleRoot, hashTip));
+    BOOST_CHECK(l1.vBids[0] == std::make_pair(BMMCommitment(bid), hashTip));
     BOOST_CHECK(txid.IsNull());
     BOOST_CHECK_MESSAGE(strError.find("resends it") != std::string::npos, strError);
     uint256 hashRoot;
-    BOOST_CHECK(bmmCache.GetBidResend(hashTip, hashRoot) && hashRoot == bid.hashMerkleRoot);
+    BOOST_CHECK(bmmCache.GetBidResend(hashTip, hashRoot) && hashRoot == BMMCommitment(bid));
 
     // Taken: the same h* again, the resend cleared, and no further bid on this tip
     l1.fConflictNext = false;
     l1.txidNext = ArithToUint256(arith_uint256(0xb416f));
     Refresh(txid);
     BOOST_REQUIRE_EQUAL(l1.nBids, 2);
-    BOOST_CHECK(l1.vBids[1] == std::make_pair(bid.hashMerkleRoot, hashTip));
+    BOOST_CHECK(l1.vBids[1] == std::make_pair(BMMCommitment(bid), hashTip));
     BOOST_CHECK(txid == l1.txidNext);
     BOOST_CHECK(!bmmCache.GetBidResend(hashTip, hashRoot));
     strError = Refresh(txid);
@@ -1924,7 +1964,7 @@ BOOST_AUTO_TEST_CASE(bid_conflict_resends_same_block)
     // A conflict that never clears: MAX_BID_RESENDS resends after the first refusal, then the tip is left alone
     l1.txidNext.SetNull();
     l1.fConflictNext = true;
-    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    bmmCache.MarkBidResend(hashTip, BMMCommitment(bid));
     for (int i = 0; i < BMMCache::MAX_BID_RESENDS + 4; i++)
         Refresh(txid);
     BOOST_CHECK_EQUAL(l1.nBids, 2 + BMMCache::MAX_BID_RESENDS);
@@ -1934,7 +1974,7 @@ BOOST_AUTO_TEST_CASE(bid_conflict_resends_same_block)
     l1.fConflictNext = false;
     l1.fMaybeSentNext = true;
     bmmCache.ClearBidResend();
-    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    bmmCache.MarkBidResend(hashTip, BMMCommitment(bid));
     Refresh(txid);
     Refresh(txid);
     BOOST_CHECK_EQUAL(l1.nBids, 1);
@@ -1942,7 +1982,7 @@ BOOST_AUTO_TEST_CASE(bid_conflict_resends_same_block)
     // Behind its node: no resend
     l1.nBids = 0;
     l1.fBehind = true;
-    bmmCache.MarkBidResend(hashTip, bid.hashMerkleRoot);
+    bmmCache.MarkBidResend(hashTip, BMMCommitment(bid));
     BOOST_CHECK_EQUAL(Refresh(txid), "behind");
     BOOST_CHECK_EQUAL(l1.nBids, 0);
     l1.fBehind = false;
@@ -2716,6 +2756,104 @@ PEGBIND_BOTH_LAYOUTS(pg1_failed_bundle_payout_is_shortfall)
     ev.status = 'S';
     ev.hashMainBlock = ArithToUint256(arith_uint256(0x5a2));
     BOOST_CHECK(IsUnexpectedPayout(ev, setPending));
+}
+
+// S5X-2b (security 11-19, Medium; testing's headers_replay step 2b): an L1 block carries at most one slot-130
+// commitment. Once E's is known (its h*, or none), every header naming E is answered locally - no connection check,
+// no L1 call - and a header with another commitment is refused at DoS 10. Before, each copy that varied a covered field
+// (S5X-2 put the parent in the commitment) cost ~3 enforcer calls under cs_main at +1 ban score.
+BOOST_AUTO_TEST_CASE(s5x_2b_known_commitment_answers_locally)
+{
+    TestL1Oracle oracle;
+    const uint256 hashL1 = GetRandHash(), hashL1None = GetRandHash();
+    uint256 hashParent;
+    uint32_t nTime = 0;
+    {
+        LOCK(cs_main);
+        hashParent = chainActive.Genesis()->GetBlockHash();   // the fixture's chain may be genesis only
+        nTime = (uint32_t)chainActive.Genesis()->GetBlockTime() + 600;
+    }
+    bmmCache.CacheMainBlockHash(hashL1);
+    bmmCache.CacheMainBlockHash(hashL1None);
+    bmmCache.CacheMainBlockTime(hashL1, nTime);
+    bmmCache.CacheMainBlockTime(hashL1None, nTime);
+
+    CBlockHeader header;
+    header.nVersion = 0x20000000;
+    header.hashPrevBlock = hashParent;
+    header.hashMerkleRoot = GetRandHash();
+    header.nTime = nTime;
+    header.hashMainchainBlock = hashL1;
+    bmmCache.CacheMainBlockCommitment(hashL1, true, BMMCommitment(header));   // what the first answer for E said
+    bmmCache.CacheMainBlockCommitment(hashL1None, false, uint256());           // an E that carries no slot-130 bid
+    bool fYes = false;
+    BOOST_CHECK(bmmCache.GetMainBlockCommitmentAnswer(hashL1, BMMCommitment(header), fYes) && fYes);
+
+    const int nCalls = oracle.nBmmCalls;
+    CValidationState state0;
+    BOOST_CHECK(ProcessNewBlockHeaders({header}, state0, Params()));          // E's own commitment: accepted
+    for (int i = 0; i < 4; i++) {
+        CBlockHeader h = header;
+        if (i == 0) h.hashPrevBlock = header.GetHash();                       // reparented onto a known header (2b)
+        if (i == 1) h.nVersion++;
+        if (i == 2) h.hashWithdrawalBundle = GetRandHash();
+        if (i == 3) h.hashMainchainBlock = hashL1None;                        // an E with no bid at all
+        CValidationState state;
+        BOOST_CHECK(!ProcessNewBlockHeaders({h}, state, Params()));
+        int nDoS = 0;
+        BOOST_CHECK(state.IsInvalid(nDoS));
+        if (i == 0) {
+            // anchored in the same E as its new parent: the L1-order rule refuses it first, also with no L1 call
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-mc-order");
+        } else {
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bmm");
+            BOOST_CHECK_EQUAL(nDoS, 10);
+        }
+    }
+    BOOST_CHECK_EQUAL(oracle.nBmmCalls, nCalls);                              // not one L1 call
+}
+
+
+// S5X-2: bmm.dat's verified-BMM hashes from a file written before the bid committed to the header (v1.2.1 and older:
+// required 20500, or the legacy 160000) are dropped on load, so -reindex checks those blocks' bids again; its deposit
+// entries are kept. A file this build writes keeps its BMM entries.
+BOOST_AUTO_TEST_CASE(s5x_2_bmm_cache_from_before_s5x_2_dropped)
+{
+    const fs::path path = GetDataDir() / "bmm.dat";
+    auto write = [&](int nRequired, const uint256& hashBMM, const uint256& txidDeposit) {
+        CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+        BOOST_REQUIRE(!fileout.IsNull());
+        fileout << nRequired << CLIENT_VERSION;
+        fileout << (int)0;                      // withdrawal bundles
+        fileout << (int)1 << hashBMM;           // verified BMM
+        fileout << (int)1 << txidDeposit;       // verified deposits
+    };
+    for (int nRequired : {FREEBANK_CACHE_MIN_VERSION, 160000}) {
+        const uint256 hashOld = GetRandHash(), txidOld = GetRandHash();
+        write(nRequired, hashOld, txidOld);
+        LoadBMMCache();
+        BOOST_CHECK_MESSAGE(!bmmCache.HaveVerifiedBMM(hashOld), "required " << nRequired << ": BMM entry kept");
+        BOOST_CHECK_MESSAGE(bmmCache.HaveVerifiedDeposit(txidOld), "required " << nRequired << ": deposit entry lost");
+    }
+    const uint256 hashNew = GetRandHash(), txidNew = GetRandHash();
+    write(BMM_CACHE_S5X2_MIN_VERSION, hashNew, txidNew);
+    LoadBMMCache();
+    BOOST_CHECK(bmmCache.HaveVerifiedBMM(hashNew));
+    BOOST_CHECK(bmmCache.HaveVerifiedDeposit(txidNew));
+
+    // this build's own file says it needs S5X-2 and reads back whole
+    DumpBMMCache();
+    {
+        CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+        BOOST_REQUIRE(!filein.IsNull());
+        int nRequired = 0, nWrote = 0;
+        filein >> nRequired >> nWrote;
+        BOOST_CHECK_EQUAL(nRequired, BMM_CACHE_S5X2_MIN_VERSION);
+        BOOST_CHECK_EQUAL(nWrote, CLIENT_VERSION);
+    }
+    LoadBMMCache();
+    BOOST_CHECK(bmmCache.HaveVerifiedBMM(hashNew));
+    fs::remove(path);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

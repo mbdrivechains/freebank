@@ -545,6 +545,12 @@ private:
     std::map<uint256 /* txid */, std::vector<COutPoint> /* targets */> mapTxFreezeTargets;
     std::map<COutPoint /* target */, uint32_t /* pooled FREEZE/UNFREEZE ops */> mapFreezeTargetCount;
 
+    // S2X-1 (plain; external s1/s2, High): the units each pooled MINT adds to its token, and their sum per token, so ATMP
+    // refuses a MINT that doesn't fit with the token's confirmed supply plus every pooled MINT of it (each fitting alone,
+    // eleven together failed every template). Kept on add and remove: a lookup, not a scan of the pool per MINT.
+    std::map<uint256 /* txid */, std::pair<uint256 /* token */, uint64_t /* units */>> mapTxMintUnits;
+    std::map<uint256 /* token */, uint64_t /* units of its pooled MINTs */> mapPendingMintUnits;
+
 public:
     indirectmap<COutPoint, const CTransaction*> mapNextTx;
     std::map<uint256, CAmount> mapDeltas;
@@ -695,6 +701,14 @@ public:
     {
         LOCK(cs);
         return mapFreezeTargetCount.count(out);
+    }
+
+    /** S2X-1: the units of every pooled MINT of this token (0 if none). */
+    uint64_t PendingMintUnits(const uint256& token) const
+    {
+        LOCK(cs);
+        const auto it = mapPendingMintUnits.find(token);
+        return it == mapPendingMintUnits.end() ? 0 : it->second;
     }
 
     /** UR-ext-9: the pooled txs that create withdrawal id wid. */

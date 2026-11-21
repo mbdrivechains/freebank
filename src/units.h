@@ -210,6 +210,13 @@ public:
     /** As CUnitsDB::Scan, over the DB with this view's writes applied. */
     std::vector<std::pair<UnitsKey, UnitsValue>> Scan(const UnitsKey& prefix, const UnitsKey& start, size_t nMax) const;
 
+    /** S2X-1 (testing 11-20): record every write from here, so RollBackJournal can put the view back exactly as it was
+     *  (CommitJournal keeps the writes). The block template's per-package check applies a package in place and undoes it
+     *  on failure; copying the view per package was quadratic in the keys earlier packages wrote (2,000 BURNs: ~1 s). */
+    void BeginJournal() { vJournal.clear(); fJournal = true; }
+    void CommitJournal() { vJournal.clear(); fJournal = false; }
+    void RollBackJournal();
+
     /** The keys this view changed (a key written back to its old value is left out) with their new and old values. */
     void GetChanges(std::map<UnitsKey, UnitsSlot>& mapChange, std::map<UnitsKey, UnitsSlot>& mapBefore) const;
     bool IsEmpty() const { return mapChange.empty(); }
@@ -221,6 +228,15 @@ private:
 
     UnitsSlot ReadDB(const UnitsKey& key) const;
     void Set(const UnitsKey& key, const UnitsSlot& slot);
+
+    struct JournalEntry {
+        UnitsKey key;
+        bool fHadChange;       // the key was in mapChange before this write
+        UnitsSlot change;      // its value there
+        bool fHadBefore;       // the key was in mapBefore before this write
+    };
+    bool fJournal = false;
+    std::vector<JournalEntry> vJournal;
 };
 
 #endif // BITCOIN_UNITS_H

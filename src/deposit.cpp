@@ -216,6 +216,10 @@ bool CheckDepositTransactionShape(const CTransaction& tx, CValidationState& stat
         uint64_t total = 0;
         if (!SumDepositPrincipal(org.vPrincipal, total))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-originate-principal");
+        // D-2026-11-20-1 (S2X-2, switch-on): no receipt above MAX_DEPOSIT_RATE_BPS (100% a year)
+        for (const uint32_t nRateBps : org.vRateBps)
+            if (nRateBps > MAX_DEPOSIT_RATE_BPS)
+                return state.DoS(100, false, REJECT_INVALID, "bad-deposit-originate-rate");
         // maturity > origination (term > 0) and the term bound are CONTEXTUAL
         // (they need this block's height) - checked in CheckDepositOperation.
         if (!CheckDepositReceiptOutputs(tx, n, state))

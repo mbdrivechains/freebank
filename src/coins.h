@@ -48,7 +48,13 @@
 //! v4 (gram-notes release, docs-local/GOLD_USD_SCOPE.md): issued-token coins
 //! (fIssued; assetID = the token's id, nIssuedUnits, nIssuedFrozen), appended
 //! last in both records, the rest written only when fIssued is set.
-static const int FREEBANK_DISK_FORMAT_VERSION = 4;
+//!
+//! v5 (S5X-2, switch-on; security's S5X-2c 11-19): no record changed. The BMM
+//! bid now commits to the header, and a datadir from before it holds blocks
+//! whose bids no longer verify; nothing at load re-checks them (VerifyDB runs
+//! without the BMM check). The bump forces -reindex, where LoadBMMCache drops
+//! the pre-S5X-2 verified-BMM entries and every bid is checked again.
+static const int FREEBANK_DISK_FORMAT_VERSION = 5;
 
 /**
  * A UTXO entry.

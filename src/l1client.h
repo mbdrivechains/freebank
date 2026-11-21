@@ -9,6 +9,7 @@
 #include <primitives/transaction.h>
 #include <uint256.h>
 
+#include <atomic>
 #include <functional>
 #include <set>
 #include <string>
@@ -69,6 +70,12 @@ std::string ChainNameFromEnforcerChainInfo(const UniValue& response);
  *  follows the same L1. False (signet/testnet family, prefix 111) until the probe runs.
  *  Defined in base58.cpp (common layer) so freebank-tx links; SET here. */
 extern bool g_fMainchainMainFamily;
+
+/** S5X-5: the double-propose guard (ListWithdrawalBundleStatus) reads the L1 withdrawal events of only this many recent
+ *  L1 blocks; above the largest preset's bundle max age (26,300). -pegbundlewindow sets it, on regtest only, so a gate
+ *  can exercise the window on a short chain. */
+static const int PEG_BUNDLE_WINDOW_DEFAULT = 28000;
+extern std::atomic<int> g_nPegBundleWindow;
 
 /** Parse a -mainchainblockpin value "<height>:<blockhash>" (forknet / mainnet-family
  *  L1 identity pin). Pure, no I/O, unit-tested. Returns false on any malformation. */

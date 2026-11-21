@@ -561,8 +561,10 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-realclock", "Count Gold B's windows (swap deadlines, cures, 30/90-day highs, ramps) on the real chain clock - 600 s of active time per clock block, from block median times - as public networks do, instead of in blocks (regtest-only test hook; move time with setmocktime)");
         strUsage += HelpMessageOpt("-maxmempoolbytes=<n>", "Keep the transaction memory pool below <n> bytes, overriding -maxmempool (regtest-only test hook)");
         strUsage += HelpMessageOpt("-testcrashpoint=<name>", "Exit at once, without flushing, right after the named side-DB commit: disconnect-after-<db> or connect-after-<db>, <db> one of sidechain, units, pool, house, bill (regtest-only test hook)");
+        strUsage += HelpMessageOpt("-pegbundlewindow=<n>", strprintf("The withdrawal-bundle guard reads the L1 withdrawal events of only the last <n> L1 blocks (regtest-only test hook; default: %d)", PEG_BUNDLE_WINDOW_DEFAULT));
         strUsage += HelpMessageOpt("-dormant=<0|1>", "Run the chain dormant (no block after genesis), as FreeBank mainnet ships (regtest-only)");
         strUsage += HelpMessageOpt("-memberopguard=0", "Let a second member op for a house into the mempool, to test the block rule (regtest-only)");
+        strUsage += HelpMessageOpt("-mintpendingguard=0", "Let MINTs of one token into the mempool past its room together, to test the block template's skip (regtest-only)");
         strUsage += HelpMessageOpt("-rateopguard=0", "Let a second rate op for a house into the mempool and the block template, to test the block rule (regtest-only)");
     }
     strUsage += HelpMessageOpt("-debug=<category>", strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
@@ -1499,6 +1501,9 @@ bool AppInitParameterInteraction()
     // show the block rule (bad-house-rate-multiple-ops) refuse it.
     if (gArgs.IsArgSet("-rateopguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-rateopguard may only be set on regtest."));
+    // S2X-1: -mintpendingguard=0 lets MINTs past a token's room pool together, so a gate can show the template skip alone.
+    if (gArgs.IsArgSet("-mintpendingguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-mintpendingguard may only be set on regtest."));
 
     // v0.2.19 (genesis M1): -dormant=0|1 is a regtest-only gate knob. On
     // mainnet the dormancy is consensus, cleared only by a later release.
@@ -1531,6 +1536,15 @@ bool AppInitParameterInteraction()
             UpdateClockIsHeight(false);
             LogPrintf("Gold B windows count the real chain clock (regtest -realclock)\n");
         }
+    }
+    if (gArgs.IsArgSet("-pegbundlewindow")) {
+        if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+            return InitError("-pegbundlewindow may only be set on regtest.");
+        const int64_t n = gArgs.GetArg("-pegbundlewindow", (int64_t)PEG_BUNDLE_WINDOW_DEFAULT);
+        if (n <= 0 || n > PEG_BUNDLE_WINDOW_DEFAULT)
+            return InitError(strprintf("-pegbundlewindow must be between 1 and %d", PEG_BUNDLE_WINDOW_DEFAULT));
+        g_nPegBundleWindow = (int)n;
+        LogPrintf("Withdrawal-bundle guard reads the last %d L1 blocks (regtest -pegbundlewindow)\n", (int)n);
     }
     if (gArgs.IsArgSet("-maxmempoolbytes")) {
         if (chainparams.NetworkIDString() != CBaseChainParams::REGTEST)

@@ -21,6 +21,8 @@
 #include <txdb.h>
 #include <util.h>
 #include <validation.h>
+#include <consensus/consensus.h>
+#include <miner.h>
 
 #include <algorithm>
 #include <atomic>
@@ -136,6 +138,15 @@ public:
 
 private:
     std::atomic<bool> m_fLastBidConflict{false}; // set by SendBMMRequest (LastBMMRequestConflicted)
+    // S5X-5: UpdateDeposits reads the treasury's changes in a window (start, L1 tip], not the whole L1 history on
+    // every template. The start sits just below the oldest change not yet recorded (or a few blocks under the tip when
+    // none is pending), so a deposit the builder skipped is read again until it is recorded. Valid only while the
+    // FreeBank tip it was computed for is still on the active chain (a disconnect can unrecord deposits) and the start
+    // is on our list of L1 main-chain blocks; else, and after any windowed call that doesn't answer, the whole history.
+    std::mutex m_csPegWindow;
+    uint256 m_hashPegWindowStart;        // null: the whole history next time
+    uint256 m_hashPegWindowSideTip;      // the FreeBank tip the window was computed for
+    int m_nPegWindowRecordedPos = -1;    // the newest recorded change's L1 position as of that tip (peg map 13)
     /*
      * Invoke a ValidatorService method and parse the JSON reply. The enforcer
      * is only ever invoked at runtime by service name - nothing of it is
@@ -204,8 +215,9 @@ private:
      * background chainstate, and /rest/tx answers 404 for weeks. */
     bool RestGetBlock(const uint256& hashBlock, std::vector<unsigned char>& vchBlock);
 
-    /* Fetch all withdrawal-bundle events for THIS_SIDECHAIN via GetTwoWayPegData. */
-    bool FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents);
+    /* Fetch withdrawal-bundle events for THIS_SIDECHAIN via GetTwoWayPegData: the whole history, or with fRecent
+     * (S5X-5) only the last g_nPegBundleWindow L1 blocks, enough to see every bundle the L1 still tracks. */
+    bool FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents, bool fRecent = false);
 
     /* Log a message once per key */
     void LogOnce(const std::string& strKey, const std::string& strMessage);
@@ -1811,16 +1823,26 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         return incoming;
     }
 
-    // The treasury's changes over the whole L1 history (a full rescan each
-    // call; the ones already recorded are dropped below by their outpoint,
-    // before their L1 block is read). A start block is a follow-up.
+    // The treasury's changes in the window (S5X-5: m_hashPegWindowStart), else over the whole L1 history; the ones
+    // already recorded are dropped below by their outpoint, before their L1 block is read.
     L1BlockHeader tip;
     if (!GetChainTip(tip))
         return incoming;
+    LOCK(cs_main);   // the builder holds it already; chainActive and the sidechain DB below need it
+    std::lock_guard<std::mutex> lockWindow(m_csPegWindow);
+    const uint256 hashSideTip = chainActive.Tip() ? chainActive.Tip()->GetBlockHash() : uint256();
+    uint256 hashStart = m_hashPegWindowStart;
+    if (!hashStart.IsNull()) {
+        const BlockMap::const_iterator mi = mapBlockIndex.find(m_hashPegWindowSideTip);
+        const CBlockIndex* pindexWindow = mi != mapBlockIndex.end() ? mi->second : nullptr;
+        if (!pindexWindow || !chainActive.Contains(pindexWindow) || bmmCache.GetMainchainBlockHeight(hashStart) < 0)
+            hashStart.SetNull();   // a FreeBank or L1 reorg since: read everything again
+    }
+    m_hashPegWindowStart.SetNull();   // set again only by a call that completes
     L1PegEvents events;
-    if (GetPegEvents(uint256(), tip.hashBlock, events) != L1Answer::YES) {
-        LogPrintf("Enforcer client: UpdateDeposits: no answer for the peg events up to %s; no new deposits this time\n",
-                  tip.hashBlock.ToString());
+    if (GetPegEvents(hashStart, tip.hashBlock, events) != L1Answer::YES) {
+        LogPrintf("Enforcer client: UpdateDeposits: no answer for the peg events in (%s, %s]; no new deposits this time\n",
+                  hashStart.IsNull() ? "the start" : hashStart.ToString(), tip.hashBlock.ToString());
         return incoming;
     }
 
@@ -1837,10 +1859,32 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     // Peg map 13 (testing 11-11): the newest recorded change is the HIGHEST L1 position of any recorded deposit, not
     // the last one written. A deposit recorded out of L1 order (an older one included after newer ones) moved the
     // point back, and old malformed paid events then failed the batch closed again (UR5-3's kind): deposits stalled.
+    // S5X-5: in a window, the newest recorded change is the larger of the last call's (the recorded set only grew
+    // since: the FreeBank tip it was taken at is still on the active chain) and any recorded change the window shows
+    // (everything recorded since was a change in the window). Only the whole-history read scans the DB.
     int nLastRecordedPos = -1;
-    if (psidechaintree) {
+    if (!psidechaintree) {
+    } else if (hashStart.IsNull()) {
         for (const SidechainDeposit& d : psidechaintree->GetDeposits(THIS_SIDECHAIN))
             nLastRecordedPos = std::max(nLastRecordedPos, bmmCache.GetMainchainBlockHeight(d.hashMainchainBlock));
+    } else {
+        nLastRecordedPos = m_nPegWindowRecordedPos;
+        for (const L1DepositEvent& ev : events.vDeposit)
+            if (psidechaintree->HaveDepositOutpoint(ev.outpoint))
+                nLastRecordedPos = std::max(nLastRecordedPos, bmmCache.GetMainchainBlockHeight(ev.hashMainBlock));
+        for (const L1WithdrawalEvent& ev : events.vWithdrawal) {
+            if (ev.status != 'S' || ev.vchTx.empty())
+                continue;
+            L1MutableTransaction mtxM6;
+            try {
+                CDataStream ss(ev.vchTx, SER_NETWORK, PROTOCOL_VERSION);
+                ss >> mtxM6;
+            } catch (const std::exception&) {
+                continue;
+            }
+            if (psidechaintree->HaveDepositOutpoint(COutPoint(mtxM6.GetHash(), 0)))
+                nLastRecordedPos = std::max(nLastRecordedPos, bmmCache.GetMainchainBlockHeight(ev.hashMainBlock));
+        }
     }
     std::vector<TreasuryChange> vChange;
     if (ScanTreasuryChanges(events, nLastRecordedPos,
@@ -1875,6 +1919,10 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
     // them: a mainnet backlog's blocks would not fit in memory).
     uint256 hashBlockHeld;
     std::vector<unsigned char> vchBlockHeld;
+    // S5X-5: the oldest change still pending (not recorded, not below the deposit start, able to fit a block), for the
+    // next window's start; one whose L1 position isn't known leaves no window (the whole history next time)
+    int nPendingPos = INT_MAX;
+    bool fWindowKnown = true;
     for (size_t i = 0; i < vRecord.size(); i++) {
         SidechainDeposit& deposit = vRecord[i];
         if (psidechaintree && psidechaintree->HaveDepositOutpoint(COutPoint(vTxid[i], deposit.nBurnIndex)))
@@ -1914,6 +1962,30 @@ std::vector<SidechainDeposit> EnforcerL1Client::UpdateDeposits(const uint256& ha
         // nothing for a withdrawal return
         deposit.amtUserPayout = vChange[i].pDeposit ? vChange[i].pDeposit->nValue : CAmount(0);
         incoming.push_back(deposit);
+        // S5X-5: pending unless this node's templates can never hold it (DepositNeverFitsTemplate, the builder's own
+        // test: security 11-19 - MAX_BLOCK_WEIGHT here let one ~90 kB standard deposit pin the window for good)
+        if (!DepositNeverFitsTemplate(deposit)) {
+            const int nPos = bmmCache.GetMainchainBlockHeight(deposit.hashMainchainBlock);
+            if (nPos < 0)
+                fWindowKnown = false;
+            else
+                nPendingPos = std::min(nPendingPos, nPos);
+        }
+    }
+
+    // S5X-5: the next window. Its start (exclusive) is the parent of the oldest pending change's L1 block, or, with
+    // none pending, the block PEG_WINDOW_TIP_MARGIN under the tip (a shallow L1 reorg stays inside the window).
+    // GetMainchainBlockHeight(h) is the list position of h's parent, so GetMainBlockHashesFrom(pos, 1) is the parent.
+    static const int PEG_WINDOW_TIP_MARGIN = 6;
+    const int nTipPos = bmmCache.GetMainchainBlockHeight(tip.hashBlock);
+    std::vector<uint256> vStart;
+    if (fWindowKnown && nTipPos >= 0) {
+        const int nStartPos = nPendingPos != INT_MAX ? nPendingPos : std::max(0, nTipPos + 1 - PEG_WINDOW_TIP_MARGIN);
+        if (bmmCache.GetMainBlockHashesFrom(nStartPos, 1, vStart) && !vStart[0].IsNull()) {
+            m_hashPegWindowStart = vStart[0];
+            m_hashPegWindowSideTip = hashSideTip;
+            m_nPegWindowRecordedPos = nLastRecordedPos;
+        }
     }
     return incoming;
 }
@@ -2226,8 +2298,10 @@ bool EnforcerL1Client::ListWithdrawalBundleStatus(std::vector<uint256>& vHashWit
     // ours broadcast from an orphaned branch carrying the same withdrawals.
     // NB the returned hashes are enforcer m6ids (blinded txids), not chassis
     // bundle hashes; do not match them against chassis hashes.
+    // S5X-5: only the recent events (FetchWithdrawalEvents fRecent): the builder asks on every template once a bundle
+    // has ever been made, and a bundle the L1 still tracks was proposed within its max age.
     std::vector<L1WithdrawalEvent> vEvents;
-    if (!FetchWithdrawalEvents(vEvents)) {
+    if (!FetchWithdrawalEvents(vEvents, true /* fRecent */)) {
         // Fail CLOSED: an unreachable or timed-out enforcer must not read as
         // "nothing pending" (v0.2.12 failed open). It only delays a proposal to
         // a later block; with the events unreadable HaveSpent/HaveFailed fail
@@ -2375,13 +2449,29 @@ bool EnforcerL1Client::IsBehindItsNode(std::string& strWhy)
     return true;
 }
 
-bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents)
+std::atomic<int> g_nPegBundleWindow{PEG_BUNDLE_WINDOW_DEFAULT};
+
+bool EnforcerL1Client::FetchWithdrawalEvents(std::vector<L1WithdrawalEvent>& vEvents, bool fRecent)
 {
     L1BlockHeader tip;
     if (!GetChainTip(tip))
         return false;
 
+    // S5X-5: with fRecent, start PEG_BUNDLE_WINDOW L1 blocks under the tip. A bundle the L1 still tracks was proposed
+    // within its max age (the enforcer's presets: at most 26,300), so its "proposed" event is in the window; a "paid"
+    // or "failed" event whose proposal fell outside it is ignored (PendingM6idsFromEvents only erases what it saw
+    // proposed). If our list of L1 blocks doesn't reach that far, the whole history, as before.
+    uint256 hashStart;
+    if (fRecent) {
+        const int nWindow = g_nPegBundleWindow.load();
+        const int nTipPos = bmmCache.GetMainchainBlockHeight(tip.hashBlock);
+        std::vector<uint256> vStart;
+        if (nTipPos + 1 - nWindow > 0 &&
+                bmmCache.GetMainBlockHashesFrom(nTipPos + 1 - nWindow, 1, vStart) && !vStart[0].IsNull())
+            hashStart = vStart[0];
+    }
     std::string strRequest = "{\"sidechain_id\": " + std::to_string(THIS_SIDECHAIN) +
+        (hashStart.IsNull() ? std::string() : ", \"start_block_hash\": {\"hex\": \"" + hashStart.ToString() + "\"}") +
         ", \"end_block_hash\": {\"hex\": \"" + tip.hashBlock.ToString() + "\"}}";
 
     // Ultra s5 #2 (UR5-2): the same whole-history GetTwoWayPegData call as UpdateDeposits' (GetPegEvents), which
@@ -2753,10 +2843,17 @@ public:
     {
         if (g_fL1AnswersHeld)
             return L1Answer::UNKNOWN;
+        bool fYes = false;
+        if (bmmCache.GetMainBlockCommitmentAnswer(hashMainBlock, hashBMM, fYes))   // S5X-2b: E's one commitment, known
+            return fYes ? L1Answer::YES : L1Answer::NO;
         uint256 hashCommitment;
         switch (GetL1Client().ReadBmmCommitment(hashMainBlock, hashCommitment)) {
-        case L1Client::Commitment::COMMITTED: return hashCommitment == hashBMM ? L1Answer::YES : L1Answer::NO;
-        case L1Client::Commitment::NONE: return L1Answer::NO;
+        case L1Client::Commitment::COMMITTED:
+            bmmCache.CacheMainBlockCommitment(hashMainBlock, true, hashCommitment);
+            return hashCommitment == hashBMM ? L1Answer::YES : L1Answer::NO;
+        case L1Client::Commitment::NONE:
+            bmmCache.CacheMainBlockCommitment(hashMainBlock, false, uint256());
+            return L1Answer::NO;
         case L1Client::Commitment::NOT_FOUND: return L1Answer::UNKNOWN;
         case L1Client::Commitment::UNKNOWN: break;
         }

@@ -61,10 +61,12 @@ bool HouseRateWindowMax(const CUnitsView& units, uint32_t nHouseID, uint32_t nHe
     CHouseRate r;
     if (!units.Get(HouseRateKey(nHouseID), r))
         return false;
-    // The latest posting and the rate in effect now both count: the latest is in effect from the next block at the
-    // latest, and every day since it was posted it has been the rate (the day records cover the days before).
-    nMaxBid = std::max(r.nBid, r.nPostHeight >= nHeight ? r.nPrevBid : r.nBid);
-    nMaxAsk = std::max(r.nAsk, r.nPostHeight >= nHeight ? r.nPrevAsk : r.nAsk);
+    // D-2026-11-20-2 (S1X-4, switch-on): the rate in effect at nHeight counts, as HouseRateAt prices it - a post at
+    // nHeight itself counts from the next block (RS-1), so where a post sits in its block no longer matters to the
+    // block's other readers. Every day since it was posted it has been the rate; the day records cover the days
+    // before, and a posting enters them only when the next one replaces it (ApplyHouseRatePost).
+    nMaxBid = r.nPostHeight >= nHeight ? r.nPrevBid : r.nBid;
+    nMaxAsk = r.nPostHeight >= nHeight ? r.nPrevAsk : r.nAsk;
     if (nDays == 0)
         return true;
     const uint32_t nToday = RateDayOf(nNow);
@@ -199,17 +201,18 @@ bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uin
     }
     next.nRestoreMax = 0;      // one-shot: any post clears a pending restore
     next.nRestoreUntil = 0;
-    // Day records: the old rate stayed in effect on every day from its posting to now; the days it was never posted on
-    // get it now (bounded: no rule reads further back than RATE_DAY_FILL_MAX days). Today gets the old and the new.
+    // Day records: the old rate stayed in effect on every day from its posting, that day included, to now (bounded: no
+    // rule reads further back than RATE_DAY_FILL_MAX days). D-2026-11-20-2 (S1X-4): the new rate doesn't enter today's
+    // record now - nothing at this height may read it - but when the next post replaces it; until then the window reads
+    // it as the rate in effect, from the next block (HouseRateWindowMax).
     const uint32_t nToday = RateDayOf(nNow);
     if (!fFirst) {
         const uint32_t nOldDay = RateDayOf(r.nPostTime);
-        const uint32_t nFrom = std::max(nOldDay + 1, nToday >= RATE_DAY_FILL_MAX ? nToday - RATE_DAY_FILL_MAX : 0u);
+        const uint32_t nFrom = std::max(nOldDay, nToday >= RATE_DAY_FILL_MAX ? nToday - RATE_DAY_FILL_MAX : 0u);
         for (uint32_t d = nFrom; d < nToday; d++)
             RaiseDay(units, nHouseID, d, r.nBid, r.nAsk);
         RaiseDay(units, nHouseID, nToday, r.nBid, r.nAsk);
     }
-    RaiseDay(units, nHouseID, nToday, nBid, nAsk);
     units.Put(HouseRateKey(nHouseID), next);
     return true;
 }
@@ -479,7 +482,7 @@ bool HouseCharterTokenForChecks(uint32_t nHouseID, uint64_t nChainID, const std:
 }
 
 uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nActive, uint64_t nFallback,
-                         int64_t nWindowSecs)
+                         int64_t nWindowSecs, uint32_t nHeight)
 {
     // The HIGHEST bid in effect in the day before nActive (review 2026-11-07: the bid at the instant T_f could be a dip
     // posted just before it and restored just after). The record keeps two postings; when the day could hold an older
@@ -488,6 +491,19 @@ uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nA
     CHouseRate r;
     if (!units.Get(HouseRateKey(nHouseID), r))
         return nFallback;
+    // D-2026-11-20-2 (S1X-4, switch-on; freebankd's audit 11-20): a post at nHeight counts from the next block for every
+    // check, so read at nHeight the posting before it is the current one, and the one before that isn't kept: where it
+    // could matter (the current came inside the day), the fallback stands, as for two postings in the day.
+    if (r.nPostHeight >= nHeight) {
+        if (r.nPrevBid == 0)
+            return nFallback;
+        r.nBid = r.nPrevBid;
+        r.nPostActive = r.nPrevPostActive;
+        r.nPrevBid = 0;
+        r.nPrevPostActive = 0;
+        const int64_t nStartShifted = nActive - WINDOW;
+        return (r.nPostActive <= nActive && r.nPostActive <= nStartShifted) ? r.nBid : nFallback;
+    }
     const int64_t nStart = nActive - WINDOW;
     if (r.nPostActive <= nActive) {
         // C is in effect at nActive; before C (if C came inside the day) P was.
@@ -503,18 +519,18 @@ uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nA
     return r.nPrevPostActive <= nStart ? r.nPrevBid : nFallback;
 }
 
-void SwapFixBidT(CUnitsView& units, const uint256& hashLock)
+void SwapFixBidT(CUnitsView& units, const uint256& hashLock, uint32_t nHeight)
 {
     CSwapRecord r;
     if (!units.Get(SwapKey(hashLock), r) || r.nBidT != 0)
         return;
     r.nBidT = g_nHouseRateTestOverride ? g_nHouseRateTestOverride
                                        : HouseBidAtActive(units, r.nHouseID, r.nDeadlineActive, r.nBid0,
-                                        Params().GetConsensus().GramAt(r.nDemandHeight).nSwapBidWindowSecs);
+                                        Params().GetConsensus().GramAt(r.nDemandHeight).nSwapBidWindowSecs, nHeight);
     units.Put(SwapKey(hashLock), r);
 }
 
-uint64_t SwapBidAtDeadlineForChecks(const CSwapRecord& r)
+uint64_t SwapBidAtDeadlineForChecks(const CSwapRecord& r, uint32_t nHeight)
 {
     if (r.nBidT != 0)
         return r.nBidT;
@@ -522,7 +538,7 @@ uint64_t SwapBidAtDeadlineForChecks(const CSwapRecord& r)
         return g_nHouseRateTestOverride;
     uint64_t n = r.nBid0;
     WithChecksView([&](const CUnitsView& units) { n = HouseBidAtActive(units, r.nHouseID, r.nDeadlineActive, r.nBid0,
-                                        Params().GetConsensus().GramAt(r.nDemandHeight).nSwapBidWindowSecs); return true; });
+                                        Params().GetConsensus().GramAt(r.nDemandHeight).nSwapBidWindowSecs, nHeight); return true; });
     return n;
 }
 

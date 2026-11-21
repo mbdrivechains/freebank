@@ -137,9 +137,28 @@ bool CUnitsView::GetRaw(const UnitsKey& key, UnitsValue& value) const
 
 void CUnitsView::Set(const UnitsKey& key, const UnitsSlot& slot)
 {
+    if (fJournal) {
+        const auto it = mapChange.find(key);
+        vJournal.push_back(JournalEntry{key, it != mapChange.end(), it != mapChange.end() ? it->second : UnitsSlot(),
+                                        mapBefore.count(key) != 0});
+    }
     if (!mapBefore.count(key))
         mapBefore[key] = ReadDB(key);
     mapChange[key] = slot;
+}
+
+void CUnitsView::RollBackJournal()
+{
+    for (auto it = vJournal.rbegin(); it != vJournal.rend(); ++it) {
+        if (it->fHadChange)
+            mapChange[it->key] = it->change;
+        else
+            mapChange.erase(it->key);
+        if (!it->fHadBefore)
+            mapBefore.erase(it->key);
+    }
+    vJournal.clear();
+    fJournal = false;
 }
 
 void CUnitsView::PutRaw(const UnitsKey& key, const UnitsValue& value)

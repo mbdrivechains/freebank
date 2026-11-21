@@ -373,6 +373,20 @@ HouseStateKeys GetHouseStateKeys(const CTransaction& mtx);
  *  status the other reads. Symmetric; two readers never conflict. Every house-slot scan in ATMP goes through this. */
 bool HouseStateKeysConflict(const HouseStateKeys& a, const HouseStateKeys& b);
 
+struct SidechainDeposit;
+struct SidechainWithdrawal;
+/** REF-1 (D-2026-11-19-1): a deposit FreeBank does not credit becomes a withdrawal row paid to an L1 script. */
+static const std::string DEPOSIT_REFUND_TAG = "refund:";            // strRefundDestination sentinel prefix
+static const CAmount DEPOSIT_REFUND_MAINCHAIN_FEE = 10000;          // to the eCash miners, as the row's mainchainFee
+static const unsigned int DEPOSIT_REFUND_MAX_INDEX = 1000000;       // the sentinel's index field is 6 digits
+static const unsigned int MAX_REFUNDS_PER_BUNDLE = 20;              // refunds ride after user withdrawals, FIFO
+CScript WithdrawalPayoutScript(const SidechainWithdrawal& w);
+bool WithdrawalPayoutRefused(const SidechainWithdrawal& w);
+bool IsDepositRefund(const SidechainWithdrawal& w);
+bool MakeDepositRefund(const SidechainDeposit& d, int nHeight, unsigned int nIndex, SidechainWithdrawal& refund);
+void OrderWithdrawalsForBundle(std::vector<SidechainWithdrawal>& vWithdrawal);
+uint32_t WithdrawalBundleLockTime(const uint256& hashPrevBundle);   // RQ-1
+
 class CPubKey;
 /** UR3-4 (ultra s3 #4): every FreeBank payload signature check (house approvals, holder, drawer, issuer, rate-key and
  *  presenter signatures). Exactly pubkey.VerifyStrict(hash, sig) outside an FbSigCacheScope. Inside one (ATMP and the
@@ -716,6 +730,15 @@ static const int FREEBANK_CACHE_MIN_VERSION = 20500;
 //! second of two equal leading hashes, shifting every height by one). Such a
 //! file requires v0.2.25, so an older binary skips it and refills from genesis.
 static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
+//! S5X-2: bmm.dat's verified-BMM hashes mean "this block's bid was found on its
+//! L1 block". Before S5X-2 the bid was the merkle root; since, it is
+//! BMMCommitment(header). A hash verified under the old rule proves nothing
+//! under the new one, and a -reindex of an older datadir trusted it and skipped
+//! the bid check. bmm.dat is written requiring this version; a file that
+//! requires less (v1.2.2 and older, and builds before S5X-2) keeps its
+//! withdrawal-bundle and deposit entries but loses its verified-BMM ones, so
+//! those blocks are checked again.
+static const int BMM_CACHE_S5X2_MIN_VERSION = 1020300;
 
 void DumpMainBlockCache();
 

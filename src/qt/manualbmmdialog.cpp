@@ -43,13 +43,13 @@ void ManualBMMDialog::on_pushButtonCreateBlock_clicked()
     }
 
     std::stringstream ss;
-    ss << "BMM hashMerkleRoot (h*):\n" << block.hashMerkleRoot.ToString();
+    ss << "BMM commitment (h*):\n" << BMMCommitment(block).ToString();   // S5X-2: not the merkle root
     ss << std::endl;
     ss << std::endl;
     ss << "BMM Block:\n" << block.ToString() << std::endl;
 
     ui->textBrowser->setText(QString::fromStdString(ss.str()));
-    ui->lineEditManualBMMHash->setText(QString::fromStdString(block.hashMerkleRoot.ToString()));
+    ui->lineEditManualBMMHash->setText(QString::fromStdString(BMMCommitment(block).ToString()));
 }
 
 void ManualBMMDialog::on_pushButtonSendCriticalRequest_clicked()
@@ -108,10 +108,10 @@ void ManualBMMDialog::on_pushButtonSubmitBlock_clicked()
     QMessageBox messageBox;
     messageBox.setDefaultButton(QMessageBox::Ok);
 
-    uint256 hashMerkleRoot = uint256S(ui->lineEditBMMHash->text().toStdString());
+    uint256 hashCommitment = uint256S(ui->lineEditBMMHash->text().toStdString());   // h*, BMMCommitment (S5X-2)
     CBlock block;
 
-    if (!bmmCache.GetBMMBlock(hashMerkleRoot, block)) {
+    if (!bmmCache.GetBMMBlock(hashCommitment, block)) {
         // Block not stored message box
         messageBox.setWindowTitle("Block not found!");
         messageBox.setText("You do not have this BMM block cached.");
@@ -136,8 +136,8 @@ void ManualBMMDialog::on_pushButtonSubmitBlock_clicked()
         QString result = "Block hash:\n";
         result += QString::fromStdString(block.GetHash().ToString());
         result += "\n\n";
-        result += "BMM (merkle root) hash: \n";
-        result += QString::fromStdString(block.hashMerkleRoot.ToString());
+        result += "BMM commitment (h*): \n";
+        result += QString::fromStdString(BMMCommitment(block).ToString());
         result += "\n";
         messageBox.setText(result);
         messageBox.exec();

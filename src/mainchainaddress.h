@@ -59,6 +59,17 @@ MainchainAddrParams GetMainchainAddrParams();
  *  FreeBank sidechain addresses and addresses of another L1 network. */
 bool ParseMainchainAddress(const std::string& str, CScript& spk, std::string& strError);
 
+/** REF-1 (consensus: a deposit refund's destination). Parse an L1 address of ANY family - main (P2PKH 0, P2SH 5,
+ *  "bc"), test (111, 196, "tb") or regtest (111, 196, "bcrt") - into its scriptPubKey, the same types as
+ *  ParseMainchainAddress. Independent of the family this node probed, so every node reads a deposit alike; one hash
+ *  gives the same script under each family, so whoever holds the key controls it on any network. */
+bool ParseMainchainAddressAnyFamily(const std::string& str, CScript& spk);
+
+/** REF-1: the string a deposit refund row stores for spk. Like EncodeMainchainCarrier, but P2PKH always carries
+ *  prefix 0, so the string doesn't depend on the probed family either; refund rows are read back (and paid) with
+ *  MainchainPayoutScriptAnyFamily. "" if the type is unsupported or the round trip fails (fail closed). */
+std::string MainchainRefundCarrier(const CScript& spk);
+
 /** The L1 form of a supported payout script (P2PKH, P2SH, v0 witness, v1-v16
  *  witness with bech32m), "" otherwise. */
 std::string EncodeMainchainAddress(const CScript& spk);

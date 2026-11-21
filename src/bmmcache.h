@@ -17,6 +17,15 @@ struct MainBlockIndex
     uint256 hash;
 };
 
+class CBlockHeader;
+
+/** S5X-2 (switch-on, from genesis; Michael 2026-11-19 "Yes", security agreed): the hash a FreeBank block's BMM bid
+ *  carries on the L1 (h*, the M8 "critical hash") - a tagged hash of the network (genesis hash) and nVersion,
+ *  hashPrevBlock, hashMerkleRoot and hashWithdrawalBundle. It was hashMerkleRoot alone, so one paid bid admitted any
+ *  number of headers that varied the other fields (testing's repro: 61 for one pair). The L1 block E the bid lands in
+ *  fixes the two fields left out (hashMainchainBlock = E, nTime pinned to E's), so one bid now admits one header. */
+uint256 BMMCommitment(const CBlockHeader& header);
+
 class BMMCache
 {
 public:
@@ -24,7 +33,7 @@ public:
 
     bool StoreBMMBlock(const CBlock& block);
 
-    bool GetBMMBlock(const uint256& hashMerkleRoot, CBlock& block);
+    bool GetBMMBlock(const uint256& hashCommitment, CBlock& block);   // keyed by BMMCommitment (S5X-2)
 
     std::vector<CBlock> GetBMMBlockCache() const;
 
@@ -68,6 +77,12 @@ public:
     // parent) cost no L1 call. Memory only; cleared at MAX_MAIN_BLOCK_TIMES.
     bool HaveBmmPair(const uint256& hashMainBlock, const uint256& hashBMM) const;
     void CacheBmmPair(const uint256& hashMainBlock, const uint256& hashBMM);
+    /** S5X-2b (security 11-19, Medium): an L1 block carries at most one slot-130 commitment, and its content never
+     *  changes. The first DEFINITE answer for E (its h*, or none) is kept; then any header naming E is answered here,
+     *  with no L1 call: YES only for E's own h*. Never filled from a "can't tell". Memory only, never written to
+     *  disk: a wrong answer from a faulty enforcer goes at the next restart (security 11-19). */
+    void CacheMainBlockCommitment(const uint256& hashMainBlock, bool fCommitted, const uint256& hashCommitment);
+    bool GetMainBlockCommitmentAnswer(const uint256& hashMainBlock, const uint256& hashBMM, bool& fYes) const;
 
     // Check if we already verified deposit
     bool HaveVerifiedDeposit(const uint256& txid) const;
@@ -155,7 +170,7 @@ private:
 
     // BMM blocks that we have created with the intention of connecting to the
     // side blockchain once the BMM h* hash is included on the mainchain
-    std::map<uint256 /* hashMerkleRoot */, CBlock> mapBMMBlocks;
+    std::map<uint256 /* BMMCommitment (S5X-2; was hashMerkleRoot) */, CBlock> mapBMMBlocks;
 
     // The bid to resend (MarkBidResend): its L1 tip, its block's merkle root, and how often it was refused on that tip
     uint256 hashResendPrev;
@@ -172,6 +187,7 @@ private:
     // v0.2.19 (7c): L1 block header times (guarded by csVerified)
     std::map<uint256 /* hashMainchainBlock */, uint32_t> mapMainBlockTime;
     std::set<std::pair<uint256, uint256>> setBmmPair; // (hashMainchainBlock, h*), guarded by csVerified
+    std::map<uint256, std::pair<bool, uint256>> mapMainBlockCommitment; // E -> (has one, its h*); csVerified
 
     // WithdrawalBundle(s) that we have already broadcasted to the mainchain.
     std::set<uint256> setWithdrawalBundleBroadcasted;

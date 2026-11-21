@@ -170,9 +170,9 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             CSwapRecord r;
             if (!DecodeNotePayload(tx.vchNotePayload, p) || !units.Get(SwapKey(p.hashLock), r))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-pay-payload");
-            const uint64_t nBidT = SwapBidAtDeadlineForChecks(r);
+            const uint64_t nBidT = SwapBidAtDeadlineForChecks(r, (uint32_t)nHeight);
             if (clock.nActiveTime >= r.nDeadlineActive)
-                SwapFixBidT(units, p.hashLock);
+                SwapFixBidT(units, p.hashLock, (uint32_t)nHeight);
             // The shortfall counts what was actually paid (review 2026-11-07): a payment built at the bid at demand that
             // confirms just past the deadline owes no shortfall.
             uint64_t nRate = SwapPayRate(r, nBidT, clock.nActiveTime);
@@ -198,12 +198,12 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             NoteSwapExpire e;
             if (!DecodeNotePayload(tx.vchNotePayload, e))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-expire-payload");
-            SwapFixBidT(units, e.hashLock);
+            SwapFixBidT(units, e.hashLock, (uint32_t)nHeight);
         } else {
             NoteSwapProtest pro;
             if (!DecodeNotePayload(tx.vchNotePayload, pro))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-protest-payload");
-            SwapFixBidT(units, pro.hashLock);
+            SwapFixBidT(units, pro.hashLock, (uint32_t)nHeight);
             SwapMarkProtested(units, pro.hashLock);
         }
     }

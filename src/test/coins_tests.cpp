@@ -942,7 +942,7 @@ BOOST_AUTO_TEST_CASE(disk_record_format_pin)
 
     // A bump without updating the pins above is also a mistake - the sizes are
     // the evidence for the version, so they move together.
-    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 4);
+    BOOST_CHECK_EQUAL(FREEBANK_DISK_FORMAT_VERSION, 5);   // v5 (S5X-2): the sizes did not move; see coins.h
 }
 
 BOOST_AUTO_TEST_SUITE_END()

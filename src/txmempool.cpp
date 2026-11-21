@@ -445,6 +445,18 @@ bool CTxMemPool::addUnchecked(const uint256& hash, const CTxMemPoolEntry &entry,
         }
     }
 
+    // S2X-1: index a MINT's units by token. ATMP admits a MINT only if the token's pooled sum stays within MAX_MONEY
+    // minus its supply, so the sum can't wrap; it saturates anyway rather than trust that.
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION && tx.nIssuedOp == ISSUED_OP_MINT) {
+        IssuedMint mint;
+        if (DecodeIssuedPayload(tx.vchIssuedPayload, mint) && mint.nUnits != 0) {
+            mapTxMintUnits[hash] = std::make_pair(mint.tokenID, mint.nUnits);
+            uint64_t& nPending = mapPendingMintUnits[mint.tokenID];
+            nPending = nPending > std::numeric_limits<uint64_t>::max() - mint.nUnits ? std::numeric_limits<uint64_t>::max()
+                                                                                      : nPending + mint.nUnits;
+        }
+    }
+
     // UR-ext-9: index the withdrawal ids this tx creates
     std::vector<uint256> vWID;
     GetTxWithdrawalIDs(tx, vWID);
@@ -494,6 +506,16 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
                 mapFreezeTargetCount.erase(itCount);
         }
         mapTxFreezeTargets.erase(itFz);
+    }
+    const auto itMint = mapTxMintUnits.find(hash);
+    if (itMint != mapTxMintUnits.end()) {
+        const auto itSum = mapPendingMintUnits.find(itMint->second.first);
+        if (itSum != mapPendingMintUnits.end()) {
+            itSum->second -= std::min(itSum->second, itMint->second.second);
+            if (itSum->second == 0)
+                mapPendingMintUnits.erase(itSum);
+        }
+        mapTxMintUnits.erase(itMint);
     }
     const auto itWID = mapTxWithdrawalIDs.find(hash);
     if (itWID != mapTxWithdrawalIDs.end()) {
@@ -674,6 +696,8 @@ void CTxMemPool::_clear()
     mapWithdrawalTx.clear();
     mapTxFreezeTargets.clear();
     mapFreezeTargetCount.clear();
+    mapTxMintUnits.clear();
+    mapPendingMintUnits.clear();
     mapLinks.clear();
     mapTx.clear();
     mapNextTx.clear();
@@ -1103,7 +1127,7 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
 size_t CTxMemPool::DynamicMemoryUsage() const {
     LOCK(cs);
     // Estimate the overhead of mapTx to be 12 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.
-    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::DynamicUsage(mapTxMintUnits) + memusage::DynamicUsage(mapPendingMintUnits) + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
 }
 
 void CTxMemPool::RemoveStaged(setEntries &stage, bool updateDescendants, MemPoolRemovalReason reason) {

@@ -1172,4 +1172,58 @@ BOOST_AUTO_TEST_CASE(deposit_demand_input_pins)
     }
 }
 
+// ===========================================================================
+// testing (2026-11-20): S2X-2 (external review of s2 at v1.2.2, Qwen-3.8-flash and GLM-5.3; security: Low, fix with
+// switch-on). vRateBps is bounded nowhere: DepositMaturityInterest saturates at MAX_MONEY, and
+// WITHDRAW and DISCHARGE must pay principal + interest, so a receipt with a huge rate can never be repaid. The ceiling's
+// figure is design's; these cases use rates no sane ceiling allows (100,000% a year, and the field's maximum) and a 5%
+// control. The rate may be refused by the shape check or contextually. Contextually, the over-ceiling ORIGINATE must be
+// refused for a different reason than the otherwise identical 5% one (both carry placeholder approver signatures, so
+// the 5% one fails later, at the approvers); if the fix checks the rate after the approvers, give these real ones.
+// FAILS on master 457a538; passes once the ceiling lands.
+// ===========================================================================
+static CMutableTransaction S2X2Originate(uint32_t nRateBps)
+{
+    CMutableTransaction mtx = MakeOriginateTx(3, {100000});
+    DepositOriginate org;
+    CDataStream in(mtx.vchDepositPayload, SER_NETWORK, PROTOCOL_VERSION);
+    in >> org;
+    org.vRateBps = {nRateBps};
+    CDataStream out(SER_NETWORK, PROTOCOL_VERSION);
+    out << org;
+    mtx.vchDepositPayload = std::vector<unsigned char>(out.begin(), out.end());
+    return mtx;
+}
+// "" if the shape check refuses, else the contextual reject reason (or "ACCEPTED").
+static std::string S2X2Reason(uint32_t nRateBps, bool& fShapeRefused)
+{
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    CHouse house = MakeOpenDepositHouse(3);
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 3) { out = house; return true; } return false; };
+    const CMutableTransaction mtx = S2X2Originate(nRateBps);
+    CValidationState stShape;
+    fShapeRefused = !CheckDepositTransactionShape(CTransaction(mtx), stShape);
+    if (fShapeRefused)
+        return stShape.GetRejectReason();
+    CValidationState state; CHouse houseOut; bool fChanged = false;
+    if (CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnNoCoin, houseOut, fChanged))
+        return "ACCEPTED";
+    return state.GetRejectReason();
+}
+
+BOOST_AUTO_TEST_CASE(s2x_2_deposit_rate_has_a_ceiling)
+{
+    bool fShapeCtl = false;
+    const std::string strCtl = S2X2Reason(500, fShapeCtl);
+    BOOST_REQUIRE_MESSAGE(!fShapeCtl, "S2X-2 control: a 5% receipt failed the shape check: " + strCtl);
+    for (const uint32_t nRate : {10000000u, 4294967295u}) {
+        bool fShape = false;
+        const std::string strHigh = S2X2Reason(nRate, fShape);
+        BOOST_CHECK_MESSAGE(fShape || (strHigh != "ACCEPTED" && strHigh != strCtl),
+                            "S2X-2: an ORIGINATE at " + std::to_string(nRate) + " bps (" +
+                            std::to_string(nRate / 100) + "% a year) got no further refusal than the 5% control (both: " +
+                            strHigh + ") - the rate is bounded nowhere, and its interest saturates at MAX_MONEY");
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -15,6 +15,9 @@
 #include <boost/multi_index/ordered_index.hpp>
 
 class CBlockIndex;
+class CCoinsViewCache;
+class CUnitsView;
+struct SidechainDeposit;
 class CChainParams;
 class CScript;
 class CValidationState;
@@ -124,8 +127,31 @@ struct update_for_parent_inclusion
 //! -bmmblockmaxweight default (v0.2.16): the weight cap for get_block_template's
 //! mempool transactions. The BMM engine stores every template in its bid records.
 static const unsigned int DEFAULT_BMM_BLOCK_MAX_WEIGHT = 300000;
+/** The weight and sigop cost every template reserves for its coinbase before anything else (BlockAssembler::resetBlock) */
+static const uint64_t COINBASE_RESERVED_WEIGHT = 4000;
+static const int64_t COINBASE_RESERVED_SIGOPS_COST = 400;
+/** The outputs a deposit record adds to the coinbase: the payout GetDepositPayoutOutput owes, if any, then the record. */
+std::vector<CTxOut> DepositCoinbaseOutputs(const SidechainDeposit& deposit);
+/** The weight and (legacy, scaled) sigop cost of a set of coinbase outputs, as the builder budgets them. */
+void DepositOutputsCost(const std::vector<CTxOut>& vOut, uint64_t& nWeight, int64_t& nSigOpsCost);
+/** The weight budget deposit records get in every template this node builds, refreshbmm's and get_block_template's
+ *  alike: -blockmaxweight (default MAX_BLOCK_WEIGHT - 4000). -bmmblockmaxweight caps get_block_template's mempool
+ *  transactions only, never deposits. */
+uint64_t DepositMaxWeight();
+/** Deposits' share of a template, on every path (security 11-19): half the room -blockmaxweight leaves after the coinbase
+ *  reserve, for weight; half of MAX_BLOCK_SIGOPS_COST after its reserve, for sigops. Packages always keep the rest. */
+uint64_t DepositCapWeight();
+int64_t DepositCapSigOpsCost();
+/** S5X-5: true if no template this node builds can ever hold the deposit's outputs, even with no other deposit (the
+ *  builder's own test, against DepositCapWeight / DepositCapSigOpsCost). Such a deposit doesn't hold UpdateDeposits' window back; any
+ *  other one does until it is recorded (security 11-19: a test that disagrees with the builder either pins the window
+ *  or drops a deposit the builder would take). */
+bool DepositNeverFitsTemplate(const SidechainDeposit& deposit);
 /** Pooled transactions a template drops before it builds the block from no mempool transactions (v0.2.19) */
 static const int MAX_TEMPLATE_EVICTIONS = 10;
+
+/** S1X-4: the most weight the template holds back for the rate pass (about a dozen rate ops) */
+static const uint64_t RATE_PASS_MAX_RESERVED_WEIGHT = 16000;
 
 class BlockAssembler
 {
@@ -142,6 +168,12 @@ private:
 
     // Information on the current status of the block
     uint64_t nBlockWeight;
+    // S5X-5 / security 11-19: neither deposits nor mempool packages may starve the other. Deposits are reserved first,
+    // up to DepositCapWeight (half the room after the coinbase reserve); then nBlockWeight may grow to
+    // nPackageWeightLimit = min(nBlockMaxWeight + the deposits' weight, DepositMaxWeight()): packages are held to this
+    // path's cap counted on themselves (plus the reserve), and the block to -blockmaxweight.
+    uint64_t nDepositReservedWeight;
+    uint64_t nPackageWeightLimit;
     uint64_t nBlockTx;
     uint64_t nBlockSigOpsCost;
     CAmount nFees;
@@ -191,6 +223,16 @@ private:
     std::set<uint256> setBlockWithdrawalIDs;
     /** D-2026-11-11-3: houses whose rate op (POST or SETKEY) the template already holds (one per house per block) */
     std::set<uint32_t> setBlockRateHouses;
+    /** S2X-1: the units state as the template's issued ops leave it, and the coins they read (null: no check, as when
+      * the template builds on a block other than the tip, whose state these views don't hold) */
+    CUnitsView* pTemplateUnits = nullptr;
+    const CCoinsViewCache* pTemplateCoins = nullptr;
+    /** S1X-4: while set (the clock and fee-rate passes), packages holding a rate op wait for addRateTxs */
+    bool fDeferRateOps = false;
+    /** S1X-4: weight held back from the earlier passes for addRateTxs */
+    uint64_t nRateReservedWeight = 0;
+    /** S2X-1b: token packages this template skipped because an issued op didn't follow (TestPackageIssued; logged) */
+    int nIssuedFailed = 0;
     /** Add a tx to the block */
     void AddToBlock(CTxMemPool::txiter iter);
 
@@ -207,6 +249,10 @@ private:
       * most half the block. A demand, protest or redemption must not wait behind
       * cheaper traffic: the sole producer's no-censorship rule (D-2026-10-03-2). */
     void addClockTxs(int &nPackagesSelected);
+    /** S1X-4: last, the pooled rate ops (POST, SETKEY) with their ancestors, so no reader in the block follows a post */
+    void addRateTxs(int &nPackagesSelected);
+    /** S1X-4: hold back the pooled rate ops' weight (capped) from the earlier passes */
+    void ReserveRateWeight();
 
     // helper functions for addPackageTxs()
     /** Remove confirmed (inBlock) entries from given set */
@@ -218,6 +264,9 @@ private:
       * These checks should always succeed, and they're here
       * only as an extra check in case of suboptimal node configuration */
     bool TestPackageTransactions(const CTxMemPool::setEntries& package);
+    /** S2X-1: run the package's issued-version txs, in block order, against the template's units state; on success the
+      * template state moves on, on failure it is untouched and the package is skipped */
+    bool TestPackageIssued(const std::vector<CTxMemPool::txiter>& sortedEntries);
     /** Return true if given transaction from mapTx has already been evaluated,
       * or if the transaction's cached data in mapTx is incorrect. */
     bool SkipMapTxEntry(CTxMemPool::txiter it, indexed_modified_transaction_set &mapModifiedTx, CTxMemPool::setEntries &failedTx);
