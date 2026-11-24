@@ -691,22 +691,8 @@ uint32_t HouseDepositWAM(const CHouse& house, int nHeight)
     return remaining > (unsigned __int128)0xffffffffULL ? 0xffffffffU : (uint32_t)remaining;
 }
 
-uint64_t HouseLoanBookExcess(const CHouse& house)
-{
-    // NEVER a bare subtraction: ActiveEscrow() is a signed CAmount and
-    // nLoanBookFace is unsigned, so `nLoanBookFace - ActiveEscrow()` promotes to
-    // unsigned and WRAPS whenever the book sits inside permanent capital - which
-    // is the common case and the state of every house that has never discounted.
-    const CAmount amountEscrow = house.ActiveEscrow();
-    const uint64_t nEscrow = amountEscrow > 0 ? (uint64_t)amountEscrow : 0;
-    return house.nLoanBookFace > nEscrow ? house.nLoanBookFace - nEscrow : 0;
-}
-
-uint64_t HouseLoanBookSlice(const CHouse& house)
-{
-    const uint64_t nExcess = HouseLoanBookExcess(house);
-    return nExcess < house.nDepositUnits ? nExcess : house.nDepositUnits;
-}
+// HouseLoanBookExcess, HouseLoanBookSlice and HouseMatchFundingOK live in issued_connect.cpp (S1X-9): they value the
+// escrow in mg at the house's rate, which only the server can read.
 
 unsigned __int128 HouseLoanBookDuration(const CHouse& house, int nHeight)
 {
@@ -729,19 +715,6 @@ unsigned __int128 HouseDepositDuration(const CHouse& house, int nHeight)
     const uint64_t h = nHeight > 0 ? (uint64_t)nHeight : 0;
     const unsigned __int128 hp = (unsigned __int128)h * (unsigned __int128)house.nDepositUnits;
     return wt > hp ? wt - hp : 0;
-}
-
-bool HouseMatchFundingOK(const CHouse& house, int nHeight)
-{
-    const uint64_t nSlice = HouseLoanBookSlice(house);
-    if (nSlice == 0)
-        return true;   // no deposits, or a book inside permanent capital
-    // Cross-multiplied to avoid division. Ceilings (house.h): L < 2^51 and
-    // DepositDuration < 2^73 give a left side < 2^124; slice < 2^51 and
-    // BookDuration < 2^71 give a right side < 2^122. Both fit u128.
-    const unsigned __int128 lhs = (unsigned __int128)house.nLoanBookFace * HouseDepositDuration(house, nHeight);
-    const unsigned __int128 rhs = (unsigned __int128)nSlice * HouseLoanBookDuration(house, nHeight);
-    return lhs >= rhs;
 }
 
 uint32_t HouseAttestNewStressOrigin(const CHouse& house, const CAmount& amountReserves, int nHeight)

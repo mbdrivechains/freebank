@@ -453,7 +453,7 @@ static bool CheckHouseMemberOperation(const CTransaction& tx, CValidationState& 
                                       const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                                       const std::function<bool(uint32_t, const uint160&, CHouseMember&)>& fnGetMember,
                                       const std::function<uint32_t(uint32_t)>& fnGetCount,
-                                      HouseMemberEffects& effOut);
+                                      HouseMemberEffects& effOut, bool fMempool = false);
 
 bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHeight, uint64_t nNoteUnitsIn,
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
@@ -465,15 +465,15 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                          const TokenView& view, TokenEffects& eff,
-                         CHouse& houseOut, bool& fHouseChanged);
+                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                            const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                            const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
-                           CHouse& houseOut, bool& fHouseChanged);
+                           CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                         const std::function<bool(uint32_t, CPool&)>& fnGetPool,
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                        CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired);
+                        CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired, bool fMempool = false);
 bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           CHouse& houseAOut, CHouse& houseBOut, bool fMempool = false);
@@ -490,9 +490,8 @@ static uint64_t CapitalCapUnits(const CHouse& house, int nHeight)
     if (!HouseCapitalForChecks(house, nHeight, 0, cap))
         return 0;
     const uint64_t nCap = cap.nCapacityMg;   // the ramp (GOLD_B §5): each escrow tranche at its multiple, at most the floor's
-    // Pending swaps are still owed (GOLD_B.md §4): they use up the room as the notes they were.
-    const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
-    return nCap > nPending ? nCap - nPending : 0;
+    const unsigned __int128 nOwed = HouseOwedOutsideNotesMg(house, nHeight);
+    return (unsigned __int128)nCap > nOwed ? nCap - (uint64_t)nOwed : 0;
 }
 static uint64_t TillCapUnits(const CHouse& house, int nHeight, CAmount amountTillSats)
 {
@@ -501,8 +500,8 @@ static uint64_t TillCapUnits(const CHouse& house, int nHeight, CAmount amountTil
         return 0;
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
     const uint64_t nCap = (uint64_t)((unsigned __int128)cap.nTillMg * 10000 / gp.nTillMinBps);
-    const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
-    return nCap > nPending ? nCap - nPending : 0;
+    const unsigned __int128 nOwed = HouseOwedOutsideNotesMg(house, nHeight);
+    return (unsigned __int128)nCap > nOwed ? nCap - (uint64_t)nOwed : 0;
 }
 /** Gold B (D-2026-11-07-1; GOLD_B.md §1, §3): the house rate a payload names, checked against the chain. BID = the
  *  house's bid in effect at nHeight (what its notes and deposits pay, and brassage); ASK30 = its highest ask of the last
@@ -708,6 +707,27 @@ static bool HouseIssueFitsMoneyRange(const CHouse& house, uint64_t nIssue, int n
         HousePendingSwapUnitsForChecks(house.nHouseID) +
         HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(nHeight), (int64_t)gp.nShortfallLapseSecs / 600);
     return nSum <= (unsigned __int128)MAX_MONEY;
+}
+
+/** S1X-5 (security Medium; Michael 2026-11-23 "Yes, build it"): may the first waterfall op take the snapshot yet? A
+ *  SWAP_DONE after MaterializeInsolvency left the swap's units in nInsolventUnits with no claimant (SwapSettle drops it
+ *  from pending, the snapshot keeps it, SWAP_CLAIM refuses it as settled), so the order of a claim and a SWAP_DONE set
+ *  the noteholders' recovery. No swap opens after the failure E (SWAP refuses an insolvent house), so every swap pending
+ *  then has its deadline within nSwapDeadlineSecs of E's active time. Hold the snapshot until none is pending or that
+ *  span has passed (rounded up to clock blocks: ClockAtHeight floors active time to 600 s); past it SWAP_DONE refuses
+ *  (bad-note-swap-late) and only SWAP_CLAIM remains, so the snapshot is order-free. E = 0 (only an "unreachable" branch
+ *  of HouseInsolventSince at the snapshot sites) fails open: holding would freeze the pot for good, since SWAP_CLAIM is
+ *  held too. Called only where the snapshot is taken (status not yet INSOLVENT). */
+static bool InsolvencySwapsSettled(const CHouse& house, int nHeight)
+{
+    if (HousePendingSwapUnitsForChecks(house.nHouseID) == 0)
+        return true;
+    const uint32_t nE = HouseInsolventSince(house, nHeight);
+    if (nE == 0)
+        return true;
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt((int)nE);
+    const int64_t nDeadlineClock = ((int64_t)gp.nSwapDeadlineSecs + 599) / 600;
+    return ClockSince(nE, nHeight) > nDeadlineClock;
 }
 
 /** Materialize insolvency on the house record (called by the FIRST waterfall
@@ -2096,9 +2116,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return state.DoS(0, false, REJECT_DUPLICATE, "refund-already-in-mempool");
             }
 
+            // UF4-1: the verify reads this node's withdrawal record and its status (bundle and L1 events), which an
+            // honest peer one block apart sees differently: refuse without a ban.
             SidechainWithdrawal withdrawal;
             if (!VerifyWithdrawalRefundRequest(id, vchSig, withdrawal)) {
-                return state.DoS(100, error("%s: Invalid withdrawal refund!", __func__),
+                return state.DoS(0, error("%s: Invalid withdrawal refund!", __func__),
                             REJECT_INVALID, "verify-withdrawal-refund-invalid");
             }
         }
@@ -2122,7 +2144,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // or MINT already in the pool isn't seen; the block template checks the pool's transactions in order.
         {
             CUnitsView unitsCheck(punitsdb.get());
-            if (!ConnectIssuedTx(tx, view, unitsCheck, GetSpendHeight(view), state))
+            if (!ConnectIssuedTx(tx, view, unitsCheck, GetSpendHeight(view), state, /*fMempool=*/true))
                 return error("%s: ConnectIssuedTx: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
             // S2X-1 (plain; external s1/s2, High; the UR-ext-8 class): ConnectIssuedTx counts this MINT against the
             // confirmed supply only, so MINTs of one token that each fit but not together all pooled, and every template
@@ -2391,7 +2413,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             auto fnGetMember = [](uint32_t nID, const uint160& key, CHouseMember& rec) { return phousetree->GetHouseMember(nID, key, rec); };
             auto fnGetCount = [](uint32_t nID) { return phousetree->GetHouseMemberCount(nID); };
             HouseMemberEffects eff;
-            if (!CheckHouseMemberOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetMember, fnGetCount, eff))
+            if (!CheckHouseMemberOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetMember, fnGetCount, eff, true))
                 return error("%s: CheckHouseMemberOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
             uint32_t nHouseIDNewLE = 0;
             memcpy(&nHouseIDNewLE, tx.vchHousePayload.data(), 4);   // shape: the payload decoded, so >= 4 bytes
@@ -2534,7 +2556,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 }
                 TokenEffects eff;   // the mempool records nothing
                 if (!CheckTokenOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, ConfirmedTokenView(),
-                        eff, houseResult, fHouseChanged))
+                        eff, houseResult, fHouseChanged, true))
                     return error("%s: CheckTokenOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
             } else if (!CheckNoteOperation(tx, state, GetSpendHeight(view), nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin, fnGetBlockHash, houseResult, fHouseChanged, true))
                 return error("%s: CheckNoteOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
@@ -2556,7 +2578,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             auto fnGetCoin = TipCoin;   // UR3-9
             CHouse houseResult;
             bool fHouseChanged = false;
-            if (!CheckDepositOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, houseResult, fHouseChanged))
+            if (!CheckDepositOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, houseResult, fHouseChanged, true))
                 return error("%s: CheckDepositOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             // UR3-8: an ORIGINATE / WITHDRAW / CLAIM / PROTEST / DISCHARGE (house-changing) and an incoming deposit
@@ -2579,7 +2601,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             CHouse houseResult;
             bool fHouseChanged = false, fPoolRetired = false;
             if (!CheckPoolOperation(tx, state, GetSpendHeight(view), fnGetPool, fnGetHouse,
-                    poolResult, houseResult, fHouseChanged, fPoolRetired))
+                    poolResult, houseResult, fHouseChanged, fPoolRetired, true))
                 return error("%s: CheckPoolOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             const uint32_t nPoolTouched = poolResult.nPoolID;
@@ -3520,8 +3542,9 @@ static bool CheckHouseMemberOperation(const CTransaction& tx, CValidationState& 
                                       const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                                       const std::function<bool(uint32_t, const uint160&, CHouseMember&)>& fnGetMember,
                                       const std::function<uint32_t(uint32_t)>& fnGetCount,
-                                      HouseMemberEffects& effOut)
+                                      HouseMemberEffects& effOut, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     HouseMemberOp op;
     if (!IsHouseMemberOp(tx.nHouseOp) || !DecodeHousePayload(tx.vchHousePayload, op))
         return state.DoS(100, false, REJECT_INVALID, "bad-house-member-payload");
@@ -3636,6 +3659,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                         CBill& billOut, CHouse& houseOut, bool& fHouseChanged, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     fHouseChanged = false;
 
     if (tx.nBillOp == BILL_OP_ISSUE) {
@@ -4427,6 +4451,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                          CHouse& houseOut, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     // v0.2.19: member-list ops change no house record; their callers route them to CheckHouseMemberOperation
     if (IsHouseMemberOp(tx.nHouseOp))
         return state.DoS(100, false, REJECT_INVALID, "bad-house-member-op-route");
@@ -4716,8 +4741,12 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         if (house.nLoanBookFace != 0)
             return state.DoS(10, false, REJECT_INVALID, "bad-house-close-book-open");
         // No claim ever came: CLOSE is the first waterfall op and takes the snapshot itself.
-        if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetProofCoin))
-            return state.DoS(0, false, REJECT_INVALID, "bad-house-close-no-price");
+        if (house.status != HOUSE_STATUS_INSOLVENT) {
+            if (!InsolvencySwapsSettled(house, nHeight))   // S1X-5: no snapshot while a pending swap can settle
+                return state.DoS(0, false, REJECT_INVALID, "bad-house-close-swaps-pending");
+            if (!MaterializeInsolvency(house, nHeight, fnGetProofCoin))
+                return state.DoS(0, false, REJECT_INVALID, "bad-house-close-no-price");
+        }
 
         // The partners' residual (escrow -> deposits -> notes loss order), in value: what the pot keeps after notes and
         // deposits take par, gold first, the rest in sECX at the snapshot price.
@@ -4860,8 +4889,12 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             // A zero-liability house can reach (lazy) insolvency with no note
             // claim ever possible - the settle is then the FIRST waterfall op
             // and materializes the snapshot itself (deadlock escape).
-            if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetProofCoin))
-                return state.DoS(0, false, REJECT_INVALID, "bad-house-settle-no-price");
+            if (house.status != HOUSE_STATUS_INSOLVENT) {
+                if (!InsolvencySwapsSettled(house, nHeight))   // S1X-5: no snapshot while a pending swap can settle
+                    return state.DoS(0, false, REJECT_INVALID, "bad-house-settle-swaps-pending");
+                if (!MaterializeInsolvency(house, nHeight, fnGetProofCoin))
+                    return state.DoS(0, false, REJECT_INVALID, "bad-house-settle-no-price");
+            }
 
             // Partners take what is left AFTER the senior note par tranche AND the
             // junior deposit tranche (escrow -> deposits -> notes loss order), in value at the snapshot price.
@@ -5102,8 +5135,11 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             CHouseCapital cap;
             const bool fCap = HouseCapitalForChecks(house, nHeight, amountSum, cap);
             const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-            const uint64_t nFloor = (uint64_t)((unsigned __int128)house.nMintedUnits * gp.nTillMinBps / 10000);
-            if (!fCap || cap.nTillMg < nFloor)
+            // S1X-3: the floor covers everything owed at the noteholders' rank - notes, pending swaps and live
+            // shortfalls - so a run (holders swapping) can't lower it and lift the deferral while swaps are owed.
+            const unsigned __int128 nFloor = ((unsigned __int128)house.nMintedUnits + HouseOwedOutsideNotesMg(house, nHeight)) *
+                                             gp.nTillMinBps / 10000;
+            if (!fCap || (unsigned __int128)cap.nTillMg < nFloor)
                 nNewStress = house.nStressSinceHeight ? house.nStressSinceHeight : (uint32_t)nHeight;
         }
 
@@ -5380,6 +5416,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                         CHouse& houseOut, bool& fHouseChanged, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     fHouseChanged = false;
     const uint256 hashOutputs = BillHashOutputs(tx);
 
@@ -5414,7 +5451,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             if (!BoundHouseRate(sw.nHouseID, sw.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap", nBid))
                 return false;
             const CScript scriptPayout(sw.vchPayoutScript.begin(), sw.vchPayoutScript.end());
-            if (scriptPayout == HouseEscrowScript(house.houseID) || IsGoldUnpayableScript(scriptPayout))
+            if (scriptPayout == HouseEscrowScript(house.houseID) || !IsHousePayableScript(scriptPayout))   // S1X-15
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payout-script");
             // The notes leave circulation now; until DONE or PAID they are the house's pending-swap liability.
             house.nMintedUnits -= sw.nUnits;
@@ -5517,8 +5554,12 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             } else {
                 return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-settled");
             }
-            if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetCoin))
-                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-no-price");
+            if (house.status != HOUSE_STATUS_INSOLVENT) {
+                if (!InsolvencySwapsSettled(house, nHeight))   // S1X-5: no snapshot while a pending swap can settle
+                    return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-swaps-pending");
+                if (!MaterializeInsolvency(house, nHeight, fnGetCoin))
+                    return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-claim-no-price");
+            }
             CAmount amountEscrowIn = 0;
             for (const CTxIn& in : tx.vin) {
                 Coin coin;
@@ -5574,7 +5615,9 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                                   nBidNow);
         }
         // NOTE_OP_SWAP_PROTEST: undelivered and unpaid a day after its deadline - an unpaid formal demand, the stress
-        // cascade (house.cpp's protest origin). An honest house can always pay sECX, so this can't be griefed.
+        // cascade (house.cpp's protest origin). An honest house can always pay sECX to the payout: since S1X-15 the
+        // SWAP door admits only a payout every stock node relays a payment to (IsHousePayableScript), so a holder can't
+        // name one the house can't pay and protest it.
         NoteSwapProtest pro;
         if (!DecodeNotePayload(tx.vchNotePayload, pro))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-protest-payload");
@@ -5751,8 +5794,26 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 nAuthTotal += u;   // overflow-checked at shape (SumNoteUnits)
             if (nAuthTotal != nNoteUnitsIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sum");
+            // S1X-14: the demand these coins belong to. Every burned note coin carries the same demand id (one demand
+            // per discharge, as the sum already requires); the standing authorisation must name that id.
+            uint256 demandIdBurn;
+            bool fHaveDemandId = false;
+            for (const CTxIn& in : tx.vin) {
+                Coin coin;
+                if (!fnGetCoin(in.prevout, coin) || !coin.fNote)
+                    continue;
+                uint256 id;
+                if (!NoteCustodyDemandId(coin.out.scriptPubKey, id))
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-custody");
+                if (fHaveDemandId && id != demandIdBurn)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-mixed-demand");
+                demandIdBurn = id;
+                fHaveDemandId = true;
+            }
+            if (!fHaveDemandId)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-custody");
             if (!FbVerifyStrict(CPubKey(redeem.vchHolderPubKey),
-                    NotePreAuthSigHash(redeem.nHouseID, redeem.vPreAuthUnits, redeem.vchPayoutScript),
+                    NotePreAuthSigHash(redeem.nHouseID, redeem.vPreAuthUnits, redeem.vchPayoutScript, demandIdBurn),
                     redeem.vchPreAuthSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sig-invalid");
         } else {
@@ -6043,7 +6104,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             // can never discharge, and the teeth would fire against a house
             // that was never actually authorized to pay.
             if (!FbVerifyStrict(CPubKey(dem.vchHolderPubKey),
-                    NotePreAuthSigHash(dem.nHouseID, dem.vUnits, dem.vchPayoutScript), dem.vchPreAuthSig))
+                    NotePreAuthSigHash(dem.nHouseID, dem.vUnits, dem.vchPayoutScript, NoteHashPrevouts(tx)), dem.vchPreAuthSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-sig-invalid");
             // The payout script must not be THIS house's escrow script: the
             // discharge's stray-escrow rule (an untracked escrow-script output
@@ -6058,11 +6119,15 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             // the vaults and, the oldest in the queue, would hold up every capital payout behind it.
             if (IsGoldUnpayableScript(scriptPayout))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-script-escrow");
+            // S1X-15: and only a script every stock node relays a payment to (the discharge pays it exactly).
+            if (!IsHousePayableScript(scriptPayout))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-script-unpayable");
             // The re-issue must land on the DEMANDING HOLDER's custody script
             // exactly (shape only proved custody-shaped): the protest pin and
             // the discharge digest both resolve through the keyid embedded
             // here, so a stranger's keyid would strand the coins.
-            const CScript scriptCustody = NotePreAuthScript(dem.vchHolderPubKey);
+            // S1X-14: every custody output carries this DEMAND's id (NoteHashPrevouts), the one the pre-auth signed.
+            const CScript scriptCustody = NoteDemandCustodyScript(dem.vchHolderPubKey, NoteHashPrevouts(tx));
             for (size_t i = 0; i < dem.vUnits.size(); i++) {
                 if (tx.vout[i].scriptPubKey != scriptCustody)
                     return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-custody-script");
@@ -6148,8 +6213,26 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 NoteProtestSigHash(pro.nHouseID, pro.vUnits, hashOutputs), pro.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-sig");
 
-        // Custody preserved, same holder (shape proved custody-SHAPED only).
-        const CScript scriptCustody = NotePreAuthScript(pro.vchHolderPubKey);
+        // Custody preserved, same holder (shape proved custody-SHAPED only). S1X-14: and the same demand - the re-issue
+        // copies the demand id the protested coins carry (one demand per protest), so the standing authorisation the
+        // DEMAND signed still discharges them.
+        uint256 demandIdPro;
+        bool fHaveDemandId = false;
+        for (const CTxIn& in : tx.vin) {
+            Coin coin;
+            if (!fnGetCoin(in.prevout, coin) || !coin.fNote)
+                continue;
+            uint256 id;
+            if (!NoteCustodyDemandId(coin.out.scriptPubKey, id))
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-custody-script");
+            if (fHaveDemandId && id != demandIdPro)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-mixed-demand");
+            demandIdPro = id;
+            fHaveDemandId = true;
+        }
+        if (!fHaveDemandId)
+            return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-custody-script");
+        const CScript scriptCustody = NoteDemandCustodyScript(pro.vchHolderPubKey, demandIdPro);
         for (size_t i = 0; i < pro.vUnits.size(); i++) {
             if (tx.vout[i].scriptPubKey != scriptCustody)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-custody-script");
@@ -6203,8 +6286,12 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // First waterfall op materializes: status char + the pro-rata
         // denominator snapshot (pot = LIVE escrow coins, units = outstanding).
-        if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetCoin))
-            return state.DoS(0, false, REJECT_INVALID, "bad-note-claim-no-price");
+        if (house.status != HOUSE_STATUS_INSOLVENT) {
+            if (!InsolvencySwapsSettled(house, nHeight))   // S1X-5: no snapshot while a pending swap can settle
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-claim-swaps-pending");
+            if (!MaterializeInsolvency(house, nHeight, fnGetCoin))
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-claim-no-price");
+        }
 
         // Escrow accounting: what this tx takes out of the pot.
         CAmount amountEscrowIn = 0;
@@ -6381,8 +6468,9 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                          const TokenView& view, TokenEffects& eff,
-                         CHouse& houseOut, bool& fHouseChanged)
+                         CHouse& houseOut, bool& fHouseChanged, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     fHouseChanged = false;
     const uint256 hashPrevouts = NoteHashPrevouts(tx);
 
@@ -6504,8 +6592,9 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             vChecked.push_back(c);
         }
         // A bound on T against the CONFIRMED total only (the same verdict in the mempool and in any block order;
-        // review M-a). nSum <= 64 x 2^50; a block's staged claims are bounded by its weight, far below the headroom.
-        if (house.nTokenClaimed > std::numeric_limits<uint64_t>::max() / 4 - nSum)
+        // review M-a). nSum <= 64 x 2^50. S4X-1: a block's staged claims are bounded by its weight, and the gap to the
+        // flush limit (token.h) is wider than a maximum-weight block of claims (pinned in token_tests).
+        if (house.nTokenClaimed > MAX_TOKEN_CLAIM_CONFIRMED_TOTAL - nSum)
             return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-total");
         for (size_t i = 0; i < claim.vEntry.size(); i++) {
             const TokenClaimEntry& e = claim.vEntry[i];
@@ -6557,8 +6646,12 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(100, false, REJECT_INVALID, "bad-token-collect-empty");
 
         // The payout is a waterfall op: the first one materializes the pro-rata snapshot (as a note claim does).
-        if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetCoin))
-            return state.DoS(0, false, REJECT_INVALID, "bad-token-collect-no-price");
+        if (house.status != HOUSE_STATUS_INSOLVENT) {
+            if (!InsolvencySwapsSettled(house, nHeight))   // S1X-5: no snapshot while a pending swap can settle
+                return state.DoS(0, false, REJECT_INVALID, "bad-token-collect-swaps-pending");
+            if (!MaterializeInsolvency(house, nHeight, fnGetCoin))
+                return state.DoS(0, false, REJECT_INVALID, "bad-token-collect-no-price");
+        }
         if (house.nTokenBaseHeight == 0) {
             house.nTokenBase = house.nTokenUnits;   // B: nothing moves nTokenUnits once insolvent but collects
             house.nTokenBaseHeight = (uint32_t)nHeight;
@@ -6672,8 +6765,9 @@ static bool IsLockedScriptFamily(const CScript& script)
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                            const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                            const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
-                           CHouse& houseOut, bool& fHouseChanged)
+                           CHouse& houseOut, bool& fHouseChanged, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     fHouseChanged = false;
     const uint256 hashOutputs = BillHashOutputs(tx);
 
@@ -6878,7 +6972,8 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         if (nHeight < 0 || (uint32_t)nHeight < TermDeadlineHeight(d.nOriginationHeight, d.nMaturityHeight, 0, nHeight))
             return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-early");   // the term in clock time
         // The payout must be a real destination, never one of the consensus-locked script families.
-        if (IsLockedScriptFamily(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())))
+        if (IsLockedScriptFamily(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())) ||
+                !IsHousePayableScript(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())))   // S1X-15
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payout-script");
         // Into custody, same holder: the house can pay it alone from now on.
         if (tx.vout[0].scriptPubKey != NotePreAuthScript(d.vchHolderPubKey))
@@ -6920,7 +7015,8 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
                 DepositProtestSigHash(pr.nHouseID, pr.nPrincipal, pr.nOriginationHeight, pr.nDemandTag, hashOutputs),
                 pr.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-sig");
-        if (IsLockedScriptFamily(CScript(pr.vchPayoutScript.begin(), pr.vchPayoutScript.end())))
+        if (IsLockedScriptFamily(CScript(pr.vchPayoutScript.begin(), pr.vchPayoutScript.end())) ||
+                !IsHousePayableScript(CScript(pr.vchPayoutScript.begin(), pr.vchPayoutScript.end())))   // S1X-15
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-payout-script");
         // The standing authorization, re-stated: whoever later pays reads it from this transaction.
         if (!FbVerifyStrict(CPubKey(pr.vchHolderPubKey),
@@ -7036,8 +7132,12 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
 
         // First waterfall op materializes: freezes pot, the note snapshot, AND the
         // deposit snapshot.
-        if (house.status != HOUSE_STATUS_INSOLVENT && !MaterializeInsolvency(house, nHeight, fnGetCoin))
-            return state.DoS(0, false, REJECT_INVALID, "bad-deposit-claim-no-price");
+        if (house.status != HOUSE_STATUS_INSOLVENT) {
+            if (!InsolvencySwapsSettled(house, nHeight))   // S1X-5: no snapshot while a pending swap can settle
+                return state.DoS(0, false, REJECT_INVALID, "bad-deposit-claim-swaps-pending");
+            if (!MaterializeInsolvency(house, nHeight, fnGetCoin))
+                return state.DoS(0, false, REJECT_INVALID, "bad-deposit-claim-no-price");
+        }
 
         // Escrow accounting: what this tx takes out of the pot (same shape as the
         // note CLAIM; only the tranche denominator differs).
@@ -7127,8 +7227,9 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
 bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                         const std::function<bool(uint32_t, CPool&)>& fnGetPool,
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                        CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired)
+                        CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     fHouseChanged = false;
     fPoolRetired = false;
     // Gram-notes release (D-2026-10-31-8 item 9): house note pools are closed while one producer is the only one; no
@@ -7586,6 +7687,7 @@ static bool CheckSettleTx(const CTransaction& tx, CValidationState& state, int n
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           std::vector<CHouse>& vHousesOut, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     vHousesOut.clear();
     if (tx.nSettleOp == SETTLE_OP_NET)
         return CheckSettleNetOperation(tx, state, nHeight, fnGetHouse, vHousesOut, fMempool);
@@ -11957,7 +12059,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 h = it->second;
             else if (!phousetree->GetHouse(kv.first, h))
                 return state.Error("Token claim totals for an unknown house!");
-            if (h.nTokenClaimed > std::numeric_limits<uint64_t>::max() / 2 - kv.second.first)
+            if (h.nTokenClaimed > TOKEN_CLAIM_FLUSH_MAX - kv.second.first)   // unreachable since S4X-1 (token.h)
                 return state.Error("Token claim totals overflow!");
             h.nTokenClaimed += kv.second.first;
             h.nTokenClaims += kv.second.second;

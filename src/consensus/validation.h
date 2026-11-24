@@ -89,6 +89,31 @@ public:
     std::string GetDebugMessage() const { return strDebugMessage; }
 };
 
+/** UF4-1 (security Medium, 2026-11-23): a FreeBank op checker on the mempool path refuses without a ban. Its verdicts
+ *  read chain state (house and pool records, status, height, caps, clocks, the L1 view), which an honest peer one
+ *  block apart sees differently, so a refusal there must not score DoS > 0. Declared first in each checker; when
+ *  fActive and the checker leaves the state invalid, the guard re-issues the same code, reason, corruption flag and
+ *  debug message at DoS 0 (nDoS only adds up, so via a fresh state). A run-time error, or a state already invalid on
+ *  entry, is left alone. The block path (fActive false) keeps every score. */
+class MempoolRefusalScoresZero {
+public:
+    MempoolRefusalScoresZero(CValidationState& state, bool fActive) : m_state(state), m_fActive(fActive && state.IsValid()) {}
+    ~MempoolRefusalScoresZero()
+    {
+        if (!m_fActive || !m_state.IsInvalid())
+            return;
+        CValidationState zero;
+        zero.DoS(0, false, m_state.GetRejectCode(), m_state.GetRejectReason(), m_state.CorruptionPossible(),
+                 m_state.GetDebugMessage());
+        m_state = zero;
+    }
+    MempoolRefusalScoresZero(const MempoolRefusalScoresZero&) = delete;
+    MempoolRefusalScoresZero& operator=(const MempoolRefusalScoresZero&) = delete;
+private:
+    CValidationState& m_state;
+    const bool m_fActive;
+};
+
 // These implement the weight = (stripped_size * 4) + witness_size formula,
 // using only serialization with and without witness data. As witness_size
 // is equal to total_size - stripped_size, this formula is identical to:

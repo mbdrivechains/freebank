@@ -60,8 +60,9 @@ bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& s
 }
 
 bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnitsView& units, int nHeight,
-                     CValidationState& state)
+                     CValidationState& state, bool fMempool)
 {
+    const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     // Frozen units: what the spent coins carry (the annex's at creation, or a later FREEZE's) must go where this
     // transaction's annex puts them, token by token; the spent coins' FREEZE records go with them.
     // Nothing is written until every check has passed, so a refused transaction leaves `units` as it found it.
@@ -620,6 +621,61 @@ bool HouseCapitalForChecks(const CHouse& house, int nHeight, CAmount amountTillS
     return true;
 }
 
+bool HouseEscrowMgForChecks(const CHouse& house, int nHeight, uint64_t& nEscrowMg)
+{
+    // The same value as HouseCapitalForChecks' nEscrowMg on the real path: the active escrow at the house's highest ask
+    // of the last 30 days. Not the ramped capacity, and never the unit tests' capital override.
+    nEscrowMg = 0;
+    uint64_t nBidMax = 0, nAskMax = 0;
+    if (!HouseRateMaxForChecks(house.nHouseID, nHeight, 30, nBidMax, nAskMax) || nAskMax == 0)
+        return false;
+    nEscrowMg = SatsToMgAt(house.ActiveEscrow(), nAskMax);
+    return true;
+}
+
+uint64_t HouseLoanBookExcess(const CHouse& house, int nHeight)
+{
+    // S1X-9 (security Medium; Michael 2026-11-23 "Yes, build it"): the book is in mg (bill.amount since gram notes), so
+    // the permanent capital it is measured against is too. It subtracted ActiveEscrow() in sats, which at any real rate
+    // dwarfed the book: the excess was 0 and match funding never bound. A house with no rate has no capital here (it
+    // can't have issued: issuing needs a fresh rate). Unsigned throughout: never a bare L - E (house.h).
+    uint64_t nEscrowMg = 0;
+    HouseEscrowMgForChecks(house, nHeight, nEscrowMg);
+    return house.nLoanBookFace > nEscrowMg ? house.nLoanBookFace - nEscrowMg : 0;
+}
+
+uint64_t HouseLoanBookSlice(const CHouse& house, int nHeight)
+{
+    const uint64_t nExcess = HouseLoanBookExcess(house, nHeight);
+    return nExcess < house.nDepositUnits ? nExcess : house.nDepositUnits;
+}
+
+bool HouseMatchFundingOK(const CHouse& house, int nHeight)
+{
+    const uint64_t nSlice = HouseLoanBookSlice(house, nHeight);
+    if (nSlice == 0)
+        return true;   // no deposits, or a book inside permanent capital
+    // Cross-multiplied to avoid division. Ceilings (house.h): L < 2^51 and
+    // DepositDuration < 2^73 give a left side < 2^124; slice < 2^51 and
+    // BookDuration < 2^71 give a right side < 2^122. Both fit u128.
+    const unsigned __int128 lhs = (unsigned __int128)house.nLoanBookFace * HouseDepositDuration(house, nHeight);
+    const unsigned __int128 rhs = (unsigned __int128)nSlice * HouseLoanBookDuration(house, nHeight);
+    return lhs >= rhs;
+}
+
+
+/** What the house still owes at the noteholders' rank beyond its notes (GOLD_B.md §4): pending swaps (their notes left
+ *  circulation, the house still owes them) and S1X-6 (security Medium; Michael 2026-11-23 "Yes, build it") the live
+ *  shortfalls of swaps it paid short, within the lapse MaterializeInsolvency counts them over. Both use up issuing room
+ *  as the notes they were; a short payment frees nothing until its shortfall lapses. In 128 bits: the ledger is
+ *  bounded only by HouseIssueFitsMoneyRange. S1X-3 (security Medium; Michael 2026-11-24 "Yes, build it"): the same
+ *  amount joins the minted units in the deferred house's recovery floor, GoldParEligible and GoldTillRatioBps. */
+unsigned __int128 HouseOwedOutsideNotesMg(const CHouse& house, int nHeight)
+{
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
+    return (unsigned __int128)HousePendingSwapUnitsForChecks(house.nHouseID) +
+        HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(nHeight), (int64_t)gp.nShortfallLapseSecs / 600);
+}
 bool GoldParEligible(const CHouse& house, int nHeight)
 {
     if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
@@ -628,17 +684,21 @@ bool GoldParEligible(const CHouse& house, int nHeight)
     if (!HouseCapitalForChecks(house, nHeight, HouseAttestedTillSats(house, nHeight), cap))
         return false;
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    return (unsigned __int128)cap.nTillMg * 10000 >= (unsigned __int128)house.nMintedUnits * gp.nTillMinBps;
+    // S1X-3: owed = notes + pending swaps + live shortfalls.
+    return (unsigned __int128)cap.nTillMg * 10000 >=
+           ((unsigned __int128)house.nMintedUnits + HouseOwedOutsideNotesMg(house, nHeight)) * gp.nTillMinBps;
 }
 
 uint32_t GoldTillRatioBps(const CHouse& house, int nHeight)
 {
-    if (house.nMintedUnits == 0)
+    // S1X-3: the till against everything owed at the noteholders' rank, not the notes alone.
+    const unsigned __int128 nOwed = (unsigned __int128)house.nMintedUnits + HouseOwedOutsideNotesMg(house, nHeight);
+    if (nOwed == 0)
         return 10000;
     CHouseCapital cap;
     if (!HouseCapitalForChecks(house, nHeight, HouseAttestedTillSats(house, nHeight), cap))
         return 0;
-    const unsigned __int128 bps = (unsigned __int128)cap.nTillMg * 10000 / (unsigned __int128)house.nMintedUnits;
+    const unsigned __int128 bps = (unsigned __int128)cap.nTillMg * 10000 / nOwed;
     return bps > 10000 ? 10000 : (uint32_t)bps;
 }
 

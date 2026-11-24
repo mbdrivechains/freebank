@@ -27,6 +27,7 @@
 #include <uint256.h>
 
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <vector>
@@ -43,6 +44,13 @@ static const uint8_t MAX_TOKEN_AMOUNT_EXP = 50;
 /** Entries per POST (issued + spent), tokens per CLAIM, claims per COLLECT. */
 static const size_t MAX_TOKEN_POST_ENTRIES = 2000;
 static const size_t MAX_TOKEN_CLAIM_ENTRIES = 64;
+/** S4X-1 (security High, Michael 2026-11-23 "Yes, build it"): a house's claim total T. A CLAIM is checked against the
+ *  CONFIRMED T only (T <= MAX_TOKEN_CLAIM_CONFIRMED_TOTAL - its sum), and ConnectBlock adds the block's claims at the
+ *  flush, which stops with a system error past TOKEN_CLAIM_FLUSH_MAX. The gap between them, 3 x 2^61, is about 96
+ *  full claims (64 x 2^50); a block holds about 67, so no block can reach the flush limit (was max/4: 65, and 67 fit).
+ *  token_tests pins the gap against the smallest claim entry a block can carry. */
+static const uint64_t MAX_TOKEN_CLAIM_CONFIRMED_TOTAL = std::numeric_limits<uint64_t>::max() / 8;
+static const uint64_t TOKEN_CLAIM_FLUSH_MAX = std::numeric_limits<uint64_t>::max() / 2;
 static const size_t MAX_TOKEN_COLLECT_ENTRIES = 100;
 /** A token secret's length: Cashu's default is 64 hex characters. */
 static const size_t MAX_TOKEN_SECRET_SIZE = 256;

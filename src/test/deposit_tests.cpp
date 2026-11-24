@@ -23,6 +23,9 @@
 #include <functional>
 
 #include <boost/test/unit_test.hpp>
+#include <houserate.h>   // CChainClock, CSwapRecord, SwapOpen, SwapSettle (S1X-5)
+#include <units.h>       // CUnitsView (S1X-5)
+#include <policy/policy.h>   // S1X-15 deposit case
 
 // Contextual deposit-op validator (validation.cpp, external linkage; not in a
 // public header). Forward-declared so the ORIGINATE gate can be exercised
@@ -30,9 +33,28 @@
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                            const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                            const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
-                           CHouse& houseOut, bool& fHouseChanged);
+                           CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 
 BOOST_FIXTURE_TEST_SUITE(deposit_tests, BasicTestingSetup)
+
+// UF4-1 (security 11-23: pin the deposit cases on both paths): a refusal that reads chain state (house status, height,
+// the receipt's term) keeps its reason in a block and on the mempool path, scores 100 in a block, and bans no peer on the
+// mempool path (a node one block apart sees the house or the clock differently).
+static void CheckDepositRefusalScores(const CMutableTransaction& mtx, int nHeight,
+                                      const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                                      const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
+                                      const std::string& strReason)
+{
+    for (const bool fMempool : {false, true}) {
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, nHeight, fnGetHouse, fnGetCoin, houseOut, fChanged, fMempool));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), strReason);
+        int nDoS = -1;
+        BOOST_CHECK(state.IsInvalid(nDoS));
+        BOOST_CHECK_MESSAGE(nDoS == (fMempool ? 0 : 100), strReason << (fMempool ? " on the mempool path" : " in a block")
+                                                                 << " scores " << nDoS << " (UF4-1)");
+    }
+}
 
 static std::vector<unsigned char> FreshPubKey()
 {
@@ -357,6 +379,7 @@ BOOST_AUTO_TEST_CASE(deposit_originate_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 2000, fnGetHouse, fnNoCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-originate-house-not-open");
+        CheckDepositRefusalScores(mtx, 2000, fnGetHouse, fnNoCoin, "bad-deposit-originate-house-not-open");
     }
     // Maturity in the past -> refused (term must be > 0).
     {
@@ -372,6 +395,7 @@ BOOST_AUTO_TEST_CASE(deposit_originate_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnNoCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-originate-not-future");
+        CheckDepositRefusalScores(mtx, 1000, fnGetHouse, fnNoCoin, "bad-deposit-originate-not-future");
     }
     // Over the shared capital cap (N + D + batch > lambda*E) -> refused. The
     // house already has notes + deposits near the cap.
@@ -509,6 +533,15 @@ BOOST_AUTO_TEST_CASE(deposit_withdraw_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 900, fnGetHouse, fnGetCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-not-matured");
+        int nDoS = -1;
+        BOOST_CHECK(state.IsInvalid(nDoS) && nDoS == 100);
+        // UF4-1: on the mempool path (a saver withdrawing at the first legal block, seen by a node one block behind)
+        // the same refusal bans no peer.
+        CValidationState statePool;
+        BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), statePool, 900, fnGetHouse, fnGetCoin, houseOut, fChanged, true));
+        BOOST_CHECK_EQUAL(statePool.GetRejectReason(), "bad-deposit-not-matured");
+        nDoS = -1;
+        BOOST_CHECK(statePool.IsInvalid(nDoS) && nDoS == 0);
     }
     // House not Open (Stressed) -> refused (junior; queues behind notes).
     {
@@ -519,6 +552,7 @@ BOOST_AUTO_TEST_CASE(deposit_withdraw_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, nHeight, fnGetHouse, fnGetCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-withdraw-house-not-open");
+        CheckDepositRefusalScores(mtx, nHeight, fnGetHouse, fnGetCoin, "bad-deposit-withdraw-house-not-open");
     }
     // Underpaid (payout below principal + accrued) -> refused (interest is a FLOOR).
     {
@@ -593,6 +627,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnGetCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-claim-not-insolvent");
+        CheckDepositRefusalScores(mtx, 1000, fnGetHouse, fnGetCoin, "bad-deposit-claim-not-insolvent");
     }
     // Positive: insolvent, escrow taken == entitlement, valid sig -> accepted, D-=P.
     {
@@ -665,7 +700,7 @@ BOOST_AUTO_TEST_CASE(deposit_match_funding_helpers)
     BOOST_CHECK_EQUAL(HouseDepositWAM(house, 8000), 0);      // past it -> clamped 0
     // With an EMPTY loan book the slice is 0, so match-funding is satisfied no
     // matter what the deposits look like (B1: D>0 alone never binds).
-    BOOST_CHECK_EQUAL(HouseLoanBookSlice(house), 0);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(house, 1000), 0);
     BOOST_CHECK(HouseMatchFundingOK(house, 1000));
     BOOST_CHECK(HouseMatchFundingOK(house, 8000));           // even when all matured
 }
@@ -1225,5 +1260,159 @@ BOOST_AUTO_TEST_CASE(s2x_2_deposit_rate_has_a_ceiling)
                             strHigh + ") - the rate is bounded nowhere, and its interest saturates at MAX_MONEY");
     }
 }
+
+// #include lines to add at the top of deposit_tests.cpp:
+//   #include <houserate.h>   // CChainClock, CSwapRecord, SwapOpen, SwapSettle (S1X-5)
+//   #include <units.h>       // CUnitsView (S1X-5)
+// (issued.h, for UnitsCheckScope and CreditHashOutputs, is already included.)
+
+// ---------------------------------------------------------------------------
+// S1X-5, deposit CLAIM (security 2026-11-23: Medium; private until fixed). The note_tests case explains the gate and
+// the three checks; this is the same at the deposit waterfall's snapshot site (validation.cpp ~7048): a house that
+// failed by the stress path and was never materialized, one depositor's correctly signed CLAIM (the sig check precedes
+// the snapshot) with a stray escrow output at vout[0], and another holder's swap opened at E - 10.
+// (1) FAILS on master 71b3558.
+// ---------------------------------------------------------------------------
+namespace {
+bool S1X5DepEndsPending(const std::string& s)
+{
+    static const std::string suffix = "-swaps-pending";
+    return s.size() > suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_5_deposit_claim_waits_for_swaps_pending_at_the_failure)
+{
+    BOOST_REQUIRE(g_fClockIsHeightForTests);
+    const uint32_t H = 5;
+    const uint64_t P = 100000;
+    const uint32_t R = 500, MAT = 1000, ORIG = 50;
+    CKey keyHolder; keyHolder.MakeNewKey(true);
+    const CPubKey pubH = keyHolder.GetPubKey();
+    const std::vector<unsigned char> holderPub(pubH.begin(), pubH.end());
+
+    // The stress-path failure (token_tests' FailedHouse), never materialized, holding one deposit.
+    CHouse house = MakeOpenDepositHouse(H);
+    house.nRegisteredHeight = 100;
+    house.nLastAttestHeight = 200;
+    house.nStressSinceHeight = 200 + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;
+    house.amountLastAttestReserves = 100 * COIN;
+    house.nMintedUnits = 100000;
+    house.nDepositUnits = P;
+    house.SetDepositWtMaturity((unsigned __int128)P * MAT);
+    const uint32_t E = HouseInsolventSince(house, 1000000);
+    BOOST_REQUIRE(E > 20);
+    BOOST_REQUIRE_EQUAL(house.status, HOUSE_STATUS_OPEN);
+
+    const uint32_t D = Params().GetConsensus().GramAt((int)E).nSwapDeadlineSecs;
+    const uint32_t O = E - 10;
+    const int64_t nDeadline = (int64_t)O * 600 + D + 234;
+    const uint32_t h1 = (uint32_t)((nDeadline - 1) / 600);
+    const uint32_t h2 = E + (D + 599) / 600 + 1;
+    BOOST_REQUIRE(h1 >= E && (int64_t)h1 * 600 < nDeadline);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)h1), HOUSE_STATUS_INSOLVENT);
+
+    Coin receipt(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(holderPub)), 60, false, false, false, uint256());
+    receipt.SetDeposit(H, P, R, MAT, ORIG);
+    const COutPoint rOut(uint256S("cl"), 0);
+    DepositClaim clm;
+    clm.nHouseID = H;
+    clm.fEscrowChange = 0;
+    clm.vchHolderPubKey = holderPub;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
+    mtx.nDepositOp = DEPOSIT_OP_CLAIM;
+    mtx.vin.push_back(CTxIn(rOut));
+    mtx.vout.push_back(CTxOut((CAmount)P, HouseEscrowScript(house.houseID)));   // stray: refused past the snapshot
+    BOOST_REQUIRE(keyHolder.Sign(DepositClaimSigHash(H, P, CreditHashOutputs(CTransaction(mtx))), clm.vchHolderSig));
+    { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << clm; mtx.vchDepositPayload.assign(ss.begin(), ss.end()); }
+
+    auto verdict = [&](int h, int nSwap, int& nDoS) {
+        CUnitsView units(nullptr);
+        CChainClock clock;
+        clock.nHeight = (uint32_t)(h - 1);
+        clock.nMonoTime = clock.nActiveTime = (int64_t)h * 600;
+        units.Put(ChainClockKey(), clock);
+        if (nSwap) {
+            const uint256 hashLock = uint256S("5150");
+            CSwapRecord rec;
+            rec.nHouseID = H;
+            rec.nUnits = 20000;
+            rec.nBid0 = 1000;
+            rec.nDemandHeight = O;
+            rec.nDeadlineActive = nDeadline;
+            rec.vchPayoutScript = ParseHex("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+            SwapOpen(units, hashLock, rec);
+            if (nSwap == 2)
+                SwapSettle(units, hashLock, SWAP_DONE, 0, (int64_t)h * 600, h, 12960);
+        }
+        UnitsCheckScope scope(&units);
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == H) { out = house; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& c) { if (o == rOut) { c = receipt; return true; } return false; };
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        CheckDepositOperation(CTransaction(mtx), state, h, fnGetHouse, fnGetCoin, houseOut, fChanged);
+        nDoS = 0;
+        state.IsInvalid(nDoS);
+        return state.GetRejectReason();
+    };
+    int nDoS = 0, nUnused = 0;
+    const std::string strControl1 = verdict((int)h1, 0, nUnused), strControl2 = verdict((int)h2, 0, nUnused);
+    BOOST_REQUIRE_MESSAGE(!S1X5DepEndsPending(strControl1) && !S1X5DepEndsPending(strControl2),
+                          "S1X-5 setup: with no swap the deposit CLAIM was held: " + strControl1 + " / " + strControl2);
+    BOOST_REQUIRE_MESSAGE(strControl1.find("-sig") == std::string::npos && strControl1.find("no-receipt") == std::string::npos,
+                          "S1X-5 setup: the deposit CLAIM stopped before the snapshot site: " + strControl1);
+    const std::string strHeld = verdict((int)h1, 1, nDoS);
+    BOOST_CHECK_MESSAGE(S1X5DepEndsPending(strHeld), "S1X-5 deposit CLAIM: the first waterfall claim passed the snapshot "
+                        "while a swap opened before the failure could still be DONE: got '" + strHeld + "'");
+    if (S1X5DepEndsPending(strHeld))
+        BOOST_CHECK_MESSAGE(nDoS == 0, "S1X-5 deposit CLAIM: the hold scores " << nDoS << ", want 0");
+    BOOST_CHECK_EQUAL(verdict((int)h2, 1, nUnused), strControl2);
+    BOOST_CHECK_EQUAL(verdict((int)h1, 2, nUnused), strControl1);
+}
+
+// S1X-15, the deposit sites (security 2026-11-24: High; freebankd's fix eb8086a whitelists them too). A deposit DEMAND's
+// payout, and the payout a deposit PROTEST restates, are scripts the house must pay (DISCHARGE) or be protested into
+// insolvency, so each must be one every stock node relays a payment to: exactly P2PKH, P2SH, P2WPKH or P2WSH. A
+// witness-v2 output and a bare OP_TRUE are consensus-valid but non-standard. Controls: the holder's P2PKH passes both.
+// FAILS on 71b3558 (IsLockedScriptFamily alone let them in); passes on 3a9206d.
+BOOST_AUTO_TEST_CASE(s1x_15_deposit_payouts_the_house_cannot_pay_are_refused)
+{
+    const DemandScene sc;
+    CHouse house = MakeOpenDepositHouse(sc.H);
+    house.nDepositUnits = sc.P;
+    house.SetDepositWtMaturity((unsigned __int128)sc.P * sc.MAT);
+    const std::vector<unsigned char> vchWitV2 =
+        ParseHex("5220" "1111111111111111111111111111111111111111111111111111111111111111");   // OP_2 <32 bytes>
+    const std::vector<unsigned char> vchBareTrue = {0x51};                                     // OP_TRUE
+    {
+        txnouttype t;
+        BOOST_REQUIRE(::IsStandard(CScript(sc.payout.begin(), sc.payout.end()), t, true));
+        BOOST_REQUIRE(!::IsStandard(CScript(vchWitV2.begin(), vchWitV2.end()), t, true));
+        BOOST_REQUIRE(!::IsStandard(CScript(vchBareTrue.begin(), vchBareTrue.end()), t, true));
+    }
+    const CScript custody = NotePreAuthScript(sc.pub);
+
+    // DEMAND.
+    BOOST_REQUIRE_EQUAL(RunDeposit(MakeDemandTx(sc, sc.payout, sc.PreAuth(sc.payout), custody), 1100, house,
+                                   sc.Receipt(0)), "OK");
+    for (const auto& bad : {vchWitV2, vchBareTrue}) {
+        const std::string r = RunDeposit(MakeDemandTx(sc, bad, sc.PreAuth(bad), custody), 1100, house, sc.Receipt(0));
+        BOOST_CHECK_MESSAGE(r != "OK", "S1X-15 deposit DEMAND: the payout " + HexStr(bad) + " was accepted; no "
+                            "DISCHARGE to it can be relayed, so the house can only be protested");
+    }
+
+    // PROTEST (as deposit_protest_gate): the restated payout.
+    const uint32_t nTag = 1100 | NOTE_DEMAND_PREAUTH_BIT;
+    const Coin demanded = sc.Receipt(nTag);
+    const int nAt = 1100 + (int)Params().GetConsensus().nDemandWindow;
+    CHouse h = house;
+    h.nLastAttestHeight = (uint32_t)nAt - 5;
+    BOOST_REQUIRE_EQUAL(RunDeposit(MakeProtestTx(sc, nTag, h, sc.PreAuth(sc.payout)), nAt, h, demanded), "OK");
+    for (const auto& bad : {vchWitV2, vchBareTrue}) {
+        const std::string r = RunDeposit(MakeProtestTx(sc, nTag, h, sc.PreAuth(bad), bad), nAt, h, demanded);
+        BOOST_CHECK_MESSAGE(r != "OK", "S1X-15 deposit PROTEST: the restated payout " + HexStr(bad) + " was accepted");
+    }
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

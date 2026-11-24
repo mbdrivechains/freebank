@@ -307,7 +307,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     // is compared against the one its own tag implies, so a custody coin can
     // never satisfy a P2PKH pin or vice versa.
     CScript expectedNoteScript;
-    CScript expectedNoteCustodyScript;
+    std::vector<unsigned char> vchExpectedNoteKey;   // S1X-14: a note custody coin is pinned by its embedded keyid
     bool fHaveExpectedNote = false;
     bool fNoteDischarge = false;
     if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
@@ -340,7 +340,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         }
         if (!vchNoteKey.empty()) {
             expectedNoteScript = NoteScriptForPubKey(vchNoteKey);
-            expectedNoteCustodyScript = NotePreAuthScript(vchNoteKey);
+            vchExpectedNoteKey = vchNoteKey;
             fHaveExpectedNote = true;
         }
     }
@@ -726,8 +726,13 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             // Tag-aware holder pin (B3): a pre-auth coin lives on the holder's
             // custody script, everything else on their P2PKH. Same key either
             // way - the coin's own tag selects which lock it must carry.
-            if (fHaveExpectedNote && coin.out.scriptPubKey !=
-                    (NoteDemandIsPreAuth(coin.nDemandHeight) ? expectedNoteCustodyScript : expectedNoteScript))
+            // S1X-14: a pre-auth note coin sits on its demand's custody form (the demand id after the keyid); the pin
+            // is the keyid, the id is the demand's own (checked where it matters: PROTEST and the discharge).
+            if (fHaveExpectedNote &&
+                    !(NoteDemandIsPreAuth(coin.nDemandHeight)
+                          ? (IsNoteDemandCustodyScript(coin.out.scriptPubKey) &&
+                             NoteCustodyKeyIs(coin.out.scriptPubKey, vchExpectedNoteKey))
+                          : coin.out.scriptPubKey == expectedNoteScript))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-input-not-holder");
             if (fPoolOpOK) {
                 // Only UNDEMANDED notes may enter a pool (operator decision 4):

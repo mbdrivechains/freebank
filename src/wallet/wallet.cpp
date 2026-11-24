@@ -5362,32 +5362,12 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     NoteDemand dem;
     dem.nHouseID = nHouseID;
     dem.vchHolderPubKey = spend[0].vchHolderPubKey;
-    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
-        fPreAuth ? NotePreAuthScript(spend[0].vchHolderPubKey) : spend[0].script));
+    // Pre-auth: a placeholder until the inputs are known; the custody script carries the demand id (S1X-14).
+    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, spend[0].script));
     dem.vUnits.push_back(U);
 
     if (fUpgrade)
         dem.nPriorDemandHeight = NoteDemandHeightOf(nPriorTag);   // the clock is preserved
-
-    if (fPreAuth) {
-        dem.fPreAuth = nMode;
-        // The script the discharge must pay: the caller's, or the holder's own
-        // P2PKH by default. The house's escrow script is poison (consensus
-        // rejects it at the door - the discharge would be unbuildable and the
-        // protest teeth would fire unjustly); fail fast with the reason.
-        const CScript scriptPay = scriptPayout.empty()
-            ? NoteScriptForPubKey(spend[0].vchHolderPubKey) : scriptPayout;
-        if (scriptPay == HouseEscrowScript(houseID256)) {
-            strFail = "The payout script must not be the house's own escrow script!";
-            return false;
-        }
-        dem.vchPayoutScript = std::vector<unsigned char>(scriptPay.begin(), scriptPay.end());
-        CKey keyPre;
-        if (!GetKey(CPubKey(spend[0].vchHolderPubKey).GetID(), keyPre) ||
-                !keyPre.Sign(NotePreAuthSigHash(nHouseID, dem.vUnits, dem.vchPayoutScript), dem.vchPreAuthSig)) {
-            strFail = "Failed to sign the standing authorisation!"; return false;
-        }
-    }
 
     const CAmount nBurnedDust = (CAmount)spend.size() * NOTE_DUST_VALUE;
     const CAmount nTarget = NOTE_DUST_VALUE + nFee;
@@ -5408,17 +5388,42 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
         if (!IsDust(out, ::dustRelayFee)) mtx.vout.push_back(out);
     }
 
+    for (const WalletNoteCoin& nc : spend)
+        mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
+    if (fPreAuth) {
+        dem.fPreAuth = nMode;
+        // The script the discharge must pay: the caller's, or the holder's own
+        // P2PKH by default. The house's escrow script is poison (consensus
+        // rejects it at the door - the discharge would be unbuildable and the
+        // protest teeth would fire unjustly); fail fast with the reason.
+        const CScript scriptPay = scriptPayout.empty()
+            ? NoteScriptForPubKey(spend[0].vchHolderPubKey) : scriptPayout;
+        if (scriptPay == HouseEscrowScript(houseID256)) {
+            strFail = "The payout script must not be the house's own escrow script!";
+            return false;
+        }
+        dem.vchPayoutScript = std::vector<unsigned char>(scriptPay.begin(), scriptPay.end());
+        // S1X-14: the demand id is NoteHashPrevouts of this tx (its inputs are all in by now); the custody output
+        // carries it and the standing authorisation signs it, so it can discharge only this demand.
+        const uint256 demandId = NoteHashPrevouts(CTransaction(mtx));
+        mtx.vout[0].scriptPubKey = NoteDemandCustodyScript(spend[0].vchHolderPubKey, demandId);
+        CKey keyPre;
+        if (!GetKey(CPubKey(spend[0].vchHolderPubKey).GetID(), keyPre) ||
+                !keyPre.Sign(NotePreAuthSigHash(nHouseID, dem.vUnits, dem.vchPayoutScript, demandId), dem.vchPreAuthSig)) {
+            strFail = "Failed to sign the standing authorisation!"; return false;
+        }
+    }
+
+
     if (!keyHolder.Sign(NoteDemandSigHash(nHouseID, dem.vUnits, BillHashOutputs(mtx)), dem.vchHolderSig)) {
         strFail = "Failed to sign the demand!"; return false;
     }
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
     ssPayload << dem;
     mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
-
-    for (const WalletNoteCoin& nc : spend)
-        mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
-    for (const auto& coin : setCoins)
-        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     const CTransaction txToSign = mtx;
     int nIn = 0;
@@ -5523,7 +5528,11 @@ bool CWallet::ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHous
     pro.nPrevProtestOpen = house.nProtestOpen;
     pro.nPrevProtestHeight = house.nProtestHeight;
     pro.nPrevProtestDemandHeight = house.nProtestDemandHeight;
-    const CScript scriptCustody = NotePreAuthScript(spend[0].vchHolderPubKey);
+    // S1X-14: one demand per protest. Coins of one holder and tag can still belong to two demands (same height); keep
+    // the first demand's coins (its custody script carries its id) and re-issue onto that same script.
+    const CScript scriptCustody = spend[0].script;
+    spend.erase(std::remove_if(spend.begin(), spend.end(),
+                               [&](const WalletNoteCoin& nc) { return nc.script != scriptCustody; }), spend.end());
     for (const WalletNoteCoin& nc : spend) {
         pro.vUnits.push_back(nc.units);
         mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, scriptCustody));
@@ -5676,7 +5685,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
             NoteDemand dem;
             if (!DecodeNotePayload(ptx->vchNotePayload, dem) || dem.nHouseID != nHouseID || !dem.fPreAuth)
                 continue;
-            const CScript scriptCustody = NotePreAuthScript(dem.vchHolderPubKey);
+            const CScript scriptCustody = NoteDemandCustodyScript(dem.vchHolderPubKey, NoteHashPrevouts(*ptx));   // S1X-14
             // The height the coins' tag carries: the block's own for a fresh
             // demand, the preserved original for an upgrade.
             const uint32_t nTagHeight = dem.nPriorDemandHeight != 0 ? dem.nPriorDemandHeight : nDH;

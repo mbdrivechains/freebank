@@ -363,6 +363,9 @@ uint256 CreditHashOutputs(const CTransaction& tx);
  *  escrow, issuer or oracle bond, pre-auth custody, a token pool's custody). Annex outputs, pre-auth demands' and token
  *  claims' payout scripts are all refused on these. */
 bool IsGoldUnpayableScript(const CScript& script);
+/** S1X-15: a payout a house must pay (SWAP, note DEMAND, deposit DEMAND/PROTEST): exactly P2PKH, P2SH, P2WPKH or P2WSH,
+ *  and not gold-unpayable. */
+bool IsHousePayableScript(const CScript& script);
 
 /** AddCoins / the mempool view: tag output n from the annex (payload-pure, so connect == rollforward == mempool). */
 void ApplyIssuedCoinTags(const CTransaction& tx, uint32_t n, Coin& coin);
@@ -392,8 +395,10 @@ struct CHouse;
  *  it no longer would. A non-POST tx is never stale here. */
 bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& strReject);
 
+/** fMempool (ATMP): every refusal scores DoS 0 (MempoolRefusalScoresZero, UF4-1): its verdicts read units state a
+ *  block can change (a pool created, a pooled MINT's supply: S2X-3, S2X-5). The block path keeps DoS 100. */
 bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnitsView& units, int nHeight,
-                     CValidationState& state);
+                     CValidationState& state, bool fMempool = false);
 
 /** Gold B (D-2026-11-07-1; GOLD_B.md §5): a house's capital as the floors and the ramp count it, in mg at the house's
  *  highest ask of the last 30 days (so a lower quote can't raise it): its sECX escrow (the active partners' pledges) and
@@ -407,6 +412,13 @@ struct CHouseCapital {
 };
 class CHouse;
 bool HouseCapitalForChecks(const CHouse& house, int nHeight, CAmount amountTillSats, CHouseCapital& cap);
+/** S1X-9: the house's active escrow in mg at its highest ask of the last 30 days (HouseCapitalForChecks' nEscrowMg on the
+ *  real path, never the test override). False and 0 when the house has no rate. */
+bool HouseEscrowMgForChecks(const CHouse& house, int nHeight, uint64_t& nEscrowMg);
+/** S1X-6 / S1X-3: what the house owes at the noteholders' rank beyond its notes - pending swaps plus live shortfalls
+ *  (MaterializeInsolvency's lapse) - in mg, 128-bit. Counted by the issuing caps, the deferred house's recovery floor,
+ *  GoldParEligible and GoldTillRatioBps. */
+unsigned __int128 HouseOwedOutsideNotesMg(const CHouse& house, int nHeight);
 /** The sECX the house last attested, while that attestation is fresh at nHeight (HOUSE_ATTEST_STALENESS); else 0. */
 CAmount HouseAttestedTillSats(const CHouse& house, int nHeight);
 /** Unit tests only: when set, HouseCapitalForChecks returns this instead (the fixture emulates the pre-gram caps). */

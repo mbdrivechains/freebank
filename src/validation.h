@@ -735,10 +735,10 @@ static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
 //! BMMCommitment(header). A hash verified under the old rule proves nothing
 //! under the new one, and a -reindex of an older datadir trusted it and skipped
 //! the bid check. bmm.dat is written requiring this version; a file that
-//! requires less (v1.2.2 and older, and builds before S5X-2) keeps its
+//! requires less (v1.2.3 and older, and builds before S5X-2) keeps its
 //! withdrawal-bundle and deposit entries but loses its verified-BMM ones, so
 //! those blocks are checked again.
-static const int BMM_CACHE_S5X2_MIN_VERSION = 1020300;
+static const int BMM_CACHE_S5X2_MIN_VERSION = 1020400;
 
 void DumpMainBlockCache();
 

@@ -30,7 +30,7 @@
 bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                         const std::function<bool(uint32_t, CPool&)>& fnGetPool,
                         const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
-                        CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired);
+                        CPool& poolOut, CHouse& houseOut, bool& fHouseChanged, bool& fPoolRetired, bool fMempool = false);
 
 // Gram-notes release: house note pools are closed while one producer is the only one (D-2026-10-31-8 item 9); no
 // forks (D-2026-11-05-3): they open by themselves at nNotePoolTime. These tests exercise the pool rules, so they open
@@ -1353,6 +1353,26 @@ static std::vector<unsigned char> SignHash(const CKey& key, const uint256& hash)
     return vchSig;
 }
 
+// UF4-1 (security 11-23: pin the pool cases on both paths): the same refusal scores 100 in a block and 0 on the
+// mempool path (a house's effective status can change between blocks with nothing confirmed).
+static void CheckPoolRefusalScores(const CMutableTransaction& mtx, int nHeight,
+                                   const std::function<bool(uint32_t, CPool&)>& fnGetPool,
+                                   const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
+                                   const std::string& strReason)
+{
+    for (const bool fMempool : {false, true}) {
+        CValidationState state; CPool poolOut; CHouse houseOut;
+        bool fHouseChanged = false, fPoolRetired = false;
+        BOOST_CHECK(!CheckPoolOperation(CTransaction(mtx), state, nHeight, fnGetPool, fnGetHouse, poolOut, houseOut,
+                                        fHouseChanged, fPoolRetired, fMempool));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), strReason);
+        int nDoS = -1;
+        BOOST_CHECK(state.IsInvalid(nDoS));
+        BOOST_CHECK_MESSAGE(nDoS == (fMempool ? 0 : 100), strReason << (fMempool ? " on the mempool path" : " in a block")
+                                                                 << " scores " << nDoS << " (UF4-1)");
+    }
+}
+
 static std::string PoolCtxReject(const CMutableTransaction& mtx, int nHeight,
                                  const std::function<bool(uint32_t, CPool&)>& fnGetPool,
                                  const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
@@ -1474,6 +1494,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_create)
         return true;
     };
     BOOST_CHECK_EQUAL(PoolCtxReject(mtx, 1100, fnNoPool, fnGetStale, poolOut), "bad-pool-create-house-not-open");
+    CheckPoolRefusalScores(mtx, 1100, fnNoPool, fnGetStale, "bad-pool-create-house-not-open");
 
     // A non-partner approver signature is refused (the charter is M-of-N).
     PoolCreate cBad = create;
@@ -1811,6 +1832,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
     const CMutableTransaction spTx = buildRetire(sp);
     BOOST_CHECK_EQUAL(PoolCtxRetire(spTx, 1100, fnGetPool, fnGetHouse, houseOut, fRetired),
                       "bad-pool-retire-trigger-not-insolvent");
+    CheckPoolRefusalScores(spTx, 1100, fnGetPool, fnGetHouse, "bad-pool-retire-trigger-not-insolvent");
 
     CHouse houseInsolvent = houseOpen;
     houseInsolvent.status = HOUSE_STATUS_INSOLVENT;   // materialized -> effective Insolvent

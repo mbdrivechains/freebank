@@ -95,6 +95,18 @@ struct Inputs {
     }
 };
 
+/** UF4-1 / S2X-3 / S2X-5: the refusal and its peer score, on the block path (fMempool false) or ATMP's (true). */
+std::pair<std::string, int> ConnectVerdict(const CMutableTransaction& mtx, const CCoinsViewCache& view, CUnitsView& units,
+                                           int nHeight, bool fMempool)
+{
+    CValidationState state;
+    if (ConnectIssuedTx(CTransaction(mtx), view, units, nHeight, state, fMempool))
+        return {"", 0};
+    int nDoS = -1;
+    state.IsInvalid(nDoS);
+    return {state.GetRejectReason(), nDoS};
+}
+
 std::string ConnectReason(const CMutableTransaction& mtx, const CCoinsViewCache& view, CUnitsView& units, int nHeight = 10)
 {
     CValidationState state;
@@ -330,6 +342,20 @@ BOOST_AUTO_TEST_CASE(issued_create_mint_burn_against_the_units_state)
     BOOST_CHECK_EQUAL(queued.nUnits, 300u);
     BOOST_CHECK_EQUAL(queued.nHeight, 12);
     BOOST_CHECK(queued.vchEthDest == burn.vchEthDest);
+
+    // S2X-5: ATMP checks against the tip's supply, so a BURN of a pooled MINT's units (more than the tip's supply
+    // covers) is refused there. An honest peer one block ahead sends it: DoS 0 in ATMP, 100 in a block.
+    IssuedBurn over = burn;
+    over.nUnits = 800;
+    CMutableTransaction bo = TokenTx(ISSUED_OP_BURN, 1, 1);
+    bo.vIssuedOut = {Out(0, token, 200)};
+    bo.vchIssuedPayload = Enc(over);
+    Inputs inO(bo, {IssuedCoin(token, 1000)});
+    for (bool fMempool : {false, true}) {
+        const auto v = ConnectVerdict(bo, inO.view, units, 13, fMempool);
+        BOOST_CHECK_EQUAL(v.first, "bad-issued-burn-supply");
+        BOOST_CHECK_EQUAL(v.second, fMempool ? 0 : 100);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(issued_frozen_units_follow_the_annex)
@@ -510,6 +536,18 @@ BOOST_AUTO_TEST_CASE(issued_token_pool_create_and_swap)
     s2.vout[1].nValue -= 1;
     s2.vchIssuedPayload = Enc(greedy);
     BOOST_CHECK_EQUAL(ConnectReason(s2, inS.view, units, 22), "bad-issued-pool-swap-amount");
+
+    // S2X-3: a SWAP on a pool this node hasn't connected (its CREATE is in a block one ahead): DoS 0 in ATMP, 100 in a
+    // block.
+    {
+        CUnitsView unitsNoPool(nullptr);
+        unitsNoPool.Put(IssuedTokenKey(token), rec);
+        for (bool fMempool : {false, true}) {
+            const auto v = ConnectVerdict(s1, inS.view, unitsNoPool, 22, fMempool);
+            BOOST_CHECK_EQUAL(v.first, "bad-issued-pool-unknown");
+            BOOST_CHECK_EQUAL(v.second, fMempool ? 0 : 100);
+        }
+    }
 
     // A freeze-keyed token has no pool (R1-6).
     const uint256 fzToken = CreateToken(units, issuer, &freezer);

@@ -25,12 +25,15 @@
 #include <map>
 
 #include <boost/test/unit_test.hpp>
+#include <houserate.h>   // CChainClock, CSwapRecord, SwapOpen (S1X-5)
+#include <issued.h>      // UnitsCheckScope (S1X-5)
+#include <units.h>       // CUnitsView (S1X-5)
 
 bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                          const TokenView& view, TokenEffects& eff,
-                         CHouse& houseOut, bool& fHouseChanged);
+                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state);
 std::vector<COutPoint> EscrowChangeBeforeOp(const CHouse& house, const CTransaction& tx, const CTxUndo* pundo,
                                             uint32_t nChangeVout);
@@ -581,6 +584,204 @@ BOOST_AUTO_TEST_CASE(escrow_change_undo_leaves_the_till_alone)
     std::vector<COutPoint> vExpect = {C, other};
     std::sort(vExpect.begin(), vExpect.end());
     BOOST_CHECK(EscrowChangeBeforeOp(house, tx, &undo, 0) == vExpect);
+}
+
+// S4X-1 (external review of s4, Qwen 3.8 flash #1, 2026-11-23; security High; private until fixed). A token CLAIM is
+// bounded against the house's CONFIRMED claim total only (validation.cpp, NOTE_OP_TOKEN_CLAIM). ConnectBlock adds the
+// block's claims to the house at the flush and, past UINT64_MAX / 2, stops with state.Error("Token claim totals
+// overflow!"): no invalid mark (retried for ever), and TestBlockValidity returns under fJustCheck before the flush, so
+// every template carries the claims again. The code relies on "a block's staged claims are bounded by its weight, far
+// below the headroom". Issuance records are uncapped (a TOKEN_POST takes 2,000 entries of up to 2^50, no check against
+// nTokenUnits), so a house running its own mint can feed claims. This builds a real full claim (64 tokens of 2^50,
+// the smallest the shape allows: 1-byte secrets, a 1-byte payout script), finds the highest confirmed total at which
+// CheckTokenOperation still accepts it (so it follows whatever bound the fix sets), and checks that a maximum-weight
+// block of such claims stays under the flush limit (security 11-23: pin it).
+BOOST_AUTO_TEST_CASE(s4x_1_a_blocks_token_claims_stay_under_the_flush_headroom)
+{
+    FailedHouse f;
+    TestMint mint;
+    mint.k[MAX_TOKEN_AMOUNT_EXP] = RandScalar();
+    const std::vector<TokenKey> vKey = mint.Keys();
+    const uint64_t id = TokenKeysetID(vKey);
+    Records rec;
+    CTokenKeyset ks;
+    ks.nHeight = 150;
+    ks.vKey = vKey;
+    rec.keyset[{f.house.nHouseID, id}] = ks;
+    const CScript pay = CScript() << OP_TRUE;
+    NoteTokenClaim claim;
+    claim.nHouseID = f.house.nHouseID;
+    for (size_t i = 0; i < MAX_TOKEN_CLAIM_ENTRIES; i++) {
+        const TestMint::Token t = mint.Issue(MAX_TOKEN_AMOUNT_EXP, std::string(1, (char)(i + 1)));
+        CTokenMark m;
+        m.nHeight = 180;
+        m.nKeysetID = id;
+        m.nAmount = t.amount;
+        rec.issued[{f.house.nHouseID, V(t.B)}] = m;
+        claim.vEntry.push_back(Entry(f.house.nHouseID, id, t, pay));
+    }
+    CMutableTransaction mtx = NoteOpTx(NOTE_OP_TOKEN_CLAIM);
+    SetPayload(mtx, claim);
+    const uint64_t nSum = (uint64_t)MAX_TOKEN_CLAIM_ENTRIES << MAX_TOKEN_AMOUNT_EXP;
+    const int nH = f.E + 1;
+
+    auto fnAt = [&](uint64_t nConfirmed) {
+        FailedHouse g = f;
+        g.house.nTokenClaimed = nConfirmed;
+        return Run(mtx, nH, g.Get(), rec);
+    };
+    BOOST_REQUIRE_EQUAL(fnAt(0), "OK");
+    BOOST_REQUIRE(fnAt(std::numeric_limits<uint64_t>::max()) != "OK");
+    // The highest confirmed total the full claim still passes at.
+    uint64_t lo = 0, hi = std::numeric_limits<uint64_t>::max();
+    while (hi - lo > 1) {
+        const uint64_t mid = lo + (hi - lo) / 2;
+        if (fnAt(mid) == "OK") lo = mid; else hi = mid;
+    }
+    const uint64_t nConfirmedMax = lo;
+    // The rule exactly (S4X-1, token.h): a full claim passes up to MAX_TOKEN_CLAIM_CONFIRMED_TOTAL - its sum.
+    BOOST_CHECK_EQUAL(nConfirmedMax, MAX_TOKEN_CLAIM_CONFIRMED_TOTAL - nSum);
+    const uint64_t nFlushLimit = TOKEN_CLAIM_FLUSH_MAX;   // ConnectBlock's claim-total flush
+
+    // On the wire: one P2WPKH fee input and a change output, as a wallet would send it.
+    CMutableTransaction wire = mtx;
+    wire.vin[0].scriptWitness.stack = {std::vector<unsigned char>(72, 0x30), std::vector<unsigned char>(33, 0x02)};
+    wire.vout[0] = CTxOut(1000, CScript() << OP_0 << std::vector<unsigned char>(20, 0x11));
+    const int64_t nWeight = GetTransactionWeight(CTransaction(wire));
+    const int64_t nFit = ((int64_t)MAX_BLOCK_WEIGHT - 4000) / nWeight;   // 4,000 WU for the header and the coinbase
+    const unsigned __int128 nStaged = (unsigned __int128)nFit * nSum;
+    const unsigned __int128 nHeadroom = (unsigned __int128)nFlushLimit - nConfirmedMax;
+    BOOST_TEST_MESSAGE("S4X-1: payload " << mtx.vchNotePayload.size() << " bytes, " << nWeight << " WU a full claim; "
+                       << nFit << " fit in a block; a full claim passes up to a confirmed total of 2^62 x "
+                       << (double)nConfirmedMax / (double)((uint64_t)1 << 62) << "; headroom to the flush "
+                       << (double)nHeadroom / (double)nSum << " full claims");
+    BOOST_CHECK_MESSAGE(nStaged <= nHeadroom,
+                        "S4X-1: " << nFit << " full claims of one house fit in a block, past the flush headroom of "
+                        << (double)nHeadroom / (double)nSum << ": the block fails every node's connect with state.Error "
+                        "and every template carries the claims again");
+}
+
+// S4X-1 (security's pin): the gap between the per-claim bound and the flush limit must exceed what a maximum-weight
+// block of the SMALLEST claim entries could add, so a later payload change that shrinks entries fails here instead of
+// silently reopening the halt. The smallest entry: a 1-byte secret, a 1-byte payout script, no relayer, and a 64-byte
+// signature (a real strict-DER one is ~70-72 bytes; shorter takes grinding r and s). Its weight is measured as the
+// marginal weight of one more entry in a claim, so no per-tx overhead is counted.
+BOOST_AUTO_TEST_CASE(s4x_1_claim_gap_exceeds_a_block_of_the_smallest_entries)
+{
+    auto weightOf = [](size_t nEntries) {
+        NoteTokenClaim claim;
+        claim.nHouseID = 1;
+        for (size_t i = 0; i < nEntries; i++) {
+            TokenClaimEntry e;
+            e.nKeysetID = std::numeric_limits<uint64_t>::max();
+            e.nAmount = (uint64_t)1 << MAX_TOKEN_AMOUNT_EXP;
+            e.vchSecret = std::vector<unsigned char>(1, (unsigned char)(i + 1));
+            e.vchB = std::vector<unsigned char>(33, 0x02);
+            e.vchC = std::vector<unsigned char>(33, 0x02);
+            e.vchE = std::vector<unsigned char>(32, 0x01);
+            e.vchS = std::vector<unsigned char>(32, 0x01);
+            e.vchPayoutScript = std::vector<unsigned char>(1, OP_TRUE);
+            e.nFeeBps = 0;
+            e.vchSig = std::vector<unsigned char>(64, 0x30);
+            claim.vEntry.push_back(e);
+        }
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << claim;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
+        return GetTransactionWeight(CTransaction(mtx));
+    };
+    const int64_t nEntryWeight = (weightOf(MAX_TOKEN_CLAIM_ENTRIES) - weightOf(1)) / (int64_t)(MAX_TOKEN_CLAIM_ENTRIES - 1);
+    BOOST_REQUIRE(nEntryWeight > 0);
+    const unsigned __int128 nPerBlock = (unsigned __int128)(MAX_BLOCK_WEIGHT / nEntryWeight) << MAX_TOKEN_AMOUNT_EXP;
+    const unsigned __int128 nGap = (unsigned __int128)TOKEN_CLAIM_FLUSH_MAX - MAX_TOKEN_CLAIM_CONFIRMED_TOTAL;
+    BOOST_TEST_MESSAGE("S4X-1: smallest claim entry " << nEntryWeight << " WU; a block of them adds "
+                       << (double)nPerBlock / (double)((unsigned __int128)1 << 56) << " x 2^56; the gap is "
+                       << (double)nGap / (double)((unsigned __int128)1 << 56) << " x 2^56");
+    BOOST_CHECK_MESSAGE(nPerBlock < nGap, "S4X-1: a block of the smallest claim entries (" << nEntryWeight
+                        << " WU each) could reach the flush limit: the halt is open again");
+}
+
+// #include lines to add at the top of token_tests.cpp:
+//   #include <houserate.h>   // CChainClock, CSwapRecord, SwapOpen (S1X-5)
+//   #include <issued.h>      // UnitsCheckScope (S1X-5)
+//   #include <units.h>       // CUnitsView (S1X-5)
+
+// ---------------------------------------------------------------------------
+// S1X-5, token COLLECT (validation.cpp ~6568; security 2026-11-23: Medium; private until fixed). See the note_tests case
+// for the gate. COLLECT waits for the token claim window (nTokenClaimWindow, ~4 weeks), far past E + the swap deadline,
+// so the gate can't bind here. PINNED (passes on master 71b3558): the window outlasts the deadline, and at the window's
+// end a swap still pending does not hold the COLLECT. The house is FailedHouse, never materialized (status Open), so
+// this COLLECT would take the snapshot itself.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(s1x_5_token_collect_is_never_held_by_a_swap_past_the_deadline)
+{
+    BOOST_REQUIRE(g_fClockIsHeightForTests);
+    FailedHouse f;
+    BOOST_REQUIRE(f.E > 20);
+    BOOST_REQUIRE_EQUAL(f.house.status, HOUSE_STATUS_OPEN);
+    f.house.nTokenUnits = 299000;
+    f.house.nTokenClaimed = 327680;
+    f.house.nTokenClaims = 3;
+    const uint32_t W = Params().GetConsensus().nTokenClaimWindow;
+    const uint32_t D = Params().GetConsensus().GramAt((int)f.E).nSwapDeadlineSecs;
+    const uint32_t nWait = (D + 599) / 600;
+    const int64_t nDeadline = (int64_t)(f.E - 10) * 600 + D + 234;
+    const uint32_t h1 = (uint32_t)((nDeadline - 1) / 600);
+    BOOST_REQUIRE_MESSAGE(W > nWait + 1, "S1X-5: the token claim window (" << W << " blocks) no longer outlasts the swap "
+                          "deadline (" << nWait << " clock blocks)");
+
+    Records rec;
+    const CScript payA = CScript() << OP_TRUE << OP_DROP << OP_1;
+    const uint256 y1 = uint256S("01");
+    CTokenClaim c;
+    c.nAmount = 131072;
+    c.vchPayoutScript.assign(payA.begin(), payA.end());
+    c.nFeeBps = 0;
+    c.nHeight = 1;
+    rec.claim[{5, y1}] = c;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_TOKEN_COLLECT;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("fee1"), 0)));
+    NoteTokenCollect col;
+    col.nHouseID = 5;
+    col.fEscrowChange = 0;
+    col.vY = {y1};
+    mtx.vout.push_back(CTxOut(131072, payA));
+    SetPayload(mtx, col);
+
+    auto verdict = [&](int h, bool fSwap) {
+        CUnitsView units(nullptr);
+        CChainClock clock;
+        clock.nHeight = (uint32_t)(h - 1);
+        clock.nMonoTime = clock.nActiveTime = (int64_t)h * 600;
+        units.Put(ChainClockKey(), clock);
+        if (fSwap) {
+            CSwapRecord r;
+            r.nHouseID = 5;
+            r.nUnits = 20000;
+            r.nBid0 = 1000;
+            r.nDemandHeight = f.E - 10;
+            r.nDeadlineActive = nDeadline;
+            r.vchPayoutScript = ParseHex("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+            SwapOpen(units, uint256S("5150"), r);
+        }
+        UnitsCheckScope scope(&units);
+        return Run(mtx, h, f.Get(), rec);
+    };
+    BOOST_CHECK_EQUAL(verdict((int)h1, true), "bad-token-collect-window-open");
+    const std::string strControl = verdict((int)(f.E + W), false);
+    BOOST_REQUIRE_MESSAGE(strControl != "bad-token-collect-window-open" && strControl != "bad-token-collect-not-insolvent",
+                          "S1X-5 setup: the COLLECT stopped before the snapshot site: " + strControl);
+    const std::string s = verdict((int)(f.E + W), true);
+    BOOST_CHECK_MESSAGE(s.find("-swaps-pending") == std::string::npos, "S1X-5 token COLLECT: a swap still pending "
+                        "weeks after the failure held the COLLECT (" + s + ")");
+    BOOST_CHECK_EQUAL(s, strControl);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

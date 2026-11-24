@@ -9,6 +9,7 @@
 #include <houserate.h>   // g_nHouseRateTestOverride (SA-N3)
 #include <issued.h>      // GoldBrassageBps (SA-N3)
 #include <token.h>   // NoteTokenKeyset (UR1-7)
+#include <units.h>   // CUnitsView (S1X-6)
 
 #include <chainparams.h>
 #include <coins.h>
@@ -26,6 +27,7 @@
 #include <functional>
 
 #include <boost/test/unit_test.hpp>
+#include <units.h>   // CUnitsView (S1X-5)
 
 // Contextual note-op validator (validation.cpp, external linkage; not in a
 // public header). Forward-declared so the negative direction of the 3.5 note
@@ -662,6 +664,121 @@ BOOST_AUTO_TEST_CASE(note_redeem_rejected_while_deferred)
     CValidationState state; CHouse houseOut; bool fChanged = false;
     BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, 1600, 100, fnGetHouse, fnNoCoin, fnNoCoin, fnNoBlock, houseOut, fChanged));
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-note-redeem-deferred");
+}
+
+BOOST_AUTO_TEST_CASE(uf4_1_state_verdicts_score_zero_in_the_mempool)
+{
+    // UF4-1 (testing's ultra on review-fixed s4, security Low): a verdict that reads chain state (the house record, its
+    // status, the height) can differ between an honest sender's tip and ours one block apart. The same refusal on
+    // both paths; DoS 0 on the mempool path (fMempool), 100 in a block.
+    const CHouse deferred = MakeDeferredHouse(1);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(deferred, 1600), HOUSE_STATUS_DEFERRED);
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+    auto check = [&](const CMutableTransaction& mtx, const CHouse* pHouse, uint64_t nUnitsIn, const std::string& strReason) {
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (pHouse && id == 1) { out = *pHouse; return true; } return false; };
+        for (bool fMempool : {false, true}) {
+            CValidationState state; CHouse houseOut; bool fChanged = false;
+            BOOST_CHECK(!CheckNoteOperation(CTransaction(mtx), state, 1600, nUnitsIn, fnGetHouse, fnNoCoin, fnNoCoin,
+                                            fnNoBlock, houseOut, fChanged, fMempool));
+            int nDoS = -1;
+            BOOST_CHECK(state.IsInvalid(nDoS));
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), strReason);
+            BOOST_CHECK_MESSAGE(nDoS == (fMempool ? 0 : 100), strReason << " fMempool=" << fMempool << " nDoS=" << nDoS);
+        }
+    };
+
+    // A MINT on a house this node hasn't connected yet (its creating block is one ahead).
+    check(MakeMintTx(1, 100), nullptr, 0, "bad-note-unknown-house");
+    // A MINT on a house that suspended in the block we have and the sender doesn't.
+    check(MakeMintTx(1, 100), &deferred, 0, "bad-note-mint-house-not-open");
+
+    // A signed REDEEM of an undemanded note while the house is suspended.
+    {
+        NoteRedeem redeem;
+        redeem.nHouseID = 1;
+        redeem.fBrassage = 0;
+        CKey keyHolder; keyHolder.MakeNewKey(true);
+        const CPubKey pub = keyHolder.GetPubKey();
+        redeem.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_REDEEM;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(redeem.vchHolderPubKey)));
+        BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(1, 100, BillHashOutputs(mtx)), redeem.vchHolderSig));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        check(mtx, &deferred, 100, "bad-note-redeem-deferred");
+    }
+
+    // A CLAIM on a house that isn't insolvent at our tip.
+    {
+        NoteClaim c;
+        c.nHouseID = 1;
+        CKey key; key.MakeNewKey(true);
+        const CPubKey pub = key.GetPubKey();
+        c.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+        c.vchHolderSig = std::vector<unsigned char>(70, 0x30);
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_CLAIM;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(c.vchHolderPubKey)));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << c;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        check(mtx, &deferred, 100, "bad-note-claim-not-insolvent");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(uf4_1_guard_rescores_only_an_active_mempool_refusal)
+{
+    // MempoolRefusalScoresZero: an active guard turns a refusal into the same refusal at DoS 0, keeping the code,
+    // reason, corruption flag and debug message; it leaves a pass, a run-time error, the block path and a state that
+    // was already invalid on entry as they were.
+    auto refuse = [](CValidationState& state, bool fActive, bool fCorrupt) {
+        const MempoolRefusalScoresZero guard(state, fActive);
+        return state.DoS(100, false, REJECT_INVALID, "bad-test-verdict", fCorrupt, "debug detail");
+    };
+    int nDoS = -1;
+    {
+        CValidationState state;
+        refuse(state, true, true);
+        BOOST_CHECK(state.IsInvalid(nDoS));
+        BOOST_CHECK_EQUAL(nDoS, 0);
+        BOOST_CHECK_EQUAL(state.GetRejectCode(), (unsigned int)REJECT_INVALID);
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-test-verdict");
+        BOOST_CHECK(state.CorruptionPossible());
+        BOOST_CHECK_EQUAL(state.GetDebugMessage(), "debug detail");
+    }
+    {
+        CValidationState state;   // the block path
+        refuse(state, false, false);
+        BOOST_CHECK(state.IsInvalid(nDoS));
+        BOOST_CHECK_EQUAL(nDoS, 100);
+        BOOST_CHECK(!state.CorruptionPossible());
+    }
+    {
+        CValidationState state;   // already invalid on entry: the caller's score stands
+        state.DoS(100, false, REJECT_INVALID, "bad-earlier");
+        refuse(state, true, false);
+        BOOST_CHECK(state.IsInvalid(nDoS));
+        BOOST_CHECK_EQUAL(nDoS, 200);
+    }
+    {
+        CValidationState state;   // a run-time error stays an error
+        {
+            const MempoolRefusalScoresZero guard(state, true);
+            state.Error("disk");
+        }
+        BOOST_CHECK(state.IsError());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "disk");
+    }
+    {
+        CValidationState state;   // a pass stays valid
+        { const MempoolRefusalScoresZero guard(state, true); }
+        BOOST_CHECK(state.IsValid());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(note_mint_rho_liveness_gate)
@@ -1598,6 +1715,457 @@ BOOST_AUTO_TEST_CASE(testing_sa_n3_stressed_redeem_cannot_skip_brassage)
         }
     }
     g_nHouseRateTestOverride = nOverridePrev;
+}
+
+// ---------------------------------------------------------------------------
+// UF4-1 (ultra on review-fixed/s4, 2026-11-23; private until fixed). A note op's status, height and cap verdicts can
+// flip from one block to the next with no tx in between: lazy insolvency (nNoCureHeight, window expiry), a deferral,
+// a till cap that moves with height. Two honest nodes one block apart then disagree about the same relayed tx, and
+// net_processing bans the relaying peer for any nDoS > 0 out of AcceptToMemoryPool. So on the mempool path
+// (fMempool = true) such a refusal must score 0, as swap-house-closed and swap-protest-status already do and as
+// protest-prior does with fMempool ? 0 : 100 (the UR3-3 rule). At connect (fMempool = false) the 100 stays.
+// ---------------------------------------------------------------------------
+namespace {
+struct NoteVerdict { bool fOk; std::string strReason; int nDoS; };
+static NoteVerdict CheckNoteVerdict(const CMutableTransaction& mtx, const CHouse& h, int nHeight, uint64_t nUnitsIn,
+                                    bool fMempool, const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
+                                    const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin)
+{
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == h.nHouseID) { out = h; return true; } return false; };
+    CValidationState state; CHouse houseOut; bool fChanged = false;
+    NoteVerdict v;
+    v.fOk = CheckNoteOperation(CTransaction(mtx), state, nHeight, nUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin,
+                               fnGetBlockHash, houseOut, fChanged, fMempool);
+    v.strReason = state.GetRejectReason();
+    v.nDoS = 0;
+    state.IsInvalid(v.nDoS);
+    return v;
+}
+
+// The well-capitalised, freshly attested Open house of note_mint_rho_liveness_gate.
+static CHouse MakeOpenMintHouse()
+{
+    CHouse house;
+    house.nHouseID = 5;
+    house.houseID = uint256S("f00d");
+    house.nTier = HOUSE_TIER_MULTI_PARTNER;
+    house.nThresholdM = 1;
+    house.status = HOUSE_STATUS_OPEN;
+    house.nRegisteredHeight = 1000;
+    house.nLastAttestHeight = 1000;
+    house.amountLastAttestReserves = 100 * COIN;
+    HousePartner p;
+    p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    p.amountPledge = 100 * COIN;
+    p.status = HOUSE_PARTNER_ACTIVE;
+    house.vPartner.push_back(p);
+    return house;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(uf4_1_status_height_and_cap_refusals_ban_no_peer_in_the_mempool)
+{
+    const std::function<bool(const COutPoint&, Coin&)> fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    const std::function<bool(uint32_t, uint256&)> fnNoBlock = [](uint32_t, uint256&) { return false; };
+    const std::function<bool(uint32_t, uint256&)> fnBlock = [](uint32_t, uint256& h) { h = uint256S("beef"); return true; };
+
+    // (1) MINT across a height-only boundary: no cure is left from height 1001, so the house is Open at 1000 and
+    // Insolvent at 1001 with nothing confirmed in between. A peer one block behind relays a MINT valid at its tip.
+    {
+        CHouse house = MakeOpenMintHouse();
+        house.nNoCureHeight = 1001;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, 1000), HOUSE_STATUS_OPEN);
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, 1001), HOUSE_STATUS_INSOLVENT);
+        const CMutableTransaction mtx = MakeMintTx(5, 100, /*nAsOfHeight=*/999);
+        BOOST_CHECK(CheckNoteVerdict(mtx, house, 1000, 0, true, fnBlock, fnNoCoin).strReason != "bad-note-mint-house-not-open");
+        const NoteVerdict pool = CheckNoteVerdict(mtx, house, 1001, 0, true, fnBlock, fnNoCoin);
+        BOOST_CHECK_EQUAL(pool.strReason, "bad-note-mint-house-not-open");
+        BOOST_CHECK_MESSAGE(pool.nDoS == 0, "mempool mint-house-not-open scores " << pool.nDoS << ", want 0 (UF4-1)");
+        BOOST_CHECK_EQUAL(CheckNoteVerdict(mtx, house, 1001, 0, false, fnBlock, fnNoCoin).nDoS, 100);
+    }
+
+    // (5, security 11-23) The attestation-deadline case is in house_tests.cpp
+    // (uf4_1_deferred_house_attest_at_its_silence_deadline_bans_no_peer): since the gram-notes release a missed
+    // attestation no longer stresses an OPEN house, so the deadline that bites is a deferred house's silence clock.
+
+    // (2) CLAIM across the same boundary, the other way: the sender is one block ahead (the house is lazily Insolvent
+    // at its spend height 1600), the receiver one block behind (1599, not yet insolvent). Any holder can send this.
+    {
+        CHouse house = MakeDeferredHouse(1);
+        house.nDeferInvokedHeight = 0;
+        house.nNoCureHeight = 1600;
+        HousePartner pt;
+        pt.vchPubKey = std::vector<unsigned char>(33, 0x02);
+        pt.status = HOUSE_PARTNER_ACTIVE;
+        house.vPartner.push_back(pt);
+        BOOST_REQUIRE(HouseEffectiveStatus(house, 1599) != HOUSE_STATUS_INSOLVENT);
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, 1600), HOUSE_STATUS_INSOLVENT);
+
+        NoteClaim c;
+        c.nHouseID = 1;
+        CKey key; key.MakeNewKey(true);
+        const CPubKey pub = key.GetPubKey();
+        c.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+        c.vchHolderSig = std::vector<unsigned char>(70, 0x30);
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_CLAIM;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(c.vchHolderPubKey)));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << c;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+
+        BOOST_CHECK(CheckNoteVerdict(mtx, house, 1600, 100, true, fnNoBlock, fnNoCoin).strReason != "bad-note-claim-not-insolvent");
+        const NoteVerdict pool = CheckNoteVerdict(mtx, house, 1599, 100, true, fnNoBlock, fnNoCoin);
+        BOOST_CHECK_EQUAL(pool.strReason, "bad-note-claim-not-insolvent");
+        BOOST_CHECK_MESSAGE(pool.nDoS == 0, "mempool claim-not-insolvent scores " << pool.nDoS << ", want 0 (UF4-1)");
+        BOOST_CHECK_EQUAL(CheckNoteVerdict(mtx, house, 1599, 100, false, fnNoBlock, fnNoCoin).nDoS, 100);
+    }
+
+    // (3) MINT over the till cap (TillCapUnits reads the height and the house's counters).
+    {
+        CHouse house = MakeOpenMintHouse();
+        house.amountLastAttestReserves = 1;
+        const CMutableTransaction mtx = MakeMintTx(5, 100, /*nAsOfHeight=*/999);
+        const NoteVerdict pool = CheckNoteVerdict(mtx, house, 1000, 0, true, fnBlock, fnNoCoin);
+        BOOST_CHECK_EQUAL(pool.strReason, "bad-note-mint-under-reserved");
+        BOOST_CHECK_MESSAGE(pool.nDoS == 0, "mempool mint-under-reserved scores " << pool.nDoS << ", want 0 (UF4-1)");
+        BOOST_CHECK_EQUAL(CheckNoteVerdict(mtx, house, 1000, 0, false, fnBlock, fnNoCoin).nDoS, 100);
+    }
+
+    // (4) REDEEM of undemanded notes while the house is Deferred (a status that a confirmed DEFER or the silence
+    // window changes between blocks). Fully signed, so the refusal is the deferral gate's.
+    {
+        CHouse house = MakeDeferredHouse(1);
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, 1600), HOUSE_STATUS_DEFERRED);
+        NoteRedeem redeem;
+        redeem.nHouseID = 1;
+        redeem.fBrassage = 0;
+        CKey keyHolder; keyHolder.MakeNewKey(true);
+        const CPubKey pub = keyHolder.GetPubKey();
+        redeem.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_REDEEM;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+        mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(redeem.vchHolderPubKey)));
+        BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(1, 100, BillHashOutputs(mtx)), redeem.vchHolderSig));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        const NoteVerdict pool = CheckNoteVerdict(mtx, house, 1600, 100, true, fnNoBlock, fnNoCoin);
+        BOOST_CHECK_EQUAL(pool.strReason, "bad-note-redeem-deferred");
+        BOOST_CHECK_MESSAGE(pool.nDoS == 0, "mempool redeem-deferred scores " << pool.nDoS << ", want 0 (UF4-1)");
+        BOOST_CHECK_EQUAL(CheckNoteVerdict(mtx, house, 1600, 100, false, fnNoBlock, fnNoCoin).nDoS, 100);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S1X-6 (s1 measuring run, 2026-11-23; security: Medium, blocks mainnet; private until fixed). A swap paid short drops
+// its whole amount from the house's pending swaps (SwapSettle), so CapitalCapUnits and TillCapUnits give the room
+// back, while the unpaid grams stay in the shortfall ledger and MaterializeInsolvency counts them in nInsolventUnits for
+// the 90-day lapse. A house (its own swap holder: mint, swap, cut the bid, pay short) can re-mint into that room and
+// the insiders' shortfall claims dilute every noteholder. Agreed fix (security 11-23): both caps subtract the live
+// shortfall beside pending swaps, with MaterializeInsolvency's lapse. Each case: the cap set exactly (the test hook),
+// minted N, room R = cap - N; (a) control, nothing owed: a MINT of R passes the cap and R + 1 is refused (the cap binds
+// here); (b) R pending in swaps instead: R is refused (the rule as built, the reference); (c) a live shortfall of S paid
+// the block before: R is refused and R - S passes; (d) the same shortfall paid just past the lapse: R passes.
+// (c)'s refusal FAILS on master 4686200.
+// ---------------------------------------------------------------------------
+namespace {
+struct S1X6Scope {
+    std::function<void(const CHouse&, int, CHouseCapital&)> fnPrev;
+    CUnitsView units;
+    std::unique_ptr<UnitsCheckScope> pScope;
+    S1X6Scope(uint32_t nHouseID, uint64_t nCapMg, uint64_t nTillMg, uint64_t nPending, uint64_t nShortfallMg,
+              int64_t nPaidClock)
+        : fnPrev(g_fnCapitalForChecksTestOverride), units(nullptr)
+    {
+        g_fnCapitalForChecksTestOverride = [nCapMg, nTillMg](const CHouse&, int, CHouseCapital& cap) {
+            cap.nEscrowMg = nCapMg;
+            cap.nCapacityMg = nCapMg;
+            cap.nTillMg = nTillMg;
+        };
+        if (nPending)
+            units.Put(SwapPendingKey(nHouseID), nPending);
+        if (nShortfallMg) {
+            CShortfallLedger led;
+            led.vEntry.push_back(std::make_pair(nPaidClock, nShortfallMg));
+            units.Put(ShortfallLedgerKey(nHouseID), led);
+        }
+        pScope.reset(new UnitsCheckScope(&units));
+    }
+    ~S1X6Scope()
+    {
+        pScope.reset();
+        g_fnCapitalForChecksTestOverride = fnPrev;
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_6_live_shortfall_uses_issuing_room_until_it_lapses)
+{
+    const int H = 20000;
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(H);
+    const int64_t nLapse = (int64_t)gp.nShortfallLapseSecs / 600;   // as MaterializeInsolvency reads it
+    BOOST_REQUIRE(nLapse > 0 && ClockAtHeight(H) - nLapse - 1 > 0);
+    const std::function<bool(const COutPoint&, Coin&)> fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    const std::function<bool(uint32_t, uint256&)> fnBlock = [](uint32_t, uint256& h) { h = uint256S("beef"); return true; };
+
+    const uint64_t N = 50000, S = 20000;
+    // Capital: capacity 100,000 mg, the till far above it. Till: the till cap 100,000 mg, the capital far above it.
+    const uint64_t nTillFor100k = 100000 * (uint64_t)gp.nTillMinBps / 10000;   // TillCapUnits = till x 10000 / bps
+    BOOST_REQUIRE_EQUAL(nTillFor100k * 10000 / gp.nTillMinBps, 100000u);
+    struct Cap { const char* name; uint64_t nCapMg; uint64_t nTillMg; const char* strReason; };
+    const Cap caps[] = {{"capital cap", 100000, 100 * 100000, "bad-note-mint-over-cap"},
+                        {"till cap", 100 * 100000, nTillFor100k, "bad-note-mint-under-reserved"}};
+    for (const Cap& cap : caps) {
+        const uint64_t R = 100000 - N;
+        CHouse house = MakeOpenMintHouse();
+        house.nLastAttestHeight = H;                                    // fresh: effectively Open at H
+        house.nMintedUnits = N;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+        auto fnVerdict = [&](uint64_t nPending, int64_t nPaidClock, uint64_t nMint) {
+            S1X6Scope scope(house.nHouseID, cap.nCapMg, cap.nTillMg, nPending, nPaidClock >= 0 ? S : 0, nPaidClock);
+            return CheckNoteVerdict(MakeMintTx(house.nHouseID, nMint, /*nAsOfHeight=*/H - 1), house, H, 0, false,
+                                    fnBlock, fnNoCoin);
+        };
+        const std::string strCap = cap.name;
+        // (a) control: the cap binds exactly at R.
+        {
+            const NoteVerdict v = fnVerdict(0, -1, R);
+            BOOST_CHECK_MESSAGE(v.strReason != cap.strReason, "S1X-6 control (" + strCap + "): a MINT of the full room " +
+                                std::to_string(R) + " was refused at the cap");
+            BOOST_CHECK_MESSAGE(fnVerdict(0, -1, R + 1).strReason == cap.strReason, "S1X-6 control (" + strCap +
+                                "): a MINT of room + 1 got past the cap: the case does not test this cap");
+        }
+        // (b) reference: R pending in swaps uses the room up (GOLD_B §4: "as the notes they were").
+        BOOST_CHECK_MESSAGE(fnVerdict(R, -1, R).strReason == cap.strReason, "S1X-6 reference (" + strCap +
+                            "): a MINT of R with R pending in swaps got past the cap");
+        // (c) a live shortfall of S, paid the block before: the room is R - S.
+        {
+            const NoteVerdict v = fnVerdict(0, ClockAtHeight(H - 1), R);
+            BOOST_CHECK_MESSAGE(v.strReason == cap.strReason, "S1X-6 (" + strCap + "): a MINT of the full room " +
+                                std::to_string(R) + " was accepted past the cap while the house owes a live " +
+                                std::to_string(S) + " mg swap shortfall that MaterializeInsolvency would count (went on "
+                                "to: " + (v.strReason.empty() ? std::string("accepted") : v.strReason) + ")");
+            BOOST_CHECK_MESSAGE(fnVerdict(0, ClockAtHeight(H - 1), R - S).strReason != cap.strReason, "S1X-6 (" + strCap +
+                                "): a MINT of R - S was refused at the cap: the shortfall took more than its own room");
+        }
+        // (d) the same shortfall, paid just past the 90-day lapse: no longer a claim, the room is back.
+        BOOST_CHECK_MESSAGE(fnVerdict(0, ClockAtHeight(H) - nLapse - 1, R).strReason != cap.strReason, "S1X-6 (" + strCap +
+                            "): a MINT of R was refused after the shortfall lapsed");
+    }
+}
+
+// S1X-5 (security 2026-11-23: Medium; findings/2026-11-23-s1x-5-swap-done-strands-escrow.md; private until fixed).
+// MaterializeInsolvency freezes the house's pending swaps into nInsolventUnits at the FIRST waterfall op; a swap still
+// pending then can be DONE afterwards (the holder reveals s), and its share of the pot is then claimed by nobody. The
+// agreed gate (security's shape, freebankd 2026-11-24): before MaterializeInsolvency at each of the six snapshot sites,
+// refuse with a reason ending "-swaps-pending", ban score 0, unless the house's pending swaps are 0 or
+// ClockSince(E, h) > ceil(nSwapDeadlineSecs / 600), E = the failure height.
+// Every case uses a house that failed by the stress path and was never materialized (status still Open), so the op
+// under test IS the first waterfall op. Another holder's swap was opened at O = E - 10, its deadline O x 600 s +
+// nSwapDeadlineSecs + 234 s (not a multiple of 600 s); the chain clock's active time at height h is h x 600 s.
+// Only what both designs (the swap's own deadline; E + the full deadline) agree on is asserted:
+//   (1) h1 = the last height whose active time is below that swap's deadline: refused "-swaps-pending", score 0 - FAILS
+//       on master 71b3558 (the op reaches the later gate);
+//   (2) h2 with ClockSince(E, h2) = ceil(nSwapDeadlineSecs / 600) + 1, the swap still pending: the same verdict as with
+//       no swap at all (the gate is open);
+//   (3) h1 with the swap settled DONE (nothing pending): the same verdict as with no swap at all.
+// Each fixture's later verdict is a stray escrow output (the first check after the snapshot), so it doesn't depend on
+// the pending amount the snapshot counts.
+// This replaces testing/s1x-5 182df99's case, whose swap deadline sat past E + 72 h (no real swap opened before the
+// failure can) and whose house was already materialized.
+// ---------------------------------------------------------------------------
+namespace {
+struct S1X5Timeline {
+    uint32_t E, O, h1, h2;
+    int64_t nDeadline;
+    explicit S1X5Timeline(uint32_t nE)
+    {
+        const uint32_t D = Params().GetConsensus().GramAt((int)nE).nSwapDeadlineSecs;
+        E = nE;
+        O = nE - 10;
+        nDeadline = (int64_t)O * 600 + D + 234;
+        h1 = (uint32_t)((nDeadline - 1) / 600);   // the last height whose active time (h x 600) is below the deadline
+        h2 = nE + (D + 599) / 600 + 1;            // ClockSince(E, h2) = ceil(D / 600) + 1
+    }
+};
+
+// What the checks read at height h: the chain clock, and (nSwap 1) another holder's swap pending, or (nSwap 2) the same
+// swap settled DONE at h. nSwap 0: no swap.
+void S1X5Units(CUnitsView& units, uint32_t nHouseID, const S1X5Timeline& t, int h, int nSwap)
+{
+    CChainClock clock;
+    clock.nHeight = (uint32_t)(h - 1);
+    clock.nMonoTime = clock.nActiveTime = (int64_t)h * 600;
+    units.Put(ChainClockKey(), clock);
+    if (nSwap == 0)
+        return;
+    const uint256 hashLock = uint256S("5150");
+    CSwapRecord rec;
+    rec.nHouseID = nHouseID;
+    rec.nUnits = 20000;
+    rec.nBid0 = 1000;
+    rec.nDemandHeight = t.O;
+    rec.nDeadlineActive = t.nDeadline;
+    rec.vchPayoutScript = ParseHex("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+    SwapOpen(units, hashLock, rec);
+    if (nSwap == 2)
+        SwapSettle(units, hashLock, SWAP_DONE, 0, (int64_t)h * 600, h, 12960);
+}
+
+// The stress-path failure of token_tests' FailedHouse, kept unmaterialized.
+CHouse S1X5FailedHouse(uint32_t nHouseID)
+{
+    CHouse house;
+    house.nHouseID = nHouseID;
+    house.houseID = uint256S("f00d");
+    house.nTier = HOUSE_TIER_MULTI_PARTNER;
+    house.nThresholdM = 1;
+    house.strClassID = "s1x5";
+    house.nDenomMgGold = 1000;
+    house.status = HOUSE_STATUS_OPEN;
+    house.nRegisteredHeight = 100;
+    house.nLastAttestHeight = 200;
+    house.nStressSinceHeight = 200 + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;   // stored origin, as FailedHouse
+    house.amountLastAttestReserves = 100 * COIN;
+    house.nMintedUnits = 100000;
+    HousePartner pt;
+    pt.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    pt.amountPledge = 10 * COIN;
+    pt.status = HOUSE_PARTNER_ACTIVE;
+    house.vPartner.push_back(pt);
+    return house;
+}
+
+bool S1X5EndsPending(const std::string& s)
+{
+    static const std::string suffix = "-swaps-pending";
+    return s.size() > suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_5_note_claim_waits_for_swaps_pending_at_the_failure)
+{
+    BOOST_REQUIRE(g_fClockIsHeightForTests);
+    const CHouse house = S1X5FailedHouse(1);
+    const uint32_t E = HouseInsolventSince(house, 1000000);
+    BOOST_REQUIRE(E > 20);
+    BOOST_REQUIRE_EQUAL(house.status, HOUSE_STATUS_OPEN);   // never materialized: this claim is the first waterfall op
+    const S1X5Timeline t(E);
+    BOOST_REQUIRE(t.h1 >= E && (int64_t)t.h1 * 600 < t.nDeadline && (int64_t)(t.h1 + 1) * 600 >= t.nDeadline);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)t.h1), HOUSE_STATUS_INSOLVENT);
+
+    // A holder's claim, correctly signed (the sig check comes before the snapshot), with a stray escrow output at vout[0]
+    // so that past the snapshot it is refused the same way whatever the snapshot counted.
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    NoteClaim c;
+    c.nHouseID = 1;
+    c.fEscrowChange = 0;
+    c.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_CLAIM;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    mtx.vout.push_back(CTxOut(100, HouseEscrowScript(house.houseID)));
+    BOOST_REQUIRE(key.Sign(NoteClaimSigHash(1, 100, CreditHashOutputs(CTransaction(mtx))), c.vchHolderSig));
+    { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << c; mtx.vchNotePayload.assign(ss.begin(), ss.end()); }
+
+    auto verdict = [&](int h, int nSwap, int& nDoS) {
+        CUnitsView units(nullptr);
+        S1X5Units(units, 1, t, h, nSwap);
+        UnitsCheckScope scope(&units);
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 1) { out = house; return true; } return false; };
+        auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+        auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        CheckNoteOperation(CTransaction(mtx), state, h, 100, fnGetHouse, fnNoCoin, fnNoCoin, fnNoBlock, houseOut, fChanged);
+        nDoS = 0;
+        state.IsInvalid(nDoS);
+        return state.GetRejectReason();
+    };
+    int nDoS = 0, nUnused = 0;
+    const std::string strControl1 = verdict((int)t.h1, 0, nUnused), strControl2 = verdict((int)t.h2, 0, nUnused);
+    BOOST_REQUIRE_MESSAGE(!S1X5EndsPending(strControl1) && !S1X5EndsPending(strControl2),
+                          "S1X-5 setup: with no swap at all the claim was held: " + strControl1 + " / " + strControl2);
+    const std::string strHeld = verdict((int)t.h1, 1, nDoS);
+    BOOST_CHECK_MESSAGE(S1X5EndsPending(strHeld), "S1X-5 note CLAIM: the first waterfall claim passed the snapshot while "
+                        "a swap opened before the failure could still be DONE (height " + std::to_string(t.h1) +
+                        ", " + std::to_string(t.h1 - E) + " blocks after the failure): got '" + strHeld + "'");
+    if (S1X5EndsPending(strHeld))
+        BOOST_CHECK_MESSAGE(nDoS == 0, "S1X-5 note CLAIM: the hold scores " << nDoS << ", want 0 (it is time, not malice)");
+    BOOST_CHECK_EQUAL(verdict((int)t.h2, 1, nUnused), strControl2);   // E + the full deadline: the gate is open
+    BOOST_CHECK_EQUAL(verdict((int)t.h1, 2, nUnused), strControl1);   // the swap DONE: nothing pending, open
+}
+
+BOOST_AUTO_TEST_CASE(s1x_5_swap_claim_waits_for_swaps_pending_at_the_failure)
+{
+    // The claimant's own swap was paid short within the lapse before the failure (a shortfall claim), so it is not
+    // pending; ANOTHER holder's swap is (as above). SWAP_CLAIM needs no signature; vout[0] is a stray escrow output.
+    BOOST_REQUIRE(g_fClockIsHeightForTests);
+    const CHouse house = S1X5FailedHouse(1);
+    const uint32_t E = HouseInsolventSince(house, 1000000);
+    BOOST_REQUIRE(E > 700);   // the claimant's swap opened 600 blocks before the failure
+    const S1X5Timeline t(E);
+    BOOST_REQUIRE(t.h1 >= E && (int64_t)t.h1 * 600 < t.nDeadline);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)t.h1), HOUSE_STATUS_INSOLVENT);
+
+    const uint256 hashMine = uint256S("a11ce");
+    CSwapRecord mine;
+    mine.nHouseID = 1;
+    mine.nUnits = 30000;
+    mine.nBid0 = 1000;
+    mine.nDemandHeight = E - 600;
+    mine.nDeadlineActive = (int64_t)(E - 600) * 600 + 259200;
+    mine.vchPayoutScript = ParseHex("76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac");
+    mine.nStatus = SWAP_PAID;
+    mine.nShortfallMg = 5000;
+    mine.nSettleClock = (int64_t)E - 5;   // within the lapse before E (the height clock)
+    mine.nSettleTime = (int64_t)(E - 5) * 600;
+
+    NoteSwapClaim c;
+    c.nHouseID = 1;
+    c.hashLock = hashMine;
+    c.fEscrowChange = 0;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_SWAP_CLAIM;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("02"), 0)));
+    mtx.vout.push_back(CTxOut(100, HouseEscrowScript(house.houseID)));
+    { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << c; mtx.vchNotePayload.assign(ss.begin(), ss.end()); }
+
+    auto verdict = [&](int h, int nSwap, int& nDoS) {
+        CUnitsView units(nullptr);
+        S1X5Units(units, 1, t, h, nSwap);
+        units.Put(SwapKey(hashMine), mine);   // not added to pending: a paid swap left it at SwapSettle
+        UnitsCheckScope scope(&units);
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 1) { out = house; return true; } return false; };
+        auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+        auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        CheckNoteOperation(CTransaction(mtx), state, h, 0, fnGetHouse, fnNoCoin, fnNoCoin, fnNoBlock, houseOut, fChanged);
+        nDoS = 0;
+        state.IsInvalid(nDoS);
+        return state.GetRejectReason();
+    };
+    int nDoS = 0, nUnused = 0;
+    const std::string strControl1 = verdict((int)t.h1, 0, nUnused), strControl2 = verdict((int)t.h2, 0, nUnused);
+    BOOST_REQUIRE_MESSAGE(!S1X5EndsPending(strControl1) && !S1X5EndsPending(strControl2),
+                          "S1X-5 setup: with no other swap the SWAP_CLAIM was held: " + strControl1 + " / " + strControl2);
+    BOOST_REQUIRE_MESSAGE(strControl1.find("swap-claim-lapsed") == std::string::npos &&
+                          strControl1.find("swap-unknown") == std::string::npos &&
+                          strControl1.find("not-insolvent") == std::string::npos,
+                          "S1X-5 setup: the SWAP_CLAIM stopped before the snapshot site: " + strControl1);
+    const std::string strHeld = verdict((int)t.h1, 1, nDoS);
+    BOOST_CHECK_MESSAGE(S1X5EndsPending(strHeld), "S1X-5 SWAP_CLAIM: the first waterfall op passed the snapshot while "
+                        "another swap opened before the failure could still be DONE: got '" + strHeld + "'");
+    if (S1X5EndsPending(strHeld))
+        BOOST_CHECK_MESSAGE(nDoS == 0, "S1X-5 SWAP_CLAIM: the hold scores " << nDoS << ", want 0");
+    BOOST_CHECK_EQUAL(verdict((int)t.h2, 1, nUnused), strControl2);
+    BOOST_CHECK_EQUAL(verdict((int)t.h1, 2, nUnused), strControl1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

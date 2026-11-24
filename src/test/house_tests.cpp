@@ -1415,8 +1415,8 @@ BOOST_AUTO_TEST_CASE(house_loan_book_helper_boundaries)
         h.nDepositUnits = 20000000;
         h.SetDepositWtMaturity((unsigned __int128)20000000 * 5000);
         BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
-        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);     // MUST NOT wrap
-        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 0);     // MUST NOT wrap
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 0);
         BOOST_CHECK(HouseLoanBookDuration(h, 1000) == 0); // MUST NOT divide by zero
         BOOST_CHECK(HouseMatchFundingOK(h, 1000));
     }
@@ -1425,8 +1425,8 @@ BOOST_AUTO_TEST_CASE(house_loan_book_helper_boundaries)
         CHouse h = LoanBookHouse(0);
         h.nDepositUnits = 20000000;
         h.SetDepositWtMaturity((unsigned __int128)20000000 * 5000);
-        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
-        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 0);
         BOOST_CHECK(HouseMatchFundingOK(h, 1000));
     }
 
@@ -1437,8 +1437,8 @@ BOOST_AUTO_TEST_CASE(house_loan_book_helper_boundaries)
         CHouse h = LoanBookHouse(100000000);
         h.nLoanBookFace = 300000000;
         h.SetLoanWtMaturity((unsigned __int128)300000000 * 100000);
-        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 200000000);
-        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);      // no deposits
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 200000000);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 0);      // no deposits
         BOOST_CHECK(HouseMatchFundingOK(h, 1000));
     }
 
@@ -1449,8 +1449,8 @@ BOOST_AUTO_TEST_CASE(house_loan_book_helper_boundaries)
         h.SetLoanWtMaturity((unsigned __int128)40000000 * 8740);
         h.nDepositUnits = 20000000;
         h.SetDepositWtMaturity((unsigned __int128)20000000 * 5320);
-        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
-        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 0);
         BOOST_CHECK(HouseMatchFundingOK(h, 100));
     }
 
@@ -1460,11 +1460,11 @@ BOOST_AUTO_TEST_CASE(house_loan_book_helper_boundaries)
         h.nLoanBookFace = 100000000;
         h.SetLoanWtMaturity((unsigned __int128)100000000 * 8740);
         h.nDepositUnits = 20000000;
-        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 0);
         BOOST_CHECK(HouseMatchFundingOK(h, 100));
         // One satoshi past it, the excess appears.
         h.nLoanBookFace = 100000001;
-        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 1);
+        BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 1);
     }
 }
 
@@ -1480,7 +1480,7 @@ BOOST_AUTO_TEST_CASE(house_match_funding_duration_rule)
     h.nDepositUnits = 50000000;
     h.SetDepositWtMaturity((unsigned __int128)50000000 * (h0 + 4320));
 
-    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 50000000);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 50000000);
     BOOST_CHECK(HouseLoanBookDuration(h, h0) == (unsigned __int128)200000000 * 8640);
     BOOST_CHECK(HouseDepositDuration(h, h0) == (unsigned __int128)50000000 * 4320);
     BOOST_CHECK(!HouseMatchFundingOK(h, h0));
@@ -1500,7 +1500,7 @@ BOOST_AUTO_TEST_CASE(house_match_funding_duration_rule)
     // slice collapses and the rule goes vacuous.
     h.nDepositUnits = 0;
     h.SetDepositWtMaturity(0);
-    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 0);
     BOOST_CHECK(HouseMatchFundingOK(h, h0));
 
     // Cure 3: more permanent capital lifts the book back inside capacity.
@@ -1508,7 +1508,7 @@ BOOST_AUTO_TEST_CASE(house_match_funding_duration_rule)
     h.SetDepositWtMaturity((unsigned __int128)50000000 * (h0 + 4320));
     BOOST_CHECK(!HouseMatchFundingOK(h, h0));
     h.vPartner[0].amountPledge = 200000000;               // TOPUP
-    BOOST_CHECK_EQUAL(HouseLoanBookExcess(h), 0);
+    BOOST_CHECK_EQUAL(HouseLoanBookExcess(h, 1000), 0);
     BOOST_CHECK(HouseMatchFundingOK(h, h0));
 }
 
@@ -1526,7 +1526,7 @@ BOOST_AUTO_TEST_CASE(house_match_funding_no_ratchet_on_runoff)
     h.SetLoanWtMaturity((unsigned __int128)100000000 * 10 + (unsigned __int128)100000000 * 10000);
     h.nDepositUnits = 200000000;
     h.SetDepositWtMaturity((unsigned __int128)200000000 * 6000);
-    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 200000000);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 200000000);
     // slice == L, so the rule reduces to DepDur >= BookDur.
     const unsigned __int128 bookDurBefore = HouseLoanBookDuration(h, h0);
     BOOST_CHECK(HouseDepositDuration(h, h0) >= bookDurBefore);
@@ -1556,14 +1556,14 @@ BOOST_AUTO_TEST_CASE(house_match_funding_max_magnitude)
     h.nDepositUnits = (uint64_t)MAX_MONEY;
     h.SetDepositWtMaturity((unsigned __int128)MAX_MONEY * MAX_DEPOSIT_TERM_BLOCKS);
 
-    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), (uint64_t)MAX_MONEY);
+    BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), (uint64_t)MAX_MONEY);
     const unsigned __int128 bookDur = HouseLoanBookDuration(h, 0);
     const unsigned __int128 depDur = HouseDepositDuration(h, 0);
     BOOST_CHECK(bookDur == (unsigned __int128)MAX_MONEY * MAX_BILL_TENOR_BLOCKS);
     BOOST_CHECK(depDur == (unsigned __int128)MAX_MONEY * MAX_DEPOSIT_TERM_BLOCKS);
     // Both products are representable, and the longer deposit book wins.
     const unsigned __int128 lhs = (unsigned __int128)h.nLoanBookFace * depDur;
-    const unsigned __int128 rhs = (unsigned __int128)HouseLoanBookSlice(h) * bookDur;
+    const unsigned __int128 rhs = (unsigned __int128)HouseLoanBookSlice(h, 1000) * bookDur;
     BOOST_CHECK(lhs > rhs);
     BOOST_CHECK(lhs / h.nLoanBookFace == depDur);      // no wrap occurred
     BOOST_CHECK(HouseMatchFundingOK(h, 0));
@@ -2520,7 +2520,7 @@ URX13Set URX13OtherDigests()
     v.push_back({"NoteRedeemSigHash", [] { return NoteRedeemSigHash(1, 100, URX13_HO); }});
     v.push_back({"NoteClaimSigHash", [] { return NoteClaimSigHash(1, 100, URX13_HO); }});
     v.push_back({"NoteDemandSigHash", [vUnits] { return NoteDemandSigHash(1, vUnits, URX13_HO); }});
-    v.push_back({"NotePreAuthSigHash", [vUnits] { return NotePreAuthSigHash(1, vUnits, URX13_SCRIPT); }});
+    v.push_back({"NotePreAuthSigHash", [vUnits] { return NotePreAuthSigHash(1, vUnits, URX13_SCRIPT, uint256()); }});
     v.push_back({"NoteProtestSigHash", [vUnits] { return NoteProtestSigHash(1, vUnits, URX13_HO); }});
     v.push_back({"TokenClaimSigHash", [] {
         return TokenClaimSigHash(1, uint256S("7713"), URX13_SCRIPT, 10, URX13_SCRIPT); }});
@@ -3123,6 +3123,399 @@ BOOST_AUTO_TEST_CASE(s2x_6_winddown_refused_while_a_swap_shortfall_is_live)
             }
         }
     }
+}
+
+// S1X-6, RECLAIM (security 11-23: Medium; private until fixed; the MINT cases are in note_tests). A tail partner may take
+// its pledge only while the house's capital still covers notes and deposits (bad-house-reclaim-cap, CapitalCapUnits).
+// A live swap shortfall is still owed at failure (MaterializeInsolvency counts it), so it must use the room as pending
+// swaps do. Capital capacity set to 100,000 mg (the test hook), 90,000 minted: (a) control, nothing owed: the cap passes
+// (the placeholder signature fails after it); (b) 10,001 pending in swaps: refused at the cap (the rule as built);
+// (c) a live 20,000 mg shortfall paid the block before: refused at the cap; (d) the same paid just past the 90-day
+// lapse: the cap passes. (c) FAILS on master 4686200.
+BOOST_AUTO_TEST_CASE(s1x_6_reclaim_counts_a_live_shortfall_against_the_capital)
+{
+    const int H = 20000;
+    const int64_t nLapse = (int64_t)Params().GetConsensus().GramAt(H).nShortfallLapseSecs / 600;
+    BOOST_REQUIRE(nLapse > 0 && ClockAtHeight(H) - nLapse - 1 > 0);
+    struct Case { const char* name; uint64_t nPending; int64_t nPaidClock; bool fRefuse; };
+    const Case cases[] = {{"control, nothing owed", 0, -1, false},
+                          {"10,001 pending in swaps (reference)", 10001, -1, true},
+                          {"a live shortfall paid the block before", 0, ClockAtHeight(H - 1), true},
+                          {"the shortfall paid just past the lapse", 0, ClockAtHeight(H) - nLapse - 1, false}};
+    const auto fnPrev = g_fnCapitalForChecksTestOverride;
+    g_fnCapitalForChecksTestOverride = [](const CHouse&, int, CHouseCapital& cap) {
+        cap.nEscrowMg = cap.nCapacityMg = 100000;
+        cap.nTillMg = 100 * 100000;
+    };
+    for (const Case& c : cases) {
+        CHouse house = MakeGuardHouse();
+        house.nLastAttestHeight = H;                                     // fresh: effectively Open at H
+        house.nMintedUnits = 90000;
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+        CUnitsView units(nullptr);
+        if (c.nPending)
+            units.Put(SwapPendingKey(house.nHouseID), c.nPending);
+        if (c.nPaidClock >= 0) {
+            CShortfallLedger led;
+            led.vEntry.push_back(std::make_pair(c.nPaidClock, (uint64_t)20000));
+            units.Put(ShortfallLedgerKey(house.nHouseID), led);
+        }
+        UnitsCheckScope scope(&units);
+
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& coin) {
+            if (o == COutPoint(uint256S("a1"), 0)) { coin = GuardEscrowCoin(house.nHouseID, HOUSE_MIN_PLEDGE); return true; }
+            return false;
+        };
+        CMutableTransaction mtx = MakeReclaimTx(house.nHouseID, 1, COutPoint(uint256S("a1"), 0));
+        CValidationState state; CHouse houseOut;
+        CheckHouseOperation(CTransaction(mtx), state, H, fnGetHouse, GuardNoHash, GuardNoClass, fnGetCoin, GuardNoBlock,
+                            houseOut);
+        const std::string strReason = state.GetRejectReason();
+        if (c.fRefuse)
+            BOOST_CHECK_MESSAGE(strReason == "bad-house-reclaim-cap", std::string("S1X-6 RECLAIM (") + c.name + "): the "
+                                "tail partner's pledge left a house whose capital covers 90,000 minted only if what it "
+                                "still owes is ignored (went on to: " + (strReason.empty() ? std::string("accepted") : strReason) + ")");
+        else
+            BOOST_CHECK_MESSAGE(strReason == "bad-house-reclaim-sig", std::string("S1X-6 RECLAIM control (") + c.name +
+                                "): want the placeholder-signature refusal after the cap, got " + strReason);
+    }
+    g_fnCapitalForChecksTestOverride = fnPrev;
+}
+
+// UF4-1, case 5 (security 11-23; private until fixed). A suspended house stays alive only by attesting: it turns
+// Insolvent, by height alone, when its silence clock runs out (CheckSilenceClock above). Its ATTEST sent in the last
+// block before that height is valid at the house's own tip, and every peer already one block on refuses it as
+// bad-house-attest-closed. At ban score 100 each of those peers bans the house's node, at the moment its attestation
+// matters most. On the mempool path the refusal must score 0, as attest-future/-stale/-monotone/-priors already do.
+BOOST_AUTO_TEST_CASE(uf4_1_deferred_house_attest_at_its_silence_deadline_bans_no_peer)
+{
+    CHouse house;
+    house.nHouseID = 1;
+    house.houseID = uint256S("f00d");
+    house.nTier = HOUSE_TIER_MULTI_PARTNER;
+    house.nThresholdM = 1;
+    house.status = HOUSE_STATUS_OPEN;
+    house.nRegisteredHeight = 1000;
+    house.nStressSinceHeight = 1100;
+    house.nDeferInvokedHeight = 1200;
+    house.nDeferActivations = 1;
+    house.nDeferLastActivation = 1200;
+    house.nLastAttestHeight = 1195;
+    HousePartner pt;
+    pt.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    pt.amountPledge = HOUSE_MIN_PLEDGE;
+    pt.status = HOUSE_PARTNER_ACTIVE;
+    house.vPartner.push_back(pt);
+
+    const uint32_t nInsolvent = HouseDeferSilenceInsolventHeight(house);
+    BOOST_REQUIRE(nInsolvent > 1200);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)nInsolvent - 1), HOUSE_STATUS_DEFERRED);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)nInsolvent), HOUSE_STATUS_INSOLVENT);
+
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    HouseAttest att;
+    att.nHouseID = 1;
+    att.nSchemaVersion = 1;
+    att.nAsOfHeight = nInsolvent - 2;
+    att.amountReserves = 50000;
+    AttestProof proof;
+    proof.outpoint = COutPoint(uint256S("d1"), 0);
+    proof.vchPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+    proof.vchSig = std::vector<unsigned char>(70, 0x30);
+    att.vProofs.push_back(proof);
+    att.vApproverIndex.push_back(0);
+    att.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
+    const CMutableTransaction mtx = MakeAttestTx(att);
+
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 1) { out = house; return true; } return false; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    auto verdict = [&](int nHeight, bool fMempool, int& nDoS) {
+        CValidationState state; CHouse houseOut;
+        BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
+                                         fnNoCoin, GuardNoBlock, houseOut, fMempool));
+        nDoS = 0;
+        state.IsInvalid(nDoS);
+        return state.GetRejectReason();
+    };
+    int nDoS = 0;
+    // The house's own tip: still Deferred, so the status gate passes (a later gate refuses the junk proof).
+    BOOST_CHECK(verdict((int)nInsolvent - 1, true, nDoS) != "bad-house-attest-closed");
+    // A peer one block on.
+    BOOST_CHECK_EQUAL(verdict((int)nInsolvent, true, nDoS), "bad-house-attest-closed");
+    BOOST_CHECK_MESSAGE(nDoS == 0, "mempool attest-closed at the silence deadline scores " << nDoS << ", want 0 (UF4-1)");
+    // In a block the refusal keeps its ban.
+    BOOST_CHECK_EQUAL(verdict((int)nInsolvent, false, nDoS), "bad-house-attest-closed");
+    BOOST_CHECK_EQUAL(nDoS, 100);
+}
+
+// ===========================================================================
+// S1X-3 (security 2026-11-24: re-rated Medium; findings/2026-11-24-s1x-3-recovery-floor.md; private until fixed). A
+// SWAP moves its units out of nMintedUnits into pending, but the deferral recovery test at ATTEST (validation.cpp
+// ~5110: till >= nMintedUnits x nTillMinBps), GoldParEligible and GoldTillRatioBps (issued_connect.cpp ~624-646) read
+// nMintedUnits alone. In a run, as holders swap, a suspended house recovers on a till sized to the units left, the
+// deferral lifts, and HOUSE_OP_RELEASE takes the locked till out of the pot while the swaps are still owed: the S1X-6
+// class. Agreed fix: count pending swaps and the live shortfall (MaterializeInsolvency's lapse) in all three readers,
+// one helper shared with S1X-6's caps.
+// Setup: N = 100,000 minted; the till set (test hook) to exactly the floor for N. Cases: (a) nothing owed: the ATTEST
+// recovers and RELEASE passes (control); (b) 50,000 pending in swaps: no recovery, RELEASE refused as not Open;
+// (c) a live 50,000 mg shortfall paid the block before: the same; (d) that shortfall paid just past the lapse: recovers
+// (control). Then par and the brassage curve at the same till. (b) and (c) FAIL on master 71b3558.
+// ===========================================================================
+namespace {
+struct S1X3Scope {
+    std::function<void(const CHouse&, int, CHouseCapital&)> fnPrev;
+    CUnitsView units;
+    std::unique_ptr<UnitsCheckScope> pScope;
+    S1X3Scope(uint32_t nHouseID, uint64_t nTillMg, uint64_t nPending, uint64_t nShortfallMg, int64_t nPaidClock)
+        : fnPrev(g_fnCapitalForChecksTestOverride), units(nullptr)
+    {
+        g_fnCapitalForChecksTestOverride = [nTillMg](const CHouse&, int, CHouseCapital& cap) {
+            cap.nEscrowMg = cap.nCapacityMg = 100 * 1000 * 1000;   // capital never binds here
+            cap.nTillMg = nTillMg;
+        };
+        if (nPending)
+            units.Put(SwapPendingKey(nHouseID), nPending);
+        if (nShortfallMg) {
+            CShortfallLedger led;
+            led.vEntry.push_back(std::make_pair(nPaidClock, nShortfallMg));
+            units.Put(ShortfallLedgerKey(nHouseID), led);
+        }
+        pScope.reset(new UnitsCheckScope(&units));
+    }
+    ~S1X3Scope()
+    {
+        pScope.reset();
+        g_fnCapitalForChecksTestOverride = fnPrev;
+    }
+};
+
+CMutableTransaction S1X3Release(const CHouse& house, const CKey& key)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+    mtx.nHouseOp = HOUSE_OP_RELEASE;
+    for (const COutPoint& out : house.vOutReserveLock)
+        mtx.vin.push_back(CTxIn(out));
+    const CPubKey pub = key.GetPubKey();
+    mtx.vout.push_back(CTxOut(1000, GetScriptForDestination(pub.GetID())));
+    HouseRelease rel;
+    rel.nHouseID = house.nHouseID;
+    rel.vApproverIndex.push_back(0);
+    rel.vApproverSig.push_back(URX12Sign(key, HouseReleaseSigHash(house.houseID, NoteHashPrevouts(CTransaction(mtx)),
+                                                                   BillHashOutputs(mtx))));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << rel;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_3_recovery_par_and_brassage_count_what_the_house_still_owes)
+{
+    const uint32_t B = 20000;          // history enough for the shortfall lapse (as the S1X-6 tests)
+    const int H = (int)B + 1300;
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(H);
+    const int64_t nLapse = (int64_t)gp.nShortfallLapseSecs / 600;   // as MaterializeInsolvency reads it
+    BOOST_REQUIRE(nLapse > 0 && ClockAtHeight(H) - nLapse - 1 > 0);
+    const uint64_t N = 100000, P = 50000, S = 50000;
+    const uint64_t nTill = (uint64_t)(((unsigned __int128)N * gp.nTillMinBps + 9999) / 10000);   // the floor for N
+    BOOST_REQUIRE(nTill > 0);
+
+    CKey keyPartner;
+    keyPartner.MakeNewKey(true);
+    const CPubKey pubPartner = keyPartner.GetPubKey();
+    // A suspended house: stressed at B+1100, deferred at B+1200 with its till locked, last attested at B+1195.
+    CHouse house = MakeGuardHouse();
+    house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
+    house.nMintedUnits = N;
+    house.amountLastAttestReserves = 0;
+    house.nStressSinceHeight = B + 1100;
+    house.nDeferInvokedHeight = B + 1200;
+    house.nDeferActivations = 1;
+    house.nDeferLastActivation = B + 1200;
+    house.nLastAttestHeight = B + 1195;
+    house.vOutReserveLock.push_back(COutPoint(uint256S("10c4"), 0));   // the till locked at DEFER
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
+
+    struct Case { const char* name; uint64_t nPending; uint64_t nShortfall; int64_t nPaidClock; bool fRecovers; };
+    const int64_t nPaidRecent = ClockAtHeight(H - 1);
+    const int64_t nPaidLapsed = ClockAtHeight(H) - nLapse - 1;
+    const Case cases[] = {{"(a) nothing owed", 0, 0, 0, true},
+                          {"(b) 50,000 pending in swaps", P, 0, 0, false},
+                          {"(c) a live 50,000 mg shortfall paid the block before", 0, S, nPaidRecent, false},
+                          {"(d) that shortfall paid just past the lapse", 0, S, nPaidLapsed, true}};
+    for (const Case& c : cases) {
+        S1X3Scope scope(house.nHouseID, nTill, c.nPending, c.nShortfall, c.nPaidClock);
+        CHouse h = house;
+        const std::string strAttest = URX12Run(h, URX12Attest(house, H, keyPartner), H);
+        BOOST_REQUIRE_MESSAGE(strAttest.empty(), std::string("S1X-3 setup ") + c.name + ": the ATTEST was refused: " + strAttest);
+        const char chAfter = HouseEffectiveStatus(h, H + 1);
+        CHouse hRel = h;
+        const std::string strRelease = URX12Run(hRel, S1X3Release(h, keyPartner), H + 1);
+        if (c.fRecovers) {
+            BOOST_CHECK_MESSAGE(chAfter == HOUSE_STATUS_OPEN, std::string("S1X-3 control ") + c.name +
+                                ": a till at the floor for every unit owed did not lift the deferral (status " + chAfter + ")");
+            BOOST_CHECK_MESSAGE(strRelease.empty(), std::string("S1X-3 control ") + c.name + ": RELEASE after recovery "
+                                "was refused: " + strRelease);
+        } else {
+            BOOST_CHECK_MESSAGE(chAfter != HOUSE_STATUS_OPEN, std::string("S1X-3 ") + c.name + ": the deferral lifted "
+                                "on a till sized to the 100,000 minted units alone, though the house still owes more");
+            BOOST_CHECK_MESSAGE(strRelease == "bad-house-release-not-open", std::string("S1X-3 ") + c.name +
+                                ": RELEASE took the locked till out of the pot while the house still owes it (got " +
+                                (strRelease.empty() ? std::string("accepted") : strRelease) + ")");
+        }
+    }
+
+    // Par and the brassage curve read the same denominator. An Open house at the same till: par with nothing owed
+    // (control), not with swaps pending or a live shortfall; the till ratio falls and a suspended house's spread rises.
+    CHouse open = MakeGuardHouse();
+    open.nMintedUnits = N;
+    open.nLastAttestHeight = H - 1;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(open, H), HOUSE_STATUS_OPEN);
+    uint32_t nRatio0 = 0, nSpread0 = 0;
+    {
+        S1X3Scope scope(open.nHouseID, nTill, 0, 0, 0);
+        BOOST_CHECK_MESSAGE(GoldParEligible(open, H), "S1X-3 control: an Open house with its till at the floor is not par eligible");
+        nRatio0 = GoldTillRatioBps(open, H);
+        nSpread0 = GoldBrassageBps(house, H);   // the suspended house above, nothing owed
+    }
+    struct Owed { const char* name; uint64_t nPending; uint64_t nShortfall; int64_t nPaidClock; };
+    const Owed owed[] = {{"50,000 pending in swaps", P, 0, 0},
+                         {"a live 50,000 mg shortfall", 0, S, nPaidRecent}};
+    for (const Owed& o : owed) {
+        S1X3Scope scope(open.nHouseID, nTill, o.nPending, o.nShortfall, o.nPaidClock);
+        BOOST_CHECK_MESSAGE(!GoldParEligible(open, H), std::string("S1X-3 par (") + o.name + "): the house still settles "
+                            "at par on a till that covers only the minted units");
+        const uint32_t nRatio = GoldTillRatioBps(open, H);
+        BOOST_CHECK_MESSAGE(nRatio < nRatio0, std::string("S1X-3 till ratio (") + o.name + "): " + std::to_string(nRatio) +
+                            " bps, the same as with nothing owed (" + std::to_string(nRatio0) + ")");
+        const uint32_t nSpread = GoldBrassageBps(house, H);
+        BOOST_CHECK_MESSAGE(nSpread > nSpread0, std::string("S1X-3 brassage (") + o.name + "): a suspended house's "
+                            "spread is " + std::to_string(nSpread) + " bps, no higher than with nothing owed (" +
+                            std::to_string(nSpread0) + ")");
+    }
+}
+
+// No new #include lines: house_tests.cpp already has houserate.h, issued.h and units.h.
+
+// ---------------------------------------------------------------------------
+// S1X-5, the two house-op snapshot sites (security 2026-11-23: Medium; private until fixed). See the note_tests case
+// for the gate and the three checks. Neither site can be held by the S1X-5 gate in practice, so these PIN that and
+// pass on master 71b3558:
+//  - residual settle (insolvent RECLAIM, validation.cpp ~4868): it already refuses while ANY swap is pending
+//    (bad-house-settle-swaps-outstanding, before the snapshot), so with a swap pending at the failure it is refused
+//    before and after E + the deadline; settled DONE, it reaches the same verdict as with no swap.
+//  - CLOSE (~4724): it waits for the 2-year claim window, far past E + the swap deadline, so the gate is always open
+//    by then. Pinned: the window outlasts the deadline; at the window's end a swap still pending does not hold CLOSE.
+// The house failed by the stress path and was never materialized (status still Open), so each op would take the
+// snapshot itself.
+// ---------------------------------------------------------------------------
+namespace {
+bool S1X5HouseEnds(const std::string& s, const std::string& suffix)
+{
+    return s.size() > suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// The guard house, failed by the stress path (as token_tests' FailedHouse) and never materialized.
+CHouse S1X5LazyFailedGuardHouse(uint64_t nMinted)
+{
+    CHouse house = MakeGuardHouse();
+    house.nLastAttestHeight = 1000;
+    house.nStressSinceHeight = house.nLastAttestHeight + HOUSE_ATTEST_MISS_N * HOUSE_ATTEST_CADENCE + 1;
+    house.nMintedUnits = nMinted;
+    return house;
+}
+
+// The units the checks read at h: the chain clock, and (nSwap 1) another holder's swap opened at E - 10 still pending,
+// or (nSwap 2) settled DONE at h.
+void S1X5HouseUnits(CUnitsView& units, uint32_t nHouseID, uint32_t E, int h, int nSwap)
+{
+    CChainClock clock;
+    clock.nHeight = (uint32_t)(h - 1);
+    clock.nMonoTime = clock.nActiveTime = (int64_t)h * 600;
+    units.Put(ChainClockKey(), clock);
+    if (!nSwap)
+        return;
+    const uint32_t D = Params().GetConsensus().GramAt((int)E).nSwapDeadlineSecs;
+    const uint256 hashLock = uint256S("5150");
+    CSwapRecord rec;
+    rec.nHouseID = nHouseID;
+    rec.nUnits = 20000;
+    rec.nBid0 = 1000;
+    rec.nDemandHeight = E - 10;
+    rec.nDeadlineActive = (int64_t)(E - 10) * 600 + D + 234;
+    rec.vchPayoutScript = ParseHex("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+    SwapOpen(units, hashLock, rec);
+    if (nSwap == 2)
+        SwapSettle(units, hashLock, SWAP_DONE, 0, (int64_t)h * 600, h, 12960);
+}
+
+std::string S1X5HouseVerdict(const CHouse& house, const CMutableTransaction& mtx, int h, uint32_t E, int nSwap)
+{
+    CUnitsView units(nullptr);
+    S1X5HouseUnits(units, house.nHouseID, E, h, nSwap);
+    UnitsCheckScope scope(&units);
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    CValidationState state; CHouse houseOut;
+    const bool f = CheckHouseOperation(CTransaction(mtx), state, h, fnGetHouse, GuardNoHash, GuardNoClass, fnNoCoin,
+                                       GuardNoBlock, houseOut);
+    return f ? std::string("OK") : state.GetRejectReason();
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_5_residual_settle_waits_for_every_pending_swap)
+{
+    BOOST_REQUIRE(g_fClockIsHeightForTests);
+    const CHouse house = S1X5LazyFailedGuardHouse(0);   // zero liability: the partners' settle is the first waterfall op
+    const uint32_t E = HouseInsolventSince(house, 1000000);
+    BOOST_REQUIRE(E > 20);
+    BOOST_REQUIRE_EQUAL(house.status, HOUSE_STATUS_OPEN);
+    const uint32_t D = Params().GetConsensus().GramAt((int)E).nSwapDeadlineSecs;
+    const int64_t nDeadline = (int64_t)(E - 10) * 600 + D + 234;
+    const uint32_t h1 = (uint32_t)((nDeadline - 1) / 600);
+    const uint32_t h2 = E + (D + 599) / 600 + 1;
+    BOOST_REQUIRE(h1 >= E);
+    const CMutableTransaction mtx = MakeReclaimTx(house.nHouseID, 1, COutPoint(uint256S("a1"), 0));
+    const std::string strControl = S1X5HouseVerdict(house, mtx, (int)h1, E, 0);
+    BOOST_REQUIRE_MESSAGE(strControl != "bad-house-reclaim-stressed" && strControl != "bad-house-settle-notes-outstanding",
+                          "S1X-5 setup: the residual settle stopped before the snapshot site: " + strControl);
+    for (uint32_t h : {h1, h2}) {
+        const std::string s = S1X5HouseVerdict(house, mtx, (int)h, E, 1);
+        BOOST_CHECK_MESSAGE(S1X5HouseEnds(s, "-swaps-outstanding") || S1X5HouseEnds(s, "-swaps-pending"),
+                            "S1X-5 residual settle at height " + std::to_string(h) + ": the partners settled while a swap "
+                            "the snapshot counts is still pending: got '" + s + "'");
+    }
+    BOOST_CHECK_EQUAL(S1X5HouseVerdict(house, mtx, (int)h1, E, 2), strControl);   // DONE: nothing pending
+}
+
+BOOST_AUTO_TEST_CASE(s1x_5_close_is_never_held_by_a_swap_past_the_deadline)
+{
+    BOOST_REQUIRE(g_fClockIsHeightForTests);
+    const CHouse house = S1X5LazyFailedGuardHouse(40);
+    const uint32_t E = HouseInsolventSince(house, 1000000);
+    BOOST_REQUIRE(E > 20);
+    BOOST_REQUIRE_EQUAL(house.status, HOUSE_STATUS_OPEN);
+    const uint32_t D = Params().GetConsensus().GramAt((int)E).nSwapDeadlineSecs;
+    const uint32_t nWait = (D + 599) / 600;
+    const int64_t nDeadline = (int64_t)(E - 10) * 600 + D + 234;
+    const uint32_t h1 = (uint32_t)((nDeadline - 1) / 600);
+    const uint32_t nOpen = HouseClaimWindowCloses(house, 1000000);
+    // The claim window outlasts any swap pending at the failure: if this ever fails, the S1X-5 gate can bind at CLOSE
+    // and CLOSE needs the three checks the claims have.
+    BOOST_REQUIRE_MESSAGE(nOpen > E + nWait + 1, "S1X-5: the claim window (" << nOpen - E << " blocks) no longer "
+                          "outlasts the swap deadline (" << nWait << " clock blocks)");
+    const CMutableTransaction mtx = MakeCloseTx(house.nHouseID, {}, {});
+    BOOST_CHECK_EQUAL(S1X5HouseVerdict(house, mtx, (int)h1, E, 1), "bad-house-close-window-open");
+    const std::string strControl = S1X5HouseVerdict(house, mtx, (int)nOpen, E, 0);
+    BOOST_REQUIRE_MESSAGE(strControl != "bad-house-close-window-open" && strControl != "bad-house-close-not-insolvent",
+                          "S1X-5 setup: CLOSE stopped before the snapshot site: " + strControl);
+    const std::string s = S1X5HouseVerdict(house, mtx, (int)nOpen, E, 1);
+    BOOST_CHECK_MESSAGE(!S1X5HouseEnds(s, "-swaps-pending"), "S1X-5 CLOSE: a swap still pending two years after the "
+                        "failure held CLOSE (" + s + "); the gate must open once E + the deadline has passed");
+    BOOST_CHECK_EQUAL(s, strControl);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

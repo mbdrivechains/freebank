@@ -19,6 +19,9 @@
 
 #include <house.h>
 #include <issued.h>
+#include <houserate.h>      // CCharterToken, CHouseCharter, ChainClockKey (S1X-15)
+#include <policy/policy.h> // IsStandard (S1X-15)
+#include <units.h>         // CUnitsView (S1X-15)
 
 #include <chainparams.h>
 #include <coins.h>
@@ -87,13 +90,27 @@ std::string CtxReject(const CMutableTransaction& mtx, int nHeight, uint64_t nUni
     return fOK ? "" : state.GetRejectReason();
 }
 
+// S1X-14: a pre-auth note demand's custody script and pre-auth digest carry its demand id, NoteHashPrevouts(DEMAND).
+// MakeDemandTx spends one coin (default "de3a":0), so its id is DemandIdFor(that hash); the other helpers default to
+// the same id, standing for "this demand's coins".
+uint256 DemandIdFor(const uint256& prevHash = uint256S("de3a"))
+{
+    CMutableTransaction m;
+    m.vin.push_back(CTxIn(COutPoint(prevHash, 0)));
+    return NoteHashPrevouts(CTransaction(m));
+}
+CScript TestCustody(const std::vector<unsigned char>& vchKey, const uint256& demandId = DemandIdFor())
+{
+    return NoteDemandCustodyScript(vchKey, demandId);
+}
+
 // A fully-signed DEMAND. Outputs are built FIRST (custody or P2PKH by mode),
 // then both signatures are made over the finished tx - exactly the wallet's
 // build order, because both digests are checked at connect.
 CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey& keyHolder,
                                  bool fPreAuth, const std::vector<unsigned char>& vchPayoutScript,
                                  bool fCustodyOutputs = true, bool fValidPreAuthSig = true,
-                                 bool fQueue = false)
+                                 bool fQueue = false, const uint256& prevHash = uint256S("de3a"))
 {
     const CPubKey pub = keyHolder.GetPubKey();
     const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
@@ -108,15 +125,16 @@ CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey&
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_DEMAND;
-    mtx.vin.push_back(CTxIn(COutPoint(uint256S("de3a"), 0)));
+    mtx.vin.push_back(CTxIn(COutPoint(prevHash, 0)));
+    const uint256 demandId = NoteHashPrevouts(CTransaction(mtx));
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
-        (fPreAuth && fCustodyOutputs) ? NotePreAuthScript(vchKey) : NoteScriptForPubKey(vchKey)));
+        (fPreAuth && fCustodyOutputs) ? TestCustody(vchKey, demandId) : NoteScriptForPubKey(vchKey)));
 
     if (fPreAuth) {
         d.vchPayoutScript = vchPayoutScript;
-        keyHolder.Sign(NotePreAuthSigHash(nHouseID, d.vUnits, d.vchPayoutScript), d.vchPreAuthSig);
+        keyHolder.Sign(NotePreAuthSigHash(nHouseID, d.vUnits, d.vchPayoutScript, demandId), d.vchPreAuthSig);
         if (!fValidPreAuthSig)
-            keyHolder.Sign(NotePreAuthSigHash(nHouseID + 1, d.vUnits, d.vchPayoutScript), d.vchPreAuthSig);
+            keyHolder.Sign(NotePreAuthSigHash(nHouseID + 1, d.vUnits, d.vchPayoutScript, demandId), d.vchPreAuthSig);
     }
     keyHolder.Sign(NoteDemandSigHash(nHouseID, d.vUnits, BillHashOutputs(mtx)), d.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << d;
@@ -130,7 +148,7 @@ CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey&
 CMutableTransaction MakeDischargeTx(uint32_t nHouseID, uint64_t nUnits, const CKey& keyHolder,
                                     const std::vector<unsigned char>& vchPayoutScript,
                                     CAmount amountPayout, CAmount amountSpread,
-                                    const uint256& houseID256)
+                                    const uint256& houseID256, const uint256& demandId = DemandIdFor())
 {
     const CPubKey pub = keyHolder.GetPubKey();
 
@@ -141,7 +159,7 @@ CMutableTransaction MakeDischargeTx(uint32_t nHouseID, uint64_t nUnits, const CK
     redeem.fPreAuthDischarge = 1;
     redeem.vPreAuthUnits.push_back(nUnits);
     redeem.vchPayoutScript = vchPayoutScript;
-    keyHolder.Sign(NotePreAuthSigHash(nHouseID, redeem.vPreAuthUnits, redeem.vchPayoutScript),
+    keyHolder.Sign(NotePreAuthSigHash(nHouseID, redeem.vPreAuthUnits, redeem.vchPayoutScript, demandId),
                    redeem.vchPreAuthSig);
     // vchHolderSig stays EMPTY - that is the entire point of the variant.
 
@@ -185,7 +203,7 @@ CMutableTransaction MakePlainRedeemTx(uint32_t nHouseID, uint64_t nUnits, const 
 // tag (input | PROTESTED) exactly as tx_verify pins it.
 CMutableTransaction MakeProtestTx(uint32_t nHouseID, uint64_t nUnits, const CKey& keyHolder,
                                   uint32_t nDemandTagOut, const CHouse& housePriors,
-                                  bool fCustodyOutputs = true)
+                                  bool fCustodyOutputs = true, const uint256& demandId = DemandIdFor())
 {
     const CPubKey pub = keyHolder.GetPubKey();
     const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
@@ -204,7 +222,7 @@ CMutableTransaction MakeProtestTx(uint32_t nHouseID, uint64_t nUnits, const CKey
     mtx.nNoteOp = NOTE_OP_PROTEST;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("9707"), 0)));
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
-        fCustodyOutputs ? NotePreAuthScript(vchKey) : NoteScriptForPubKey(vchKey)));
+        fCustodyOutputs ? TestCustody(vchKey, demandId) : NoteScriptForPubKey(vchKey)));
 
     keyHolder.Sign(NoteProtestSigHash(nHouseID, p.vUnits, BillHashOutputs(mtx)), p.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << p;
@@ -346,7 +364,7 @@ BOOST_AUTO_TEST_CASE(demand_preauth_digest_and_custody_pins)
         CMutableTransaction mtx = MakeDemandTx(1, U, key, true, payout);
         CKey stranger; stranger.MakeNewKey(true);
         const CPubKey pubS = stranger.GetPubKey();
-        mtx.vout[0].scriptPubKey = NotePreAuthScript(std::vector<unsigned char>(pubS.begin(), pubS.end()));
+        mtx.vout[0].scriptPubKey = TestCustody(std::vector<unsigned char>(pubS.begin(), pubS.end()));   // only the keyid differs
         // re-sign the demand digest over the altered outputs so ONLY the
         // custody pin can be the reject
         NoteDemand d;
@@ -373,7 +391,7 @@ BOOST_AUTO_TEST_CASE(discharge_floor_and_diii_boundary)
     const CPubKey pub = key.GetPubKey();
     const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
     const std::vector<unsigned char> payout = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
-    const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), NotePreAuthScript(vchKey));
+    const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(vchKey));
 
     // Inside the window: par exactly. One sat under par is short.
     {
@@ -424,7 +442,7 @@ BOOST_AUTO_TEST_CASE(discharge_signature_and_payout_rules)
     const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
     const std::vector<unsigned char> payout = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
     CHouse house = MakeOpenHouse(1, H, 2 * U);
-    const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), NotePreAuthScript(vchKey));
+    const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(vchKey));
 
     // A pre-auth signature by the WRONG key (or over the wrong material) is
     // not an authorisation.
@@ -433,7 +451,7 @@ BOOST_AUTO_TEST_CASE(discharge_signature_and_payout_rules)
         NoteRedeem r;
         { CDataStream ss(mtx.vchNotePayload, SER_NETWORK, PROTOCOL_VERSION); ss >> r; }
         CKey wrong; wrong.MakeNewKey(true);
-        wrong.Sign(NotePreAuthSigHash(1, r.vPreAuthUnits, r.vchPayoutScript), r.vchPreAuthSig);
+        wrong.Sign(NotePreAuthSigHash(1, r.vPreAuthUnits, r.vchPayoutScript, DemandIdFor()), r.vchPreAuthSig);
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION); ss2 << r;
         mtx.vchNotePayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
         BOOST_CHECK_EQUAL(CtxReject(mtx, H, U, house, fnCoin), "bad-note-redeem-discharge-sig-invalid");
@@ -479,7 +497,7 @@ BOOST_AUTO_TEST_CASE(discharge_brassage_incidence)
     BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_STRESSED);
     const CAmount amountSpread = HouseBrassageAmount(U, GoldBrassageBps(house, H));
     BOOST_REQUIRE(amountSpread > 0);
-    const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), NotePreAuthScript(vchKey));
+    const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(vchKey));
 
     // floor = U - spread to the payout script, spread to escrow: accepted.
     BOOST_CHECK_EQUAL(CtxReject(MakeDischargeTx(1, U, key, payout, (CAmount)U - amountSpread,
@@ -502,6 +520,9 @@ BOOST_AUTO_TEST_CASE(protest_window_priors_and_effects)
     const uint64_t U = 1000000;
     CKey key; key.MakeNewKey(true);
     const uint32_t tagOut = NoteDemandTag(D, true) | NOTE_DEMAND_PROTESTED_BIT;
+    // S1X-14: the protest reads the demand id from the custody coins it re-issues.
+    const CPubKey pubKey = key.GetPubKey();
+    const auto fnCustody = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(std::vector<unsigned char>(pubKey.begin(), pubKey.end())));
 
     // W-1: one block early is EARLY. W: the sheet's "sat undischarged for
     // HOUSE_DEMAND_WINDOW blocks" is first true - accepted, and the effects
@@ -509,10 +530,10 @@ BOOST_AUTO_TEST_CASE(protest_window_priors_and_effects)
     {
         CHouse house = MakeOpenHouse(1, (int)(D + W), 2 * U);
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, house), (int)(D + W - 1), U,
-                                    house, fnNoCoin), "bad-note-protest-early");
+                                    house, fnCustody), "bad-note-protest-early");
         CHouse houseOut; bool fChanged = false;
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, house), (int)(D + W), U,
-                                    house, fnNoCoin, &houseOut, &fChanged), "");
+                                    house, fnCustody, &houseOut, &fChanged), "");
         BOOST_CHECK(fChanged);
         BOOST_CHECK_EQUAL(houseOut.nProtestOpen, 1u);            // one marked coin re-issued
         BOOST_CHECK_EQUAL(houseOut.nProtestHeight, D + W);
@@ -535,7 +556,7 @@ BOOST_AUTO_TEST_CASE(protest_window_priors_and_effects)
         const uint32_t tag2 = NoteDemandTag(D2, true) | NOTE_DEMAND_PROTESTED_BIT;
         CHouse houseOut2; bool fChanged2 = false;
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tag2, houseOut), (int)(D2 + W), U,
-                                    houseOut, fnNoCoin, &houseOut2, &fChanged2), "");
+                                    houseOut, fnCustody, &houseOut2, &fChanged2), "");
         BOOST_CHECK_EQUAL(houseOut2.nProtestOpen, 2u);
         BOOST_CHECK_EQUAL(houseOut2.nProtestHeight, D + W);      // unchanged
         BOOST_CHECK_EQUAL(houseOut2.nProtestDemandHeight, D);    // unchanged
@@ -552,7 +573,7 @@ BOOST_AUTO_TEST_CASE(protest_window_priors_and_effects)
         BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)(D + W)), HOUSE_STATUS_OPEN);
         CHouse houseOut; bool fChanged = false;
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, house), (int)(D + W), U,
-                                    house, fnNoCoin, &houseOut, &fChanged), "");
+                                    house, fnCustody, &houseOut, &fChanged), "");
         BOOST_CHECK_EQUAL(houseOut.nProtestOpen, 1u);
         BOOST_CHECK_EQUAL(houseOut.nProtestHeight, D + W);       // overwritten, not min'd
         BOOST_CHECK_EQUAL(houseOut.nProtestDemandHeight, D);     // overwritten, not min'd
@@ -564,7 +585,7 @@ BOOST_AUTO_TEST_CASE(protest_window_priors_and_effects)
         CHouse wrongPriors = house;
         wrongPriors.nProtestOpen = 7;
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, wrongPriors), (int)(D + W), U,
-                                    house, fnNoCoin), "bad-note-protest-prior");
+                                    house, fnCustody), "bad-note-protest-prior");
     }
     // Status gates: at Deferred the clause governs; at Insolvent the waterfall.
     {
@@ -572,19 +593,19 @@ BOOST_AUTO_TEST_CASE(protest_window_priors_and_effects)
         house.nDeferInvokedHeight = D + W - 10;
         BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)(D + W)), HOUSE_STATUS_DEFERRED);
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, house), (int)(D + W), U,
-                                    house, fnNoCoin), "bad-note-protest-status");
+                                    house, fnCustody), "bad-note-protest-status");
     }
     {
         CHouse house = MakeOpenHouse(1, (int)(D + W), 2 * U);
         house.status = HOUSE_STATUS_INSOLVENT;
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, house), (int)(D + W), U,
-                                    house, fnNoCoin), "bad-note-protest-status");
+                                    house, fnCustody), "bad-note-protest-status");
     }
     // Custody preserved to the SAME holder; a bad signature is not a protest.
     {
         CHouse house = MakeOpenHouse(1, (int)(D + W), 2 * U);
         BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagOut, house, /*fCustodyOutputs=*/false),
-                                    (int)(D + W), U, house, fnNoCoin), "bad-note-protest-custody-script");
+                                    (int)(D + W), U, house, fnCustody), "bad-note-protest-custody-script");
         CMutableTransaction mtx = MakeProtestTx(1, U, key, tagOut, house);
         NoteProtest p;
         { CDataStream ss(mtx.vchNotePayload, SER_NETWORK, PROTOCOL_VERSION); ss >> p; }
@@ -617,8 +638,8 @@ BOOST_AUTO_TEST_CASE(redeem_decrements_the_protest_counter)
     house.nProtestDemandHeight = D;
 
     const uint32_t tagMarked = NoteDemandTag(D, true) | NOTE_DEMAND_PROTESTED_BIT;
-    const auto fnMarked = ServeCoin(1, U, tagMarked, NotePreAuthScript(vchKey));
-    const auto fnUnmarked = ServeCoin(1, U, NoteDemandTag(D, true), NotePreAuthScript(vchKey));
+    const auto fnMarked = ServeCoin(1, U, tagMarked, TestCustody(vchKey));
+    const auto fnUnmarked = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(vchKey));
 
     // 2 -> 1: heights stay (the clock never resets without a real recovery).
     CHouse houseMid;
@@ -888,7 +909,7 @@ BOOST_AUTO_TEST_CASE(suspended_redeem_demanded_only_at_floor)
     {
         const uint32_t D0 = S - 500;
         const std::vector<unsigned char> payout = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
-        const auto fnPreAuth = ServeCoin(1, U, NoteDemandTag(D0, true), NotePreAuthScript(vchKey));
+        const auto fnPreAuth = ServeCoin(1, U, NoteDemandTag(D0, true), TestCustody(vchKey));
         const CAmount I0 = Interest(U, (uint32_t)H - (D0 + W));
         BOOST_CHECK_EQUAL(CtxReject(MakeDischargeTx(1, U, key, payout, (CAmount)U + I0, 0, house.houseID),
                                     H, U, house, fnPreAuth), "");
@@ -1059,7 +1080,7 @@ BOOST_AUTO_TEST_CASE(protest_queue_demand_window_starts_at_reopen)
     const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
     auto fnCoinAt = [&](uint32_t nCoinHeight) {
         return [=](const COutPoint&, Coin& coin) {
-            coin = Coin(CTxOut(NOTE_DUST_VALUE, NotePreAuthScript(vchKey)), (int)nCoinHeight, false, false, false, uint256());
+            coin = Coin(CTxOut(NOTE_DUST_VALUE, TestCustody(vchKey)), (int)nCoinHeight, false, false, false, uint256());
             coin.SetNote(1, U, NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH_QUEUE));
             return true;
         };
@@ -1085,7 +1106,7 @@ BOOST_AUTO_TEST_CASE(protest_queue_demand_window_starts_at_reopen)
                                 houseLate, fnNoCoin), "bad-note-protest-coin");
     // A B3 formal demand keeps its own window from the demand.
     BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagB3Out, house), (int)(E + W - 1), U,
-                                house, fnNoCoin), "");
+                                house, ServeCoin(1, U, tagB3Out & ~NOTE_DEMAND_PROTESTED_BIT, TestCustody(vchKey))), "");
 }
 
 // v0.2.19 members-only houses: a PLAIN demand re-issues notes to a P2PKH the holder names (shape only), so it is held
@@ -1139,6 +1160,386 @@ BOOST_AUTO_TEST_CASE(demand_plain_members_only_rule)
     // The pre-auth modes re-issue into custody pinned to the holder: not this rule's business
     BOOST_CHECK_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, std::vector<unsigned char>(scriptOther.begin(), scriptOther.end()),
                                              true, true, true), H, U, house, fnNoCoin), "");
+}
+
+// S1X-14 (security 2026-11-24: Medium; findings/2026-11-24-s1x-14-preauth-replay.md). A pre-auth signature covers
+// only (house, unit vector, payout script), so nothing ties it to ONE demand. A discharge needs no holder signature
+// and the custody script is open, so anyone holding an OLD discharged demand's pre-auth (it is public once that
+// discharge confirms) can discharge a LATER pre-auth demand by the same key, at the same house, for the same total -
+// paying the OLD payee. The old payee (or a house that controls it) funds the floor to itself and the new demand's
+// notes are burned without paying its own payee.
+// The test takes the old signature out of the old DEMAND's payload, so it holds whatever the fix binds the digest to.
+// Any refusal passes; the check is at CheckNoteOperation, which reads the custody coins' tags.
+namespace {
+// The pre-auth signature a DEMAND carries (what a third party reads from the chain).
+std::vector<unsigned char> PreAuthSigOf(const CMutableTransaction& mtxDemand)
+{
+    NoteDemand d;
+    CDataStream ss(mtxDemand.vchNotePayload, SER_NETWORK, PROTOCOL_VERSION);
+    ss >> d;
+    return d.vchPreAuthSig;
+}
+// A DISCHARGE built by someone WITHOUT the holder's key: it re-supplies a signature it found.
+CMutableTransaction ReplayDischargeTx(uint32_t nHouseID, uint64_t nUnits, const CPubKey& pubHolder,
+                                      const std::vector<unsigned char>& vchPayoutScript,
+                                      const std::vector<unsigned char>& vchFoundSig, CAmount amountPayout)
+{
+    NoteRedeem redeem;
+    redeem.nHouseID = nHouseID;
+    redeem.fBrassage = 0;
+    redeem.vchHolderPubKey = std::vector<unsigned char>(pubHolder.begin(), pubHolder.end());
+    redeem.fPreAuthDischarge = 1;
+    redeem.vPreAuthUnits.push_back(nUnits);
+    redeem.vchPayoutScript = vchPayoutScript;
+    redeem.vchPreAuthSig = vchFoundSig;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_REDEEM;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("d15c"), 0)));
+    mtx.vout.push_back(CTxOut(amountPayout, CScript(vchPayoutScript.begin(), vchPayoutScript.end())));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_14a_an_old_preauth_cannot_discharge_a_later_demand)
+{
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t D1 = 10000, D2 = 20000;        // two demands by one key, same house, same total
+    const uint64_t U = 1000000;
+    const int H = (int)(D2 + W - 1);              // inside D2's window: par exactly
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const std::vector<unsigned char> vchPayeeA = ParseHex("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+    const std::vector<unsigned char> vchPayeeB = ParseHex("76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac");
+    CHouse house = MakeOpenHouse(1, H, 4 * U);
+
+    // D1 named payee A and was discharged long ago: its pre-auth is public.
+    // (S1X-14 fix: D1 spent other coins than D2, so it has its own demand id.)
+    const std::vector<unsigned char> vchSigA =
+        PreAuthSigOf(MakeDemandTx(1, U, key, true, vchPayeeA, true, true, false, uint256S("d1d1")));
+    BOOST_REQUIRE(!vchSigA.empty());
+    // D2's custody coins: demanded at D2, pre-auth, the holder's custody script.
+    const auto fnCoinD2 = ServeCoin(1, U, NoteDemandTag(D2, true), TestCustody(vchKey));
+
+    // Control: D2's own pre-auth (payee B) discharges D2.
+    BOOST_REQUIRE_EQUAL(CtxReject(MakeDischargeTx(1, U, key, vchPayeeB, (CAmount)U, 0, house.houseID),
+                                  H, U, house, fnCoinD2), "");
+
+    // The replay: payee A spends D2's coins with D1's signature and pays itself.
+    const std::string strReplay = CtxReject(ReplayDischargeTx(1, U, pub, vchPayeeA, vchSigA, (CAmount)U),
+                                            H, U, house, fnCoinD2);
+    BOOST_CHECK_MESSAGE(!strReplay.empty(),
+        "S1X-14 (a): a discharge of the demand made at height " << D2 << " (payee B) was accepted with the pre-auth "
+        "of an earlier demand made at height " << D1 << " (payee A), paying A; nothing binds a pre-auth to its demand");
+}
+
+BOOST_AUTO_TEST_CASE(s1x_14b_two_demands_in_one_block_cannot_swap_preauths)
+{
+    // The residual a height-only binding would leave: two pre-auth demands by one key, at one house, for one total,
+    // filed in the SAME block to different payees (two payments the same day). Their coins carry the same tag, so
+    // binding the demand height alone does not tell them apart. security decides whether this case must hold or the
+    // wallet guards it instead (one pre-auth demand per key, house and total per block); kept separate for that.
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t D = 20000;
+    const uint64_t U = 1000000;
+    const int H = (int)(D + W - 1);
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const std::vector<unsigned char> vchPayeeA = ParseHex("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+    const std::vector<unsigned char> vchPayeeB = ParseHex("76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac");
+    CHouse house = MakeOpenHouse(1, H, 4 * U);
+
+    const std::vector<unsigned char> vchSigA =
+        PreAuthSigOf(MakeDemandTx(1, U, key, true, vchPayeeA, true, true, false, uint256S("a1a1")));   // its own coins
+    const auto fnCoinB = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(vchKey));   // demand B's coins
+
+    BOOST_REQUIRE_EQUAL(CtxReject(MakeDischargeTx(1, U, key, vchPayeeB, (CAmount)U, 0, house.houseID),
+                                  H, U, house, fnCoinB), "");
+    const std::string strReplay = CtxReject(ReplayDischargeTx(1, U, pub, vchPayeeA, vchSigA, (CAmount)U),
+                                            H, U, house, fnCoinB);
+    BOOST_CHECK_MESSAGE(!strReplay.empty(),
+        "S1X-14 (b): two pre-auth demands filed at height " << D << " by one key for one total: payee A discharged "
+        "payee B's demand with A's pre-auth, paying A");
+}
+
+// S1X-15 (Claude max s1 run 1, #2/#3; testing reads High): a payout script the house must pay later is chosen by the
+// holder alone, so the chain must refuse at the door any script the house cannot pay. Otherwise one holder with a few
+// notes makes a demand or swap the house cannot discharge; the window lapses, a protest follows, and the house fails
+// with no cure. Two ways a script is unpayable:
+// - (b) non-standard: the discharge REDEEM / SWAP_PAY must pay it exactly at vout[0], policy refuses the output
+//   (policy.cpp, "scriptpubkey") and main refuses -acceptnonstdtxn, so no stock node relays or mines the payment;
+// - (a) the noteholders' fund script: tx_verify refuses every swap-op output to it (bad-note-swap-stray-escrow), but the
+//   SWAP open check (IsGoldUnpayableScript) leaves it out.
+// The test asserts only that each is refused at the door (any reason), with an accepted P2PKH control each time.
+BOOST_AUTO_TEST_CASE(s1x_15_payouts_the_house_cannot_pay_are_refused_at_the_door)
+{
+    const int H = 5000;
+    const uint64_t U = 1000000;
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const CHouse house = MakeOpenHouse(1, H, 2 * U);
+
+    const std::vector<unsigned char> vchP2PKH = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
+    const std::vector<unsigned char> vchWitV2 =
+        ParseHex("5220" "1111111111111111111111111111111111111111111111111111111111111111");   // OP_2 <32 bytes>
+    const std::vector<unsigned char> vchBareTrue = {0x51};                                     // OP_TRUE
+    const CScript scriptFund = MutualFundScript();
+    const std::vector<unsigned char> vchFund(scriptFund.begin(), scriptFund.end());
+
+    // The premise, checked against the node's own policy: the P2PKH control is standard, the two bad scripts are not.
+    {
+        txnouttype t;
+        BOOST_REQUIRE(::IsStandard(CScript(vchP2PKH.begin(), vchP2PKH.end()), t, true));
+        BOOST_REQUIRE(!::IsStandard(CScript(vchWitV2.begin(), vchWitV2.end()), t, true));
+        BOOST_REQUIRE(!::IsStandard(CScript(vchBareTrue.begin(), vchBareTrue.end()), t, true));
+    }
+
+    // (b) A pre-auth DEMAND at an Open house. The discharge must pay the payout script at vout[0] (validation.cpp,
+    // bad-note-redeem-discharge-payout-script), so a non-standard one makes the house's only cure unminable.
+    BOOST_REQUIRE_EQUAL(CtxReject(MakeDemandTx(1, U, key, true, vchP2PKH), H, U, house, fnNoCoin), "");
+    for (const auto& bad : {vchWitV2, vchBareTrue}) {
+        const std::string strReason = CtxReject(MakeDemandTx(1, U, key, true, bad), H, U, house, fnNoCoin);
+        BOOST_CHECK_MESSAGE(!strReason.empty(),
+                            "S1X-15 (b): a pre-auth DEMAND naming the non-standard payout " + HexStr(bad) +
+                            " was accepted; its discharge could never be relayed or mined on main");
+    }
+
+    // (a)+(b) A SWAP (holder-unilateral). The holder never reveals the preimage, so SWAP_PAY to the payout script is the
+    // house's only way to settle; to the fund it is refused by tx_verify, to a non-standard script by policy.
+    {
+        CUnitsView units(nullptr);
+        CHouseCharter charter;
+        CCharterToken tok;
+        tok.nChainID = 1;
+        tok.vchContract = std::vector<unsigned char>(20, 0xc0);
+        tok.nDecimals = 18;
+        tok.nGramsNum = 1;
+        tok.nGramsDen = 1;
+        tok.nAddedTime = 1;
+        charter.vToken.push_back(tok);
+        units.Put(HouseCharterKey(1), charter);
+        CChainClock clock;
+        clock.nHeight = (uint32_t)(H - 1);
+        clock.nMonoTime = clock.nActiveTime = (int64_t)H * 600;
+        units.Put(ChainClockKey(), clock);
+        UnitsCheckScope scope(&units);
+
+        auto swapReject = [&](const std::vector<unsigned char>& vchPayout) {
+            NoteSwap sw;
+            sw.nHouseID = 1;
+            sw.nUnits = U;
+            sw.vchHolderPubKey = vchKey;
+            sw.nChainID = 1;
+            sw.vchContract = tok.vchContract;
+            sw.vchEthAddress = std::vector<unsigned char>(20, 0xe7);
+            sw.hashLock = uint256S("51015");
+            sw.nRateNamed = 0;   // the unit tests' rate override names the bid
+            sw.vchPayoutScript = vchPayout;
+            CMutableTransaction mtx;
+            mtx.nVersion = TRANSACTION_NOTE_VERSION;
+            mtx.nNoteOp = NOTE_OP_SWAP;
+            mtx.vin.push_back(CTxIn(COutPoint(uint256S("5a0b"), 0)));
+            mtx.vout.push_back(CTxOut(10000, CScript(vchP2PKH.begin(), vchP2PKH.end())));   // fee change
+            BOOST_REQUIRE(key.Sign(NoteSwapSigHash(sw, CTransaction(mtx)), sw.vchHolderSig));
+            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << sw;
+            mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+            return CtxReject(mtx, H, U, house, fnNoCoin);
+        };
+        BOOST_REQUIRE_EQUAL(swapReject(vchP2PKH), "");   // control: the open reaches the end of its checks
+        for (const auto& bad : {vchFund, vchWitV2}) {
+            const std::string strReason = swapReject(bad);
+            BOOST_CHECK_MESSAGE(!strReason.empty(),
+                                "S1X-15 (a/b): a SWAP naming the payout " + HexStr(bad) +
+                                " was accepted; no SWAP_PAY to it can confirm, so the house can only be protested");
+        }
+    }
+}
+
+// S1X-15, security's extra case (2026-11-24): with a payable (whitelisted) payout the house's cure works. A swap to a
+// P2PKH, unpaid a day past its deadline, can be protested (control: the protest path is live in this fixture); the house
+// can pay it with a SWAP_PAY to that script; and once it is PAID, no protest can be built against it. Holds on master
+// and after the fix (it pins that the whitelist keeps the cure, and that a paid swap closes the protest path).
+BOOST_AUTO_TEST_CASE(s1x_15_a_paid_whitelisted_payout_cannot_be_protested)
+{
+    const uint64_t U = 1000000;
+    const int64_t DEADLINE = 4000 * 600;
+    const Consensus::GramParams& gpSwap = Params().GetConsensus().GramAt(4000);
+    const int64_t nProtestAt = DEADLINE + (int64_t)gpSwap.nSwapPayWindowSecs;   // the first protestable active time
+    const int H = (int)(nProtestAt / 600) + 1;
+    const CHouse house = MakeOpenHouse(1, H, 2 * U);
+    const std::vector<unsigned char> vchP2PKH = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
+    const uint256 hashLock = uint256S("51015b");
+
+    CSwapRecord rec;
+    rec.nHouseID = 1;
+    rec.nUnits = U;
+    rec.nBid0 = 1000;
+    rec.nDemandHeight = 3500;
+    rec.nDeadlineActive = DEADLINE;
+    rec.vchPayoutScript = vchP2PKH;
+
+    auto run = [&](const CMutableTransaction& mtx, uint8_t nSettled) {
+        CUnitsView units(nullptr);
+        SwapOpen(units, hashLock, rec);
+        if (nSettled != SWAP_PENDING)
+            SwapSettle(units, hashLock, nSettled, 1000, nProtestAt, H - 1, 12960);
+        CChainClock clock;
+        clock.nHeight = (uint32_t)(H - 1);
+        clock.nMonoTime = clock.nActiveTime = nProtestAt;
+        units.Put(ChainClockKey(), clock);
+        UnitsCheckScope scope(&units);
+        return CtxReject(mtx, H, 0, house, fnNoCoin);
+    };
+    auto protestTx = [&]() {
+        NoteSwapProtest pro;
+        pro.nHouseID = 1;
+        pro.hashLock = hashLock;
+        pro.nPrevProtestOpen = house.nProtestOpen;
+        pro.nPrevProtestHeight = house.nProtestHeight;
+        pro.nPrevProtestDemandHeight = house.nProtestDemandHeight;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_SWAP_PROTEST;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("9a0b"), 0)));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << pro;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        return mtx;
+    };
+    auto payTx = [&]() {
+        NoteSwapPay pay;
+        pay.nHouseID = 1;
+        pay.hashLock = hashLock;
+        pay.nRateNamed = 0;   // the unit tests' rate override names the bid
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_SWAP_PAY;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("9a0c"), 0)));
+        mtx.vout.push_back(CTxOut(100 * COIN, CScript(vchP2PKH.begin(), vchP2PKH.end())));   // well over what is owed
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << pay;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        return mtx;
+    };
+
+    BOOST_REQUIRE_EQUAL(run(protestTx(), SWAP_PENDING), "");   // control: unpaid past the pay window, protestable
+    BOOST_CHECK_EQUAL(run(payTx(), SWAP_PENDING), "");          // the house can cure it: SWAP_PAY to the P2PKH
+    const std::string strPaid = run(protestTx(), SWAP_PAID);
+    BOOST_CHECK_MESSAGE(!strPaid.empty(), "S1X-15: a SWAP_PROTEST was accepted against a swap the house had already "
+                        "PAID to its whitelisted payout");
+}
+
+
+// S1X-14 (security's checks): the demand id travels with the coins. A DEMAND puts its own id on its custody output; a
+// discharge refuses burned coins of mixed demands; the 57-byte custody form stays standard to create and to spend. (A
+// PROTEST copying the id is exercised by the protest cases above: their inputs and outputs carry one id, and the
+// check refuses any other.)
+BOOST_AUTO_TEST_CASE(s1x_14_the_demand_id_travels_with_the_coins)
+{
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t D = 20000;
+    const uint64_t U = 1000000;
+    const int H = (int)(D + W - 1);
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const std::vector<unsigned char> payout = ParseHex("76a914cccccccccccccccccccccccccccccccccccccccc88ac");
+    CHouse house = MakeOpenHouse(1, H, 4 * U);
+
+    // A DEMAND's custody output carries its own id (NoteHashPrevouts) and pins the holder's key.
+    CMutableTransaction dem = MakeDemandTx(1, U, key, true, payout);
+    BOOST_CHECK(IsNoteDemandCustodyScript(dem.vout[0].scriptPubKey));
+    uint256 id;
+    BOOST_REQUIRE(NoteCustodyDemandId(dem.vout[0].scriptPubKey, id));
+    BOOST_CHECK(id == NoteHashPrevouts(CTransaction(dem)));
+    BOOST_CHECK(NoteCustodyKeyIs(dem.vout[0].scriptPubKey, vchKey));
+
+    // A discharge whose burned coins belong to two demands is refused (one served per input: alternate ids).
+    {
+        const CScript scriptA = TestCustody(vchKey, DemandIdFor());
+        const CScript scriptB = TestCustody(vchKey, DemandIdFor(uint256S("b2b2")));
+        CMutableTransaction dis = MakeDischargeTx(1, U, key, payout, (CAmount)U, 0, house.houseID);
+        dis.vin.push_back(CTxIn(COutPoint(uint256S("d15d"), 0)));
+        auto fnMixed = [&](const COutPoint& op, Coin& coin) {
+            coin = Coin(CTxOut(NOTE_DUST_VALUE, op.hash == uint256S("d15c") ? scriptA : scriptB), (int)D, false, false,
+                        false, uint256());
+            coin.SetNote(1, U / 2, NoteDemandTag(D, true));
+            return true;
+        };
+        BOOST_CHECK_EQUAL(CtxReject(dis, H, U, house, fnMixed), "bad-note-redeem-discharge-mixed-demand");
+    }
+
+    // The custody form is standard to create (the DEMAND) and to spend (a discharge burning a tagged custody coin).
+    std::string reason;
+    BOOST_CHECK_MESSAGE(IsStandardTx(CTransaction(dem), reason, true), "DEMAND not standard: " << reason);
+    {
+        CCoinsView base;
+        CCoinsViewCache view(&base);
+        CMutableTransaction dis = MakeDischargeTx(1, U, key, payout, (CAmount)U, 0, house.houseID);
+        Coin coin(CTxOut(NOTE_DUST_VALUE, TestCustody(vchKey)), (int)D, false, false, false, uint256());
+        coin.SetNote(1, U, NoteDemandTag(D, true));
+        view.AddCoin(dis.vin[0].prevout, std::move(coin), false);
+        BOOST_CHECK(AreInputsStandard(CTransaction(dis), view));
+    }
+}
+
+// S1X-14 (security's integration ask, as a unit case): a queue demand UPGRADED (Delta-1b, mode 2) gets a fresh id from
+// the upgrade's own inputs; a PROTEST of the upgraded coins must carry that id onward, and the discharge then verifies
+// the UPGRADE's pre-auth over it - not the original demand's id. The house here is synthetic (reopened with no earlier
+// episode, which a real chain can't produce: DEFER needs a protest); the id checks don't read the episode. testing's
+// gate runs the reachable path: the first protest still open at the recovery, the upgraded demand's protest joining it.
+BOOST_AUTO_TEST_CASE(s1x_14_an_upgraded_demand_keeps_its_id_through_protest_and_discharge)
+{
+    const uint32_t D = 10000, E = 15000;
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint64_t U = 1000000;
+    const uint32_t U2 = E + 3 * W;                         // the upgrade's block (the tag keeps D)
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const std::vector<unsigned char> payout = ParseHex("76a914dddddddddddddddddddddddddddddddddddddddd88ac");
+    const uint32_t tagQueue = NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH_QUEUE);
+    const uint32_t tagQueueOut = tagQueue | NOTE_DEMAND_PROTESTED_BIT;
+
+    CHouse house = MakeOpenHouse(1, (int)(U2 + W), 2 * U);
+    house.nDeferEndedHeight = E;
+    house.nLastAttestHeight = U2 + W - 2;                  // still attesting: Open at these heights
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, (int)(U2 + W)), HOUSE_STATUS_OPEN);
+
+    // The upgrade spent its own coins: its id, and the pre-auth it signed over that id.
+    const CMutableTransaction upgrade = MakeDemandTx(1, U, key, true, payout, true, true, true, uint256S("a9a9"));
+    uint256 idUp;
+    BOOST_REQUIRE(NoteCustodyDemandId(upgrade.vout[0].scriptPubKey, idUp));
+    BOOST_REQUIRE(idUp != DemandIdFor());
+    auto fnUpgraded = [&](uint32_t nTag) {
+        return [=](const COutPoint&, Coin& coin) {
+            coin = Coin(CTxOut(NOTE_DUST_VALUE, TestCustody(vchKey, idUp)), (int)U2, false, false, false, uint256());
+            coin.SetNote(1, U, nTag);
+            return true;
+        };
+    };
+
+    // PROTEST: re-issued onto the upgrade's id - accepted; onto any other id - refused.
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, house, true, idUp), (int)(U2 + W), U, house,
+                                fnUpgraded(tagQueue)), "");
+    BOOST_CHECK_EQUAL(CtxReject(MakeProtestTx(1, U, key, tagQueueOut, house, true, DemandIdFor()), (int)(U2 + W), U,
+                                house, fnUpgraded(tagQueue)), "bad-note-protest-custody-script");
+
+    // Discharge of the protested coins (still on the upgrade's id): the upgrade's pre-auth verifies; a pre-auth over
+    // another id (an earlier demand by the same key for the same units) does not.
+    const std::vector<unsigned char> vchSigUp = PreAuthSigOf(upgrade);
+    const std::vector<unsigned char> vchSigOld =
+        PreAuthSigOf(MakeDemandTx(1, U, key, true, payout, true, true, true, uint256S("de3a")));
+    const std::string strUp = CtxReject(ReplayDischargeTx(1, U, pub, payout, vchSigUp, (CAmount)U), (int)(U2 + W), U,
+                                        house, fnUpgraded(tagQueueOut));
+    BOOST_CHECK_MESSAGE(strUp != "bad-note-redeem-discharge-sig-invalid" && strUp != "bad-note-redeem-discharge-custody" &&
+                        strUp != "bad-note-redeem-discharge-mixed-demand",
+                        "S1X-14: the upgrade's own pre-auth was refused on its protested coins: " << strUp);
+    BOOST_CHECK_EQUAL(CtxReject(ReplayDischargeTx(1, U, pub, payout, vchSigOld, (CAmount)U), (int)(U2 + W), U, house,
+                                fnUpgraded(tagQueueOut)), "bad-note-redeem-discharge-sig-invalid");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

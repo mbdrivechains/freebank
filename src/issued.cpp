@@ -13,6 +13,7 @@
 #include <token.h>
 #include <house.h>
 #include <note.h>
+#include <script/standard.h>
 #include <pool.h>
 #include <pubkey.h>
 #include <script/script.h>
@@ -462,7 +463,25 @@ uint256 CreditHashOutputs(const CTransaction& tx)
 
 bool IsGoldUnpayableScript(const CScript& script)
 {
+    // S1X-15 (absorbs S2X-4): the mutual fund's script too - tx_verify refuses any payout to it, so a swap naming it
+    // could never be paid and units sent there freeze.
     return script.IsUnspendable() || IsHouseEscrowScript(script) || IsBillEscrowScript(script) ||
            IsPoolEscrowScript(script) ||
-           IsNotePreAuthScript(script) || IsTokenPoolScript(script);
+           IsNotePreAuthScript(script) || IsTokenPoolScript(script) || IsMutualFundScript(script);
+}
+
+bool IsHousePayableScript(const CScript& script)
+{
+    // S1X-15 (security High; Michael 2026-11-24 "Yes, build it"): a payout a counterparty names and a house must pay
+    // or face a protest must be one every stock node relays: exactly P2PKH, P2SH, P2WPKH or P2WSH. Anything else (a
+    // non-standard script, an unknown witness version) makes every payment non-standard, so the house can't pay it
+    // through any stock node and is protested into insolvency.
+    if (IsGoldUnpayableScript(script))
+        return false;
+    txnouttype which;
+    std::vector<std::vector<unsigned char>> vSolutions;
+    if (!Solver(script, which, vSolutions))
+        return false;
+    return which == TX_PUBKEYHASH || which == TX_SCRIPTHASH || which == TX_WITNESS_V0_KEYHASH ||
+           which == TX_WITNESS_V0_SCRIPTHASH;
 }

@@ -42,8 +42,39 @@ bool IsNotePreAuthScript(const CScript& script)
 {
     // <20-byte push> OP_DROP OP_TRUE - the escrow family with a keyid-sized
     // push (the escrows push 32). Shape only; WHICH keyid is contextual.
-    return script.size() == 23 && script[0] == 0x14 &&
-           script[21] == OP_DROP && script[22] == OP_TRUE;
+    // S1X-14: or a note demand's form, which carries its demand id.
+    return (script.size() == 23 && script[0] == 0x14 &&
+            script[21] == OP_DROP && script[22] == OP_TRUE) ||
+           IsNoteDemandCustodyScript(script);
+}
+
+CScript NoteDemandCustodyScript(const std::vector<unsigned char>& vchPubKey, const uint256& demandId)
+{
+    const CKeyID keyid = CPubKey(vchPubKey).GetID();
+    return CScript() << std::vector<unsigned char>(keyid.begin(), keyid.end()) << OP_DROP
+                     << std::vector<unsigned char>(demandId.begin(), demandId.end()) << OP_DROP << OP_TRUE;
+}
+
+bool IsNoteDemandCustodyScript(const CScript& script)
+{
+    return script.size() == 57 && script[0] == 0x14 && script[21] == OP_DROP && script[22] == 0x20 &&
+           script[55] == OP_DROP && script[56] == OP_TRUE;
+}
+
+bool NoteCustodyDemandId(const CScript& script, uint256& demandId)
+{
+    if (!IsNoteDemandCustodyScript(script))
+        return false;
+    memcpy(demandId.begin(), script.data() + 23, 32);
+    return true;
+}
+
+bool NoteCustodyKeyIs(const CScript& script, const std::vector<unsigned char>& vchPubKey)
+{
+    if (!IsNotePreAuthScript(script))
+        return false;
+    const CKeyID keyid = CPubKey(vchPubKey).GetID();
+    return memcmp(script.data() + 1, keyid.begin(), 20) == 0;
 }
 
 uint256 NoteHashPrevouts(const CTransaction& tx)
@@ -139,7 +170,7 @@ uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits
 }
 
 uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
-                           const std::vector<unsigned char>& vchPayoutScript)
+                           const std::vector<unsigned char>& vchPayoutScript, const uint256& demandId)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankNote/preauth");   // domain-separated: NOT the demand digest
@@ -147,6 +178,7 @@ uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
     ss << nHouseID;
     ss << vUnits;
     ss << vchPayoutScript;
+    ss << demandId;   // S1X-14: this one demand (NoteHashPrevouts of its DEMAND), never a later one by the same key
     return ss.GetHash();
 }
 

@@ -112,7 +112,7 @@ BOOST_AUTO_TEST_CASE(preauth_and_protest_digests_are_domain_separated)
     const uint256 outs = uint256S("beef");
 
     const uint256 demand  = NoteDemandSigHash(H, vUnits, outs);
-    const uint256 preauth = NotePreAuthSigHash(H, vUnits, script);
+    const uint256 preauth = NotePreAuthSigHash(H, vUnits, script, uint256S("d1d"));
     const uint256 protest = NoteProtestSigHash(H, vUnits, outs);
 
     // THE POINT: a pre-auth signature must not be replayable as a demand
@@ -124,16 +124,18 @@ BOOST_AUTO_TEST_CASE(preauth_and_protest_digests_are_domain_separated)
     BOOST_CHECK(preauth != protest);
 
     // every input is bound
-    BOOST_CHECK(preauth != NotePreAuthSigHash(H + 1, vUnits, script));
+    BOOST_CHECK(preauth != NotePreAuthSigHash(H + 1, vUnits, script, uint256S("d1d")));
     std::vector<uint64_t> vOther;
     vOther.push_back(1000);
     vOther.push_back(2501);
-    BOOST_CHECK(preauth != NotePreAuthSigHash(H, vOther, script));
-    BOOST_CHECK(preauth != NotePreAuthSigHash(H, vUnits, Bytes("76a900")));
+    BOOST_CHECK(preauth != NotePreAuthSigHash(H, vOther, script, uint256S("d1d")));
+    BOOST_CHECK(preauth != NotePreAuthSigHash(H, vUnits, Bytes("76a900"), uint256S("d1d")));
+    // S1X-14: and the demand it was signed for
+    BOOST_CHECK(preauth != NotePreAuthSigHash(H, vUnits, script, uint256S("d2d")));
     // and it does NOT bind hashOutputs - by design: the discharge that
     // satisfies it does not exist when this is signed. Pinning the SCRIPT is
     // what makes a unilateral discharge possible at all.
-    BOOST_CHECK_EQUAL(preauth.ToString(), NotePreAuthSigHash(H, vUnits, script).ToString());
+    BOOST_CHECK_EQUAL(preauth.ToString(), NotePreAuthSigHash(H, vUnits, script, uint256S("d1d")).ToString());
     // protest binds outputs (it is an ordinary same-tx authorisation)
     BOOST_CHECK(protest != NoteProtestSigHash(H, vUnits, uint256S("dead")));
 }

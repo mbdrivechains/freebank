@@ -501,7 +501,21 @@ CScript NoteScriptForPubKey(const std::vector<unsigned char>& vchPubKey);
  * against the key this keyid pins). See the custody note at
  * NOTE_DEMAND_PROTESTED_BIT for why P2PKH cannot carry a pre-auth coin. */
 CScript NotePreAuthScript(const std::vector<unsigned char>& vchPubKey);
+/** Either custody form: the 23-byte one above (deposit receipts) or a note demand's 57-byte one below. */
 bool IsNotePreAuthScript(const CScript& script);
+
+/** S1X-14 (security Medium; Michael 2026-11-24 "Yes, build it"): a pre-auth NOTE demand's custody lock carries its
+ *  demand id, so the standing authorisation can be bound to that one demand:
+ *   <20-byte holder keyid> OP_DROP <32-byte demand id> OP_DROP OP_TRUE
+ *  The demand id is NoteHashPrevouts(the DEMAND tx): unique, and known when the holder signs the pre-auth inside the
+ *  DEMAND (its block height isn't). A PROTEST re-issue copies it; the discharge REDEEM reads it from the coins it burns.
+ *  Deposit receipts keep the 23-byte form: DepositPreAuthSigHash already pins one receipt. */
+CScript NoteDemandCustodyScript(const std::vector<unsigned char>& vchPubKey, const uint256& demandId);
+bool IsNoteDemandCustodyScript(const CScript& script);
+/** The demand id a note demand's custody script carries; false for any other script. */
+bool NoteCustodyDemandId(const CScript& script, uint256& demandId);
+/** Does a custody script (either form) pin this holder key? */
+bool NoteCustodyKeyIs(const CScript& script, const std::vector<unsigned char>& vchPubKey);
 
 /** SHA256d over every input outpoint of tx - the tx-unique element bound into
  * the mint sighash so reused M-of-N approver signatures cannot authorize a
@@ -644,7 +658,7 @@ uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits
  * and binds the payout SCRIPT rather than a transaction's outputs - the
  * discharge that satisfies it does not exist yet when this is signed. */
 uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
-                           const std::vector<unsigned char>& vchPayoutScript);
+                           const std::vector<unsigned char>& vchPayoutScript, const uint256& demandId);
 uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
 /** v0.2.20 token records. Both bind hashPrevouts (tx-unique: approvals can't be
  * replayed onto a second, differently-funded tx - the MINT rule) and the outputs.

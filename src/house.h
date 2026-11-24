@@ -398,7 +398,7 @@ struct CHouse {
     // account. An ASSET, "reported not counted as backing" (ARCH:428) - it
     // enters NO cap, NO reserve and NO insolvency pot. It exists so the
     // match-funding rule can bind and so Tx-14/Tx-15 have a substrate.
-    // nLoanBookFace = Sigma(bill.amount) over house-held bills, in sats, valued
+    // nLoanBookFace = Sigma(bill.amount) over house-held bills, in mg since gram notes (S1X-9), valued
     // at FACE (B1 OD-2: face is what canon attests, what matures, and is already
     // in the immutable bill record). nLoanWtMat{Hi,Lo} = the 128-bit
     // Sigma(face_i * maturity_height_i) accumulator - one term overflows u64 -
@@ -1472,11 +1472,13 @@ uint32_t HouseDepositWAM(const CHouse& house, int nHeight);
 // all. Do not "simplify" these back.
 //
 
-/** Book face beyond permanent capital: max(0, L - ActiveEscrow), unsigned. */
-uint64_t HouseLoanBookExcess(const CHouse& house);
+/** Book face beyond permanent capital: max(0, L - E), unsigned, both in mg: E is the active escrow at the house's
+ *  highest ask of the last 30 days at nHeight (HouseEscrowMgForChecks; 0 with no rate). S1X-9: E was sats. Defined in
+ *  issued_connect.cpp (server): it reads the house's rate. */
+uint64_t HouseLoanBookExcess(const CHouse& house, int nHeight);
 
-/** The DEPOSIT-FUNDED slice of the loan book: min(excess, D), in sats. */
-uint64_t HouseLoanBookSlice(const CHouse& house);
+/** The DEPOSIT-FUNDED slice of the loan book: min(excess, D), in mg. */
+uint64_t HouseLoanBookSlice(const CHouse& house, int nHeight);
 
 /** Dollar-duration of the loan book at nHeight: Sigma(face_i * remaining_i),
  * computed as WtMat - nHeight*L and clamped at 0.

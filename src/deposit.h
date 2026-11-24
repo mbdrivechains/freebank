@@ -31,7 +31,8 @@ class CValidationState;
 // notes; notes senior). Receipt-ness rides the coin TAG (fDeposit + terms), never
 // the script - like notes/bills.
 //
-// v1 is base-native 1:1 (principal is literally base sats; the ECX/gold
+// v1 was base-native 1:1 (principal in base sats). Since gram notes the principal
+// (nDepositUnits) is in mg, like notes and the loan book (S1X-9). The ECX/gold
 // denomination distinction the canon markets does not physically exist until the
 // D14 oracle migration). Whole-receipt atomic transfers (divisibility via batch
 // origination). Mint-model funding (ORIGINATE authorizes the liability + emits

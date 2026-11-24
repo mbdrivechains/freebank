@@ -564,7 +564,7 @@ BOOST_AUTO_TEST_CASE(discount_match_funding_post_state)
         const CMutableTransaction mtx = MakeDiscount(s, d);
         CValidationState state; CBill b; CHouse h; bool f = false;
         BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
-        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h), 0);
+        BOOST_CHECK_EQUAL(HouseLoanBookSlice(h, 1000), 0);
     }
     // Now give the house a book already well past its escrow, funded by SHORT
     // deposits: the post-state must fail the dollar-duration comparison. The
@@ -2458,6 +2458,79 @@ BOOST_AUTO_TEST_CASE(ur_ext_11_mint_ceiling_counts_pending_swaps)
                                 " = MAX_MONEY + 1000 got past the issuing ceiling (it went on to: " +
                                 (strReason.empty() ? std::string("accepted") : strReason) + ")");
         }
+    }
+}
+
+// S1X-9 (testing 2026-11-23, s1 measuring run round 3; security: Medium, findings/2026-11-23-s1x-9-match-funding-units):
+// HouseLoanBookExcess subtracts ActiveEscrow() - sats - from nLoanBookFace - mg since gram notes (bill.amount, bill.h) -
+// so wherever a gram costs more than 1,000 sats the escrow "covers" any book and match funding never binds. The unit
+// tests' house rate (1,000 sats per gram = 1 sat per mg) hid it: there the two units are the same number. This case
+// prices the gram at 1,000,000 sats (1,000 sats per mg) and uses the REAL capital count (no
+// g_fnCapitalForChecksTestOverride; security's condition): the escrow of 1,000 COIN is 100,000,000 mg, the book after
+// the discount 240,000,000 mg, the deposit-funded slice the whole 50,000,000 mg of deposits, and those deposits mature
+// in 100 blocks against a book of ~8,640. The DISCOUNT must be refused for match funding, and HouseMatchFundingOK -
+// which the RPC's matchfundingok (rpc/misc.cpp, at tip + 1) and the wallet's pre-check read - must say false.
+namespace {
+struct S1X9Scope {
+    std::function<void(const CHouse&, int, CHouseCapital&)> fnPrev;
+    uint64_t nRatePrev;
+    explicit S1X9Scope(uint64_t nSatsPerGram)
+        : fnPrev(g_fnCapitalForChecksTestOverride), nRatePrev(g_nHouseRateTestOverride)
+    {
+        g_nHouseRateTestOverride = nSatsPerGram;
+        g_fnCapitalForChecksTestOverride = nullptr;   // the real count: escrow sats -> mg at the house's ask
+    }
+    ~S1X9Scope()
+    {
+        g_fnCapitalForChecksTestOverride = fnPrev;
+        g_nHouseRateTestOverride = nRatePrev;
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_9_match_funding_values_the_escrow_in_mg)
+{
+    const uint64_t RATE = 1000000;                           // sats per gram = 1,000 sats per mg
+    const CAmount PLEDGE = 1000 * COIN;                      // 100,000,000 mg at RATE
+    const uint64_t BOOK = 200000000, DEP = 50000000;         // mg
+    struct Run { const char* name; uint32_t nDepositMaturity; bool fExpectOk; };
+    const Run runs[] = {{"long deposits (control)", (uint32_t)H + 20000, true},
+                        {"short deposits", (uint32_t)H + 100, false}};
+    for (const Run& run : runs) {
+        Scene s = MakeScene();
+        s.house.vPartner[0].amountPledge = PLEDGE;
+        s.house.nLoanBookFace = BOOK;
+        s.house.SetLoanWtMaturity((unsigned __int128)BOOK * (unsigned __int128)MATURITY);
+        s.house.nDepositUnits = DEP;
+        s.house.SetDepositWtMaturity((unsigned __int128)DEP * (unsigned __int128)run.nDepositMaturity);
+        S1X9Scope scope(RATE);
+        {
+            CHouseCapital cap;
+            BOOST_REQUIRE(HouseCapitalForChecks(s.house, H, 0, cap));
+            BOOST_REQUIRE_EQUAL(cap.nEscrowMg, (uint64_t)PLEDGE / (RATE / 1000));   // 100,000,000 mg: not 1 sat per mg
+        }
+
+        // The consensus path: DISCOUNT (post-state match funding, validation.cpp's step 22).
+        BillDiscount d;
+        const CMutableTransaction mtx = MakeDiscount(s, d);
+        CValidationState state; CBill billOut; CHouse houseOut; bool fChanged = false;
+        const bool fOk = RunOp(s, mtx, state, billOut, houseOut, fChanged);
+        if (run.fExpectOk) {
+            BOOST_CHECK_MESSAGE(fOk, std::string("S1X-9 ") + run.name + ": refused: " + state.GetRejectReason());
+        } else {
+            BOOST_CHECK_MESSAGE(!fOk, std::string("S1X-9 ") + run.name + ": a DISCOUNT taking the book to 240,000,000 mg "
+                                      "over a 100,000,000 mg escrow, funded by 50,000,000 mg of 100-block deposits, was "
+                                      "accepted (match funding compared mg with sats)");
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-discount-match-funding");
+        }
+
+        // The read the RPC's matchfundingok and the wallet's pre-check make, on the post-discount house.
+        CHouse post = s.house;
+        post.nLoanBookFace += (uint64_t)FACE;
+        post.SetLoanWtMaturity(post.LoanWtMaturity() + (unsigned __int128)(uint64_t)FACE * (unsigned __int128)MATURITY);
+        BOOST_CHECK_MESSAGE(HouseMatchFundingOK(post, H) == run.fExpectOk,
+                            std::string("S1X-9 ") + run.name + ": HouseMatchFundingOK (the RPC's matchfundingok) said " +
+                            (run.fExpectOk ? "false" : "true"));
     }
 }
 
