@@ -285,16 +285,19 @@ BOOST_AUTO_TEST_CASE(bill_endorsement_sig)
 
     const uint256 billID = BillIDFromBody(TestBody());
     std::vector<unsigned char> vchTo(pubTo.begin(), pubTo.end());
+    std::vector<unsigned char> vchFrom(pubFrom.begin(), pubFrom.end());
 
-    const uint256 sighash = BillEndorseSigHash(billID, vchTo, 100);
+    const uint256 sighash = BillEndorseSigHash(billID, vchFrom, vchTo, 100, 2);
     std::vector<unsigned char> vchSig;
     BOOST_REQUIRE(keyFrom.Sign(sighash, vchSig));
 
     BOOST_CHECK(pubFrom.Verify(sighash, vchSig));
     // Signature does not verify for a different height or endorsee
-    BOOST_CHECK(!pubFrom.Verify(BillEndorseSigHash(billID, vchTo, 101), vchSig));
-    std::vector<unsigned char> vchFrom(pubFrom.begin(), pubFrom.end());
-    BOOST_CHECK(!pubFrom.Verify(BillEndorseSigHash(billID, vchFrom, 100), vchSig));
+    BOOST_CHECK(!pubFrom.Verify(BillEndorseSigHash(billID, vchFrom, vchTo, 101, 2), vchSig));
+    BOOST_CHECK(!pubFrom.Verify(BillEndorseSigHash(billID, vchFrom, vchFrom, 100, 2), vchSig));
+    // S1X-34: nor for another endorser or another place in the chain (a replay after RECOURSE lands one link later)
+    BOOST_CHECK(!pubFrom.Verify(BillEndorseSigHash(billID, vchTo, vchTo, 100, 2), vchSig));
+    BOOST_CHECK(!pubFrom.Verify(BillEndorseSigHash(billID, vchFrom, vchTo, 100, 3), vchSig));
 }
 
 BOOST_AUTO_TEST_CASE(bill_record_serialization)
@@ -2089,6 +2092,141 @@ BOOST_AUTO_TEST_CASE(s1x_29_title_release)
     BOOST_CHECK_EQUAL(fnRun(bill), "");
     bill.nEscrowHouseID = 3;   // op 11 at a failed house: its title stays put
     BOOST_CHECK_EQUAL(fnRun(bill), "bad-bill-titlerelease-escrowed");
+}
+
+// ===========================================================================
+// testing (2026-11-26): S1X-34 (Claude max run 4 #2; security 11-26 Medium; fixed in consensus batch 2, Michael
+// 2026-11-26 "Yes, build all 6"). P endorses its bill to X; after the grace deadline P pays X by RECOURSE, so P is the
+// holder again while the title coin stays with X. Within BILL_ENDORSE_HEIGHT_SLACK of P's endorsement, X replays P's
+// link (P's own signature, public on chain) and takes the bill back: P paid and keeps nothing. Driven through
+// CheckBillOperation op by op (ENDORSE, RECOURSE, the replay), each op's effects feeding the next. The endorse digest
+// changes with the fix (it binds the endorser and the link's index), so Run4EndorseDigest uses the fix's form when it
+// exists and master's otherwise: this file builds before and after the fix.
+// FAILS on master 7f65d2e (the replay is accepted); passes on mb/consensus-batch-2 (refused bad-bill-endorse-sig; a
+// fresh link P signs at the new index is accepted).
+// ===========================================================================
+namespace {
+template <typename V>
+auto Run4EndorseDigestImpl(const uint256& id, const V& from, const V& to, uint32_t h, uint32_t idx, int)
+    -> decltype(BillEndorseSigHash(id, from, to, h, idx))
+{
+    return BillEndorseSigHash(id, from, to, h, idx);
+}
+template <typename V>
+auto Run4EndorseDigestImpl(const uint256& id, const V& from, const V& to, uint32_t h, uint32_t idx, long)
+    -> decltype(BillEndorseSigHash(id, to, h))
+{
+    (void)from; (void)idx;
+    return BillEndorseSigHash(id, to, h);
+}
+uint256 Run4EndorseDigest(const uint256& id, const std::vector<unsigned char>& from,
+                          const std::vector<unsigned char>& to, uint32_t h, uint32_t idx)
+{
+    return Run4EndorseDigestImpl(id, from, to, h, idx, 0);
+}
+
+// One bill op at nHeight against `bill`; "" on accept (billOut = the effects), else the reason.
+std::string Run4BillOp(const CMutableTransaction& mtx, const CBill& bill, int nHeight, CBill& billOut)
+{
+    const CBill b = bill;
+    std::function<bool(uint32_t, CBill&)> getBill = [b](uint32_t id, CBill& out) {
+        if (id != b.nBillID) return false;
+        out = b; return true;
+    };
+    std::function<bool(const uint256&)> haveHash = [b](const uint256& x) { return x == b.billID; };
+    std::function<bool(uint32_t, CHouse&)> getHouse = [](uint32_t, CHouse&) { return false; };
+    std::function<bool(const COutPoint&, Coin&)> noCoin = [](const COutPoint&, Coin&) { return false; };
+    std::function<bool(uint32_t, uint256&)> noBlock = [](uint32_t, uint256&) { return false; };
+    CValidationState state;
+    CHouse houseOut;
+    bool fHouseChanged = false;
+    billOut = CBill();
+    if (CheckBillOperation(CTransaction(mtx), state, nHeight, 10 * COIN, getBill, haveHash, getHouse, noCoin, noBlock,
+                           billOut, houseOut, fHouseChanged, false))
+        return std::string();
+    return state.GetRejectReason().empty() ? std::string("(refused, no reason)") : state.GetRejectReason();
+}
+
+CMutableTransaction Run4EndorseTx(uint32_t nBillID, const BillEndorsement& e)
+{
+    BillEndorse en;
+    en.nBillID = nBillID;
+    en.endorsement = e;
+    return UR16Tx(BILL_OP_ENDORSE, en, e.vchTo, BILL_TITLE_VALUE);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_34_a_paid_endorser_keeps_the_bill_after_recourse)
+{
+    CKey keyDrawer, keyAcceptor, keyP, keyX, keyY;
+    keyDrawer.MakeNewKey(true); keyAcceptor.MakeNewKey(true);
+    keyP.MakeNewKey(true); keyX.MakeNewKey(true); keyY.MakeNewKey(true);
+    const std::vector<unsigned char> vP = UR16Pub(keyP), vX = UR16Pub(keyX), vY = UR16Pub(keyY);
+
+    CBill bill;
+    bill.nBillID = 34;
+    bill.billID = uint256S("b134");
+    bill.amount = 10000;                 // 10 g of face (mg): 10,000 sats at the suite's 1,000 sats per gram
+    bill.amountEscrow = 4000;            // the drawee's bond, below the face's value
+    bill.nIssuedHeight = 4000;
+    bill.nMaturityHeight = 4600;
+    bill.nGraceBlocks = 10;
+    bill.vchDrawerPubKey = UR16Pub(keyDrawer);
+    bill.vchAcceptorPubKey = UR16Pub(keyAcceptor);
+    bill.vchHolderPubKey = vP;
+    bill.nRefHouseID = 5;
+    bill.nOwnerHouseID = 0;
+    bill.status = BILL_STATUS_ACTIVE;
+
+    // 1. P endorses the overdue bill to X at 4980: link 0.
+    const uint32_t hEndorse = 4980;
+    BillEndorsement link0;
+    link0.vchFrom = vP;
+    link0.vchTo = vX;
+    link0.nAtHeight = hEndorse;
+    BOOST_REQUIRE(keyP.Sign(Run4EndorseDigest(bill.billID, vP, vX, hEndorse, 0), link0.vchSig));
+    CBill billEndorsed;
+    std::string r = Run4BillOp(Run4EndorseTx(bill.nBillID, link0), bill, (int)hEndorse, billEndorsed);
+    BOOST_REQUIRE_MESSAGE(r.empty(), "S1X-34 setup: P's ENDORSE to X was refused: " + r);
+    BOOST_REQUIRE(billEndorsed.vchHolderPubKey == vX);
+    BOOST_REQUIRE_EQUAL(billEndorsed.vEndorsement.size(), 1u);
+
+    // 2. Past the grace deadline P, the endorser liable to X, pays X max(face at the ask, bond) = 10,000 sats by RECOURSE.
+    BillRecourse rec;
+    rec.nBillID = bill.nBillID;
+    rec.vchPayerPubKey = vP;
+    rec.vchPrevHolderPubKey = vX;
+    rec.nRateNamed = 1000;
+    CMutableTransaction mtxRec = UR16Tx(BILL_OP_RECOURSE, rec, vX, 10000);
+    BOOST_REQUIRE(keyP.Sign(BillRecourseSigHash(rec, bill.billID, BillHashPrevouts(CTransaction(mtxRec)),
+                                                BillHashOutputs(CTransaction(mtxRec))), rec.vchPayerSig));
+    mtxRec = UR16Tx(BILL_OP_RECOURSE, rec, vX, 10000);
+    CBill billRecoursed;
+    r = Run4BillOp(mtxRec, billEndorsed, 4990, billRecoursed);
+    BOOST_REQUIRE_MESSAGE(r.empty(), "S1X-34 setup: P's RECOURSE paying X 10,000 sats was refused: " + r);
+    BOOST_REQUIRE(billRecoursed.vchHolderPubKey == vP);
+    BOOST_REQUIRE(billRecoursed.status == BILL_STATUS_ACTIVE);
+    BOOST_REQUIRE_EQUAL(billRecoursed.vEndorsement.size(), 1u);   // recourse appends no link
+
+    // 3. At 5000 (20 blocks after P signed link 0, inside the 64-block slack) X replays link 0.
+    CBill billReplayed;
+    r = Run4BillOp(Run4EndorseTx(bill.nBillID, link0), billRecoursed, 5000, billReplayed);
+    BOOST_CHECK_MESSAGE(r == "bad-bill-endorse-sig",
+                        "S1X-34: X's replay of P's old endorsement, after P paid X by recourse, was " +
+                        (r.empty() ? std::string("ACCEPTED: the holder is ") +
+                                         (billReplayed.vchHolderPubKey == vX ? "X again" : "not X") +
+                                         ", so P paid 10,000 sats and keeps nothing"
+                                   : "refused for another reason: " + r));
+
+    // Control: P can still endorse onward with a fresh link (link 1).
+    BillEndorsement link1;
+    link1.vchFrom = vP;
+    link1.vchTo = vY;
+    link1.nAtHeight = 5000;
+    BOOST_REQUIRE(keyP.Sign(Run4EndorseDigest(bill.billID, vP, vY, 5000, 1), link1.vchSig));
+    CBill billOnward;
+    r = Run4BillOp(Run4EndorseTx(bill.nBillID, link1), billRecoursed, 5000, billOnward);
+    BOOST_CHECK_MESSAGE(r.empty(), "S1X-34 control: P's fresh endorsement to Y after the recourse was refused: " + r);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

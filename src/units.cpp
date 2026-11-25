@@ -29,6 +29,13 @@ bool CUnitsDB::CheckOrWriteVersion(std::string& strError)
     }
     if (fVersion && nVersion == UNITS_DB_VERSION_CURRENT)
         return true;
+    // From layout 5 (Gold B) on, the transaction wire format is this build's, so -reindex rebuilds the units DB from the
+    // blocks on disk (v1.2.6: layout 6 only grew the house rate record, S1X-40).
+    if (fVersion && nVersion >= 5) {
+        strError = strprintf("The units database (blocks/Units) is layout %u, but this build reads and writes layout %u. "
+                             "Restart with -reindex to rebuild it", nVersion, UNITS_DB_VERSION_CURRENT);
+        return false;
+    }
     // Gold B also changed the transaction wire format (the vault-move field is gone), so -reindex can't re-read blocks an
     // older build wrote: the data directory's blocks/ and chainstate/ must be resynced from peers (review 2026-11-07).
     strError = strprintf("The units database (blocks/Units) was written by an earlier build (layout %u, this build %u): "

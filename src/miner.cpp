@@ -751,6 +751,23 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 //   segwit activation)
 // - the withdrawal poison-row guard (from nWithdrawalGuardHeight)
 // - credit transactions below nCreditBindingHeight
+/** The ops the template's last pass adds (S1X-4, S1X-33): a write some op of the same block reads, by an op that takes no
+ *  slot of that house or whose place in the block ATMP never saw. A rate op (POST, SETKEY) moves the 30-day highest
+ *  ask; a SWAP_DONE (S1X-33, testing High; security 11-26) closes a pending swap, which lowers the pending total that a
+ *  pooled REDEEM's exact spread reads through the block-so-far view (HouseOwedOutsideNotesMg). Every pooled op was
+ *  checked against the tip, where none of these had happened, so they go after every reader. DONE is the only op that
+ *  changes pending or the live shortfall without a slot (SWAP, PAY and CLAIM take one; EXPIRE only fixes nBidT), and
+ *  of their readers only the spread is not monotone in DONE's direction (caps, par eligibility, the recovery floor and
+ *  S1X-31's SWAP refusal all loosen as pending falls). */
+static bool IsLastPassOp(const CTransaction& tx)
+{
+    uint32_t nHouse = 0;
+    bool fSetKey = false;
+    if (HouseRateOpOf(tx, nHouse, fSetKey))
+        return true;
+    return tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_SWAP_DONE;
+}
+
 bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package)
 {
     // Withdrawal poison-row guard (v0.2.13): from nWithdrawalGuardHeight a block
@@ -776,13 +793,10 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
     for (const CTxMemPool::txiter it : package) {
         // S1X-4: in the clock and fee-rate passes a package holding a rate op (as the tx or an ancestor) is left for
         // addRateTxs, which adds only the rate op and its ancestors: its descendants wait for the next block, since
-        // after the post they could read the new rate where ATMP checked them against the tip's.
-        if (fDeferRateOps) {
-            uint32_t nDeferHouse = 0;
-            bool fDeferSetKey = false;
-            if (HouseRateOpOf(it->GetTx(), nDeferHouse, fDeferSetKey))
-                return false;
-        }
+        // after the post they could read the new rate where ATMP checked them against the tip's. S1X-33: a SWAP_DONE
+        // likewise (IsLastPassOp).
+        if (fDeferRateOps && IsLastPassOp(it->GetTx()))
+            return false;
         // D-2026-11-11-3 (R121-R2): one rate op per house per block (bad-house-rate-multiple-ops). The pool holds at
         // most one per house, but a reorg's re-adds can leave two; then SETKEY goes first (security RS-2), so a POST
         // waits while its house has a SETKEY pooled.
@@ -1041,11 +1055,10 @@ void BlockAssembler::ReserveRateWeight()
     // S1X-4 (security 11-20): without room of its own a house's post never lands once the other passes fill the
     // block, whatever fee it pays, and the house goes stale - a lever the house can't outbid. Reserve the pooled rate
     // ops' own weight, at most RATE_PASS_MAX_RESERVED_WEIGHT, out of the packages' share.
+    // S1X-33: the pooled SWAP_DONEs share this room (IsLastPassOp).
     uint64_t nWeight = 0;
     for (CTxMemPool::txiter it = mempool.mapTx.begin(); it != mempool.mapTx.end(); ++it) {
-        uint32_t nHouse = 0;
-        bool fSetKey = false;
-        if (HouseRateOpOf(it->GetTx(), nHouse, fSetKey))
+        if (IsLastPassOp(it->GetTx()))
             nWeight += WITNESS_SCALE_FACTOR * it->GetTxSize();
         if (nWeight >= RATE_PASS_MAX_RESERVED_WEIGHT)
             break;
@@ -1062,11 +1075,12 @@ void BlockAssembler::addRateTxs(int &nPackagesSelected)
     // the cap) it made that reader fail, though ATMP had checked it against the tip: eleven such readers emptied every
     // block and the post itself was never mined. Rate ops (POST and SETKEY, one per house) go last, after every reader,
     // with their unconfirmed ancestors, highest fee rate first. (D-2026-11-20-2 makes the order irrelevant at switch-on.)
+    // S1X-33: SWAP_DONEs too (IsLastPassOp), after every REDEEM whose spread reads the pending total they lower. The
+    // rate ops and the DONEs don't read each other's writes (a DONE reads its swap record and the clock), so their
+    // order within this pass is the fee rate's.
     std::vector<CTxMemPool::txiter> vRate;
     for (CTxMemPool::txiter it = mempool.mapTx.begin(); it != mempool.mapTx.end(); ++it) {
-        uint32_t nHouse = 0;
-        bool fSetKey = false;
-        if (!inBlock.count(it) && HouseRateOpOf(it->GetTx(), nHouse, fSetKey))
+        if (!inBlock.count(it) && IsLastPassOp(it->GetTx()))
             vRate.push_back(it);
     }
     if (vRate.empty())

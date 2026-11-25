@@ -69,8 +69,11 @@ bool HouseRateWindowMax(const CUnitsView& units, uint32_t nHouseID, uint32_t nHe
     nMaxAsk = r.nPostHeight >= nHeight ? r.nPrevAsk : r.nAsk;
     if (nDays == 0)
         return true;
+    // S1X-22 (testing: Low; security 11-26; Michael 2026-11-26 "Yes, build all 6"): today plus the previous nDays whole
+    // days (nDays + 1 day records), so the window covers at least nDays days. With nToday + 1 - nDays it covered
+    // nDays - 1 to nDays, and a high ask from 29 days and some hours ago dropped out of the "30-day" ASK30.
     const uint32_t nToday = RateDayOf(nNow);
-    const uint32_t nFirst = nToday + 1 >= nDays ? nToday + 1 - nDays : 0;
+    const uint32_t nFirst = nToday >= nDays ? nToday - nDays : 0;
     for (uint32_t d = nFirst; d <= nToday; d++) {
         CRateDay day;
         if (units.Get(RateDayKey(nHouseID, d), day)) {
@@ -208,6 +211,8 @@ bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uin
         } else {
             next.nRiseCurMin = std::min(next.nRiseCurMin, nBid);
         }
+        next.nPrev2Bid = r.nPrevBid;                 // S1X-40: the block-start record's previous posting, kept
+        next.nPrev2PostActive = r.nPrevPostActive;   // (already converted to when it took effect, S1X-19)
         next.nPrevBid = r.nBid;
         next.nPrevAsk = r.nAsk;
         next.nPrevPostActive = PostEffectiveActive(units, r.nPostHeight, r.nPostActive);   // S1X-19: when it took effect
@@ -501,6 +506,26 @@ bool HouseCharterTokenForChecks(uint32_t nHouseID, uint64_t nChainID, const std:
     });
 }
 
+/** The highest bid in effect in [nActive - WINDOW, nActive] from two postings: C (bid, the active time it took effect)
+ *  and the one before it, P (0 = none). When the day could hold a posting older than P, the fallback stands. */
+static uint64_t BidAtActiveFrom(uint64_t nCurBid, int64_t nCurEffective, uint64_t nPrevBid, int64_t nPrevEffective,
+                                int64_t nActive, int64_t nWindowSecs, uint64_t nFallback)
+{
+    const int64_t nStart = nActive - nWindowSecs;
+    if (nCurEffective <= nActive) {
+        // C is in effect at nActive; before C (if C came inside the day) P was.
+        if (nCurEffective <= nStart || nPrevBid == 0)
+            return nCurBid;
+        if (nPrevEffective <= nStart)
+            return std::max(nCurBid, nPrevBid);
+        return nFallback;
+    }
+    // C came after nActive: P was in effect at nActive.
+    if (nPrevBid == 0 || nPrevEffective > nActive)
+        return nFallback;
+    return nPrevEffective <= nStart ? nPrevBid : nFallback;
+}
+
 uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nActive, uint64_t nFallback,
                          int64_t nWindowSecs, uint32_t nHeight)
 {
@@ -511,35 +536,20 @@ uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nA
     CHouseRate r;
     if (!units.Get(HouseRateKey(nHouseID), r))
         return nFallback;
-    // D-2026-11-20-2 (S1X-4, switch-on; freebankd's audit 11-20): a post at nHeight counts from the next block for every
-    // check, so read at nHeight the posting before it is the current one, and the one before that isn't kept: where it
-    // could matter (the current came inside the day), the fallback stands, as for two postings in the day.
+    // D-2026-11-20-2 (S1X-4, switch-on): a post at nHeight counts from the next block for every check, so read at
+    // nHeight the record is the one at the block's start: C was the previous posting, P the one before it. S1X-40: P is
+    // kept (nPrev2*), so the answer is the same whether the POST sits before or after the reader in the block (before,
+    // with P gone, this branch returned the fallback where the block-start record gave C, max(C, P) or P).
     if (r.nPostHeight >= nHeight) {
         if (r.nPrevBid == 0)
-            return nFallback;
-        r.nBid = r.nPrevBid;
-        r.nPostActive = r.nPrevPostActive;
-        r.nPrevBid = 0;
-        r.nPrevPostActive = 0;
-        const int64_t nStartShifted = nActive - WINDOW;
-        return (r.nPostActive <= nActive && r.nPostActive <= nStartShifted) ? r.nBid : nFallback;
+            return nFallback;   // no posting was in effect at the block's start
+        return BidAtActiveFrom(r.nPrevBid, r.nPrevPostActive, r.nPrev2Bid, r.nPrev2PostActive, nActive, WINDOW,
+                               nFallback);
     }
-    const int64_t nStart = nActive - WINDOW;
     // S1X-19: C counts from the active time it took effect at (its own block's clock); nPrevPostActive was converted
     // the same way when C was posted.
     const int64_t nCurEffective = PostEffectiveActive(units, r.nPostHeight, r.nPostActive);
-    if (nCurEffective <= nActive) {
-        // C is in effect at nActive; before C (if C came inside the day) P was.
-        if (nCurEffective <= nStart || r.nPrevBid == 0)
-            return r.nBid;
-        if (r.nPrevPostActive <= nStart)
-            return std::max(r.nBid, r.nPrevBid);
-        return nFallback;
-    }
-    // C came after nActive: P was in effect at nActive.
-    if (r.nPrevBid == 0 || r.nPrevPostActive > nActive)
-        return nFallback;
-    return r.nPrevPostActive <= nStart ? r.nPrevBid : nFallback;
+    return BidAtActiveFrom(r.nBid, nCurEffective, r.nPrevBid, r.nPrevPostActive, nActive, WINDOW, nFallback);
 }
 
 void SwapFixBidT(CUnitsView& units, const uint256& hashLock, uint32_t nHeight)

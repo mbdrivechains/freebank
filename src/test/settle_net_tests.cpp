@@ -29,6 +29,8 @@
 #include <test/test_bitcoin.h>
 #include <version.h>
 
+#include <tinyformat.h>
+#include <utiltime.h>
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
@@ -776,6 +778,65 @@ BOOST_AUTO_TEST_CASE(ur1_2_netting_receipt_floor_is_546_sats)
     BOOST_CHECK_MESSAGE(r != "OK", "UR1-2 control: a netting receipt of 545 sats was accepted");
     r = round(50000, 545);                     // nets 20 g, but paid 545 sats
     BOOST_CHECK_MESSAGE(r != "OK", "UR1-2: a creditor netting 20 g but paid 545 sats (dust) passed the shape check");
+}
+
+// S1X-36 (NET half). A NET has no house cap; its shape check parses every presenting house's key in full before any
+// input, fee or approver check. A ring of H houses (house i presents house i+1, the last presents the first), 1-byte
+// signatures, as a probe would build it. Measures CheckTransaction at a standard-size round (~100 KB) and a block-size
+// one (~1 MB). A measurement: it prints the medians.
+BOOST_AUTO_TEST_CASE(s1x_36_net_shape_parse_cost)
+{
+    for (const size_t H : {size_t(750), size_t(7500)}) {
+        SettleNet n;
+        for (size_t i = 0; i < H; i++) {
+            CKey k;
+            k.MakeNewKey(true);
+            n.vHouseID.push_back((uint32_t)(i + 1));
+            n.vReceive.push_back(0);
+            n.vPrevMintedUnits.push_back(1000000);
+            n.vPrevLastSettleHeight.push_back(0);
+            n.vPresentKey.push_back(PK(k));
+            n.vPresentSig.push_back(std::vector<unsigned char>(1, 0x01));
+            n.vApproverIndex.push_back({0});
+            n.vApproverSig.push_back({std::vector<unsigned char>(1, 0x02)});
+        }
+        for (size_t i = 0; i + 1 < H; i++) {
+            SettleNetBundle b;
+            b.nPresenter = (uint32_t)(i + 1);
+            b.nIssuer = (uint32_t)(i + 2);
+            b.nUnits = 1000;
+            b.nCount = 1;
+            n.vBundle.push_back(b);
+        }
+        SettleNetBundle last;
+        last.nPresenter = (uint32_t)H;
+        last.nIssuer = 1;
+        last.nUnits = 1000;
+        last.nCount = 1;
+        n.vBundle.push_back(last);
+        n.nExpiryHeight = 0;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_SETTLE_VERSION;
+        mtx.nSettleOp = SETTLE_OP_NET;
+        for (size_t i = 0; i < H; i++)
+            mtx.vin.push_back(CTxIn(COutPoint(uint256S(strprintf("%x", 0x36000 + i)), 0)));
+        mtx.vout.emplace_back(1000, CScript() << OP_TRUE);
+        mtx.vchSettlePayload = Encode(n);
+        const CTransaction tx(mtx);
+        std::vector<int64_t> vT;
+        std::string strReason;
+        for (int r = 0; r < 7; r++) {
+            CValidationState state;
+            const int64_t t0 = GetTimeMicros();
+            const bool fOk = CheckTransaction(tx, state);
+            vT.push_back(GetTimeMicros() - t0);
+            strReason = fOk ? "passes" : state.GetRejectReason();
+        }
+        std::sort(vT.begin(), vT.end());
+        BOOST_TEST_MESSAGE(strprintf("S1X-36 NET: CheckTransaction on %u presenting houses (%u bytes, %s): median %d us (%.2f us a house)",
+                                     (unsigned)H, (unsigned)::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION), strReason,
+                                     vT[vT.size() / 2], double(vT[vT.size() / 2]) / H));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

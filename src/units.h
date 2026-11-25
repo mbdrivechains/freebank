@@ -78,7 +78,8 @@ static const unsigned char UNITS_DB_VERSION = 'v';      // -> uint32 the layout 
 /** The units DB's layout version. 2 = v1.1.0, 3 = no forks (D-2026-11-05-3). 4 = Gold B (D-2026-11-07-1): the oracle,
  *  vault, bond, exit and reporter records are gone, and the chain clock and house rates are new. A DB with blocks in it
  *  and another (or no) version was written by an earlier build: the node asks for -reindex. */
-static const uint32_t UNITS_DB_VERSION_CURRENT = 5;   // 5: Gold B clock records per height (H), demand bids (B), shortfall ledger (M)
+static const uint32_t UNITS_DB_VERSION_CURRENT = 6;   // 5: Gold B clock records per height (H), demand bids (B), shortfall ledger (M);
+                                                      // 6: S1X-40's CHouseRate nPrev2Bid/nPrev2PostActive (security 11-26)
 static const unsigned char UNITS_BLOCK_UNDO = 'u';
 static const unsigned char UNITS_TEST = '~';     // unit tests only
 static const unsigned char UNITS_ISSUED_TOKEN = 'T';    // + token id -> CIssuedToken (issued.h)

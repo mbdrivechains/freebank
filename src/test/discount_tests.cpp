@@ -199,7 +199,8 @@ static CMutableTransaction MakeDiscount(const Scene& s, BillDiscount& dOut,
     // The stored link carries the CLASSIC endorse digest, so the chain stays
     // verifiable from CBill alone.
     BOOST_REQUIRE(s.seller.Sign(
-            BillEndorseSigHash(s.bill.billID, d.endorsement.vchTo, d.endorsement.nAtHeight),
+            BillEndorseSigHash(s.bill.billID, d.endorsement.vchFrom, d.endorsement.vchTo, d.endorsement.nAtHeight,
+                               (uint32_t)s.bill.vEndorsement.size()),
             d.endorsement.vchSig));
 
     // One shared digest carries both authorities.
@@ -1963,7 +1964,8 @@ BOOST_AUTO_TEST_CASE(shipped_ops_refuse_house_held_bills)
         e.endorsement.vchTo = Pub(s.stranger);
         e.endorsement.nAtHeight = (uint32_t)H;
         BOOST_REQUIRE(const_cast<CKey&>(s.custody).Sign(
-                BillEndorseSigHash(s.bill.billID, e.endorsement.vchTo, e.endorsement.nAtHeight),
+                BillEndorseSigHash(s.bill.billID, e.endorsement.vchFrom, e.endorsement.vchTo, e.endorsement.nAtHeight,
+                                   (uint32_t)s.bill.vEndorsement.size()),
                 e.endorsement.vchSig));
         CMutableTransaction mtx;
         mtx.nVersion = TRANSACTION_BILL_VERSION;

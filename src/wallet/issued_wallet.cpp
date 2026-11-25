@@ -1034,7 +1034,8 @@ UniValue gethousecapital(const JSONRPCRequest& request)
             "sECX escrow and the attested till (sECX the house showed it controls at a recent block; it can spend it\n"
             "afterwards), in sats and in mg at the 30-day ask; the issuing caps (capital_cap_mg on the ramp: each escrow\n"
             "tranche counts 1x, doubling per 180 clean days up to 10x; a protest restarts it; an issue is checked against both caps less\n"
-            "pending_swaps_mg, the notes still owed by open swaps); rate_fresh (issuing needs a rate posted within 24 h of the chain clock;\n"
+            "owed_outside_notes_mg: pending_swaps_mg, the notes still owed by open swaps, plus live_shortfall_mg, what swaps paid short\n"
+            "still owe until their lapse); rate_fresh (issuing needs a rate posted within 24 h of the chain clock;\n"
             "rate_posted_time and rate_fresh_until are on that clock, median-time based); and overdue_bills_seen, the bills in its\n"
             "book the chain sees as overdue. That count is never complete: a house can repay a bill for its borrower, so not\n"
             "every bad loan shows. A house closes only when it doesn't pay a demand (D-2026-11-07-3).\n");
@@ -1077,6 +1078,15 @@ UniValue gethousecapital(const JSONRPCRequest& request)
     o.pushKV("deposits_mg", (uint64_t)house.nDepositUnits);
     // Notes still owed by open swaps (units 'W'): the issue checks take them off both caps (GOLD_B §4); the caps shown are gross.
     o.pushKV("pending_swaps_mg", HousePendingSwapUnitsForChecks(nHouseID));
+    // S1X-46: and the live shortfalls of swaps it paid short (S1X-6): the issue checks take pending + live shortfall
+    // (owed_outside_notes_mg) off both caps.
+    {
+        const unsigned __int128 nOwed = HouseOwedOutsideNotesMg(house, nNext);
+        const uint64_t nPending = HousePendingSwapUnitsForChecks(nHouseID);
+        const uint64_t nOwed64 = (uint64_t)std::min<unsigned __int128>(nOwed, (unsigned __int128)UINT64_MAX);
+        o.pushKV("live_shortfall_mg", nOwed64 > nPending ? nOwed64 - nPending : 0);
+        o.pushKV("owed_outside_notes_mg", nOwed64);
+    }
     // The ramp (GOLD_B §5): each escrow tranche at 1x, doubling per 180 clean days, up to the 10% floor's 10x.
     o.pushKV("capital_cap_mg", fCap ? UniValue(cap.nCapacityMg) : NullUniValue);
     o.pushKV("capital_cap_at_full_ramp_mg", (uint64_t)((unsigned __int128)cap.nEscrowMg * 10000 / gp.nCapitalMinBps));

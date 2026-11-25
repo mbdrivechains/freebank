@@ -248,6 +248,13 @@ bool AreFreeBankOutputsStandard(const CTransaction& tx, std::string& reason)
     if (!fHaveFamily && !fFreeBankTx)
         return true;
     const std::vector<Coin> vTag = FreeBankOutputTags(tx);
+    // S1X-50 (security 11-26: Medium; policy only): a house CLOSE and a whole-house residual settle (RECLAIM at an
+    // insolvent house) pay each partner's share at P2PKH and the rest to the mutual fund EXACTLY - consensus pins every
+    // one of those outputs, whatever its size. A 1-sat rounding remainder in the fund, or a share below dust, made the
+    // op non-standard, so stock nodes never relayed or mined it and the partners' whole residual stayed held. Their
+    // P2PKH and fund outputs skip the dust rule (one CLOSE per house; a RECLAIM takes the house's slot).
+    const bool fPinnedPayouts = tx.nVersion == TRANSACTION_HOUSE_VERSION &&
+                                (tx.nHouseOp == HOUSE_OP_CLOSE || tx.nHouseOp == HOUSE_OP_RECLAIM);
     for (size_t o = 0; o < tx.vout.size(); o++) {
         const CScript& script = tx.vout[o].scriptPubKey;
         if (IsFreeBankFamilyScript(script)) {
@@ -258,6 +265,10 @@ bool AreFreeBankOutputsStandard(const CTransaction& tx, std::string& reason)
             }
             continue;
         }
+        if (fPinnedPayouts && (IsMutualFundScript(script) ||
+                               (script.size() == 25 && script[0] == OP_DUP && script[1] == OP_HASH160 &&
+                                script[2] == 20 && script[23] == OP_EQUALVERIFY && script[24] == OP_CHECKSIG)))
+            continue;   // S1X-50: a P2PKH share (consensus forces the shares onto P2PKH) or the fund
         if (fFreeBankTx && !script.IsUnspendable() && IsDust(tx.vout[o], ::dustRelayFee) &&
                 (o >= vTag.size() || !HasFreeBankTag(vTag[o]))) {
             reason = "dust";

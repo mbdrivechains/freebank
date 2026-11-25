@@ -507,7 +507,7 @@ bool IsNotePreAuthScript(const CScript& script);
 /** S1X-14 (security Medium; Michael 2026-11-24 "Yes, build it"): a pre-auth NOTE demand's custody lock carries its
  *  demand id, so the standing authorisation can be bound to that one demand:
  *   <20-byte holder keyid> OP_DROP <32-byte demand id> OP_DROP OP_TRUE
- *  The demand id is NoteHashPrevouts(the DEMAND tx): unique, and known when the holder signs the pre-auth inside the
+ *  The demand id is NoteDemandId(the DEMAND tx): unique, and known when the holder signs the pre-auth inside the
  *  DEMAND (its block height isn't). A PROTEST re-issue copies it; the discharge REDEEM reads it from the coins it burns.
  *  Deposit receipts keep the 23-byte form: DepositPreAuthSigHash already pins one receipt. */
 CScript NoteDemandCustodyScript(const std::vector<unsigned char>& vchPubKey, const uint256& demandId);
@@ -522,6 +522,13 @@ bool NoteCustodyKeyIs(const CScript& script, const std::vector<unsigned char>& v
  * second, differently-funded mint (MINT spends only fungible plain inputs, so
  * without this its authorization is replayable). */
 uint256 NoteHashPrevouts(const CTransaction& tx);
+
+/** S1X-42 (testing: Low; Michael 2026-11-26 "Yes, build all 6"): a pre-auth note demand's id commits to the DEMAND's
+ *  payout script and unit vector as well as its inputs. With the inputs alone (S1X-14's NoteHashPrevouts) a replaced
+ *  DEMAND over the same inputs had the confirmed one's id, so the replaced one's pre-auth signature discharged the
+ *  confirmed demand's coins to the payout the holder had replaced. */
+uint256 NoteDemandId(const CTransaction& tx, const std::vector<uint64_t>& vUnits,
+                     const std::vector<unsigned char>& vchPayoutScript);
 
 uint256 NoteMintSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 NoteTransferSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);

@@ -1020,12 +1020,14 @@ BOOST_AUTO_TEST_CASE(house_attest_hash_helpers)
     // Approver sighash binds every field
     const uint256 ps = HouseAttestProofSetHash({p1});
     const uint256 ho = uint256S("ee");
-    const uint256 sh = HouseAttestSigHash(houseA, 100, 5000, ps, ho);
-    BOOST_CHECK(sh != HouseAttestSigHash(houseB, 100, 5000, ps, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 101, 5000, ps, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5001, ps, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, HouseAttestProofSetHash({p3}), ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, ps, uint256S("ef")));
+    const uint256 hp = uint256S("dd");
+    const uint256 sh = HouseAttestSigHash(houseA, 100, 5000, ps, hp, ho);
+    BOOST_CHECK(sh != HouseAttestSigHash(houseB, 100, 5000, ps, hp, ho));
+    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 101, 5000, ps, hp, ho));
+    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5001, ps, hp, ho));
+    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, HouseAttestProofSetHash({p3}), hp, ho));
+    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, ps, hp, uint256S("ef")));
+    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, ps, uint256S("de"), ho));   // S1X-35: the prevouts
 }
 
 // Build a shape-valid ATTEST tx around the given payload
@@ -1360,7 +1362,7 @@ BOOST_AUTO_TEST_CASE(house_op_status_guards)
         mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
         def.vApproverIndex.push_back(0);
         std::vector<unsigned char> vchSig;
-        BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, BillHashOutputs(mtx)), vchSig));
+        BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)), vchSig));
         def.vApproverSig.push_back(vchSig);
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << def;
         mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
@@ -2136,7 +2138,7 @@ BOOST_AUTO_TEST_CASE(testing_ur3_3_stale_prior_does_not_ban_in_mempool)
     mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
     def.vApproverIndex.push_back(0);
     std::vector<unsigned char> vchSig;
-    BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, BillHashOutputs(mtx)), vchSig));
+    BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)), vchSig));
     def.vApproverSig.push_back(vchSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << def;
@@ -2342,6 +2344,7 @@ CMutableTransaction URX12Attest(const CHouse& house, uint32_t nHeight, const CKe
     att.vApproverIndex.push_back(0);
     att.vApproverSig.push_back(URX12Sign(key, HouseAttestSigHash(house.houseID, att.nAsOfHeight, att.amountReserves,
                                                                  HouseAttestProofSetHash(att.vProofs),
+                                                                 NoteHashPrevouts(CTransaction(mtx)),
                                                                  BillHashOutputs(mtx))));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << att;
@@ -2366,6 +2369,7 @@ CMutableTransaction URX12Defer(const CHouse& house, const CKey& key)
     mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
     def.vApproverIndex.push_back(0);
     def.vApproverSig.push_back(URX12Sign(key, HouseDeferSigHash(house.houseID, def.nPrevLastActivation,
+                                                                NoteHashPrevouts(CTransaction(mtx)),
                                                                 BillHashOutputs(mtx))));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << def;
@@ -2544,14 +2548,14 @@ URX13Set URX13HouseDigests()
     v.push_back({"HouseExitSigHash", [] { return HouseExitSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
     v.push_back({"HouseWinddownSigHash", [] { return HouseWinddownSigHash(URX13_ID, URX13_HP, URX13_HO); }});
     v.push_back({"HouseReclaimSigHash", [] { return HouseReclaimSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
-    v.push_back({"HouseDeferSigHash", [] { return HouseDeferSigHash(URX13_ID, 0, URX13_HO); }});
+    v.push_back({"HouseDeferSigHash", [] { return HouseDeferSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
     v.push_back({"HouseRenewSigHash", [] { return HouseRenewSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
     v.push_back({"HouseReleaseSigHash", [] { return HouseReleaseSigHash(URX13_ID, URX13_HP, URX13_HO); }});
     v.push_back({"HouseMemberSigHash",
                  [] { return HouseMemberSigHash(URX13_ID, HOUSE_OP_MEMBER_ADD, HouseMemberOp(), URX13_HP); }});
     v.push_back({"HouseRateSigHash", [tx] { return HouseRateSigHash(1, tx, HouseRate()); }});
     v.push_back({"HouseCharterSigHash", [tx] { return HouseCharterSigHash(1, tx, HouseCharter()); }});
-    v.push_back({"HouseAttestSigHash", [] { return HouseAttestSigHash(URX13_ID, 100, 100000, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseAttestSigHash", [] { return HouseAttestSigHash(URX13_ID, 100, 100000, URX13_HP, URX13_HP, URX13_HO); }});
     return v;
 }
 
@@ -2561,7 +2565,7 @@ URX13Set URX13OtherDigests()
     URX13Set v;
     v.push_back({"BillIssueSigHash", [] {
         return BillIssueSigHash(URX13_ID, 10000, 546, 8000, 144, URX13_PUB, URX13_PUB2, URX13_PUB, 5); }});
-    v.push_back({"BillEndorseSigHash", [] { return BillEndorseSigHash(URX13_ID, URX13_PUB, 100); }});
+    v.push_back({"BillEndorseSigHash", [] { return BillEndorseSigHash(URX13_ID, URX13_PUB, URX13_PUB, 100, 0); }});
     v.push_back({"BillRetireSigHash", [] { return BillRetireSigHash(URX13_ID, 1000, URX13_HP, URX13_HO, false); }});
     v.push_back({"BillClaimSigHash", [] { return BillClaimSigHash(URX13_ID, URX13_HP, URX13_HO, false); }});
     v.push_back({"DepositTransferSigHash", [] { return DepositTransferSigHash(1, 100000, 500, 8000, 100, URX13_HO); }});
@@ -3898,6 +3902,316 @@ BOOST_AUTO_TEST_CASE(s1x_16a_admit_approval_expires)
                       "bad-house-admit-expiry-far");
     // The signatures bind the expiry: a relayer can't extend an approval.
     BOOST_CHECK_EQUAL(run(build(E, E + 100), (int)E + 1, false).strReason, "bad-house-admit-new-sig");
+}
+
+// ===========================================================================
+// testing (2026-11-26): S1X-35 (Claude max run 4 #3; security 11-26 Medium, the S1X-16b class; fixed in consensus batch 2,
+// Michael 2026-11-26 "Yes, build all 6"). A displaced, unmined ATTEST, re-funded by anyone, executes later: the approvers
+// signed as-of, reserves, proofs and outputs, not the inputs, and the undo priors are only compared with the record.
+// The house is Stressed with a live protest; its wallet builds ATTEST_A; the partners DEFER instead (DEFER doesn't move
+// the last attestation, so ATTEST_A's as-of stays newer); a relayer sends ATTEST_A with a funding input of its own and the
+// post-DEFER priors, and on master it counts as a recovery and lifts the deferral the partners just invoked. The same for
+// a DEFER re-funded with another input. (The relayer can't keep the house's own funding input: the house's input
+// signature covers the payload with its old priors. CheckHouseOperation doesn't see input scripts, so that half isn't
+// here.) Run4AttestDigest / Run4DeferDigest use the fix's form (with the prevouts) when it exists and master's otherwise,
+// so this file builds before and after the fix.
+// FAILS on master 7f65d2e (both re-funded ops accepted); passes on mb/consensus-batch-2 (both refused for their approver
+// signature; the same ops signed over their own inputs are accepted).
+// ===========================================================================
+namespace {
+template <typename H>
+auto Run4AttestDigestImpl(const uint256& id, uint32_t nAsOf, const CAmount& amount, const H& proofs, const H& prevouts,
+                          const H& outputs, int) -> decltype(HouseAttestSigHash(id, nAsOf, amount, proofs, prevouts, outputs))
+{
+    return HouseAttestSigHash(id, nAsOf, amount, proofs, prevouts, outputs);
+}
+template <typename H>
+auto Run4AttestDigestImpl(const uint256& id, uint32_t nAsOf, const CAmount& amount, const H& proofs, const H& prevouts,
+                          const H& outputs, long) -> decltype(HouseAttestSigHash(id, nAsOf, amount, proofs, outputs))
+{
+    (void)prevouts;
+    return HouseAttestSigHash(id, nAsOf, amount, proofs, outputs);
+}
+template <typename H>
+auto Run4DeferDigestImpl(const uint256& id, uint32_t nPrev, const H& prevouts, const H& outputs, int)
+    -> decltype(HouseDeferSigHash(id, nPrev, prevouts, outputs))
+{
+    return HouseDeferSigHash(id, nPrev, prevouts, outputs);
+}
+template <typename H>
+auto Run4DeferDigestImpl(const uint256& id, uint32_t nPrev, const H& prevouts, const H& outputs, long)
+    -> decltype(HouseDeferSigHash(id, nPrev, outputs))
+{
+    (void)prevouts;
+    return HouseDeferSigHash(id, nPrev, outputs);
+}
+
+// The ATTEST payload a wallet builds for `house` at nHeight (zero reserves; as-of nHeight - 1), priors from `house`.
+HouseAttest Run4AttestPayload(const CHouse& house, uint32_t nHeight)
+{
+    HouseAttest att;
+    att.nHouseID = house.nHouseID;
+    att.nSchemaVersion = 1;
+    att.nAsOfHeight = nHeight - 1;
+    att.amountReserves = 0;
+    att.nPrevLastAttestHeight = house.nLastAttestHeight;
+    att.nPrevStressSince = house.nStressSinceHeight;
+    att.amountPrevReserves = house.amountLastAttestReserves;
+    att.nPrevDeferInvokedHeight = house.nDeferInvokedHeight;
+    att.nPrevDeferRenewals = house.nDeferRenewals;
+    att.nPrevDeferCumBlocks = house.nDeferCumBlocks;
+    att.nPrevDeferEndedHeight = house.nDeferEndedHeight;
+    att.nPrevCureLeft = house.nCureLeft;
+    att.nPrevEpisodeDeferBlocks = house.nEpisodeDeferBlocks;
+    att.nPrevEpisodeFloorUsed = house.fEpisodeFloorUsed;
+    att.nPrevDeferInEpisode = house.fDeferInEpisode;
+    return att;
+}
+
+// The ATTEST tx around `att`, funded by `funding`; the approver signs it if fSign (else att's signatures are kept).
+CMutableTransaction Run4AttestTx(const CHouse& house, HouseAttest att, const COutPoint& funding, const CKey& key, bool fSign)
+{
+    CMutableTransaction mtx = MakeAttestTx(att);
+    mtx.vin.clear();
+    mtx.vin.push_back(CTxIn(funding));
+    if (fSign) {
+        att.vApproverIndex.assign(1, 0);
+        att.vApproverSig.assign(1, URX12Sign(key, Run4AttestDigestImpl(house.houseID, att.nAsOfHeight, att.amountReserves,
+                                                                         HouseAttestProofSetHash(att.vProofs),
+                                                                         NoteHashPrevouts(CTransaction(mtx)),
+                                                                         BillHashOutputs(mtx), 0)));
+    }
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << att;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+
+// URX12Defer's DEFER, funded by `funding`; signed by the approver if fSign, else carrying vSigFrom's signatures.
+CMutableTransaction Run4DeferTx(const CHouse& house, const COutPoint& funding, const CKey& key, bool fSign,
+                                const CMutableTransaction* pSigFrom = nullptr)
+{
+    HouseDefer def;
+    def.nHouseID = house.nHouseID;
+    def.nPrevLastActivation = house.nDeferLastActivation;
+    def.nPrevEpisodeAnchor = house.nEpisodeAnchor;
+    def.nPrevEpisodeDeferBlocks = house.nEpisodeDeferBlocks;
+    def.nPrevEpisodeFloorUsed = house.fEpisodeFloorUsed;
+    def.nPrevDeferInEpisode = house.fDeferInEpisode;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+    mtx.nHouseOp = HOUSE_OP_DEFER;
+    mtx.vin.push_back(CTxIn(funding));
+    mtx.vout.push_back(CTxOut(std::max<CAmount>(house.amountLastAttestReserves, 1000), HouseEscrowScript(house.houseID)));
+    mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
+    if (fSign) {
+        def.vApproverIndex.assign(1, 0);
+        def.vApproverSig.assign(1, URX12Sign(key, Run4DeferDigestImpl(house.houseID, def.nPrevLastActivation,
+                                                                       NoteHashPrevouts(CTransaction(mtx)),
+                                                                       BillHashOutputs(mtx), 0)));
+    } else {
+        HouseDefer from;
+        CDataStream ssFrom(pSigFrom->vchHousePayload, SER_NETWORK, PROTOCOL_VERSION);
+        ssFrom >> from;
+        def.vApproverIndex = from.vApproverIndex;
+        def.vApproverSig = from.vApproverSig;
+    }
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << def;
+    mtx.vchHousePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+
+const char* Run4Status(const CHouse& house, uint32_t h)
+{
+    switch (HouseEffectiveStatus(house, (int)h)) {
+    case HOUSE_STATUS_OPEN: return "Open";
+    case HOUSE_STATUS_STRESSED: return "Stressed";
+    case HOUSE_STATUS_DEFERRED: return "Deferred";
+    case HOUSE_STATUS_INSOLVENT: return "Insolvent";
+    default: return "other";
+    }
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_35_a_displaced_attest_or_defer_cannot_be_refunded_by_another)
+{
+    CKey keyPartner;
+    keyPartner.MakeNewKey(true);
+    const CPubKey pubPartner = keyPartner.GetPubKey();
+    CHouse house = MakeGuardHouse();
+    house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
+    house.nMintedUnits = 0;
+    house.amountLastAttestReserves = 0;
+    const uint32_t P0 = 2000;   // a demand protested at P0, unpaid; the house attested at P0
+    house.nProtestOpen = 1;
+    house.nProtestHeight = P0;
+    house.nProtestDemandHeight = P0 - 10;
+    house.nLastAttestHeight = P0;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, P0 + 1), HOUSE_STATUS_STRESSED);
+
+    const COutPoint fundHouse(uint256S("35a0"), 0), fundRelayer(uint256S("35e1"), 3);
+
+    // ATTEST_A: the house's wallet builds and its approver signs it at P0 + 4 (as-of P0 + 3); it is not mined.
+    const HouseAttest attA = [&] {
+        const CMutableTransaction m = Run4AttestTx(house, Run4AttestPayload(house, P0 + 4), fundHouse, keyPartner, true);
+        HouseAttest a;
+        CDataStream ss(m.vchHousePayload, SER_NETWORK, PROTOCOL_VERSION);
+        ss >> a;
+        return a;
+    }();
+
+    // The partners DEFER instead, at P0 + 5.
+    const CMutableTransaction mtxDefer = Run4DeferTx(house, COutPoint(uint256S("35d0"), 0), keyPartner, true);
+    std::string r = URX12Run(house, mtxDefer, P0 + 5);
+    BOOST_REQUIRE_MESSAGE(r.empty(), "S1X-35 setup: the partners' DEFER was refused: " + r);
+    BOOST_REQUIRE_MESSAGE(HouseEffectiveStatus(house, P0 + 6) == HOUSE_STATUS_DEFERRED,
+                          std::string("S1X-35 setup: after the DEFER the house is ") + Run4Status(house, P0 + 6));
+
+    // At P0 + 6 a relayer sends ATTEST_A with its own funding input and the post-DEFER priors, keeping the approver's
+    // signature.
+    {
+        HouseAttest att = Run4AttestPayload(house, P0 + 4);   // the post-DEFER priors, ATTEST_A's as-of
+        att.vApproverIndex = attA.vApproverIndex;
+        att.vApproverSig = attA.vApproverSig;
+        CHouse houseAfter = house;
+        r = URX12Run(houseAfter, Run4AttestTx(house, att, fundRelayer, keyPartner, false), P0 + 6);
+        BOOST_CHECK_MESSAGE(r == "bad-house-attest-approver",
+                            "S1X-35: the displaced ATTEST re-funded by a relayer after the partners' DEFER was " +
+                            (r.empty() ? std::string("ACCEPTED: the house is now ") + Run4Status(houseAfter, P0 + 7) +
+                                             " (it was Deferred), so the deferral the partners invoked is lifted"
+                                       : "refused for another reason: " + r));
+        // Control: the same attestation signed over its own inputs is accepted (the partners' own recovery).
+        houseAfter = house;
+        r = URX12Run(houseAfter, Run4AttestTx(house, Run4AttestPayload(house, P0 + 4), fundRelayer, keyPartner, true), P0 + 6);
+        BOOST_CHECK_MESSAGE(r.empty(), "S1X-35 control: the ATTEST signed over its own inputs was refused: " + r);
+    }
+
+    // A DEFER the partners signed over one funding input, re-funded by someone else before any other activation.
+    {
+        CHouse houseStressed = MakeGuardHouse();
+        houseStressed.vPartner[0].vchPubKey = house.vPartner[0].vchPubKey;
+        houseStressed.nMintedUnits = 0;
+        houseStressed.amountLastAttestReserves = 0;
+        houseStressed.nProtestOpen = 1;
+        houseStressed.nProtestHeight = P0;
+        houseStressed.nProtestDemandHeight = P0 - 10;
+        houseStressed.nLastAttestHeight = P0;
+        const CMutableTransaction mtxSigned = Run4DeferTx(houseStressed, fundHouse, keyPartner, true);
+        CHouse h1 = houseStressed;
+        r = URX12Run(h1, Run4DeferTx(houseStressed, fundRelayer, keyPartner, false, &mtxSigned), P0 + 5);
+        BOOST_CHECK_MESSAGE(r == "bad-house-defer-approver",
+                            "S1X-35: a DEFER the partners signed over another funding input, re-funded by a relayer, was " +
+                            (r.empty() ? std::string("ACCEPTED") : "refused for another reason: " + r));
+        CHouse h2 = houseStressed;
+        r = URX12Run(h2, mtxSigned, P0 + 5);
+        BOOST_CHECK_MESSAGE(r.empty(), "S1X-35 control: the DEFER over its own input was refused: " + r);
+    }
+}
+
+// ===========================================================================
+// testing (2026-11-26): S1X-50 (security 11-26: Low; from testing's S1X-15 site list). CLOSE pins every partner share
+// and the mutual-fund output to exact values. A partner output is untagged P2PKH, and the fund output isn't tagged
+// either (AddCoins tags no CLOSE output), so AreFreeBankOutputsStandard refuses a CLOSE in which either one is below
+// dust. Then the failed house can't CLOSE through standard relay. The fund is the rounding remainder whenever the
+// residual covers the live escrow, so a 1-sat fund is the ordinary case, not an edge case.
+// The fix's layout isn't settled. Security's suggestion (not yet agreed): fold every share below dust into the fund,
+// and if the fund is still below dust it goes to the fee (no fund output). So for each case this test asks only that
+// SOME CLOSE be valid at consensus AND standard, trying two layouts: master's (exact shares + fund) and security's.
+// If the fix chooses a third layout, add it to the candidates.
+// FAILS on master 7f65d2e in cases (a), (b) and (c) (master's layout is refused "dust", security's is refused at
+// consensus); the control passes.
+// ===========================================================================
+namespace {
+struct Run4CloseCase {
+    const char* name;
+    CAmount pot;               // the insolvency pot (the senior claim is 100 units at 1 sat a mg)
+    CAmount live0, live1;      // the two partners' live pledge coins
+    CAmount pledge0, pledge1;  // their insolvent pledges (the share weights)
+};
+
+// The CLOSE outputs consensus pins today, and security's suggested layout.
+void Run4CloseLayouts(const CHouse& house, CAmount live, std::vector<CTxOut>& vMaster, std::vector<CTxOut>& vFolded,
+                      std::string& strShape)
+{
+    const CAmount senior = SeniorSatsReserved(house.nInsolventUnits + house.nInsolventDepositPrincipal,
+                                              house.nInsolventGoldMg, house.amountInsolventPot,
+                                              house.nInsolventSatsPerGram);
+    const CAmount residual = house.amountInsolventPot > senior ? house.amountInsolventPot - senior : 0;
+    const CAmount paid = std::min(residual, live);
+    const CAmount sum = house.vPartner[0].amountInsolventPledge + house.vPartner[1].amountInsolventPledge;
+    std::vector<CTxOut> vShare;
+    CAmount shares = 0;
+    for (size_t j = 0; j < 2 && paid > 0; j++) {
+        const CAmount s = HouseResidualShare(house.vPartner[j].amountInsolventPledge, paid, sum);
+        if (s > 0) {
+            vShare.emplace_back(s, NoteScriptForPubKey(house.vPartner[j].vchPubKey));
+            shares += s;
+        }
+    }
+    const CAmount fund = live - shares;
+    vMaster = vShare;
+    if (fund > 0)
+        vMaster.emplace_back(fund, MutualFundScript());
+    const CAmount dust = GetDustThreshold(CTxOut(0, NoteScriptForPubKey(house.vPartner[0].vchPubKey)), ::dustRelayFee);
+    vFolded.clear();
+    CAmount folded = fund;
+    for (const CTxOut& o : vShare) {
+        if (o.nValue < dust)
+            folded += o.nValue;
+        else
+            vFolded.push_back(o);
+    }
+    const CAmount dustFund = GetDustThreshold(CTxOut(0, MutualFundScript()), ::dustRelayFee);
+    if (folded >= dustFund)
+        vFolded.emplace_back(folded, MutualFundScript());
+    strShape = strprintf("shares %s, fund %d (dust %d)",
+                         [&] { std::string r; for (const CTxOut& o : vShare) r += (r.empty() ? "" : "+") + std::to_string(o.nValue); return r.empty() ? std::string("none") : r; }(),
+                         fund, dust);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(s1x_50_a_failed_house_can_always_close_through_standard_relay)
+{
+    const COutPoint a0(uint256S("a0"), 0), a1(uint256S("a1"), 0);
+    const std::vector<Run4CloseCase> vCase = {
+        {"control: every output above dust", 2000100, 1000000, 1000000, 1000000, 1000000},
+        {"(a) a sub-dust partner share", 300100, 1000000, 1000, 1000000, 1000},
+        {"(b) a sub-dust fund (the rounding remainder)", 50000000, 500000, 500001, 500000, 500000},
+        {"(c) a sub-dust share and a sub-dust fund, below dust together", 50000000, 1000000, 101, 1000000, 100},
+    };
+    for (const Run4CloseCase& c : vCase) {
+        CHouse house = MakeFailedHouse(c.pot);
+        house.vPartner[0].amountInsolventPledge = c.pledge0;
+        house.vPartner[1].amountInsolventPledge = c.pledge1;
+        const int nOpen = (int)HouseClaimWindowCloses(house, 1000000);
+        BOOST_REQUIRE(nOpen > 0);
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+        auto fnGetCoin = [&](const COutPoint& o, Coin& coin) {
+            if (o == a0) { coin = GuardEscrowCoin(house.nHouseID, c.live0); return true; }
+            if (o == a1) { coin = GuardEscrowCoin(house.nHouseID, c.live1); return true; }
+            return false;
+        };
+        std::vector<CTxOut> vMaster, vFolded;
+        std::string strShape;
+        Run4CloseLayouts(house, c.live0 + c.live1, vMaster, vFolded, strShape);
+        std::string strReport;
+        bool fAny = false;
+        for (int k = 0; k < 2; k++) {
+            const CMutableTransaction mtx = MakeCloseTx(house.nHouseID, {a0, a1}, k == 0 ? vMaster : vFolded);
+            CValidationState state;
+            CHouse houseOut;
+            const bool fConsensus = CheckHouseOperation(CTransaction(mtx), state, nOpen, fnGetHouse, GuardNoHash,
+                                                        GuardNoClass, fnGetCoin, GuardNoBlock, houseOut);
+            std::string strPolicy;
+            const bool fStandard = AreFreeBankOutputsStandard(CTransaction(mtx), strPolicy);
+            fAny = fAny || (fConsensus && fStandard);
+            strReport += strprintf("%s layout: consensus %s, policy %s; ", k == 0 ? "master's" : "security's",
+                                   fConsensus ? "OK" : state.GetRejectReason(), fStandard ? "OK" : strPolicy);
+        }
+        BOOST_CHECK_MESSAGE(fAny, strprintf("S1X-50 %s (%s): no CLOSE is both valid and standard: %s", c.name, strShape,
+                                            strReport));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

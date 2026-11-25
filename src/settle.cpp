@@ -91,6 +91,13 @@ static bool IsValidSettlePubKey(const std::vector<unsigned char>& vch)
     return pubkey.IsFullyValid();
 }
 
+/** S1X-36: a compressed key's bytes only (no curve work), for the NET's presenting keys - one per house, with no cap on
+ *  houses in a round. The point is parsed when CheckSettleNetOperation verifies the presenter's signature with it. */
+static bool IsSettlePubKeyShape(const std::vector<unsigned char>& vch)
+{
+    return vch.size() == CPubKey::COMPRESSED_PUBLIC_KEY_SIZE && (vch[0] == 0x02 || vch[0] == 0x03);
+}
+
 static bool IsSettleSigShape(const std::vector<unsigned char>& vchSig)
 {
     return !vchSig.empty() && vchSig.size() <= 80;
@@ -247,7 +254,7 @@ static bool CheckSettleNetShape(const CTransaction& tx, CValidationState& state)
             if (!n.vPresentSig[i].empty())
                 return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig");
         } else {
-            if (!IsValidSettlePubKey(n.vPresentKey[i]))
+            if (!IsSettlePubKeyShape(n.vPresentKey[i]))   // S1X-36: parsed at the signature check
                 return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-key");
             if (!IsSettleSigShape(n.vPresentSig[i]))
                 return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig");

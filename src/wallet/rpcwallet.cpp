@@ -6361,8 +6361,11 @@ UniValue decodenetting(const JSONRPCRequest& request)
             CDataStream ss(r.vchTx, SER_NETWORK, PROTOCOL_VERSION);
             ss >> mtx;
             SettleNet n;
+            // S1X-44 (testing: Low): every per-house vector this reads, vPresentKey included, is one per house - the
+            // round comes from a counterparty, and a short vPresentKey made this read past the end (SIGSEGV).
             if (DecodeSettlePayload(mtx.vchSettlePayload, n) && n.vApproverSig.size() == n.vHouseID.size() &&
-                    n.vPresentSig.size() == n.vHouseID.size()) {
+                    n.vPresentSig.size() == n.vHouseID.size() && n.vPresentKey.size() == n.vHouseID.size() &&
+                    n.vApproverIndex.size() == n.vHouseID.size()) {
                 fComplete = true;
                 for (size_t i = 0; i < n.vHouseID.size(); i++) {
                     const bool fSigned = !n.vApproverSig[i].empty() &&
@@ -7303,7 +7306,9 @@ UniValue signdiscount(const JSONRPCRequest& request)
             "  \"face_mg\": n,           (numeric) what the drawee owes at maturity, mg of gold\n"
             "  \"price_mg\": n,          (numeric) what the house pays now (new notes to the seller), mg of gold\n"
             "  \"bond\": x.xxx,          (numeric) the seller's bond in escrow, sECX\n"
-            "  \"repay_rate\": n,        (numeric) sats per gram the bill repays at, the two figures below use (null: no rate)\n"
+            "  \"ref_house_id\": n,      (numeric) the bill's reference house: the drawee repays at its 30-day highest ask\n"
+            "  \"repay_rate\": n,        (numeric) sats per gram the bill repays at (the reference house's ask), the two\n"
+            "                            figures below use (null: no rate)\n"
             "  \"max_deficiency\": x.xxx, (numeric) face not covered by the bond, sECX at that price\n"
             "  \"max_loss\": x.xxx       (numeric) price minus bond, sECX at that price: the most the house loses if the drawee pays\n"
             "                            nothing. Recourse to the seller is CAPPED at the bond, not added to it\n"
@@ -7345,18 +7350,26 @@ UniValue signdiscount(const JSONRPCRequest& request)
             return response;
     }
     // v1.1.1: the face and price are mg of gold, the bond sECX; the two loss figures compare them at the rate the bill
-    // repays at once discounted: the BUYING house's highest ask of the last 30 days (a bill a house holds repays at its
-    // own ask; security stage A W3: the reference house's ask could show a loss of 0).
+    // repays at once discounted. S1X-39 (testing: Medium; security 11-26): that is the bill's REFERENCE house's highest
+    // ask of the last 30 days (D-2026-11-20-1, S1X-1: consensus's BillRepaymentOwed for ops 3, 7, 9 and 10), its window
+    // ending at that house's failure if it has failed - not the buying house's ask, which stage A W3 had shown here.
     response.pushKV("face_mg", (uint64_t)bill.amount);
     response.pushKV("price_mg", (uint64_t)prop.amountPrice);
     response.pushKV("bond", ValueFromAmount(bill.amountEscrow));
+    response.pushKV("ref_house_id", (uint64_t)bill.nRefHouseID);
     uint64_t nPrice = 0;
     bool fPrice;
     {
         LOCK(cs_main);
         uint64_t nBidUnused = 0;
-        const uint32_t nRepayHouse = prop.nHouseID;
-        fPrice = HouseRateMaxForChecks(nRepayHouse, chainActive.Height() + 1, 30, nBidUnused, nPrice) && nPrice > 0;
+        const int nNext = chainActive.Height() + 1;
+        int nAnchor = 0;
+        CHouse ref;
+        if (bill.nRefHouseID != 0 && phousetree->GetHouse(bill.nRefHouseID, ref) &&
+                HouseEffectiveStatus(ref, nNext) == HOUSE_STATUS_INSOLVENT)
+            nAnchor = (int)HouseInsolventSince(ref, nNext);
+        fPrice = (nAnchor > 0 ? HouseRateMaxAtForChecks(bill.nRefHouseID, nAnchor, 30, nBidUnused, nPrice)
+                              : HouseRateMaxForChecks(bill.nRefHouseID, nNext, 30, nBidUnused, nPrice)) && nPrice > 0;
     }
     if (fPrice) {
         auto toSats = [nPrice](uint64_t nMg) {

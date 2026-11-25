@@ -748,7 +748,7 @@ static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
 //! requires less (v1.2.3 and older, and builds before S5X-2) keeps its
 //! withdrawal-bundle and deposit entries but loses its verified-BMM ones, so
 //! those blocks are checked again.
-static const int BMM_CACHE_S5X2_MIN_VERSION = 1020500;
+static const int BMM_CACHE_S5X2_MIN_VERSION = 1020600;
 
 void DumpMainBlockCache();
 

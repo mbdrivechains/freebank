@@ -63,10 +63,15 @@ struct CHouseRate {
     // D-2026-11-11-3 (security RS-1): the previous posting's clock, so freshness goes with the price - a POST at h
     // refreshes the house from h+1, when its rate takes effect (HouseRateFresh), never inside its own block.
     int64_t nPrevPostTime;
+    // S1X-40 (testing: Low; security 11-26: Medium; Michael 2026-11-26 "Yes, build all 6"): the posting before the
+    // previous one (its bid, and the active time it took effect at), so a read at the height of a POST - which counts
+    // from the next block - sees the record as it stood at the block's start, whatever the order inside the block.
+    uint64_t nPrev2Bid;
+    int64_t nPrev2PostActive;
 
     CHouseRate() : nBid(0), nAsk(0), nPostHeight(0), nPostTime(0), nPrevBid(0), nPrevAsk(0), nRiseCurStart(0),
                    nRiseCurMin(0), nRisePrevMin(0), nRestoreMax(0), nRestoreUntil(0), nPostActive(0), nPrevPostActive(0),
-                   nPrevPostTime(0) {}
+                   nPrevPostTime(0), nPrev2Bid(0), nPrev2PostActive(0) {}
 
     ADD_SERIALIZE_METHODS
     template <typename Stream, typename Operation>
@@ -85,6 +90,8 @@ struct CHouseRate {
         READWRITE(nPostActive);
         READWRITE(nPrevPostActive);
         READWRITE(nPrevPostTime);
+        READWRITE(nPrev2Bid);          // S1X-40
+        READWRITE(nPrev2PostActive);
     }
 };
 

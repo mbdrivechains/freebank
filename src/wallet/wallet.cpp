@@ -3624,7 +3624,8 @@ bool CWallet::EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t
     endorse.endorsement.vchTo = vchToPubKey;
     endorse.endorsement.nAtHeight = nAtHeight;
 
-    const uint256 sighash = BillEndorseSigHash(bill.billID, vchToPubKey, nAtHeight);
+    const uint256 sighash = BillEndorseSigHash(bill.billID, bill.vchHolderPubKey, vchToPubKey, nAtHeight,
+                                               (uint32_t)bill.vEndorsement.size());   // S1X-34
     if (!keyHolder.Sign(sighash, endorse.endorsement.vchSig)) {
         strFail = "Failed to sign endorsement!";
         return false;
@@ -4321,10 +4322,12 @@ static uint64_t WalletGoldCap(const CHouse& house, int nHeight, bool fTill, CAmo
     if (!HouseCapitalForChecks(house, nHeight, amountTillSats, cap))
         return 0;
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
-    // As consensus counts it (CapitalCapUnits / TillCapUnits): the ramped capacity, less the pending swaps.
+    // As consensus counts it (CapitalCapUnits / TillCapUnits): the ramped capacity, less what the house owes outside its
+    // notes. S1X-46 (testing: Low): that is the pending swaps AND the live shortfalls (HouseOwedOutsideNotesMg, S1X-6);
+    // with the pending swaps alone a house with a live shortfall built and signed issues consensus then refused.
     const uint64_t nCap = fTill ? (uint64_t)((unsigned __int128)cap.nTillMg * 10000 / gp.nTillMinBps) : cap.nCapacityMg;
-    const uint64_t nPending = HousePendingSwapUnitsForChecks(house.nHouseID);
-    return nCap > nPending ? nCap - nPending : 0;
+    const unsigned __int128 nOwed = HouseOwedOutsideNotesMg(house, nHeight);
+    return (unsigned __int128)nCap > nOwed ? nCap - (uint64_t)nOwed : 0;
 }
 
 bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee, const CScript& scriptRecipient)
@@ -5478,9 +5481,10 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
             return false;
         }
         dem.vchPayoutScript = std::vector<unsigned char>(scriptPay.begin(), scriptPay.end());
-        // S1X-14: the demand id is NoteHashPrevouts of this tx (its inputs are all in by now); the custody output
-        // carries it and the standing authorisation signs it, so it can discharge only this demand.
-        const uint256 demandId = NoteHashPrevouts(CTransaction(mtx));
+        // S1X-14: the demand id is this tx's (its inputs are all in by now; S1X-42: with the payout script and the
+        // vector, NoteDemandId); the custody output carries it and the standing authorisation signs it, so it can
+        // discharge only this demand.
+        const uint256 demandId = NoteDemandId(CTransaction(mtx), dem.vUnits, dem.vchPayoutScript);
         mtx.vout[0].scriptPubKey = NoteDemandCustodyScript(spend[0].vchHolderPubKey, demandId);
         CKey keyPre;
         if (!GetKey(CPubKey(spend[0].vchHolderPubKey).GetID(), keyPre) ||
@@ -5798,8 +5802,8 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
         NoteDemand dem;
         if (!DecodeNotePayload(ptx->vchNotePayload, dem) || dem.nHouseID != nHouseID || !dem.fPreAuth)
             continue;
-        // The script binds the coins to THIS tx (S1X-14: the id is its prevouts hash).
-        if (NoteDemandCustodyScript(dem.vchHolderPubKey, NoteHashPrevouts(*ptx)) != group.first)
+        // The script binds the coins to THIS tx (S1X-14; S1X-42: its prevouts, vector and payout, NoteDemandId).
+        if (NoteDemandCustodyScript(dem.vchHolderPubKey, NoteDemandId(*ptx, dem.vUnits, dem.vchPayoutScript)) != group.first)
             continue;
         // The height the coins' tag carries: the DEMAND's block for a fresh
         // demand, the preserved original for an upgrade.
@@ -5814,14 +5818,14 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
                 nTotal += cc.units;
             }
         }
-        // All-or-nothing per demand (the digest binds the full vector). A
-        // mismatch means a partial voluntary redeem or a claim - skip; the
-        // holder's own paths handle those coins.
-        if (nTotal != nNeeded || vGroup.empty())
+        // S1X-32: what remains of the demand. The digest binds the full vector, but consensus takes any burn up to its
+        // sum (the holder may have redeemed part of it itself), so the house discharges the rest. More than the
+        // vector can't be this demand's coins alone: skip.
+        if (vGroup.empty() || nTotal == 0 || nTotal > nNeeded)
             continue;
         vCandidates.push_back(Candidate{nTxHeight, nPos, dem, vGroup, nTagHeight});
     }
-    if (vCandidates.empty()) { strFail = "No fully-collectable pre-auth demand to discharge (partial redeems)!"; return false; }
+    if (vCandidates.empty()) { strFail = "No pre-auth demand to discharge!"; return false; }
     std::sort(vCandidates.begin(), vCandidates.end(), [](const Candidate& a, const Candidate& b) {
         return a.nHeight != b.nHeight ? a.nHeight < b.nHeight : a.nPos < b.nPos;
     });
@@ -8202,6 +8206,10 @@ static void AbandonDisplacedSettles(CWallet* pwallet, uint32_t nHouseA, uint32_t
     }
 }
 
+/** S1X-38 (testing: Medium; security 11-26): the proposal this wallet last issued on a presenting key, kept in the
+ *  address book under that key, so completesettle signs only the exchange it proposed. */
+static const char* const SETTLE_PROPOSAL_DESTDATA = "fbsettleprop";
+
 bool CWallet::ProposeSettle(std::string& strFail, std::string& strHexOut, uint256& txidConsolidate,
                             uint32_t nOwnHouseID, uint32_t nCounterpartyHouseID,
                             uint64_t nMaxUnits, uint32_t nExpiryBlocks, const CAmount& nFee)
@@ -8282,6 +8290,15 @@ bool CWallet::ProposeSettle(std::string& strFail, std::string& strHexOut, uint25
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << prop;
     strHexOut = HexStr(ss.begin(), ss.end());
+    // S1X-38: remembered under the presenting key; completesettle compares the responder's exchange with it. The newest
+    // proposal on a key replaces the last (the address book's in-memory insert keeps an existing value, so erase first).
+    const CKeyID keyPresent = CPubKey(prop.vchPresentKey).GetID();
+    EraseDestData(keyPresent, SETTLE_PROPOSAL_DESTDATA);
+    if (!AddDestData(keyPresent, SETTLE_PROPOSAL_DESTDATA, strHexOut)) {
+        strFail = "Could not record the proposal in the wallet!";
+        strHexOut.clear();
+        return false;
+    }
     return true;
 }
 
@@ -8545,6 +8562,56 @@ bool CWallet::CompleteSettle(std::string& strFail, uint256& txidOut, const std::
         if (mtx.vout.empty() ||
                 mtx.vout[0].scriptPubKey != NoteScriptForPubKey(houseOwn.vchRedemptionDestPK)) {
             strFail = "The residual does not pay this house's redemption key!"; return false;
+        }
+    }
+
+    // S1X-38 (testing: Medium; security 11-26): sign only the exchange this wallet proposed. The responder builds the
+    // tx, so before this it could put far more of our notes in our region than we offered (any coins on any key of
+    // ours), at the band's floor and with no expiry, and we signed every empty input there. Now our region must be
+    // exactly the proposal's bundle on its key, both houses and the expiry as proposed, and a residual paid to us at
+    // least the band's midpoint now (what SignSettle prices at).
+    {
+        const std::vector<unsigned char>& vchOurKey = fSignA ? x.vchPresentKeyOfBNotes : x.vchPresentKeyOfANotes;
+        std::string strProp;
+        if (vchOurKey.size() != CPubKey::COMPRESSED_PUBLIC_KEY_SIZE ||
+                !GetDestData(CPubKey(vchOurKey).GetID(), SETTLE_PROPOSAL_DESTDATA, &strProp) || !IsHex(strProp)) {
+            strFail = "This wallet issued no settle proposal on the presenting key the exchange names!"; return false;
+        }
+        SettleProposalV1 prop;
+        try {
+            std::vector<unsigned char> vch = ParseHex(strProp);
+            CDataStream ss(vch, SER_NETWORK, PROTOCOL_VERSION);
+            ss >> prop;
+        } catch (const std::exception&) { strFail = "The recorded proposal is undecodable!"; return false; }
+        const uint32_t nCtpy = fSignA ? x.nHouseB : x.nHouseA;
+        const uint64_t nOurUnits = fSignA ? x.nUnitsBNotes : x.nUnitsANotes;
+        const size_t nOurCount = fSignA ? x.nCountBNotes : x.nCountANotes;
+        const size_t nOurStart = fSignA ? x.nCountANotes : 0;
+        if (prop.nHouseInitiator != nOwn || prop.nHouseCounterparty != nCtpy || prop.vchPresentKey != vchOurKey ||
+                prop.nUnitsPresented != nOurUnits || prop.vBundle.size() != nOurCount) {
+            strFail = "The exchange does not present what this wallet proposed (houses, key, units or coins)!"; return false;
+        }
+        for (size_t k = 0; k < nOurCount; k++) {
+            if (nOurStart + k >= mtx.vin.size() || mtx.vin[nOurStart + k].prevout != prop.vBundle[k]) {
+                strFail = "The exchange's coins in our region are not the proposed bundle!"; return false;
+            }
+        }
+        if (prop.nExpiryHeight == 0 || x.nExpiryHeight != prop.nExpiryHeight) {
+            strFail = "The exchange's expiry is not the proposed one!"; return false;
+        }
+        if ((uint32_t)chainActive.Height() >= prop.nExpiryHeight) { strFail = "Proposal expired!"; return false; }
+        if (x.nMode == 1) {
+            const uint64_t dU = x.nUnitsANotes >= x.nUnitsBNotes ? x.nUnitsANotes - x.nUnitsBNotes
+                                                                  : x.nUnitsBNotes - x.nUnitsANotes;
+            uint64_t nPrice = 0;
+            if (!WalletSettleRate({x.nHouseA, x.nHouseB}, nPrice, strFail))
+                return false;
+            const CAmount amountMid = (CAmount)(((unsigned __int128)dU * nPrice) / 1000);
+            if (x.amountResidual < amountMid || mtx.vout[0].nValue < x.amountResidual) {
+                strFail = strprintf("The residual (%d sats) is below the band's midpoint now (%d sats)!",
+                                    x.amountResidual, amountMid);
+                return false;
+            }
         }
     }
 
@@ -9103,6 +9170,13 @@ bool CWallet::SignNetting(std::string& strFail, std::string& strRoundOut, uint25
             ss >> mtxPrev;
         } catch (const std::exception&) { strFail = "Undecodable transaction in the round!"; return false; }
         if (!DecodeSettlePayload(mtxPrev.vchSettlePayload, prev)) { strFail = "Undecodable payload in the round!"; return false; }
+        // S1X-44 (testing: Low): the signature vectors come from a counterparty and are indexed at nOwn below; the terms
+        // comparison replaces them, so check their shape here (a short one wrote past its end, or dropped our sigs).
+        const size_t nH = n.vHouseID.size();
+        if (prev.vHouseID.size() != nH || prev.vApproverIndex.size() != nH || prev.vApproverSig.size() != nH ||
+                prev.vPresentSig.size() != nH || prev.vPresentKey.size() != nH) {
+            strFail = "The round's transaction has a malformed signature list - start a new round!"; return false;
+        }
         bool fSame = mtxPrev.nVersion == mtx.nVersion && mtxPrev.nSettleOp == mtx.nSettleOp &&
                      mtxPrev.nLockTime == mtx.nLockTime && mtxPrev.vin.size() == mtx.vin.size() &&
                      mtxPrev.vout == mtx.vout;
@@ -9744,7 +9818,8 @@ bool CWallet::CompleteDiscount(std::string& strFail, uint256& txidOut, const std
     // The link first: the classic endorse digest, which the shared digest does
     // NOT cover, so its height stays ours to set as late as possible.
     d.endorsement.nAtHeight = (uint32_t)chainActive.Height();
-    if (!keyHolder.Sign(BillEndorseSigHash(bill.billID, d.endorsement.vchTo, d.endorsement.nAtHeight),
+    if (!keyHolder.Sign(BillEndorseSigHash(bill.billID, d.endorsement.vchFrom, d.endorsement.vchTo,
+                                           d.endorsement.nAtHeight, (uint32_t)bill.vEndorsement.size()),   // S1X-34
                         d.endorsement.vchSig)) {
         strFail = "Failed to sign the endorsement link!"; return false;
     }
@@ -11310,7 +11385,7 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
         // Bind the anti-replay anchor (the prior activation height), NOT the
         // invocation height - see HouseDeferSigHash. A crisis tool must not be
         // valid in only one block.
-        const uint256 sighash = HouseDeferSigHash(house.houseID, def.nPrevLastActivation, hashOutputs);
+        const uint256 sighash = HouseDeferSigHash(house.houseID, def.nPrevLastActivation, hashPrevouts, hashOutputs);   // S1X-35
         if (!SignHouseApprovers(pwallet, house, sighash, def.vApproverIndex, def.vApproverSig, strFail))
             return false;
         ssPayload << def;
@@ -11738,17 +11813,18 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
         att.vProofs.push_back(proof);
     }
 
+    // S1X-35: the inputs go in before the approvers sign, who sign the prevouts.
+    for (const auto& coin : setCoins)
+        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+
     const uint256 sighash = HouseAttestSigHash(house.houseID, nAsOfHeight, amountReserves,
-        HouseAttestProofSetHash(att.vProofs), BillHashOutputs(mtx));
+        HouseAttestProofSetHash(att.vProofs), NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
     if (!SignHouseApprovers(this, house, sighash, att.vApproverIndex, att.vApproverSig, strFail))
         return false;
 
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
     ssPayload << att;
     mtx.vchHousePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
-
-    for (const auto& coin : setCoins)
-        mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     const CTransaction txToSign = mtx;
     int nIn = 0;

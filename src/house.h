@@ -865,10 +865,13 @@ struct AttestProof {
  * PARENT-chain UTXO state - order-independent within a block; a coin spent
  * earlier in the same block does not falsify the snapshot. Floor logic (T2/T4)
  * runs on acceptance: below rho -> Stressed; at/above rho + buffer -> recovery;
- * in-band -> state preserved. The three nPrev* fields are undo priors: connect
- * requires them to equal the DB values, so DisconnectBlock restores exactly and
- * a replayed attestation always fails (structural replay protection - with the
- * nAsOfHeight monotone rule, no prevouts binding needed). */
+ * in-band -> state preserved. The nPrev* fields are undo priors: connect
+ * requires them to equal the DB values, so DisconnectBlock restores exactly.
+ * They are not signed: S1X-35 (testing: Medium; security 11-26; Michael
+ * 2026-11-26 "Yes, build all 6") - a displaced, unmined ATTEST could be
+ * re-funded with the post-DEFER priors and lift the deferral the partners had
+ * just invoked. So the approvers sign the tx's prevouts, and the house's own
+ * input signatures (credit binding) cover the payload with its priors. */
 struct HouseAttest {
     uint32_t nHouseID;                     // leading - mempool-guard convention
     uint8_t nSchemaVersion;                // = 1 (D11); v2+ adds fields by bump
@@ -1290,7 +1293,8 @@ uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned cha
 uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashOutputs);
+uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashPrevouts,
+                          const uint256& hashOutputs);   // S1X-35: hashPrevouts
 uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
 /** The till op's approvers sign the house, the prevouts, the outputs, the annex and the vault moves. */
@@ -1314,10 +1318,10 @@ uint256 HouseAttestChallenge(const uint256& houseID, uint32_t nAsOfHeight,
 uint256 HouseAttestProofSetHash(const std::vector<AttestProof>& vProofs);
 
 /** What the M-of-N approvers sign: house identity, as-of height, the claimed
- * reserve total, the proof set, and the exact output set of the carrier tx. */
+ * reserve total, the proof set, the carrier tx's inputs (S1X-35) and its exact output set. */
 uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
                            const CAmount& amountReserves, const uint256& hashProofSet,
-                           const uint256& hashOutputs);
+                           const uint256& hashPrevouts, const uint256& hashOutputs);
 
 /** Pledge escrow lock: <house_id> OP_DROP OP_TRUE (Bills-D1 family). */
 CScript HouseEscrowScript(const uint256& houseID);

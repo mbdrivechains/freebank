@@ -20,6 +20,8 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <random>   // testing: run 4 properties (std::mt19937)
+
 BOOST_FIXTURE_TEST_SUITE(houserate_tests, BasicTestingSetup)
 
 static const int64_t DAY = RATE_DAY_SECONDS;
@@ -148,7 +150,12 @@ BOOST_AUTO_TEST_CASE(rate_window_max)
     BOOST_CHECK_EQUAL(nMaxBid, 90000u);
     // Day 40: 80. Day 40 itself had 90 until the posting.
     BOOST_CHECK(ApplyHouseRatePost(units, 3, 80000, 80000, 4, 40 * DAY + 5, gp, strReject));
+    // S1X-22: read at the start of day 50 the 30-day window is today plus the 30 whole days before (days 20-50), and
+    // 100 was in effect on day 20 until 20 * DAY + 5, 30 days less 5 s ago: it counts (it dropped out before).
     BOOST_CHECK(HouseRateWindowMax(units, 3, 5, 50 * DAY, 30, nMaxBid, nMaxAsk));
+    BOOST_CHECK_EQUAL(nMaxBid, 100000u);
+    // A day later only 90 (days 21-51).
+    BOOST_CHECK(HouseRateWindowMax(units, 3, 5, 51 * DAY, 30, nMaxBid, nMaxAsk));
     BOOST_CHECK_EQUAL(nMaxBid, 90000u);
     // Day 75: the 30-day window (days 46-75) saw only 80, which is the rate in effect, recorded or not.
     BOOST_CHECK(HouseRateWindowMax(units, 3, 5, 75 * DAY, 30, nMaxBid, nMaxAsk));
@@ -360,9 +367,10 @@ BOOST_AUTO_TEST_CASE(s1x_19_post_dated_from_its_own_block)
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, PA + 600 + DAY, 7, DAY), 90000u);
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, PA + 599 + DAY, 7, DAY), 100000u);
     // Read in the posting block itself (nHeight 50: its clock record would not exist yet) the current posting is the
-    // one before (D-2026-11-20-2), dated from block 1's clock.
+    // one before (D-2026-11-20-2), dated from block 1's clock. S1X-40: the record at the block's start had that posting
+    // alone (none before it), so it is the answer either side of its own date, as a read before the POST gives.
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + 600 + DAY, 7, DAY, 50), 100000u);
-    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + 599 + DAY, 7, DAY, 50), 7u);
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + 599 + DAY, 7, DAY, 50), 100000u);
 }
 
 BOOST_AUTO_TEST_CASE(swap_payload_shape)
@@ -910,8 +918,35 @@ BOOST_AUTO_TEST_CASE(s1x_4_bid_at_deadline_skips_a_post_at_the_height_read)
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, nActive, 7, DAY, 51), 120000u);   // h+1: the new posting
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, nActive, 7, DAY), 120000u);       // no height: the new posting
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, nActive, 7, DAY, 50), 100000u);   // h: the posting before it
-    // At h with T_f inside the day after the earlier posting, the posting before that isn't kept: the fallback.
-    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + DAY / 2, 7, DAY, 50), 7u);
+    // At h with T_f inside the day after the earlier posting: S1X-40 keeps the record as at the block's start (that
+    // posting alone), so the answer is the one a read before the POST gives, not the fallback.
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + DAY / 2, 7, DAY, 50), 100000u);
+}
+
+// S1X-40 (testing: Low; security 11-26: Medium; Michael 2026-11-26 "Yes, build all 6"): the swap's bid at the deadline
+// doesn't depend on where a POST sits in its block. Run 4 #5's case: demanded at 100,000 (the fallback); the house cut to
+// 80,000 2.5 days before T_f and re-posted 80,000 12 h before it; after T_f, block h carries its next POST and the swap's
+// EXPIRE. Before: [EXPIRE, POST] gave 80,000 and [POST, EXPIRE] the fallback 100,000.
+BOOST_AUTO_TEST_CASE(s1x_40_bid_at_deadline_is_the_same_either_side_of_a_post_in_the_block)
+{
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t Tf = 40 * DAY;
+    BOOST_REQUIRE(ApplyHouseRatePost(units, 2, 100000, 100000, 1, 10 * DAY, gp, strReject, 10 * DAY));
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 2, 80000, 80000, 10, Tf - 5 * DAY / 2, gp, strReject, Tf - 5 * DAY / 2),
+                          "setup: the cut was refused: " + strReject);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 2, 80000, 80000, 20, Tf - DAY / 2, gp, strReject, Tf - DAY / 2),
+                          "setup: the re-post was refused: " + strReject);
+    const uint32_t h = 30;
+    const uint64_t nBefore = HouseBidAtActive(units, 2, Tf, 100000, DAY, h);   // [EXPIRE, POST]: read before the POST
+    BOOST_CHECK_EQUAL(nBefore, 80000u);
+    BOOST_REQUIRE_MESSAGE(ApplyHouseRatePost(units, 2, 80000, 80000, h, Tf + 100, gp, strReject, Tf + 100),
+                          "setup: the post at h was refused: " + strReject);
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, Tf, 100000, DAY, h), nBefore);   // [POST, EXPIRE]: the same
+    // From h+1 the record's current posting came after T_f and the one before it inside the day, so the rule's
+    // fallback stands (D-2026-11-20-2 rule 2).
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, Tf, 100000, DAY, h + 1), 100000u);
 }
 
 // Security 11-20 (freebankd's audit, a spot covered only by an equality): RETIRE, RECOURSE and ops 7, 9 and 10 read the
@@ -950,5 +985,144 @@ BOOST_AUTO_TEST_CASE(refhouse_anchor_at_h_prices_as_the_plain_window)
     g_nHouseRateTestOverride = nOverridePrev;
 }
 
-BOOST_AUTO_TEST_SUITE_END()
+// ===========================================================================
+// testing (2026-11-26): S1X-22 and S1X-40 (S1X-40 is Claude max run 4 on v1.2.5 #5; S1X-22 is GPT-6.1's round 12
+// window finding; security 11-26: S1X-22 Low, S1X-40 Medium; fixed in consensus batch 2, Michael 2026-11-26 "Yes,
+// build all 6"). Written from the findings and the signed rules, not from freebankd's cases: random posting histories,
+// checked against an oracle (S1X-22) and against the block-start read (S1X-40). Each case reports its first
+// counterexample. FAIL on master 7f65d2e (src = c53f2e6); pass on mb/consensus-batch-2.
+// ===========================================================================
+namespace {
+struct Run4Post { uint32_t nHeight; int64_t nTime; uint64_t nBid; uint64_t nAsk; };
 
+// The highest bid and ask in effect at any instant of [nFrom, nTo]: each accepted posting is in effect from its time
+// until the next one's.
+void Run4OracleMax(const std::vector<Run4Post>& v, int64_t nFrom, int64_t nTo, uint64_t& nBid, uint64_t& nAsk)
+{
+    nBid = nAsk = 0;
+    for (size_t i = 0; i < v.size(); i++) {
+        const int64_t nStart = v[i].nTime;
+        const int64_t nEnd = i + 1 < v.size() ? v[i + 1].nTime : std::numeric_limits<int64_t>::max();
+        if (nStart <= nTo && nEnd > nFrom) {
+            nBid = std::max(nBid, v[i].nBid);
+            nAsk = std::max(nAsk, v[i].nAsk);
+        }
+    }
+}
+
+// Plays a random history of postings for house 4 (heights strictly rising, times rising, gaps under RATE_DAY_FILL_MAX
+// days; moves from -35% to +25%; a refused post writes nothing and is left out). Returns the accepted ones.
+std::vector<Run4Post> Run4History(CUnitsView& units, std::mt19937& rng, int nPosts, int64_t nStart, int64_t nMaxGap)
+{
+    Consensus::GramParams gp;
+    std::vector<Run4Post> v;
+    uint32_t h = 10;
+    int64_t t = nStart;
+    uint64_t bid = 100000;
+    for (int i = 0; i < nPosts; i++) {
+        h += 1 + rng() % 50;
+        t += 1 + (int64_t)(rng() % (uint64_t)nMaxGap);
+        const int64_t nMove = (int64_t)(rng() % 61) - 35;
+        const uint64_t nBid = (uint64_t)std::max<int64_t>(1000, (int64_t)bid + (int64_t)bid * nMove / 100);
+        const uint64_t nAsk = nBid + nBid * (rng() % 21) / 1000;   // spread 0 .. 2%
+        std::string strReject;
+        if (ApplyHouseRatePost(units, 4, nBid, nAsk, h, t, gp, strReject, t)) {
+            v.push_back(Run4Post{h, t, nBid, nAsk});
+            bid = nBid;
+        }
+    }
+    return v;
+}
+} // namespace
+
+// S1X-22: the "N-day" highest bid and ask (ASK30 for RETIRE, RECOURSE and HRETIRE; the 90-day high) include every rate
+// in effect at any instant of the last N days. Master counted today plus the previous N - 1 days, so a rate in effect
+// only N - 1 days and some hours ago dropped out. Also checked: the window never reaches past today plus the N whole
+// days before it (the fix's own statement).
+BOOST_AUTO_TEST_CASE(s1x_22_window_max_covers_every_instant_of_the_last_n_days)
+{
+    std::mt19937 rng(20261126);
+    const std::vector<uint32_t> vDays = {1, 7, 30, 90};
+    int nChecks = 0, nLow = 0, nHigh = 0;
+    std::string strFirstLow, strFirstHigh;
+    for (int trial = 0; trial < 400; trial++) {
+        CUnitsView units(nullptr);
+        const std::vector<Run4Post> v = Run4History(units, rng, 3 + (int)(rng() % 10), 100 * DAY + (int64_t)(rng() % DAY),
+                                                    rng() % 2 ? 3 * DAY : 20 * DAY);
+        if (v.empty())
+            continue;
+        for (int r = 0; r < 6; r++) {
+            const uint32_t nDays = vDays[rng() % vDays.size()];
+            const int64_t nNow = v.back().nTime + (int64_t)(rng() % (uint64_t)(40 * DAY));
+            uint64_t nMaxBid = 0, nMaxAsk = 0;
+            BOOST_REQUIRE(HouseRateWindowMax(units, 4, v.back().nHeight + 1, nNow, nDays, nMaxBid, nMaxAsk));
+            uint64_t nWantBid, nWantAsk, nCapBid, nCapAsk;
+            Run4OracleMax(v, nNow - (int64_t)nDays * DAY, nNow, nWantBid, nWantAsk);
+            Run4OracleMax(v, ((int64_t)RateDayOf(nNow) - (int64_t)nDays) * DAY, nNow, nCapBid, nCapAsk);
+            nChecks++;
+            if ((nMaxBid < nWantBid || nMaxAsk < nWantAsk) && nLow++ == 0)
+                strFirstLow = strprintf("trial %d: N=%u, now=%d: window max bid %u ask %u, but bid %u / ask %u was in "
+                                        "effect within the last N days (%u postings, the last at %d)",
+                                        trial, nDays, nNow, nMaxBid, nMaxAsk, nWantBid, nWantAsk, v.size(), v.back().nTime);
+            if ((nMaxBid > nCapBid || nMaxAsk > nCapAsk) && nHigh++ == 0)
+                strFirstHigh = strprintf("trial %d: N=%u, now=%d: window max bid %u ask %u exceeds the highest in effect "
+                                         "since the start of day today-N (bid %u ask %u)",
+                                         trial, nDays, nNow, nMaxBid, nMaxAsk, nCapBid, nCapAsk);
+        }
+    }
+    BOOST_REQUIRE_GT(nChecks, 1000);
+    BOOST_CHECK_MESSAGE(nLow == 0, strprintf("S1X-22: %d of %d window reads missed a rate in effect within the last N "
+                                             "days. First: %s", nLow, nChecks, strFirstLow));
+    BOOST_CHECK_MESSAGE(nHigh == 0, strprintf("S1X-22: %d of %d window reads counted a rate from before today-N. "
+                                              "First: %s", nHigh, nChecks, strFirstHigh));
+}
+
+// S1X-40 (D-2026-11-20-2's promise, houserate.cpp and miner.cpp: a POST's place in its block doesn't matter): the bid at a
+// swap's deadline read at height h is the same before and after a POST at h is applied, so the answer a swap op gets
+// doesn't depend on whether the house's POST sits before or after it in the block. Master's shifted branch returned the
+// fallback where the block-start record gave a posting.
+BOOST_AUTO_TEST_CASE(s1x_40_bid_at_active_ignores_a_same_block_post)
+{
+    std::mt19937 rng(20261140);
+    const uint64_t FALLBACK = 7;
+    Consensus::GramParams gp;
+    int nChecks = 0, nDiff = 0;
+    std::string strFirst;
+    for (int trial = 0; trial < 400; trial++) {
+        CUnitsView units(nullptr);
+        const std::vector<Run4Post> v = Run4History(units, rng, 1 + (int)(rng() % 6), 100 * DAY,
+                                                    rng() % 2 ? DAY / 2 : 3 * DAY);
+        if (v.empty())
+            continue;
+        // Deadlines T_f anywhere from a day before the first posting to two days after the last.
+        std::vector<int64_t> vActive;
+        for (int r = 0; r < 12; r++)
+            vActive.push_back(v.front().nTime - DAY +
+                              (int64_t)(rng() % (uint64_t)(v.back().nTime - v.front().nTime + 3 * DAY)));
+        const uint32_t h = v.back().nHeight + 1 + (uint32_t)(rng() % 5);
+        std::vector<uint64_t> vBefore;
+        for (const int64_t a : vActive)
+            vBefore.push_back(HouseBidAtActive(units, 4, a, FALLBACK, DAY, h));
+        // The house's POST at h: a re-post, a cut or a small rise.
+        const int64_t nMove = (int64_t)(rng() % 41) - 20;
+        const uint64_t nBid = (uint64_t)std::max<int64_t>(1000, (int64_t)v.back().nBid + (int64_t)v.back().nBid * nMove / 100);
+        const int64_t t = v.back().nTime + 1 + (int64_t)(rng() % (uint64_t)DAY);
+        std::string strReject;
+        if (!ApplyHouseRatePost(units, 4, nBid, nBid, h, t, gp, strReject, t))
+            continue;
+        for (size_t i = 0; i < vActive.size(); i++) {
+            const uint64_t nAfter = HouseBidAtActive(units, 4, vActive[i], FALLBACK, DAY, h);
+            nChecks++;
+            if (nAfter != vBefore[i] && nDiff++ == 0)
+                strFirst = strprintf("trial %d: %u postings (the last bid %u at %d, the one before %u), T_f %d, read at "
+                                     "h=%u: %u before the POST at h, %u after it",
+                                     trial, v.size(), v.back().nBid, v.back().nTime,
+                                     v.size() > 1 ? v[v.size() - 2].nBid : (uint64_t)0, vActive[i], h, vBefore[i], nAfter);
+        }
+    }
+    BOOST_REQUIRE_GT(nChecks, 1000);
+    BOOST_CHECK_MESSAGE(nDiff == 0, strprintf("S1X-40: %d of %d reads at a POST's height changed when the POST was "
+                                              "applied first. First: %s", nDiff, nChecks, strFirst));
+}
+
+BOOST_AUTO_TEST_SUITE_END()

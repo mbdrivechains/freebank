@@ -70,6 +70,10 @@ static const size_t SETTLE_MAX_BUNDLE_INPUTS = 100;
 // Payload ceiling (largest realistic op: 2 presenter keys + 2 sigs + 2 full
 // M-of-N approver sets ~ 2.5KB at 15 partners each).
 static const size_t MAX_SETTLE_PAYLOAD = 4096;
+/** S1X-37 (testing: Medium; security 11-26), relay policy only: the most houses a NET round may name to enter the
+ *  mempool. Consensus keeps no cap (NETTING_DESIGN.md); each named house costs every node reads before the round's
+ *  quorum is known good, so a free round over thousands of invented houses was a repeatable cost. */
+static const size_t MAX_SETTLE_NET_HOUSES_POLICY = 100;
 
 // Magnitude ceiling for presented units - the shared overflow envelope
 // (== POOL_MAX_AMOUNT; equality is static_asserted in settle_tests.cpp).

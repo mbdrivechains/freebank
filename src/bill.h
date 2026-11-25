@@ -178,8 +178,9 @@ struct CBill {
     // While nonzero the bill is in exactly one house's loan book and the plain
     // ops 2/3/4 refuse to touch it, so a single custody key can move nothing.
     uint32_t nOwnerHouseID;
-    // Gold B (D-2026-11-07-1; GOLD_B.md §3): the reference house named at ISSUE. While the bill is privately held, the
-    // drawee repays in sECX at this house's highest ask of the last 30 days; while a house holds it, at that house's.
+    // Gold B (D-2026-11-07-1; GOLD_B.md §3): the reference house named at ISSUE. The drawee repays in sECX at this
+    // house's highest ask of the last 30 days, whoever holds the bill (D-2026-11-20-1, S1X-1: ops 3, 7, 9 and 10 alike;
+    // S1X-39 corrected this comment).
     uint32_t nRefHouseID;
     // S1X-25 (security: Medium; Michael 11-25 yes): the failed house whose escrow took this bill's money (ops 10 and
     // 11 set it, their undo clears it). RECOURSE refuses such a bill: after op 11 the holder is still the house's
@@ -650,7 +651,12 @@ uint256 BillIDFromBody(const std::vector<unsigned char>& vchBody);
 // bound by one of these payload-level signatures.
 //
 uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID);
-uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned char>& vchTo, uint32_t nAtHeight);
+/** S1X-34 (testing: Medium; security 11-26; Michael 2026-11-26 "Yes, build all 6"): the link also binds its endorser and
+ *  its index in the chain (the bill's vEndorsement.size() when it is appended). RECOURSE appends no link, so with
+ *  (bill, to, height) alone the endorsee of a link whose endorser later paid recourse could replay that link within
+ *  BILL_ENDORSE_HEIGHT_SLACK and take the bill back. The chain stays verifiable from CBill alone: link j's index is j. */
+uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned char>& vchFrom,
+                           const std::vector<unsigned char>& vchTo, uint32_t nAtHeight, uint32_t nLinkIndex);
 
 // Retire / claim spend the escrow coin with an EMPTY scriptSig, so nothing
 // else pins the transaction's outputs - these signatures bind hashOutputs

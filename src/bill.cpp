@@ -43,14 +43,17 @@ uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAm
     return ss.GetHash();
 }
 
-uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned char>& vchTo, uint32_t nAtHeight)
+uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned char>& vchFrom,
+                           const std::vector<unsigned char>& vchTo, uint32_t nAtHeight, uint32_t nLinkIndex)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/endorse");
     HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
+    ss << vchFrom;      // S1X-34
     ss << vchTo;
     ss << nAtHeight;
+    ss << nLinkIndex;   // S1X-34: this link's place in the chain; recourse appends none, so a replay lands elsewhere
     return ss.GetHash();
 }
 

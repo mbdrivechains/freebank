@@ -471,8 +471,16 @@ BOOST_AUTO_TEST_CASE(enforcerconnect_client_against_fake)
     BOOST_CHECK_EQUAL(n, 1);
     BOOST_CHECK(out.find("timed out waiting for the reply") != std::string::npos);
     BOOST_CHECK(nTook >= 900 && nTook < 2500);
-    BOOST_CHECK(fake.LastRequest().find("Connect-Timeout-Ms: 1000\r\n") != std::string::npos ||
-                fake.LastRequest().find("Connect-Timeout-Ms: 99") != std::string::npos);
+    // The header carries what is left of the 1 s budget when the request goes out: a slow runner (macOS CI, v1.2.5's
+    // tag run) spends more than 10 ms first, so accept anything a stall-free client could have sent (500..1000).
+    {
+        const std::string req = fake.LastRequest();
+        const std::string key = "Connect-Timeout-Ms: ";
+        const size_t pos = req.find(key);
+        BOOST_REQUIRE(pos != std::string::npos);
+        const int nHeaderMs = atoi(req.c_str() + pos + key.size());
+        BOOST_CHECK_MESSAGE(nHeaderMs >= 500 && nHeaderMs <= 1000, "Connect-Timeout-Ms " << nHeaderMs);
+    }
     fake.nStallMs = 0;
 }
 

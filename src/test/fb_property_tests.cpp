@@ -260,7 +260,8 @@ CMutableTransaction BuildEndorse(World& w, const WBill& wb, const CKey& to)
     e.endorsement.vchTo = Pub(to);
     e.endorsement.nAtHeight = (uint32_t)w.nHeight;
     BOOST_REQUIRE(wb.holder.Sign(
-            BillEndorseSigHash(wb.bill.billID, e.endorsement.vchTo, e.endorsement.nAtHeight),
+            BillEndorseSigHash(wb.bill.billID, e.endorsement.vchFrom, e.endorsement.vchTo, e.endorsement.nAtHeight,
+                               (uint32_t)wb.bill.vEndorsement.size()),
             e.endorsement.vchSig));
 
     CMutableTransaction mtx;
@@ -303,7 +304,8 @@ CMutableTransaction BuildDiscount(World& w, const WBill& wb, const WHouse& wh)
     d.endorsement.vchTo = wh.house.vchRedemptionDestPK;
     d.endorsement.nAtHeight = (uint32_t)w.nHeight;
     BOOST_REQUIRE(wb.holder.Sign(
-            BillEndorseSigHash(wb.bill.billID, d.endorsement.vchTo, d.endorsement.nAtHeight),
+            BillEndorseSigHash(wb.bill.billID, d.endorsement.vchFrom, d.endorsement.vchTo, d.endorsement.nAtHeight,
+                               (uint32_t)wb.bill.vEndorsement.size()),
             d.endorsement.vchSig));
 
     CMutableTransaction mtx;

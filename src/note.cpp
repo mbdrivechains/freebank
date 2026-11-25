@@ -85,6 +85,17 @@ uint256 NoteHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
+uint256 NoteDemandId(const CTransaction& tx, const std::vector<uint64_t>& vUnits,
+                     const std::vector<unsigned char>& vchPayoutScript)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankNote/demandid");   // S1X-42
+    ss << NoteHashPrevouts(tx);
+    ss << vUnits;
+    ss << vchPayoutScript;
+    return ss.GetHash();
+}
+
 uint256 NoteMintSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashPrevouts, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
@@ -178,7 +189,7 @@ uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
     ss << nHouseID;
     ss << vUnits;
     ss << vchPayoutScript;
-    ss << demandId;   // S1X-14: this one demand (NoteHashPrevouts of its DEMAND), never a later one by the same key
+    ss << demandId;   // S1X-14: this one demand (S1X-42: NoteDemandId of its DEMAND), never a later one by the same key
     return ss.GetHash();
 }
 
@@ -527,6 +538,13 @@ static bool IsValidNotePubKey(const std::vector<unsigned char>& vch)
     return pubkey.IsFullyValid();
 }
 
+/** S1X-36: a compressed key's bytes only (33 bytes, 0x02/0x03) - no curve work. For lists a peer can fill for free
+ *  inside CheckTransaction; the point itself is parsed in the contextual check, after the signature that pays for it. */
+static bool IsNotePubKeyShape(const std::vector<unsigned char>& vch)
+{
+    return vch.size() == CPubKey::COMPRESSED_PUBLIC_KEY_SIZE && (vch[0] == 0x02 || vch[0] == 0x03);
+}
+
 /** vout[0..nUnits-1] must each be a dust-valued note output: P2PKH normally,
  * or (fCustody, B3) the consensus-custody shape a pre-auth re-issue moves the
  * coins onto. Shape only; the exact keyid inside a custody script is
@@ -848,9 +866,12 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
         const size_t n = post.vIssued.size() + post.vSpent.size();
         if (n == 0 || n > MAX_TOKEN_POST_ENTRIES)
             return state.DoS(100, false, REJECT_INVALID, "bad-token-post-size");
+        // S1X-36 (testing: Medium; security 11-26): bytes only here - up to MAX_TOKEN_POST_ENTRIES full point parses
+        // (~13 ms) ran inside CheckTransaction before any input or fee check. Each B is parsed in CheckNoteOperation,
+        // after the posting key's signature (the same transactions are refused, only later).
         std::set<std::vector<unsigned char>> setB;
         for (const TokenIssued& iss : post.vIssued) {
-            if (!IsValidNotePubKey(iss.vchB) || iss.nAmount == 0 || !setB.insert(iss.vchB).second)
+            if (!IsNotePubKeyShape(iss.vchB) || iss.nAmount == 0 || !setB.insert(iss.vchB).second)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-post-issued");
         }
         std::set<uint256> setY;

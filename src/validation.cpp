@@ -1647,10 +1647,29 @@ void EvictUnpayableWithdrawals()
             // takes it out of the pool and the owner's pending list.
             std::vector<uint256> vWID;
             GetTxWithdrawalIDs(mi->GetTx(), vWID);
+            bool fStored = false;
             for (const uint256& wid : vWID) {
                 SidechainWithdrawal held;
                 if (psidechaintree->GetWithdrawal(wid, held)) {
                     vEvict.push_back(std::make_pair(mi->GetSharedTx(), "withdrawal id " + wid.ToString() + " already stored"));
+                    fStored = true;
+                    break;
+                }
+            }
+            if (fStored)
+                continue;
+            // S1X-48 (security 11-26: High; mempool policy): a refund request was verified only at ATMP; once its
+            // withdrawal moved on, the template skipped it but it stayed pooled. Verified again at each tip; one that
+            // fails leaves with its descendants.
+            if (mi->IsWithdrawalRefund()) {
+                for (const CTxOut& o : mi->GetTx().vout) {
+                    uint256 id;
+                    std::vector<unsigned char> vchSig;
+                    if (!o.scriptPubKey.IsWithdrawalRefundRequest(id, vchSig))
+                        continue;
+                    SidechainWithdrawal withdrawal;
+                    if (id.IsNull() || !VerifyWithdrawalRefundRequest(id, vchSig, withdrawal))
+                        vEvict.push_back(std::make_pair(mi->GetSharedTx(), "refund request for " + id.ToString() + " no longer valid"));
                     break;
                 }
             }
@@ -2181,6 +2200,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return state.DoS(0, false, REJECT_NONSTANDARD, "withdrawal-refund-multiple", false,
                                  "at most one withdrawal refund request per transaction");
             }
+            // S1X-48 (policy): a refund request rides a plain tx only (the wallet's refunds are plain:
+            // CreateWithdrawalRefundRequest builds them).
+            if (tx.nVersion >= TRANSACTION_BITASSET_CREATE_VERSION) {
+                return state.DoS(0, false, REJECT_NONSTANDARD, "withdrawal-refund-not-plain", false,
+                                 "a withdrawal refund request must be on a plain transaction");
+            }
 
             if (id.IsNull()) {
                 return state.DoS(100, error("%s: Invalid withdrawal refund!", __func__),
@@ -2222,7 +2247,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // CheckTxInputs. The same two floors as the checks below, on the same fee (nFees plus the prioritisation delta,
         // i.e. nModifiedFees), against the size without the sigop adjustment, which is never more than the entry's: so
         // this can only refuse what the later checks refuse too. Those run unchanged.
-        if (!bypass_limits && tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+        // S1X-37 (testing: Medium; security 11-26): a settle round too - its check reads every named house's record,
+        // rates and par eligibility, and a zero-fee round could be re-sent with a new nLockTime forever.
+        if (!bypass_limits && ((tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) ||
+                               tx.nVersion == TRANSACTION_SETTLE_VERSION)) {
             CAmount nModFeesEarly = nFees;
             pool.ApplyDelta(tx.GetHash(), nModFeesEarly);
             const unsigned int nSizeEarly = GetVirtualTransactionSize(tx);
@@ -2473,6 +2501,14 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // A NET round (v0.2.22) takes every participant's slot: the same guard over the whole set. UR3-8: and a pooled
         // op that reads one of those houses' status (a DEMAND, a pool CREATE) is a conflict too (HouseStateKeysConflict).
         if (tx.nVersion == TRANSACTION_SETTLE_VERSION) {
+            // S1X-37 (policy): at most MAX_SETTLE_NET_HOUSES_POLICY houses in a NET round, before any house is read.
+            if (tx.nSettleOp == SETTLE_OP_NET) {
+                SettleNet net;
+                if (DecodeSettlePayload(tx.vchSettlePayload, net) && net.vHouseID.size() > MAX_SETTLE_NET_HOUSES_POLICY)
+                    return state.DoS(0, false, REJECT_NONSTANDARD, "settle-net-too-many-houses", false,
+                                     strprintf("%u houses, at most %u relayed", (unsigned)net.vHouseID.size(),
+                                               (unsigned)MAX_SETTLE_NET_HOUSES_POLICY));
+            }
             auto fnGetHouse = [](uint32_t nID, CHouse& house) { return phousetree->GetHouse(nID, house); };
             std::vector<CHouse> vSettleHouses;
             if (!CheckSettleTx(tx, state, GetSpendHeight(view), fnGetHouse, vSettleHouses, true))
@@ -3835,7 +3871,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (nAtHeight > (uint32_t)nHeight || (uint32_t)nHeight - nAtHeight > BILL_ENDORSE_HEIGHT_SLACK)
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-endorse-height");
 
-        const uint256 sighash = BillEndorseSigHash(bill.billID, endorse.endorsement.vchTo, nAtHeight);
+        const uint256 sighash = BillEndorseSigHash(bill.billID, endorse.endorsement.vchFrom, endorse.endorsement.vchTo,
+                                                   nAtHeight, (uint32_t)bill.vEndorsement.size());   // S1X-34
         if (!FbVerifyStrict(CPubKey(endorse.endorsement.vchFrom), sighash, endorse.endorsement.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-endorse-sig");
 
@@ -4071,7 +4108,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // endorsement chain stays verifiable from CBill alone by anyone who
         // never saw the discount payload.
         if (!BillVerifyStrict(d.endorsement.vchFrom,
-                BillEndorseSigHash(bill.billID, d.endorsement.vchTo, nAtHeight),
+                BillEndorseSigHash(bill.billID, d.endorsement.vchFrom, d.endorsement.vchTo, nAtHeight,
+                                   (uint32_t)bill.vEndorsement.size()),   // S1X-34
                 d.endorsement.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-link-sig");
 
@@ -5199,8 +5237,9 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         // Freshness: as-of must be a real past height, within the staleness
         // window, and strictly after the last accepted attestation (monotone -
-        // with the priors check below this makes any replay structurally
-        // invalid without binding prevouts).
+        // with the priors check below this makes a replay of the same tx
+        // invalid; S1X-35: the approvers also sign the prevouts, so a displaced
+        // ATTEST can't be re-funded with later priors).
         // v0.2.24: every as-of / cadence timing reject (here, DEFER, MINT, DISCOUNT and the reserve proofs) scores 0
         // in the mempool and 100 at connect, as the oracle's do. A peer relaying an op across a cadence boundary, or
         // one block ahead of us, is honest; at 10 per tx (v0.2.23) ten such relays still banned it.
@@ -5237,7 +5276,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
         // M-of-N approval over the claim + proof set + exact output set
         const uint256 sighash = HouseAttestSigHash(house.houseID, att.nAsOfHeight,
-            att.amountReserves, HouseAttestProofSetHash(att.vProofs), BillHashOutputs(tx));
+            att.amountReserves, HouseAttestProofSetHash(att.vProofs), NoteHashPrevouts(tx), BillHashOutputs(tx));   // S1X-35
         if (!VerifyHouseApprovers(house, att.vApproverIndex, att.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-attest-approver"))
             return false;
@@ -5389,7 +5428,8 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-stray-escrow");
         }
 
-        const uint256 sighash = HouseDeferSigHash(house.houseID, def.nPrevLastActivation, BillHashOutputs(tx));
+        const uint256 sighash = HouseDeferSigHash(house.houseID, def.nPrevLastActivation, NoteHashPrevouts(tx),
+                                                  BillHashOutputs(tx));   // S1X-35
         if (!VerifyHouseApprovers(house, def.vApproverIndex, def.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-defer-approver"))
             return false;
@@ -5966,14 +6006,20 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         //   can move these coins.
         if (redeem.fPreAuthDischarge) {
             // The vector is re-supplied verbatim because the digest binds the
-            // VECTOR, unreconstructable from an unordered burned-coin set; the
-            // sum equality pins it to exactly these coins, so a discharge can
-            // neither short a demand nor batch strangers' units under one sig.
-            // (This also makes a discharge all-or-nothing per demand.)
+            // VECTOR, unreconstructable from an unordered burned-coin set.
+            // S1X-32 (testing: High; security 11-26; Michael 2026-11-26 "Yes,
+            // build all 6"): a discharge burns AT MOST the vector's sum, not
+            // exactly it. The holder can plain-REDEEM part of its own demand
+            // (legal, tx_verify), and with an exact sum the house could never
+            // discharge the rest, so a protest ran its cure out. Strangers'
+            // units still can't ride one signature: every burned coin carries
+            // this demand's id (S1X-14, below). The floor is priced on the
+            // units burned (nNoteUnitsIn), and the protest counter is per
+            // marked coin, so partial discharges stay exact.
             uint64_t nAuthTotal = 0;
             for (const uint64_t u : redeem.vPreAuthUnits)
                 nAuthTotal += u;   // overflow-checked at shape (SumNoteUnits)
-            if (nAuthTotal != nNoteUnitsIn)
+            if (nNoteUnitsIn == 0 || nNoteUnitsIn > nAuthTotal)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sum");
             // S1X-14: the demand these coins belong to. Every burned note coin carries the same demand id (one demand
             // per discharge, as the sum already requires); the standing authorisation must name that id.
@@ -6285,7 +6331,8 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             // can never discharge, and the teeth would fire against a house
             // that was never actually authorized to pay.
             if (!FbVerifyStrict(CPubKey(dem.vchHolderPubKey),
-                    NotePreAuthSigHash(dem.nHouseID, dem.vUnits, dem.vchPayoutScript, NoteHashPrevouts(tx)), dem.vchPreAuthSig))
+                    NotePreAuthSigHash(dem.nHouseID, dem.vUnits, dem.vchPayoutScript,
+                                       NoteDemandId(tx, dem.vUnits, dem.vchPayoutScript)), dem.vchPreAuthSig))   // S1X-42
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-preauth-sig-invalid");
             // The payout script must not be THIS house's escrow script: the
             // discharge's stray-escrow rule (an untracked escrow-script output
@@ -6307,8 +6354,10 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             // exactly (shape only proved custody-shaped): the protest pin and
             // the discharge digest both resolve through the keyid embedded
             // here, so a stranger's keyid would strand the coins.
-            // S1X-14: every custody output carries this DEMAND's id (NoteHashPrevouts), the one the pre-auth signed.
-            const CScript scriptCustody = NoteDemandCustodyScript(dem.vchHolderPubKey, NoteHashPrevouts(tx));
+            // S1X-14: every custody output carries this DEMAND's id, the one the pre-auth signed. S1X-42: the id commits to
+            // the payout script and the unit vector too (NoteDemandId), so a replaced DEMAND's signature can't discharge it.
+            const CScript scriptCustody = NoteDemandCustodyScript(dem.vchHolderPubKey,
+                                                                  NoteDemandId(tx, dem.vUnits, dem.vchPayoutScript));
             for (size_t i = 0; i < dem.vUnits.size(); i++) {
                 if (tx.vout[i].scriptPubKey != scriptCustody)
                     return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-custody-script");
@@ -6703,6 +6752,11 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(10, false, REJECT_INVALID, "bad-token-post-keyset");
         if (!FbVerifyStrict(CPubKey(ks.vchPostingPubKey), TokenPostSigHash(post, hashPrevouts), post.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-token-post-sig");
+        // S1X-36: each issued B is a real point (the shape check reads its bytes only), checked after the signature.
+        for (const TokenIssued& iss : post.vIssued) {
+            if (!CPubKey(iss.vchB).IsFullyValid())
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-post-issued");
+        }
         CTokenMark mark;
         mark.nHeight = (uint32_t)nHeight;
         mark.txid = tx.GetHash();
@@ -7792,6 +7846,27 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
     if (nHeight < 0)
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-net-not-attested");
 
+    // S1X-37 (testing: Medium; security 11-26): each house's record, then every quorum and presenter signature, before
+    // the rate, eligibility and prior reads (about 45 reads a house), so a round with forged signatures costs one
+    // record read a house. The same rounds are refused as before; only the order of the checks moved.
+    std::vector<CHouse> vHouse(n.vHouseID.size());
+    for (size_t i = 0; i < n.vHouseID.size(); i++) {
+        if (!fnGetHouse(n.vHouseID[i], vHouse[i]))
+            return state.DoS(100, false, REJECT_INVALID, "bad-settle-unknown-house");
+    }
+    // One digest: every house's M-of-N quorum, and every presenting house's key.
+    {
+        const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(tx), BillHashOutputs(tx));
+        for (size_t i = 0; i < n.vHouseID.size(); i++) {
+            if (!VerifyHouseApprovers(vHouse[i], n.vApproverIndex[i], n.vApproverSig[i],
+                    sighash, vHouse[i].nThresholdM, state, "bad-settle-approver"))
+                return false;
+            if (!n.vPresentKey[i].empty() &&
+                    !FbVerifyStrict(CPubKey(n.vPresentKey[i]), sighash, n.vPresentSig[i]))
+                return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
+        }
+    }
+
     // Gold B (GOLD_B.md §3): each net creditor's receipt is sECX between the lowest bid and the highest ask of the
     // round's houses, times its net (mg).
     {
@@ -7808,11 +7883,8 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
                 return state.DoS(0, false, REJECT_INVALID, "bad-settle-band");
     }
 
-    std::vector<CHouse> vHouse(n.vHouseID.size());
     for (size_t i = 0; i < n.vHouseID.size(); i++) {
         CHouse& h = vHouse[i];
-        if (!fnGetHouse(n.vHouseID[i], h))
-            return state.DoS(100, false, REJECT_INVALID, "bad-settle-unknown-house");
         // Par-eligible, as for the exchange (gram-notes release: effectively Open with its gold till at the floor).
         if (!GoldParEligible(h, nHeight))
             return state.DoS(100, false, REJECT_INVALID, "bad-settle-house-ineligible");
@@ -7843,17 +7915,6 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
 
     if (n.nExpiryHeight != 0 && (uint32_t)nHeight > n.nExpiryHeight)
         return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-settle-expired");   // v0.2.24: timing, 0 in the mempool
-
-    // One digest: every house's M-of-N quorum, and every presenting house's key.
-    const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(tx), BillHashOutputs(tx));
-    for (size_t i = 0; i < n.vHouseID.size(); i++) {
-        if (!VerifyHouseApprovers(vHouse[i], n.vApproverIndex[i], n.vApproverSig[i],
-                sighash, vHouse[i].nThresholdM, state, "bad-settle-approver"))
-            return false;
-        if (!n.vPresentKey[i].empty() &&
-                !FbVerifyStrict(CPubKey(n.vPresentKey[i]), sighash, n.vPresentSig[i]))
-            return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
-    }
 
     for (size_t i = 0; i < n.vHouseID.size(); i++) {
         vHouse[i].nMintedUnits -= vBurn[i];

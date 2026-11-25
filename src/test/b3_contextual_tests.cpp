@@ -30,6 +30,7 @@
 #include <script/standard.h>
 #include <streams.h>
 #include <test/test_bitcoin.h>
+#include <tinyformat.h>
 #include <utilstrencodings.h>
 #include <version.h>
 
@@ -90,9 +91,9 @@ std::string CtxReject(const CMutableTransaction& mtx, int nHeight, uint64_t nUni
     return fOK ? "" : state.GetRejectReason();
 }
 
-// S1X-14: a pre-auth note demand's custody script and pre-auth digest carry its demand id, NoteHashPrevouts(DEMAND).
-// MakeDemandTx spends one coin (default "de3a":0), so its id is DemandIdFor(that hash); the other helpers default to
-// the same id, standing for "this demand's coins".
+// S1X-14: a pre-auth note demand's custody script and pre-auth digest carry its demand id (S1X-42: NoteDemandId of the
+// DEMAND, its prevouts with its vector and payout). The discharge helpers default to DemandIdFor(), an opaque id
+// standing for "this demand's coins"; MakeDemandTx computes its own.
 uint256 DemandIdFor(const uint256& prevHash = uint256S("de3a"))
 {
     CMutableTransaction m;
@@ -126,12 +127,13 @@ CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey&
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_DEMAND;
     mtx.vin.push_back(CTxIn(COutPoint(prevHash, 0)));
-    const uint256 demandId = NoteHashPrevouts(CTransaction(mtx));
+    if (fPreAuth)
+        d.vchPayoutScript = vchPayoutScript;
+    const uint256 demandId = NoteDemandId(CTransaction(mtx), d.vUnits, d.vchPayoutScript);   // S1X-42
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
         (fPreAuth && fCustodyOutputs) ? TestCustody(vchKey, demandId) : NoteScriptForPubKey(vchKey)));
 
     if (fPreAuth) {
-        d.vchPayoutScript = vchPayoutScript;
         keyHolder.Sign(NotePreAuthSigHash(nHouseID, d.vUnits, d.vchPayoutScript, demandId), d.vchPreAuthSig);
         if (!fValidPreAuthSig)
             keyHolder.Sign(NotePreAuthSigHash(nHouseID + 1, d.vUnits, d.vchPayoutScript, demandId), d.vchPreAuthSig);
@@ -456,8 +458,8 @@ BOOST_AUTO_TEST_CASE(discharge_signature_and_payout_rules)
         mtx.vchNotePayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
         BOOST_CHECK_EQUAL(CtxReject(mtx, H, U, house, fnCoin), "bad-note-redeem-discharge-sig-invalid");
     }
-    // The re-supplied vector must sum to the burn: a mismatch means the sig
-    // authorises a DIFFERENT demand than the coins being burned.
+    // The burn may not exceed the re-supplied vector's sum (S1X-32: it may fall short of it - the rest of a demand the
+    // holder partly redeemed itself).
     {
         CMutableTransaction mtx = MakeDischargeTx(1, U / 2, key, payout, (CAmount)U, 0, house.houseID);
         BOOST_CHECK_EQUAL(CtxReject(mtx, H, U, house, fnCoin), "bad-note-redeem-discharge-sum");
@@ -1437,6 +1439,45 @@ BOOST_AUTO_TEST_CASE(s1x_15_a_paid_whitelisted_payout_cannot_be_protested)
 // discharge refuses burned coins of mixed demands; the 57-byte custody form stays standard to create and to spend. (A
 // PROTEST copying the id is exercised by the protest cases above: their inputs and outputs carry one id, and the
 // check refuses any other.)
+// S1X-42 (testing: Low; Michael 2026-11-26 "Yes, build all 6"): a replaced DEMAND over the same inputs (another payout)
+// has another id, so the replaced one's pre-auth signature can't discharge the confirmed demand's coins to its payout.
+BOOST_AUTO_TEST_CASE(s1x_42_a_replaced_demands_signature_does_not_discharge_the_confirmed_one)
+{
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t D = 20000;
+    const uint64_t U = 1000000;
+    const int H = (int)(D + W - 1);
+    CKey key; key.MakeNewKey(true);
+    const std::vector<unsigned char> payout1 = ParseHex("76a914cccccccccccccccccccccccccccccccccccccccc88ac");
+    const std::vector<unsigned char> payout2 = ParseHex("76a914dddddddddddddddddddddddddddddddddddddddd88ac");
+    CHouse house = MakeOpenHouse(1, H, 4 * U);
+
+    // Same inputs, different payouts (and vectors): different ids.
+    CMutableTransaction dem1 = MakeDemandTx(1, U, key, true, payout1);
+    CMutableTransaction dem2 = MakeDemandTx(1, U, key, true, payout2);
+    BOOST_CHECK(NoteHashPrevouts(CTransaction(dem1)) == NoteHashPrevouts(CTransaction(dem2)));
+    uint256 id1, id2;
+    BOOST_REQUIRE(NoteCustodyDemandId(dem1.vout[0].scriptPubKey, id1));
+    BOOST_REQUIRE(NoteCustodyDemandId(dem2.vout[0].scriptPubKey, id2));
+    BOOST_CHECK(id1 != id2);
+    BOOST_CHECK(NoteDemandId(CTransaction(dem1), std::vector<uint64_t>{U}, payout1) !=
+                NoteDemandId(CTransaction(dem1), std::vector<uint64_t>{U + 1}, payout1));
+
+    // DEMAND2 confirmed (its coins carry id2). A discharge carrying DEMAND1's signature (payout1, signed over id1) is
+    // refused; DEMAND2's own (payout2, over id2) is accepted.
+    auto fnCoins = [&](const COutPoint&, Coin& coin) {
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, TestCustody(std::vector<unsigned char>(key.GetPubKey().begin(),
+                                                                                   key.GetPubKey().end()), id2)),
+                    (int)D, false, false, false, uint256());
+        coin.SetNote(1, U, NoteDemandTag(D, true));
+        return true;
+    };
+    CMutableTransaction disOld = MakeDischargeTx(1, U, key, payout1, (CAmount)U, 0, house.houseID, id1);
+    BOOST_CHECK_EQUAL(CtxReject(disOld, H, U, house, fnCoins), "bad-note-redeem-discharge-sig-invalid");
+    CMutableTransaction disNew = MakeDischargeTx(1, U, key, payout2, (CAmount)U, 0, house.houseID, id2);
+    BOOST_CHECK_EQUAL(CtxReject(disNew, H, U, house, fnCoins), "");
+}
+
 BOOST_AUTO_TEST_CASE(s1x_14_the_demand_id_travels_with_the_coins)
 {
     const uint32_t W = Params().GetConsensus().nDemandWindow;
@@ -1449,12 +1490,12 @@ BOOST_AUTO_TEST_CASE(s1x_14_the_demand_id_travels_with_the_coins)
     const std::vector<unsigned char> payout = ParseHex("76a914cccccccccccccccccccccccccccccccccccccccc88ac");
     CHouse house = MakeOpenHouse(1, H, 4 * U);
 
-    // A DEMAND's custody output carries its own id (NoteHashPrevouts) and pins the holder's key.
+    // A DEMAND's custody output carries its own id (S1X-42: NoteDemandId) and pins the holder's key.
     CMutableTransaction dem = MakeDemandTx(1, U, key, true, payout);
     BOOST_CHECK(IsNoteDemandCustodyScript(dem.vout[0].scriptPubKey));
     uint256 id;
     BOOST_REQUIRE(NoteCustodyDemandId(dem.vout[0].scriptPubKey, id));
-    BOOST_CHECK(id == NoteHashPrevouts(CTransaction(dem)));
+    BOOST_CHECK(id == NoteDemandId(CTransaction(dem), std::vector<uint64_t>{U}, payout));
     BOOST_CHECK(NoteCustodyKeyIs(dem.vout[0].scriptPubKey, vchKey));
 
     // A discharge whose burned coins belong to two demands is refused (one served per input: alternate ids).
@@ -1591,6 +1632,184 @@ BOOST_AUTO_TEST_CASE(s1x_21_a_protest_signature_cannot_be_replayed_onto_another_
         "S1X-21: the holder's protest signature for demand A protested demand B without the holder; the house is now "
         << (HouseEffectiveStatus(houseOut, H) == HOUSE_STATUS_INSOLVENT ? "Insolvent at once (no cure: an episode ended "
             "100 blocks before)" : "protested"));
+}
+
+// S1X-32 (testing 2026-11-26; security 11-26: High). A holder must not be able to leave part of its own pre-auth
+// demand undischargeable. A DEMAND re-issues custody coins under ONE pre-auth signature over its whole unit vector. The
+// holder alone may plain-REDEEM some of those coins (legal: the voluntary path, tx_verify). The house holds only the
+// demand's pre-auth, and the discharge must burn exactly the signed vector's sum, so the rest can never be discharged;
+// the holder protests it after the window, only a REDEEM of marked coins lowers nProtestOpen, and the house runs out its
+// cure (or is insolvent at once with no cure left). Cost: a few mg of notes, against any Open house.
+// PASS (security's suggestion, not yet agreed: a discharge burns any coins carrying the demand id, at most the signed
+// total, the floor priced on the units burned): the house discharges the protested remainder with the demand's own
+// pre-auth and the protest clears; a 100-coin demand discharges in two txs. FAIL on master c53f2e6:
+// bad-note-redeem-discharge-sum at each discharge.
+namespace {
+// A discharge burning vIn (each a custody coin of the demand) under the demand's pre-auth over vDemandUnits.
+CMutableTransaction MakeDischargeOf(uint32_t nHouseID, const std::vector<uint64_t>& vDemandUnits,
+                                    const std::vector<unsigned char>& vchPreAuthSig, const CKey& keyHolder,
+                                    const std::vector<unsigned char>& vchPayoutScript, const std::vector<COutPoint>& vIn,
+                                    CAmount amountPayout)
+{
+    const CPubKey pub = keyHolder.GetPubKey();
+    NoteRedeem redeem;
+    redeem.nHouseID = nHouseID;
+    redeem.fBrassage = 0;
+    redeem.vchHolderPubKey = std::vector<unsigned char>(pub.begin(), pub.end());
+    redeem.fPreAuthDischarge = 1;
+    redeem.vPreAuthUnits = vDemandUnits;
+    redeem.vchPayoutScript = vchPayoutScript;
+    redeem.vchPreAuthSig = vchPreAuthSig;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_NOTE_VERSION;
+    mtx.nNoteOp = NOTE_OP_REDEEM;
+    for (const COutPoint& o : vIn)
+        mtx.vin.push_back(CTxIn(o));
+    mtx.vout.push_back(CTxOut(amountPayout, CScript(vchPayoutScript.begin(), vchPayoutScript.end())));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
+    mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    return mtx;
+}
+COutPoint CustodyCoin(int i) { return COutPoint(uint256S(strprintf("%x", 0x5320 + i)), 0); }
+}
+
+BOOST_AUTO_TEST_CASE(s1x_32_a_holder_cannot_strand_part_of_its_own_preauth_demand)
+{
+    const uint32_t D = 10000;
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint64_t U1 = 400000, U2 = 600000;
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    const std::vector<unsigned char> payout = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
+    const uint256 id = DemandIdFor();
+    const CScript custody = TestCustody(vchKey, id);
+    const std::vector<uint64_t> vDemand{U1, U2};
+    std::vector<unsigned char> vchPreAuth;
+    BOOST_REQUIRE(key.Sign(NotePreAuthSigHash(1, vDemand, payout, id), vchPreAuth));
+    const uint32_t nTag = NoteDemandTag(D, NOTE_DEMAND_MODE_PREAUTH);
+    const uint32_t nTagProtested = nTag | NOTE_DEMAND_PROTESTED_BIT;
+
+    // Control: inside the window the house discharges both coins together with the demand's pre-auth (par).
+    {
+        const int H = (int)(D + W - 1);
+        CHouse house = MakeOpenHouse(1, H, 2 * (U1 + U2));
+        BOOST_CHECK_EQUAL(CtxReject(MakeDischargeOf(1, vDemand, vchPreAuth, key, payout, {CustodyCoin(1), CustodyCoin(2)},
+                                                    (CAmount)(U1 + U2)),
+                                    H, U1 + U2, house, ServeCoin(1, U1, nTag, custody)), "");
+    }
+
+    // The split: the holder alone plain-REDEEMs c1 (its own fresh signature over the burn and the outputs). It stays
+    // legal (the voluntary path); the defect is what it leaves behind.
+    {
+        const int H = (int)(D + W - 1);
+        CHouse house = MakeOpenHouse(1, H, 2 * (U1 + U2));
+        BOOST_CHECK_EQUAL(CtxReject(MakePlainRedeemTx(1, U1, key, (CAmount)U1), H, U1, house,
+                                    ServeCoin(1, U1, nTag, custody)), "");
+    }
+
+    // After the window the holder protests c2: the house is Stressed and its cure runs.
+    const int P = (int)(D + W);
+    CHouse houseProtested;
+    {
+        CHouse house = MakeOpenHouse(1, P, 2 * (U1 + U2) - U1);
+        bool fChanged = false;
+        BOOST_REQUIRE_EQUAL(CtxReject(MakeProtestTx(1, U2, key, nTagProtested, house, true, id), P, U2, house,
+                                      ServeCoin(1, U2, nTag, custody), &houseProtested, &fChanged), "");
+        BOOST_REQUIRE_EQUAL(houseProtested.nProtestOpen, 1u);
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(houseProtested, P + 1), HOUSE_STATUS_STRESSED);
+    }
+
+    // The house pays c2 with the only authorisation it holds, the demand's pre-auth, at the floor on c2's units. It must
+    // be accepted and clear the protest; otherwise only the holder can ever lift it.
+    {
+        const int Hd = P + 1;
+        const CAmount amountFloor = (CAmount)U2 + Interest(U2, (uint32_t)(Hd - (int)(D + W)));
+        CHouse houseOut; bool fChanged = false;
+        const std::string strReason = CtxReject(MakeDischargeOf(1, vDemand, vchPreAuth, key, payout, {CustodyCoin(2)},
+                                                                amountFloor),
+                                                Hd, U2, houseProtested, ServeCoin(1, U2, nTagProtested, custody),
+                                                &houseOut, &fChanged);
+        BOOST_CHECK_MESSAGE(strReason.empty(), "S1X-32: the house cannot discharge the protested remainder of a split "
+                            "pre-auth demand: " << strReason << " (the protest can then only be lifted by the holder)");
+        if (strReason.empty())
+            BOOST_CHECK_EQUAL(houseOut.nProtestOpen, 0u);
+        // The other encoding the house could try (the remainder's own vector) is not the holder's signature.
+        BOOST_CHECK_EQUAL(CtxReject(MakeDischargeOf(1, {U2}, vchPreAuth, key, payout, {CustodyCoin(2)}, amountFloor),
+                                    Hd, U2, houseProtested, ServeCoin(1, U2, nTagProtested, custody)),
+                          "bad-note-redeem-discharge-sig-invalid");
+        // A discharge still can't burn more than the holder authorised.
+        BOOST_CHECK(!CtxReject(MakeDischargeOf(1, vDemand, vchPreAuth, key, payout, {CustodyCoin(2), CustodyCoin(3)},
+                                               (CAmount)(U1 + U2 + U2) * 2),
+                               Hd, U1 + U2 + U2, houseProtested, ServeCoin(1, U2, nTagProtested, custody)).empty());
+    }
+
+    // Fan-out: a 100-coin demand (MAX_NOTE_OUTPUTS) discharged in two txs of 50 coins, inside the window (par).
+    {
+        const int H = (int)(D + W - 1);
+        CHouse house = MakeOpenHouse(1, H, 200000);
+        const std::vector<uint64_t> vFan(MAX_NOTE_OUTPUTS, 1000);
+        std::vector<unsigned char> vchFanSig;
+        BOOST_REQUIRE(key.Sign(NotePreAuthSigHash(1, vFan, payout, id), vchFanSig));
+        for (int half = 0; half < 2; half++) {
+            std::vector<COutPoint> vIn;
+            for (int i = 0; i < 50; i++)
+                vIn.push_back(CustodyCoin(100 + 50 * half + i));
+            const std::string strReason = CtxReject(MakeDischargeOf(1, vFan, vchFanSig, key, payout, vIn, 50000), H, 50000,
+                                                    house, ServeCoin(1, 1000, nTag, custody));
+            BOOST_CHECK_MESSAGE(strReason.empty(), "S1X-32 fan-out: half " << half << " of a 100-coin pre-auth demand "
+                                "can't be discharged on its own: " << strReason);
+        }
+    }
+}
+
+// ===========================================================================
+// testing (2026-11-26): S1X-42 (Claude max run 4 #10; testing Low; fixed in consensus batch 2 with S1X-32, Michael
+// 2026-11-26 "Yes, build all 6"). The holder relays DEMAND1 (inputs X, payout P1, pre-auth signature S1); it stalls and
+// they replace it with DEMAND2 (the same inputs X, payout P2), which confirms. With the demand id a hash of the inputs
+// alone, both have the same id, so a discharge carrying DEMAND1's vector, payout P1 and S1 burns DEMAND2's coins and
+// pays P1, the payout the holder replaced. Version-free: the DEMANDs come from MakeDemandTx, which computes the id the
+// way its branch does, and the ids are read back from their custody scripts.
+// FAILS on master 7f65d2e (the old signature discharges the confirmed demand to P1); passes on mb/consensus-batch-2.
+// ===========================================================================
+BOOST_AUTO_TEST_CASE(s1x_42_a_replaced_demand_does_not_pay_its_old_payout)
+{
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t D = 20000;
+    const uint64_t U = 1000000;
+    const int H = (int)(D + W - 1);
+    CKey key;
+    key.MakeNewKey(true);
+    const std::vector<unsigned char> vchKey = [&] { const CPubKey p = key.GetPubKey(); return std::vector<unsigned char>(p.begin(), p.end()); }();
+    const std::vector<unsigned char> payout1 = ParseHex("76a914a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a188ac");
+    const std::vector<unsigned char> payout2 = ParseHex("76a914b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b288ac");
+    const CHouse house = MakeOpenHouse(1, H, 4 * U);
+
+    const CMutableTransaction dem1 = MakeDemandTx(1, U, key, true, payout1);   // relayed, stalled, replaced
+    const CMutableTransaction dem2 = MakeDemandTx(1, U, key, true, payout2);   // the same input; confirmed at D
+    BOOST_REQUIRE(dem1.vin[0].prevout == dem2.vin[0].prevout);
+    uint256 id1, id2;
+    BOOST_REQUIRE(NoteCustodyDemandId(dem1.vout[0].scriptPubKey, id1));
+    BOOST_REQUIRE(NoteCustodyDemandId(dem2.vout[0].scriptPubKey, id2));
+
+    // DEMAND2's custody coin, as the chain holds it.
+    const CScript scriptCoin2 = dem2.vout[0].scriptPubKey;
+    auto fnCoin2 = [&](const COutPoint&, Coin& coin) {
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, scriptCoin2), (int)D, false, false, false, uint256());
+        coin.SetNote(1, U, NoteDemandTag(D, true));
+        return true;
+    };
+
+    // The discharge a stranger builds from DEMAND1's public payload: its vector, its payout P1 and its signature over id1.
+    const std::string rOld = CtxReject(MakeDischargeTx(1, U, key, payout1, (CAmount)U, 0, house.houseID, id1), H, U, house, fnCoin2);
+    BOOST_CHECK_MESSAGE(!rOld.empty(),
+                        std::string("S1X-42: DEMAND1's pre-auth signature (payout P1) discharged the confirmed DEMAND2's coins ") +
+                        "to P1, the payout the holder replaced (ids " + (id1 == id2 ? "equal" : "different") + ")");
+    BOOST_CHECK_MESSAGE(rOld.empty() || rOld == "bad-note-redeem-discharge-sig-invalid",
+                        "S1X-42: refused, but not for its signature: " + rOld);
+    // Control: DEMAND2's own authorisation (payout P2, over id2) discharges it.
+    const std::string rNew = CtxReject(MakeDischargeTx(1, U, key, payout2, (CAmount)U, 0, house.houseID, id2), H, U, house, fnCoin2);
+    BOOST_CHECK_MESSAGE(rNew.empty(), "S1X-42 control: DEMAND2's own discharge was refused: " + rNew);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

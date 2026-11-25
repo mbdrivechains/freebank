@@ -8,10 +8,12 @@
 #include <cashu.h>
 #include <chainparams.h>
 #include <coins.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <house.h>
 #include <key.h>
 #include <note.h>
+#include <settle.h>     // SettleNet (testing: S1X-37)
 #include <random.h>
 #include <streams.h>
 #include <token.h>
@@ -1066,6 +1068,139 @@ BOOST_AUTO_TEST_CASE(dleq_cache_remembers_only_valid_checks)
         BOOST_CHECK(!FbVerifyDLEQ(A, t.C_, t.B, t.e, t.s));     // the key binds the points' roles
     }
     BOOST_CHECK(!FbVerifyDLEQ(A, t.B, t.C_, t.e, sBad));         // and outside the scope: the plain check
+}
+
+// S1X-36 (testing 2026-11-26; Claude max run 4 #6; security 11-26: Medium, Low if well under 1 ms a probe). The cost of
+// the context-free TOKEN_POST shape check a peer makes a node pay before any input, fee or standardness check: every
+// vIssued key is parsed in full (IsFullyValid). Measures CheckTransaction on a valid-shape post with
+// MAX_TOKEN_POST_ENTRIES distinct keys. A measurement, not a pass/fail gate: it prints the median.
+BOOST_AUTO_TEST_CASE(s1x_36_token_post_shape_parse_cost)
+{
+    NoteTokenPost post;
+    post.nHouseID = 1;
+    post.nKeysetID = 1;
+    for (size_t i = 0; i < MAX_TOKEN_POST_ENTRIES; i++) {
+        CKey k;
+        k.MakeNewKey(true);
+        const CPubKey pub = k.GetPubKey();
+        post.vIssued.emplace_back(std::vector<unsigned char>(pub.begin(), pub.end()), 1);
+    }
+    post.vchSig.assign(70, 0x30);
+    CMutableTransaction mtx = NoteOpTx(NOTE_OP_TOKEN_POST);
+    SetPayload(mtx, post);
+    const CTransaction tx(mtx);
+    std::vector<int64_t> vT;
+    std::string strReason;
+    for (int i = 0; i < 9; i++) {
+        CValidationState state;
+        const int64_t t0 = GetTimeMicros();
+        const bool fOk = CheckTransaction(tx, state);
+        vT.push_back(GetTimeMicros() - t0);
+        strReason = fOk ? "passes" : state.GetRejectReason();
+    }
+    std::sort(vT.begin(), vT.end());
+    BOOST_TEST_MESSAGE(strprintf("S1X-36 TOKEN_POST: CheckTransaction on %u keys (%u bytes, %s): median %d us (%.2f us a key)",
+                                 (unsigned)MAX_TOKEN_POST_ENTRIES, (unsigned)::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION),
+                                 strReason, vT[vT.size() / 2], double(vT[vT.size() / 2]) / MAX_TOKEN_POST_ENTRIES));
+    BOOST_CHECK_EQUAL(strReason, "passes");
+}
+
+// ===========================================================================
+// testing (2026-11-26): S1X-37 (Claude max run 4 #7; security 11-26 Medium, policy; fix 2db1f65 on mb/s1x-33, freebankd's
+// suggested test). A settle NET has no house cap, and ATMP read every named house's record, rates and par eligibility
+// before the first approver check and before any fee floor, refusing at DoS 0, so a zero-fee round could be re-sent
+// with a new nLockTime for ever. The fix: a NET naming more than 100 houses is refused nonstandard before any house is
+// read, and a settle tx meets the S1X-30 early fee floor first. Probes are NET rings (house i presents house i+1, the
+// last the first) of real note coins on the presenters' keys, so they pass CheckTransaction and the NET input layer;
+// the houses don't exist, so anything that reads one refuses with a house reason.
+// FAILS on master 7f65d2e (both probes reach the house reads); passes on mb/s1x-33 2db1f65.
+// ===========================================================================
+namespace {
+CMutableTransaction Run4NetRing(TokenPoolSetup& s, size_t H, CAmount nFee)
+{
+    SettleNet n;
+    std::vector<std::vector<unsigned char>> vKey;
+    for (size_t i = 0; i < H; i++) {
+        CKey k;
+        k.MakeNewKey(true);
+        vKey.push_back(V(k.GetPubKey()));
+        n.vHouseID.push_back((uint32_t)(i + 900001));
+        n.vReceive.push_back(0);
+        n.vPrevMintedUnits.push_back(1000000);
+        n.vPrevLastSettleHeight.push_back(0);
+        n.vPresentKey.push_back(vKey.back());
+        n.vPresentSig.push_back(std::vector<unsigned char>(70, 0x30));
+        n.vApproverIndex.push_back({0});
+        n.vApproverSig.push_back({std::vector<unsigned char>(70, 0x30)});
+    }
+    for (size_t i = 0; i < H; i++) {
+        SettleNetBundle b;
+        b.nPresenter = (uint32_t)(i + 900001);
+        b.nIssuer = (uint32_t)((i + 1) % H + 900001);
+        b.nUnits = 1000;
+        b.nCount = 1;
+        n.vBundle.push_back(b);
+    }
+    std::sort(n.vBundle.begin(), n.vBundle.end(), [](const SettleNetBundle& a, const SettleNetBundle& b) {
+        return a.nPresenter != b.nPresenter ? a.nPresenter < b.nPresenter : a.nIssuer < b.nIssuer;
+    });
+    n.nExpiryHeight = 0;
+    CMutableTransaction mtx;
+    mtx.nVersion = TRANSACTION_SETTLE_VERSION;
+    mtx.nSettleOp = SETTLE_OP_NET;
+    CAmount nIn = 0;
+    for (const SettleNetBundle& b : n.vBundle) {
+        const COutPoint o(uint256S(strprintf("%x", 0x37000000 + ++s.nNext)), 0);
+        Coin coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vKey[b.nPresenter - 900001])), chainActive.Height(), false,
+                  false, false, uint256());
+        coin.SetNote(b.nIssuer, b.nUnits);
+        pcoinsTip->AddCoin(o, std::move(coin), false);
+        mtx.vin.push_back(CTxIn(o));
+        nIn += NOTE_DUST_VALUE;
+    }
+    mtx.vin.push_back(CTxIn(s.TipFee()));   // plain funding after the bundles: 1 coin
+    nIn += COIN;
+    mtx.vout.emplace_back(nIn - nFee, CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x37)
+                                                << OP_EQUALVERIFY << OP_CHECKSIG);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << n;
+    mtx.vchSettlePayload.assign(ss.begin(), ss.end());
+    return mtx;
+}
+
+std::string Run4Atmp(const CMutableTransaction& mtx, int& nDoS)
+{
+    CValidationState state;
+    const bool fOk = AcceptToMemoryPool(mempool, state, MakeTransactionRef(mtx), nullptr, nullptr, false, 0);
+    nDoS = -1;
+    state.IsInvalid(nDoS);
+    return fOk ? std::string("ACCEPTED") : state.GetRejectReason();
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(s1x_37_settle_net_probes_are_refused_before_any_house_is_read, TokenPoolSetup)
+{
+    LOCK(cs_main);
+    int nDoS = -1;
+    // Controls: the probes are well formed up to the house reads.
+    {
+        CValidationState state;
+        BOOST_REQUIRE_MESSAGE(CheckTransaction(CTransaction(Run4NetRing(*this, 101, 20000)), state),
+                              "S1X-37 setup: the 101-house NET ring fails CheckTransaction: " + state.GetRejectReason());
+    }
+    // A NET naming 101 houses, paying a normal fee: refused nonstandard, before any house is read.
+    std::string r = Run4Atmp(Run4NetRing(*this, 101, 20000), nDoS);
+    BOOST_CHECK_MESSAGE(r == "settle-net-too-many-houses",
+                        "S1X-37: a NET naming 101 houses was refused \"" + r + "\" (DoS " + std::to_string(nDoS) +
+                        "), not as too many houses before the house reads");
+    // A zero-fee NET of three houses: refused at the fee floor, before any house is read.
+    r = Run4Atmp(Run4NetRing(*this, 3, 0), nDoS);
+    BOOST_CHECK_MESSAGE(r == "min relay fee not met" || r == "mempool min fee not met",
+                        "S1X-37: a zero-fee NET was refused \"" + r + "\" (DoS " + std::to_string(nDoS) +
+                        "), not at the fee floor before the house reads");
+    // And a 100-house NET with a fee is not refused for its size (it reaches the house reads).
+    r = Run4Atmp(Run4NetRing(*this, 100, 20000), nDoS);
+    BOOST_CHECK_MESSAGE(r != "settle-net-too-many-houses", "S1X-37 control: a 100-house NET was refused as too many houses");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

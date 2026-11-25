@@ -207,7 +207,8 @@ uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, cons
     return ss.GetHash();
 }
 
-uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashOutputs)
+uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashPrevouts,
+                          const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/defer");
@@ -219,6 +220,7 @@ uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, 
     // needs it. The prior-activation value is what a replay cannot reproduce
     // (connect requires it to equal the DB, and a DEFER moves it).
     ss << nPrevLastActivation;
+    ss << hashPrevouts;   // S1X-35: a displaced DEFER can't be re-funded by someone else
     ss << hashOutputs;
     return ss.GetHash();
 }
@@ -320,7 +322,7 @@ uint256 HouseAttestProofSetHash(const std::vector<AttestProof>& vProofs)
 
 uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
                            const CAmount& amountReserves, const uint256& hashProofSet,
-                           const uint256& hashOutputs)
+                           const uint256& hashPrevouts, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/attest");
@@ -329,6 +331,7 @@ uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
     ss << nAsOfHeight;
     ss << amountReserves;
     ss << hashProofSet;
+    ss << hashPrevouts;   // S1X-35: a displaced ATTEST can't be re-funded with later priors
     ss << hashOutputs;
     return ss.GetHash();
 }

@@ -467,9 +467,9 @@ BOOST_AUTO_TEST_CASE(binding_height_per_network)
     BOOST_CHECK(easynet->GetConsensus().CreditBindingActive(0));
     // ...and credits treasury changes only from its deposit start (L1 2,058 for the v1.2.2 restart; 1,676 at v1.2.0,
     // 1,100 at v1.1.0); every other network from the start. Building the params also checks easynet's genesis hash.
-    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3795);   // v1.2.5 restart
-    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0xa49c082c149439615898a5a510661d9229b00e7578bf5df3ee6eb23931273520"));
-    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0b);   // a fresh chain's magic (v1.2.5, D-2026-11-23-1)
+    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3896);   // v1.2.6 restart
+    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x75c478c230b3e2e213ee81074065cf73efea1f80636eee16b1081b03f20ff3cc"));
+    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0c);   // a fresh chain's magic (v1.2.6, D-2026-11-23-1)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nDepositStartL1Height, 0);
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nDepositStartL1Height, 0);
 }
