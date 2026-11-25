@@ -339,6 +339,32 @@ BOOST_AUTO_TEST_CASE(bid_at_deadline_from_postings)
     BOOST_CHECK_EQUAL(HouseBidAtActive(units, 9, A + DAY, 7, DAY), 7u);                // never posted
 }
 
+// S1X-19 (security: Low; Michael 11-25 yes): a posting counts from its own block's clock (RS-1: it takes effect the
+// block after), not from the parent's clock it was connected under. At the exact boundary - the window starting at the
+// parent's active time of the cut's block - the old high bid was still in force for that block, so it counts.
+BOOST_AUTO_TEST_CASE(s1x_19_post_dated_from_its_own_block)
+{
+    Consensus::GramParams gp;
+    CUnitsView units(nullptr);
+    std::string strReject;
+    const int64_t A = 1000;
+    auto clockAt = [&](uint32_t h, int64_t nActive) { CClockAt at; at.nActive = nActive; at.nMono = nActive; units.Put(ClockAtKey(h), at); };
+    BOOST_CHECK(ApplyHouseRatePost(units, 2, 100000, 100000, 1, 10 * DAY, gp, strReject, A));   // P, connected under A
+    clockAt(1, A + 600);                                                                     // block 1's own clock
+    const int64_t PA = A + 2 * DAY;                                                          // the cut's parent clock
+    BOOST_CHECK(ApplyHouseRatePost(units, 2, 90000, 90000, 50, 12 * DAY, gp, strReject, PA));  // C, connected under PA
+    clockAt(50, PA + 600);                                                                   // block 50's own clock
+    // The window [PA, PA + DAY]: the old bid was in force for block 50, so the high counts (it read 90000 before).
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, PA + DAY, 7, DAY), 100000u);
+    // From the cut's own clock on, the window holds the cut alone.
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, PA + 600 + DAY, 7, DAY), 90000u);
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, PA + 599 + DAY, 7, DAY), 100000u);
+    // Read in the posting block itself (nHeight 50: its clock record would not exist yet) the current posting is the
+    // one before (D-2026-11-20-2), dated from block 1's clock.
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + 600 + DAY, 7, DAY, 50), 100000u);
+    BOOST_CHECK_EQUAL(HouseBidAtActive(units, 2, A + 599 + DAY, 7, DAY, 50), 7u);
+}
+
 BOOST_AUTO_TEST_CASE(swap_payload_shape)
 {
     CKey key;
@@ -613,6 +639,35 @@ void H2Setup(H2Chain& c, const CKey& keyA)
 
 std::string H2Show(const std::string& s) { return s.empty() ? std::string("accepted") : "refused (" + s + ")"; }
 } // namespace
+
+// S1X-11 (security's counter, adopted; Michael 11-25 yes): the partners' SETKEY restore survives their routine re-post
+// (or an in-bound rise) and is still there for the restore itself; a CUT clears it, so the rate key alone can't cut and
+// snap back within W.
+BOOST_AUTO_TEST_CASE(s1x_11_restore_survives_a_repost_not_a_cut)
+{
+    CKey keyA, keyB;
+    keyA.MakeNewKey(true);
+    keyB.MakeNewKey(true);
+    {   // a re-post of the current bid keeps the restore
+        H2Chain c;
+        H2Setup(c, keyA);                                            // 100,000, then the thief's cut to 1
+        BOOST_REQUIRE(c.Block(H2_TKEY, c.SetKey(keyB)).empty());
+        BOOST_CHECK(c.Block(H2_TKEY + 600, c.Post(keyB, 1)).empty());   // the ticker re-posts the current bid
+        const std::string str = c.Block(H2_TKEY + 1200, c.Post(keyB, 100000));
+        BOOST_CHECK_MESSAGE(str.empty(), "S1X-11: the restore after a re-post was " + H2Show(str));
+    }
+    {   // a cut clears it
+        H2Chain c;
+        BOOST_REQUIRE(c.Block(H2_T0 - 600, c.SetKey(keyA)).empty());
+        BOOST_REQUIRE(c.Block(H2_T0, c.Post(keyA, 100000)).empty());
+        BOOST_REQUIRE(c.Block(H2_T0 + 10 * DAY, c.Post(keyA, 80000)).empty());   // a cut by the old key
+        BOOST_REQUIRE(c.Block(H2_TKEY, c.SetKey(keyB)).empty());
+        BOOST_CHECK(c.Block(H2_TKEY + 600, c.Post(keyB, 80000)).empty());          // a re-post keeps it ...
+        BOOST_CHECK(c.Block(H2_TKEY + 1200, c.Post(keyB, 70000)).empty());         // ... a cut clears it
+        const std::string str = c.Block(H2_TKEY + 1800, c.Post(keyB, 100000));
+        BOOST_CHECK_MESSAGE(str == "bad-house-rate-rise", "S1X-11: a snap-back after a cut was " + H2Show(str));
+    }
+}
 
 BOOST_AUTO_TEST_CASE(testing_h2_setkey_arms_a_restore)
 {

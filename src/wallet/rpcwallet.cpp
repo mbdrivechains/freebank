@@ -7460,6 +7460,89 @@ UniValue recoursebill(const JSONRPCRequest& request)
     return response;
 }
 
+UniValue mergehouseescrow(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+        throw std::runtime_error(
+            "mergehouseescrow \"id\" \"list\" ( fee )\n"
+            "\nArguments:\n"
+            "1. \"id\"    (numeric, required) the house\n"
+            "2. \"list\"  (string, required) \"change\" (the brassage / claim escrow change) or \"reserve\" (the locked till)\n"
+            "3. \"fee\"   (numeric or string, optional) default 0.0001, from this wallet's plain coins\n"
+            "\nMerge up to 500 of the house's escrow coins on that list into one escrow coin holding their sum, so the\n"
+            "house's settle and CLOSE stay buildable. Anyone may; nothing leaves the escrow. A pending merge gives way\n"
+            "to any other op on the house.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("mergehouseescrow", "1 change")
+            + HelpExampleRpc("mergehouseescrow", "1, \"change\"")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nHouseID = request.params[0].get_int();
+    const std::string strList = request.params[1].get_str();
+    uint8_t nList;
+    if (strList == "change") nList = HOUSE_ESCROW_LIST_CHANGE;
+    else if (strList == "reserve") nList = HOUSE_ESCROW_LIST_RESERVE;
+    else throw JSONRPCError(RPC_INVALID_PARAMETER, "list must be \"change\" or \"reserve\"");
+    CAmount nFee = 10000;
+    if (request.params.size() >= 3 && !request.params[2].isNull()) nFee = AmountFromValue(request.params[2]);
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    uint256 txid;
+    size_t nMerged = 0;
+    std::string strFail;
+    if (!pwallet->MergeHouseEscrow(strFail, txid, nMerged, nHouseID, nList, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    response.pushKV("merged", (uint64_t)nMerged);
+    return response;
+}
+
+UniValue releasebilltitle(const JSONRPCRequest& request)
+{
+    CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
+        return NullUniValue;
+
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+        throw std::runtime_error(
+            "releasebilltitle \"id\" ( fee )\n"
+            "\nArguments:\n"
+            "1. \"id\"   (numeric, required) a bill that has ended (retired or defaulted)\n"
+            "2. \"fee\"  (numeric or string, optional) default 0.00001, out of the title's own value\n"
+            "\nRelease the bill's title coin (its 0.0001 title value) to a new key of this wallet. The title has no\n"
+            "use once a bill has ended; this wallet must hold it. Not for a bill a failed house's escrow took.\n"
+            + HelpRequiringPassphrase(pwallet) +
+            "\nExamples:\n"
+            + HelpExampleCli("releasebilltitle", "1")
+            + HelpExampleRpc("releasebilltitle", "1")
+        );
+
+    ObserveSafeMode();
+    const uint32_t nBillID = request.params[0].get_int();
+    CAmount nFee = 1000;
+    if (request.params.size() >= 2 && !request.params[1].isNull()) nFee = AmountFromValue(request.params[1]);
+    EnsureWalletIsUnlocked(pwallet);
+    pwallet->BlockUntilSyncedToCurrentChain();
+    uint256 txid;
+    std::string strFail;
+    if (!pwallet->ReleaseBillTitle(strFail, txid, nBillID, nFee)) {
+        LogPrintf("%s: %s\n", __func__, strFail);
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("txid", txid.ToString());
+    return response;
+}
+
 UniValue getnewbillpubkey(const JSONRPCRequest& request)
 {
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
@@ -8175,6 +8258,7 @@ static const CRPCCommand commands[] =
     { "bills",              "signdiscount",                     &signdiscount,                  {"proposal", "fee"} },
     { "bills",              "completediscount",                 &completediscount,              {"hex"} },
     { "bills",              "recoursebill",                     &recoursebill,                  {"id", "fee", "margin_bps"} },
+    { "bills",              "releasebilltitle",                 &releasebilltitle,              {"id", "fee"} },
     { "bills",              "listmybills",                      &listmybills,                   {} },
     { "bills",              "getnewbillpubkey",                 &getnewbillpubkey,              {} },
     { "notes",              "mintnote",                         &mintnote,                      {"id", "units", "fee", "address"} },
@@ -8234,6 +8318,7 @@ static const CRPCCommand commands[] =
     { "houses",             "deferhouse",                       &deferhouse,                    {"id", "fee"} },
     { "houses",             "renewdeferral",                    &renewdeferral,                 {"id", "fee"} },
     { "houses",             "releasereserves",                  &releasereserves,               {"id", "fee"} },
+    { "houses",             "mergehouseescrow",                 &mergehouseescrow,              {"id", "list", "fee"} },
     { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee"} },
     { "houses",             "closehouse",                       &closehouse,                    {"id", "fee"} },
 

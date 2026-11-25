@@ -349,22 +349,22 @@ public:
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;
-        pchMessageStart[3] = 0x0a;   // v1.2.4 (D-2026-11-23-1): a fresh chain again (09: the s1/s2 review fixes)
+        pchMessageStart[3] = 0x0b;   // v1.2.5 (D-2026-11-23-1): a fresh chain again (0a: v1.2.4's security fixes)
         nDefaultPort = 28455;
 
-        genesis = CreateGenesisBlock("FreeBank easynet genesis 7: v1.2.4 security fixes, easynet slot 130, 2026-11-23",
+        genesis = CreateGenesisBlock("FreeBank easynet genesis 8: v1.2.5 consensus batch, easynet slot 130, 2026-11-25",
                                      CScript() << OP_RETURN,
-                                     1795392000, 1, 0);   // 2026-11-23 00:00Z: before every L1 block it will use
+                                     1795564800, 1, 0);   // 2026-11-25 00:00Z: before every L1 block it will use
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0x1f07c608e9ed748cf2b9fd1e5df27f0ceff46d7d719c7780c4de1c18e2e001bc"));
+        assert(consensus.hashGenesisBlock == uint256S("0xa49c082c149439615898a5a510661d9229b00e7578bf5df3ee6eb23931273520"));
         // The fresh chain binds credit signatures from genesis.
         consensus.nCreditBindingHeight = 0;
-        // ...and credits only treasury changes from L1 block 3,573 (v1.2.4 restart; the L1 tip + 1 when this was cut): the
-        // 273.29792050 ECX in the treasury at L1 3,572 (CTIP ad49da97..:0, sequence 12; the last slot-130 event the
-        // deposit at 2,935; no bundle pending or in vote; easynet's enforcer, 2026-11-23 23:37Z) stays the old chains'.
-        // Each later deposit credits what it added (DEPOSITS_664_SPEC). (The s1/s2 chain: 2,935; S5X-2 + RQ-1's: 2,730;
-        // v1.2.2's: 2,058; v1.2.0's: 1,676; v1.1.0's: 1,100.)
-        consensus.nDepositStartL1Height = 3573;
+        // ...and credits only treasury changes from L1 block 3,795 (v1.2.5 restart; the L1 tip + 1 when this was cut): the
+        // 323.29792050 ECX in the treasury at L1 3,794 (CTIP c95222e1..:0, sequence 13; the last slot-130 event the
+        // deposit at 3,650; no bundle pending or in vote; easynet's enforcer, 2026-11-25 06:03Z) stays the old chains'.
+        // Each later deposit credits what it added (DEPOSITS_664_SPEC). (v1.2.4's chain: 3,573; the s1/s2 chain: 2,935;
+        // S5X-2 + RQ-1's: 2,730; v1.2.2's: 2,058; v1.2.0's: 1,676; v1.1.0's: 1,100.)
+        consensus.nDepositStartL1Height = 3795;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
         // No forks (D-2026-11-05-3): easynet switches the later rules on days after the release that carries them, so
         // they can be seen working before mainnet's date. EASYNET_LATER_RULES_TIME: set at that release.

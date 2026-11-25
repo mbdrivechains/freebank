@@ -63,6 +63,11 @@ static const uint8_t BILL_OP_HRETIRE_NOTES = 9;
 //   11 HCLAIM_ESCROW:  after maturity + grace, ANYONE moves its bond into escrow - no quorum, the destination is fixed.
 static const uint8_t BILL_OP_HRETIRE_ESCROW = 10;
 static const uint8_t BILL_OP_HCLAIM_ESCROW  = 11;
+// S1X-29 (security: Low; Michael 11-25 yes): 12 TITLE_RELEASE: spends the 10,000-sat title coin of a bill that is no
+//                      longer ACTIVE, to plain outputs. Only ENDORSE and DISCOUNT spend a title and both need an ACTIVE
+//                      bill, so a title was stranded once its bill ended. The title's own script authorises it (P2PKH of
+//                      whoever it sits with, the old holder after a RECOURSE too); no bill or house state changes.
+static const uint8_t BILL_OP_TITLE_RELEASE  = 12;
 
 // On-chain bill status (Issued / Endorsed collapse to active)
 static const char BILL_STATUS_ACTIVE    = 'a';
@@ -127,7 +132,7 @@ static const uint64_t LOAN_BOOK_MAX_FACE = (uint64_t)MAX_MONEY;
 // STRICT byte compare (which is what catches u128 accumulator drift). Only a
 // house-held bill takes the versioned layout.
 static const uint32_t BILL_SER_SENTINEL = 0xFFFFFFFFU;
-static const uint8_t BILL_SER_VERSION = 3;   // 3 = Gold B: nRefHouseID
+static const uint8_t BILL_SER_VERSION = 4;   // 3 = Gold B: nRefHouseID; 4 = S1X-25: nEscrowHouseID
 
 /** One link of the endorsement chain (ARCH §4): signed over
  * (bill_id, to_pk, at_height) with a domain tag. */
@@ -176,10 +181,15 @@ struct CBill {
     // Gold B (D-2026-11-07-1; GOLD_B.md §3): the reference house named at ISSUE. While the bill is privately held, the
     // drawee repays in sECX at this house's highest ask of the last 30 days; while a house holds it, at that house's.
     uint32_t nRefHouseID;
+    // S1X-25 (security: Medium; Michael 11-25 yes): the failed house whose escrow took this bill's money (ops 10 and
+    // 11 set it, their undo clears it). RECOURSE refuses such a bill: after op 11 the holder is still the house's
+    // custody key, and a liable party's payment must never reach the operator's key (FAILED_HOUSE_DESIGN A). What that
+    // gives up: an endorser's liability on such a bill can be settled only off chain.
+    uint32_t nEscrowHouseID;
 
     CBill() : nBillID(0), amount(0), amountEscrow(0), nIssuedHeight(0),
               nMaturityHeight(0), nGraceBlocks(0), status(BILL_STATUS_ACTIVE),
-              nOwnerHouseID(0), nRefHouseID(0) {}
+              nOwnerHouseID(0), nRefHouseID(0), nEscrowHouseID(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -204,7 +214,7 @@ struct CBill {
         } else {
             // Emit the legacy layout iff the record carries no post-legacy
             // state, so the on-disk bytes of an untouched bill never change.
-            if (nOwnerHouseID != 0 || nRefHouseID != 0) {
+            if (nOwnerHouseID != 0 || nRefHouseID != 0 || nEscrowHouseID != 0) {
                 uint32_t nSentinel = BILL_SER_SENTINEL;
                 nSerVersion = BILL_SER_VERSION;
                 READWRITE(nSentinel);
@@ -236,6 +246,11 @@ struct CBill {
             READWRITE(nRefHouseID);
         } else if (ser_action.ForRead()) {
             nRefHouseID = 0;
+        }
+        if (nSerVersion >= 4) {
+            READWRITE(nEscrowHouseID);
+        } else if (ser_action.ForRead()) {
+            nEscrowHouseID = 0;
         }
     }
 };
@@ -514,6 +529,20 @@ struct BillHRetireNotes {
     }
 };
 
+/** TITLE_RELEASE (op 12, S1X-29): the bill whose title the transaction spends. */
+struct BillTitleRelease {
+    uint32_t nBillID;
+
+    BillTitleRelease() : nBillID(0) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nBillID);
+    }
+};
+
 /** HCLAIM_ESCROW (op 11, v0.2.28): op 8's fields without approvers - at a Deferred/Insolvent house anyone may move a
  * defaulted bill's bond into the house's escrow (vout[0], pinned; the fee comes from the submitter's own coins). */
 struct BillHClaimEscrow {
@@ -629,8 +658,12 @@ uint256 BillEndorseSigHash(const uint256& billID, const std::vector<unsigned cha
 // itself.
 uint256 BillHashOutputs(const CTransaction& tx);
 /** UR1-6 (switch-on): nRateNamed is part of the digest ops 3 RETIRE and 7 HRETIRE sign. */
-uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashOutputs);
-uint256 BillClaimSigHash(const uint256& billID, const uint256& hashOutputs);
+/** S1X-17: a hash of every input (prevout, nSequence) and nLockTime, so a bill op's payload signature fixes the whole
+ *  transaction even when no input carries a signature (an escrow-only CLAIM, HCLAIM, HRETIRE or HRETIRE_ESCROW). */
+uint256 BillTxBindingHash(const CTransaction& tx);
+uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashTxBinding,
+                          const uint256& hashOutputs, bool fHouseHeld);
+uint256 BillClaimSigHash(const uint256& billID, const uint256& hashTxBinding, const uint256& hashOutputs, bool fHouseHeld);
 
 /** SHA256d over every input outpoint of tx - bound into the B1 digests (the R-i6
  * rule: bind prevouts wherever a payload signature authorizes a spend). */

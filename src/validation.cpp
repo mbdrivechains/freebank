@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <crypto/common.h>   // ReadLE32 (S1X-10)
 #include <validation.h>
 #include <miner.h>   // the inclusion log (7j)
 
@@ -285,7 +286,7 @@ public:
 
 private:
     bool ActivateBestChainStep(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace);
-    bool ConnectTip(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions &disconnectpool);
+    bool ConnectTip(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions &disconnectpool, bool fInReorg = false);
 
     CBlockIndex* AddToBlockIndex(const CBlockHeader& block);
     /** Create a new block index entry for a given block hash */
@@ -725,6 +726,8 @@ static bool InsolvencySwapsSettled(const CHouse& house, int nHeight)
     const uint32_t nE = HouseInsolventSince(house, nHeight);
     if (nE == 0)
         return true;
+    // S1X-5n: E's entry covers every swap pending at E only while no later entry shortened the deadline; the schedule
+    // never does (pinned per network in creditbind_tests s1x_5n_swap_deadline_never_shortens).
     const Consensus::GramParams& gp = Params().GetConsensus().GramAt((int)nE);
     const int64_t nDeadlineClock = ((int64_t)gp.nSwapDeadlineSecs + 599) / 600;
     return ClockSince(nE, nHeight) > nDeadlineClock;
@@ -1065,11 +1068,11 @@ static bool NotePayloadHouse(const CTransaction& tx, uint32_t& nHouseID)
 {
     if (tx.vchNotePayload.size() < 4)
         return false;
-    memcpy(&nHouseID, tx.vchNotePayload.data(), 4);
+    nHouseID = ReadLE32(tx.vchNotePayload.data());
     return true;
 }
 
-static bool TokenClaimYs(const CTransaction& tx, uint32_t& nHouseID, std::set<uint256>& setY)
+bool TokenClaimYs(const CTransaction& tx, uint32_t& nHouseID, std::set<uint256>& setY)
 {
     NoteTokenClaim claim;
     if (!DecodeNotePayload(tx.vchNotePayload, claim))
@@ -1103,25 +1106,17 @@ static bool TokenClaimStillValid(const CTransaction& tx, int nHeight)
     return true;
 }
 
-/** v0.2.21: does a pooled token CLAIM of house nHouseID share a token (Y) with setMine? The house first: no hashing for
- * another house's claims (review M-b). UR3-10: the one body ATMP and the wallet's TokenClaimConflictsMempool use. */
-static bool PooledTokenClaimSharesY(const CTxMemPool& pool, uint32_t nHouseID, const std::set<uint256>& setMine)
+/** v0.2.21: does a pooled token CLAIM share a token (Y, at the same house) with tx? UR3-10: the one test ATMP and the
+ * wallet use. S1X-27 (security's sibling, Medium): one lookup per token in the pool's identity index, whose keys were
+ * computed once at add; it was a scan running TokenClaimYs (a decode and up to 64 hash-to-curve) on every pooled claim
+ * of the house for each arrival, before any fee check. */
+static bool TokenClaimYsPooled(const CTxMemPool& pool, uint32_t nHouseID, const std::set<uint256>& setMine)
 {
-    AssertLockHeld(pool.cs);
-    for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-        const CTransaction& mtx = mi->GetTx();
-        uint32_t nTheirHouse = 0;
-        if (mtx.nVersion != TRANSACTION_NOTE_VERSION || mtx.nNoteOp != NOTE_OP_TOKEN_CLAIM ||
-                !NotePayloadHouse(mtx, nTheirHouse) || nTheirHouse != nHouseID)
-            continue;
-        std::set<uint256> setTheirs;
-        if (!TokenClaimYs(mtx, nTheirHouse, setTheirs))
-            continue;
-        for (const uint256& y : setMine)
-            if (setTheirs.count(y))
-                return true;
-    }
-    return false;
+    std::vector<uint256> vKeys;
+    vKeys.reserve(setMine.size());
+    for (const uint256& y : setMine)
+        vKeys.push_back(TokenClaimIdentityKey(nHouseID, y));
+    return pool.HaveIdentityKey(vKeys);
 }
 
 bool TokenClaimConflictsMempool(const CTransaction& tx)
@@ -1130,8 +1125,7 @@ bool TokenClaimConflictsMempool(const CTransaction& tx)
     uint32_t nMineHouse = 0;
     if (!TokenClaimYs(tx, nMineHouse, setMine))
         return true;
-    LOCK(mempool.cs);
-    return PooledTokenClaimSharesY(mempool, nMineHouse, setMine);
+    return TokenClaimYsPooled(mempool, nMineHouse, setMine);
 }
 
 /** v0.2.21: the token claim records as confirmed (HouseDB). The mempool reads this; ConnectBlock stages the block's
@@ -1152,7 +1146,7 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     nB = 0;
     if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseSlotOp(mtx.nHouseOp) &&
             mtx.vchHousePayload.size() >= 4) {
-        memcpy(&nA, mtx.vchHousePayload.data(), 4);
+        nA = ReadLE32(mtx.vchHousePayload.data());
         return nA != 0;
     }
     // B1: DISCOUNT / HRETIRE / HCLAIM (and v0.2.27's HRETIRE_NOTES) mutate a
@@ -1169,7 +1163,7 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
              mtx.nBillOp == BILL_OP_HCLAIM || mtx.nBillOp == BILL_OP_HRETIRE_NOTES ||
              mtx.nBillOp == BILL_OP_HRETIRE_ESCROW || mtx.nBillOp == BILL_OP_HCLAIM_ESCROW) &&
             mtx.vchBillPayload.size() >= 8) {
-        memcpy(&nA, mtx.vchBillPayload.data() + 4, 4);
+        nA = ReadLE32(mtx.vchBillPayload.data() + 4);
         return nA != 0;
     }
     // PROTEST (B3 T-b3) writes the CHouse protest fields, so it takes the
@@ -1185,19 +1179,19 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
              mtx.nNoteOp == NOTE_OP_SWAP_PAY || mtx.nNoteOp == NOTE_OP_SWAP_PROTEST ||
              mtx.nNoteOp == NOTE_OP_SWAP_CLAIM) &&
             mtx.vchNotePayload.size() >= 4) {
-        memcpy(&nA, mtx.vchNotePayload.data(), 4);
+        nA = ReadLE32(mtx.vchNotePayload.data());
         return nA != 0;
     }
     if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION &&
             (mtx.nDepositOp == DEPOSIT_OP_ORIGINATE || mtx.nDepositOp == DEPOSIT_OP_WITHDRAW ||
              mtx.nDepositOp == DEPOSIT_OP_CLAIM || mtx.nDepositOp == DEPOSIT_OP_PROTEST ||
              mtx.nDepositOp == DEPOSIT_OP_DISCHARGE) && mtx.vchDepositPayload.size() >= 4) {
-        memcpy(&nA, mtx.vchDepositPayload.data(), 4);
+        nA = ReadLE32(mtx.vchDepositPayload.data());
         return nA != 0;
     }
     if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.nPoolOp == POOL_OP_RETIRE &&
             mtx.vchPoolPayload.size() >= 4) {
-        memcpy(&nA, mtx.vchPoolPayload.data(), 4);   // nPoolID == nHouseID
+        nA = ReadLE32(mtx.vchPoolPayload.data());   // nPoolID == nHouseID
         return nA != 0;
     }
     // v16 settles take two or more slots: GetHouseSlotSet reads them (SettleSlotHouses).
@@ -1232,12 +1226,12 @@ bool GetHouseStatusReaderID(const CTransaction& mtx, uint32_t& nHouse)
 {
     nHouse = 0;
     if (mtx.nVersion == TRANSACTION_NOTE_VERSION && mtx.nNoteOp == NOTE_OP_DEMAND && mtx.vchNotePayload.size() >= 4)
-        memcpy(&nHouse, mtx.vchNotePayload.data(), 4);
+        nHouse = ReadLE32(mtx.vchNotePayload.data());
     else if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION && mtx.nDepositOp == DEPOSIT_OP_DEMAND &&
              mtx.vchDepositPayload.size() >= 4)
-        memcpy(&nHouse, mtx.vchDepositPayload.data(), 4);
+        nHouse = ReadLE32(mtx.vchDepositPayload.data());
     else if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.nPoolOp == POOL_OP_CREATE && mtx.vchPoolPayload.size() >= 4)
-        memcpy(&nHouse, mtx.vchPoolPayload.data(), 4);   // nPoolID == nHouseID
+        nHouse = ReadLE32(mtx.vchPoolPayload.data());   // nPoolID == nHouseID
     return nHouse != 0;
 }
 
@@ -1280,6 +1274,39 @@ bool FbVerifyStrict(const CPubKey& pubkey, const uint256& hash, const std::vecto
     return true;
 }
 
+/** S1X-30 (security 11-25, Medium): a token CLAIM's NUT-12 DLEQ checks (about 391 us a token, 25 ms for
+ * a 64-token claim) ran before the fee check, and a re-send with a fresh nLockTime is a new txid, so each free re-send
+ * cost every node the whole curve work again. Inside an FbSigCacheScope (ATMP and the mempool sweeps only) a DLEQ that
+ * verified is remembered, keyed by a hash of (A, B_, C_, e, s), as FbVerifyStrict remembers ECDSA (UR3-4); a re-send
+ * then costs its hash-to-curve only. Outside a scope (ConnectBlock, TestBlockValidity) it is the plain check. Bounded:
+ * the set is cleared when it reaches its cap, never grown past it. */
+static CCriticalSection cs_fbDleqCache;
+static std::set<uint256> g_setFbDleqOk GUARDED_BY(cs_fbDleqCache);
+static const size_t FB_DLEQ_CACHE_MAX = 200000;   // ~ 13 MB of uint256 tree nodes at most
+
+bool FbVerifyDLEQ(const CPubKey& A, const CPubKey& B_, const CPubKey& C_, const CashuScalar& e, const CashuScalar& s)
+{
+    if (!g_fFbSigCacheScope)
+        return CashuVerifyDLEQ(A, B_, C_, e, s);   // block validation: the plain check, untouched
+    CHashWriter hw(SER_GETHASH, 0);
+    hw << std::string("fb-dleq-ok") << A << B_ << C_;
+    hw.write((const char*)e.data(), e.size());
+    hw.write((const char*)s.data(), s.size());
+    const uint256 key = hw.GetHash();
+    {
+        LOCK(cs_fbDleqCache);
+        if (g_setFbDleqOk.count(key))
+            return true;
+    }
+    if (!CashuVerifyDLEQ(A, B_, C_, e, s))
+        return false;
+    LOCK(cs_fbDleqCache);
+    if (g_setFbDleqOk.size() >= FB_DLEQ_CACHE_MAX)
+        g_setFbDleqOk.clear();
+    g_setFbDleqOk.insert(key);
+    return true;
+}
+
 /** H1 (stage A, plain v1.2.1): a house rate POST (HOUSE_OP_RATE, kind POST). The kind byte follows the leading house
  * id (HouseRate's serialization), so this stays a pure byte read like GetHouseSlotIDs. External linkage for the unit
  * suite. */
@@ -1293,7 +1320,7 @@ bool HouseRateOpOf(const CTransaction& mtx, uint32_t& nHouseID, bool& fSetKey)
 {
     if (mtx.nVersion != TRANSACTION_HOUSE_VERSION || !IsHouseRateOp(mtx.nHouseOp) || mtx.vchHousePayload.size() < 5)
         return false;
-    memcpy(&nHouseID, mtx.vchHousePayload.data(), 4);
+    nHouseID = ReadLE32(mtx.vchHousePayload.data());
     fSetKey = mtx.vchHousePayload[4] == HOUSE_RATE_SETKEY;
     return nHouseID != 0;
 }
@@ -1663,6 +1690,40 @@ static bool SpendsPooledStampedOutput(const CTransaction& tx, const CTxMemPool& 
     return false;
 }
 
+/** S1X-23 / S1X-24 (Claude max run 3 on s1, testing 11-25; security: High, both): the credit checks on the mempool path
+ * read their input coins at the tip (TipCoin, UR3-9), so a coin made by a pooled tx is invisible to them while a block
+ * sees it with its real tags. Where such a coin was skipped rather than refused, the pool accepted what every block
+ * refuses: a RECLAIM / CLOSE / RELEASE / claim mixing a pooled pledge (tagged house 0 here) with its own escrow passed
+ * the mixed-house and own-pledge checks, and a REDEEM of notes from a pooled TRANSFER skipped the demanded-note interest
+ * floor - each squats a slot and, ten at a time, empties the template (MAX_TEMPLATE_EVICTIONS). So:
+ *   (a) no tx may spend a pooled tx's output that the mempool view tags as house escrow, and
+ *   (b) a note REDEEM or PROTEST (the note ops that read their note inputs at the tip) may not spend a pooled tx's
+ *       note output.
+ * ATMP refuses such a tx (unconfirmed-credit-parent, DoS 0); UpdateMempoolForReorg drops one already pooled when a
+ * reorg puts its parent back (as UR3-7 does for stamped outputs). Blocks are unchanged. What waits one confirmation:
+ * a REDEEM or PROTEST of notes a pooled TRANSFER / MINT / DISCOUNT / UNLOCK made, and a chain off escrow change - at
+ * one house the slot already stopped that, except after a COLLECT or SWAP_CLAIM, which take no slot. Every other note op
+ * reads its inputs on the mempool view (tx_verify, payload-pure tags) and chains as before. A NEW check that reads an
+ * input coin through TipCoin must refuse a coin it can't see, or be listed here. */
+bool SpendsPooledCreditOutput(const CTransaction& tx, const CTxMemPool& pool)
+{
+    const bool fReadsNotesAtTip = tx.nVersion == TRANSACTION_NOTE_VERSION &&
+            (tx.nNoteOp == NOTE_OP_REDEEM || tx.nNoteOp == NOTE_OP_PROTEST);
+    CCoinsViewMemPool viewPool(pcoinsTip.get(), pool);   // its pooled-output tags: the payload-pure taggers AddCoins uses
+    for (const CTxIn& txin : tx.vin) {
+        if (!pool.exists(txin.prevout.hash))
+            continue;
+        Coin coin;
+        if (!viewPool.GetCoin(txin.prevout, coin))
+            continue;
+        if (coin.fHouseEscrow)
+            return true;
+        if (fReadsNotesAtTip && coin.fNote)
+            return true;
+    }
+    return false;
+}
+
 void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool fAddToMempool)
 {
     AssertLockHeld(cs_main);
@@ -1711,7 +1772,8 @@ void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool f
     // UR3-7 (ultra s3 #7): likewise a tx spending a stamped output of a re-added
     // fresh DEMAND or ORIGINATE (SpendsPooledStampedOutput, ATMP's
     // unconfirmed-stamp-parent rule): it stayed templatable and failed in every
-    // template until the template's drop loop found it.
+    // template until the template's drop loop found it. S1X-23 / S1X-24: likewise a tx spending a pooled escrow
+    // output, or a REDEEM / PROTEST of a pooled note output (SpendsPooledCreditOutput, unconfirmed-credit-parent).
     {
         std::vector<CTransactionRef> vDrop;
         {
@@ -1724,7 +1786,8 @@ void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool f
                         break;
                     }
                 }
-                if (fDrop || SpendsPooledStampedOutput(e.GetTx(), mempool))
+                if (fDrop || SpendsPooledStampedOutput(e.GetTx(), mempool) ||
+                        SpendsPooledCreditOutput(e.GetTx(), mempool))   // S1X-23 / S1X-24
                     vDrop.push_back(e.GetSharedTx());
             }
         }
@@ -1844,12 +1907,22 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
 
     // Check for conflicts with in-memory transactions
     std::set<uint256> setConflicts;
+    // S1X-18 (security's note 1): a pooled ESCROW_MERGE spends listed escrow coins, so a claim, CLOSE, settle RECLAIM or
+    // RELEASE needing one of them met it as an INPUT conflict, refused at the opt-out test below before the slot yield
+    // was ever reached. A non-MERGE incomer whose conflict is a pooled MERGE replaces it for free, whatever it signals
+    // or pays (it never counts in the BIP125 fee sums); the MERGEs and their descendants leave before addUnchecked.
+    const bool fIncomingMergeTx = IsHouseEscrowMergeTx(tx);
+    std::set<uint256> setMergeInputYield;
     for (const CTxIn &txin : tx.vin)
     {
         auto itConflicting = pool.mapNextTx.find(txin.prevout);
         if (itConflicting != pool.mapNextTx.end())
         {
             const CTransaction *ptxConflicting = itConflicting->second;
+            if (!fIncomingMergeTx && IsHouseEscrowMergeTx(*ptxConflicting)) {
+                setMergeInputYield.insert(ptxConflicting->GetHash());
+                continue;
+            }
             if (!setConflicts.count(ptxConflicting->GetHash()))
             {
                 // Allow opt-out of transaction replacement by setting
@@ -1938,6 +2011,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         if (SpendsPooledStampedOutput(tx, pool))
             return state.DoS(0, false, REJECT_NONSTANDARD, "unconfirmed-stamp-parent", false,
                              "spends a note of an unconfirmed demand or a receipt of an unconfirmed deposit; wait for it to confirm");
+        // S1X-23 / S1X-24: a pooled escrow output, or a pooled note output under a REDEEM or PROTEST, is invisible to the
+        // credit checks below (they read the tip), so the pool would accept what every block refuses.
+        if (SpendsPooledCreditOutput(tx, pool))
+            return state.DoS(0, false, REJECT_NONSTANDARD, "unconfirmed-credit-parent", false,
+                             "spends house escrow of an unconfirmed transaction, or redeems or protests notes of one; wait for it to confirm");
         // This tx moves an asset if it is a genesis or spends a coloured coin.
         // Its inputs are confirmed coins or outputs of plain pooled txs (the
         // rule above), so the view's colours are exact.
@@ -2139,6 +2217,22 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         if (!Consensus::CheckTxInputs(tx, state, view, GetSpendHeight(view), nFees)) {
             return error("%s: Consensus::CheckTxInputs: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
         }
+        // S1X-30 (security 11-25, Medium): a token CLAIM's contextual check is curve work per token (hash-to-curve, the
+        // entry signatures, the DLEQs), so the claim meets both fee floors first and a zero-fee probe pays only
+        // CheckTxInputs. The same two floors as the checks below, on the same fee (nFees plus the prioritisation delta,
+        // i.e. nModifiedFees), against the size without the sigop adjustment, which is never more than the entry's: so
+        // this can only refuse what the later checks refuse too. Those run unchanged.
+        if (!bypass_limits && tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+            CAmount nModFeesEarly = nFees;
+            pool.ApplyDelta(tx.GetHash(), nModFeesEarly);
+            const unsigned int nSizeEarly = GetVirtualTransactionSize(tx);
+            const CAmount nPoolFloorEarly = pool.GetMinFee(MaxMempoolBytes()).GetFee(nSizeEarly);
+            if (nPoolFloorEarly > 0 && nModFeesEarly < nPoolFloorEarly)
+                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "mempool min fee not met", false,
+                                 strprintf("%d < %d", nModFeesEarly, nPoolFloorEarly));
+            if (nModFeesEarly < ::minRelayTxFee.GetFee(nSizeEarly))
+                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "min relay fee not met");
+        }
 
         // Gram-notes release: issued tokens against the units state at the tip, on a view that is dropped. A FREEZE
         // or MINT already in the pool isn't seen; the block template checks the pool's transactions in order.
@@ -2191,15 +2285,13 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // of them per pool at a time (two binding the same prior would put an invalid one in a template). Swaps chain
         // on the custody coins and need no such rule.
         if (tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) && tx.nIssuedOp != ISSUED_OP_POOL_SWAP) {
-            const uint256 poolToken = IssuedPoolOpToken(tx);
-            LOCK(pool.cs);
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                const CTransaction& other = mi->GetTx();
-                if (other.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(other.nIssuedOp) &&
-                        other.nIssuedOp != ISSUED_OP_POOL_SWAP && IssuedPoolOpToken(other) == poolToken)
-                    return state.DoS(0, false, REJECT_INVALID, "issued-pool-lp-op-pending", false,
-                                     "this pool already has a liquidity change waiting; try again after the next block");
-            }
+            // S1X-27 (security, Low): one lookup in the identity index (the LP op keyed by its token), not a decode of
+            // every pooled LP op.
+            std::vector<uint256> vIdKeys;
+            PooledIdentityKeys(tx, vIdKeys);
+            if (pool.HaveIdentityKey(vIdKeys))
+                return state.DoS(0, false, REJECT_INVALID, "issued-pool-lp-op-pending", false,
+                                 "this pool already has a liquidity change waiting; try again after the next block");
         }
 
         // The incomer's parent txids, hoisted ONCE for every displacement site
@@ -2210,6 +2302,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         std::set<uint256> setInPrevouts;
         for (const CTxIn& in : tx.vin)
             setInPrevouts.insert(in.prevout.hash);
+        // S1X-18 note 1: never spend what a freely replaced MERGE (or a descendant of it) created.
+        for (const uint256& hashMerge : setMergeInputYield) {
+            CTxMemPool::txiter itMerge = pool.mapTx.find(hashMerge);
+            if (itMerge != pool.mapTx.end() && SpendsPooledOrDescendant(setInPrevouts, pool, itMerge))
+                return state.Invalid(false, REJECT_DUPLICATE, "txn-mempool-conflict");
+        }
 
         // D-2026-11-11-3 (R121-R2; was H1, v1.2.1): rate ops (POST, SETKEY) take their own slot, one per house per
         // block, so they never conflict with the house's other ops. Between rate ops on one house, SETKEY always beats
@@ -2224,7 +2322,15 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         const bool fRateOpIn = HouseRateOpOf(tx, nRateHouseIn, fRateSetKeyIn);
         const bool fIncomerMayDisplacePost = fRateOpIn && fRateSetKeyIn;
         std::set<uint256> setRatePostYield;
+        // S1X-18 (security's addition (a)): a pooled ESCROW_MERGE yields to every other op on its house for free, and
+        // an incoming MERGE displaces nothing (fnSlotYields refuses it), so a permissionless op can never keep a DEMAND,
+        // PROTEST, CLAIM or discharge out. The yielded MERGEs ride setRatePostYield (free, outside the fee sums).
+        const bool fIncomingMerge = IsHouseEscrowMergeTx(tx);
         auto fnRatePostYields = [&](CTxMemPool::txiter mi) {
+            if (!fIncomingMerge && IsHouseEscrowMergeTx(mi->GetTx()) && !SpendsPooledOrDescendant(setInPrevouts, pool, mi)) {
+                setRatePostYield.insert(mi->GetTx().GetHash());
+                return true;
+            }
             if (!fIncomerMayDisplacePost || !IsHouseRatePostTx(mi->GetTx()) || SpendsPooledOrDescendant(setInPrevouts, pool, mi))
                 return false;
             setRatePostYield.insert(mi->GetTx().GetHash());
@@ -2254,6 +2360,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         auto fnSlotYields = [&](CTxMemPool::txiter mi, const char* pszReason) {
             if (fnRatePostYields(mi))
                 return true;
+            if (fIncomingMerge)
+                return false;   // S1X-18: a MERGE never takes a slot from another op, whatever it pays
             if (SpendsPooledOrDescendant(setInPrevouts, pool, mi))
                 return false;
             setSlotConflicts.insert(mi->GetTx().GetHash());
@@ -2346,38 +2454,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // endianness, and a guard that silently stops matching restores the
             // brick with no test able to see it. The house arm below keys the
             // same way.
-            const bool fIncomingIssue = (tx.nBillOp == BILL_OP_ISSUE);
-            uint32_t nBillIDNewLE = 0;
-            if (!fIncomingIssue && tx.vchBillPayload.size() >= 4)
-                memcpy(&nBillIDNewLE, tx.vchBillPayload.data(), 4);
-
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                const CTransaction& mtx = mi->GetTx();
-                if (mtx.nVersion != TRANSACTION_BILL_VERSION)
-                    continue;
-                // Cross-class pairs cannot collide and are skipped: a pooled
-                // ISSUE has no dense id, and no pooled op can name one, because
-                // ATMP's fnGetBill reads BillDB only.
-                if (fIncomingIssue != (mtx.nBillOp == BILL_OP_ISSUE))
-                    continue;
-                if (fIncomingIssue) {
-                    // Decode only when BOTH sides are issues - the REGISTER x
-                    // REGISTER precedent below - so the common case stays a
-                    // memcpy and only ISSUE traffic pays the decode. Compare
-                    // the BODY, not its hash: identity IS sha256(body), so
-                    // equal bodies are exactly the collision, and a memcmp
-                    // beats a SHA256 over each pooled issue.
-                    BillIssue issuePooled;
-                    if (DecodeBillPayload(mtx.vchBillPayload, issuePooled) &&
-                            issuePooled.vchEncryptedBody == billResult.vchEncryptedBody)
-                        return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
-                } else if (mtx.vchBillPayload.size() >= 4) {
-                    uint32_t nTheirs = 0;
-                    memcpy(&nTheirs, mtx.vchBillPayload.data(), 4);  // nBillID leads ops 2-8
-                    if (nTheirs == nBillIDNewLE)
-                        return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
-                }
-            }
+            // S1X-27: one lookup in the pool's identity index (PooledIdentityKeys: an ISSUE by its body, any other op
+            // by the raw id bytes, the same function for both sides), not a scan that decoded every pooled ISSUE.
+            std::vector<uint256> vIdKeys;
+            PooledIdentityKeys(tx, vIdKeys);
+            if (pool.HaveIdentityKey(vIdKeys))
+                return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
         }
 
         // Settle ops (v16, T-s5): contextual admission + the dual-slot guard.
@@ -2416,7 +2498,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             if (!CheckHouseMemberOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetMember, fnGetCount, eff, true))
                 return error("%s: CheckHouseMemberOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
             uint32_t nHouseIDNewLE = 0;
-            memcpy(&nHouseIDNewLE, tx.vchHousePayload.data(), 4);   // shape: the payload decoded, so >= 4 bytes
+            nHouseIDNewLE = ReadLE32(tx.vchHousePayload.data());   // shape: the payload decoded, so >= 4 bytes
             // -memberopguard=0 (regtest only) lets a second one in, so a gate can show the block rule refuse it
             const bool fGuard = gArgs.GetBoolArg("-memberopguard", true);
             for (CTxMemPool::txiter mi = pool.mapTx.begin(); fGuard && mi != pool.mapTx.end(); mi++) {
@@ -2424,7 +2506,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 uint32_t nTheirs = 0;
                 if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseMemberOp(mtx.nHouseOp) &&
                         mtx.vchHousePayload.size() >= 4) {
-                    memcpy(&nTheirs, mtx.vchHousePayload.data(), 4);
+                    nTheirs = ReadLE32(mtx.vchHousePayload.data());
                     if (nTheirs == nHouseIDNewLE)
                         return state.DoS(0, false, REJECT_DUPLICATE, "house-member-op-in-mempool");
                 }
@@ -2485,22 +2567,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // drift). Only REGISTER x REGISTER is decided here: a pooled REGISTER has no dense id yet, so two collide on
             // the declared house id or class id, and only then are pooled REGISTERs decoded.
             if (IsHouseRegisterOp(tx.nHouseOp)) {
-                const uint256 hashNew = houseResult.houseID;
-                std::string strClassNew;
-                HouseRegister reg;
-                uint8_t nFlags = 0;
-                if (DecodeHouseRegisterAny(tx, reg, nFlags))
-                    strClassNew = reg.strClassID;
-                for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                    const CTransaction& mtx = mi->GetTx();
-                    if (mtx.nVersion != TRANSACTION_HOUSE_VERSION || !IsHouseRegisterOp(mtx.nHouseOp))
-                        continue;
-                    HouseRegister mreg;
-                    uint8_t nMFlags = 0;
-                    if (DecodeHouseRegisterAny(mtx, mreg, nMFlags) &&
-                            (HouseIDFromDeclaration(mreg, nMFlags) == hashNew || mreg.strClassID == strClassNew))
-                        return state.DoS(0, false, REJECT_DUPLICATE, "house-op-in-mempool");
-                }
+                // S1X-27: one lookup in the pool's identity index (the declared house id and the class id), not a scan
+                // that decoded every pooled REGISTER.
+                std::vector<uint256> vIdKeys;
+                PooledIdentityKeys(tx, vIdKeys);
+                if (pool.HaveIdentityKey(vIdKeys))
+                    return state.DoS(0, false, REJECT_DUPLICATE, "house-op-in-mempool");
             }
         }
 
@@ -2545,13 +2617,15 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             }
             if (IsTokenClaimOp(tx.nNoteOp)) {
                 // v0.2.21: a token CLAIM takes no house slot, so two pooled claims must not share a token (Y): the
-                // second would make a block that holds both invalid. Checked before any curve work (review L2).
+                // second would make a block that holds both invalid. Checked before the claim's contextual checks;
+                // the incomer's own TokenClaimYs is curve work (one hash-to-curve per entry, bounded by its size), and
+                // the pooled claims' tokens are one lookup each in the identity index (S1X-27), never re-hashed.
                 if (tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
                     std::set<uint256> setMine;
                     uint32_t nMineHouse = 0;
                     if (!TokenClaimYs(tx, nMineHouse, setMine))
                         return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payload");
-                    if (PooledTokenClaimSharesY(pool, nMineHouse, setMine))   // UR3-10: the wallet's helper's body
+                    if (TokenClaimYsPooled(pool, nMineHouse, setMine))   // UR3-10: the wallet's test too
                         return state.DoS(0, false, REJECT_DUPLICATE, "token-claim-pending");
                 }
                 TokenEffects eff;   // the mempool records nothing
@@ -2609,7 +2683,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 const CTransaction& mtx = mi->GetTx();
                 if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.vchPoolPayload.size() >= 4) {
                     uint32_t nTheirs = 0;
-                    memcpy(&nTheirs, mtx.vchPoolPayload.data(), 4); // nPoolID leads every pool payload
+                    nTheirs = ReadLE32(mtx.vchPoolPayload.data()); // nPoolID leads every pool payload
                     // UR-ext-2: a RETIRE takes its house's slot, so RETIRE vs any op on its pool goes by fee (the
                     // house can't re-RETIRE every block to keep LPs' REMOVE out); ADD/REMOVE/SWAP among themselves
                     // stay first-seen (no one pays to jump someone's trade).
@@ -3010,6 +3084,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             CTxMemPool::txiter itInput = pool.mapTx.find(hashInput);
             if (itInput != pool.mapTx.end())
                 pool.CalculateDescendants(itInput, allInputConflicting);
+        }
+        for (const uint256& hashMerge : setMergeInputYield) {   // S1X-18 note 1: the freely replaced MERGEs
+            CTxMemPool::txiter itMerge = pool.mapTx.find(hashMerge);
+            if (itMerge != pool.mapTx.end())
+                pool.CalculateDescendants(itMerge, allInputConflicting);
         }
         for (const CTxMemPool::txiter it : allInputConflicting)
         {
@@ -3788,7 +3867,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (bill.nOwnerHouseID != 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-house-held");
 
-        const uint256 sighash = BillRetireSigHash(bill.billID, retire.nRateNamed, BillHashOutputs(tx));   // UR1-6
+        const uint256 sighash = BillRetireSigHash(bill.billID, retire.nRateNamed, BillTxBindingHash(tx), BillHashOutputs(tx),
+                                                  false);   // UR1-6; S1X-17
         if (!FbVerifyStrict(CPubKey(bill.vchAcceptorPubKey), sighash, retire.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-sig");
 
@@ -3832,7 +3912,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // The holder signs the exact output set - where the escrow goes is
         // the holder's choice, the signature is the authorization
-        const uint256 sighash = BillClaimSigHash(bill.billID, BillHashOutputs(tx));
+        const uint256 sighash = BillClaimSigHash(bill.billID, BillTxBindingHash(tx), BillHashOutputs(tx), false);   // S1X-17
         if (!FbVerifyStrict(CPubKey(bill.vchHolderPubKey), sighash, claim.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-claim-sig");
 
@@ -4061,7 +4141,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         CAmount amountOwed = 0;
         if (fRetire) {
             if (!BillVerifyStrict(bill.vchAcceptorPubKey,
-                    BillHRetireEscrowSigHash(hr, bill.billID, BillHashPrevouts(tx), BillHashOutputs(tx)),
+                    BillHRetireEscrowSigHash(hr, bill.billID, BillTxBindingHash(tx), BillHashOutputs(tx)),   // S1X-17: + nSequence, nLockTime
                     hr.vchAcceptorSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-sig");
             // Gram-notes release: what's left after the notes burned at par is mg, paid in sECX at the bound price.
@@ -4109,8 +4189,28 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         billOut = bill;
         billOut.status = fRetire ? BILL_STATUS_RETIRED : BILL_STATUS_DEFAULTED;
         billOut.nOwnerHouseID = 0;
+        billOut.nEscrowHouseID = house.nHouseID;   // S1X-25: RECOURSE refuses it from here on
         houseOut = house;
         fHouseChanged = true;
+        return true;
+    }
+
+    if (tx.nBillOp == BILL_OP_TITLE_RELEASE) {
+        // S1X-29 (security: Low; Michael 11-25 yes): the title of a bill that has ended. Not at a failed house's bill
+        // (security's (a)): after op 11 the title sits with the house's custody key, and its 10,000 sats must not
+        // reach the operator either. No state changes; the stale sweep re-runs this, so a reorg that makes the bill
+        // ACTIVE again evicts a pooled release (security's (c)).
+        BillTitleRelease r;
+        if (!DecodeBillPayload(tx.vchBillPayload, r))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-payload");
+        CBill bill;
+        if (!fnGetBill(r.nBillID, bill))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-unknown");
+        if (bill.status == BILL_STATUS_ACTIVE)
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-bill-titlerelease-active");
+        if (bill.nEscrowHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-escrowed");
+        billOut = bill;
         return true;
     }
 
@@ -4254,7 +4354,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         if (fRetire) {
             if (!BillVerifyStrict(bill.vchAcceptorPubKey,
-                    BillRetireSigHash(bill.billID, hr.nRateNamed, BillHashOutputs(tx)), hr.vchAcceptorSig))   // UR1-6
+                    BillRetireSigHash(bill.billID, hr.nRateNamed, BillTxBindingHash(tx), BillHashOutputs(tx), true),
+                    hr.vchAcceptorSig))   // UR1-6; S1X-17
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-sig");
             // Face paid to the current holder - which check 12 pinned to the
             // house's custody key when the discount happened. D-2026-11-20-1 (S1X-1): at the bill's REFERENCE house's
@@ -4271,7 +4372,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             // The QUORUM replaces the single holder signature of op 4: the
             // custody key alone must never direct the escrow payout.
             if (!VerifyHouseApprovers(house, hc.vApproverIndex, hc.vApproverSig,
-                    BillClaimSigHash(bill.billID, BillHashOutputs(tx)),
+                    BillClaimSigHash(bill.billID, BillTxBindingHash(tx), BillHashOutputs(tx), true),   // S1X-17
                     house.nThresholdM, state, "bad-bill-hclaim-approvers"))
                 return false;
         }
@@ -4317,6 +4418,11 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // historical cascade order: drawee, then escrow, then the endorsers.
         if (bill.nOwnerHouseID != 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-house-held");
+        // S1X-25 (security: Medium; Michael 11-25 yes): nor on a bill a failed house's escrow took (ops 10/11). Op 11
+        // leaves the holder as the house's custody key, so the payment would reach the operator's key; the money the
+        // bill owed is already in the pot. Endorsers' liability on it can then be settled only off chain.
+        if (bill.nEscrowHouseID != 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-escrowed");
         if (bill.status != BILL_STATUS_ACTIVE && bill.status != BILL_STATUS_DEFAULTED)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-status");
         if (bill.status == BILL_STATUS_ACTIVE &&
@@ -4535,7 +4641,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(100, false, REJECT_INVALID, "bad-house-topup-escrow");
 
         // Signature binds the exact output set (escrow value + destination)
-        const uint256 sighash = HouseTopupSigHash(house.houseID, topup.nPartnerIndex, BillHashOutputs(tx));
+        const uint256 sighash = HouseTopupSigHash(house.houseID, topup.nPartnerIndex, BillHashPrevouts(tx), BillHashOutputs(tx));
         if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, topup.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-topup-sig");
 
@@ -4573,8 +4679,13 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         if (tx.vout[0].scriptPubKey != HouseEscrowScript(house.houseID))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-admit-escrow");
 
+        // S1X-16: the approval expires, and names a height at most HOUSE_ADMIT_APPROVAL_MAX_BLOCKS ahead.
+        if ((uint32_t)nHeight > admit.nExpiryHeight)
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-admit-expired");
+        if ((uint64_t)admit.nExpiryHeight > (uint64_t)nHeight + HOUSE_ADMIT_APPROVAL_MAX_BLOCKS)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-admit-expiry-far");
         // New partner accepts (binds own key + pledge); M active partners approve
-        const uint256 sighash = HouseAdmitSigHash(house.houseID, admit.vchNewPubKey, tx.vout[0].nValue);
+        const uint256 sighash = HouseAdmitSigHash(house.houseID, admit.vchNewPubKey, tx.vout[0].nValue, admit.nExpiryHeight);
         if (!FbVerifyStrict(CPubKey(admit.vchNewPubKey), sighash, admit.vchNewSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-admit-new-sig");
         if (!VerifyHouseApprovers(house, admit.vApproverIndex, admit.vApproverSig, sighash,
@@ -4633,9 +4744,13 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-exit-cap");
         }
 
-        // Voluntary (partner's own signature) OR expulsion (M-of-N approvers).
+        // Voluntary (partner's own signature) OR expulsion (M-of-N approvers) - exactly one (S1X-17; the shape check
+        // refuses both too, this keeps the arm self-contained): a partner-signed exit with approver entries would skip
+        // them below, so junk entries made a new txid.
+        if (!ex.vchPartnerSig.empty() && !(ex.vApproverIndex.empty() && ex.vApproverSig.empty()))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-twoauth");
         // Binds the output set so a leaked/dropped exit sig is not replayable.
-        const uint256 sighash = HouseExitSigHash(house.houseID, ex.nPartnerIndex, BillHashOutputs(tx));
+        const uint256 sighash = HouseExitSigHash(house.houseID, ex.nPartnerIndex, BillHashPrevouts(tx), BillHashOutputs(tx));
         bool fAuthorized = false;
         if (!ex.vchPartnerSig.empty()) {
             if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, ex.vchPartnerSig))
@@ -4695,7 +4810,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         }
 
         // Binds the output set so a leaked/dropped winddown sig is not replayable.
-        const uint256 sighash = HouseWinddownSigHash(house.houseID, BillHashOutputs(tx));
+        const uint256 sighash = HouseWinddownSigHash(house.houseID, BillHashPrevouts(tx), BillHashOutputs(tx));
         if (!VerifyHouseApprovers(house, wd.vApproverIndex, wd.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-winddown-approver"))
             return false;
@@ -4908,7 +5023,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-no-residual");
 
             // The trigger partner signs the exact (forced) output set
-            const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, CreditHashOutputs(tx));
+            const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, BillHashPrevouts(tx), CreditHashOutputs(tx));
             if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, rec.vchSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
 
@@ -5038,7 +5153,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         }
 
         // The partner signs the exact output set - destination is their choice
-        const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, CreditHashOutputs(tx));
+        const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, BillHashPrevouts(tx), CreditHashOutputs(tx));
         if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, rec.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
 
@@ -5305,6 +5420,8 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         CHouse house;
         if (!fnGetHouse(ch.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
+        if (ch.houseID != house.houseID)   // S1X-26: signed for this house, not whichever holds the dense id now
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-charter-house");
         const char chEffStatus = HouseEffectiveStatus(house, nHeight);
         if (chEffStatus != HOUSE_STATUS_OPEN && chEffStatus != HOUSE_STATUS_STRESSED &&
                 chEffStatus != HOUSE_STATUS_DEFERRED)
@@ -5327,6 +5444,8 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         CHouse house;
         if (!fnGetHouse(rate.nHouseID, house))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
+        if (rate.houseID != house.houseID)   // S1X-26: signed for this house, not whichever holds the dense id now
+            return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-rate-house");
         const char chEffStatus = HouseEffectiveStatus(house, nHeight);
         if (chEffStatus != HOUSE_STATUS_OPEN && chEffStatus != HOUSE_STATUS_STRESSED &&
                 chEffStatus != HOUSE_STATUS_DEFERRED)
@@ -5336,6 +5455,59 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                                       HouseRateSigHash(rate.nHouseID, tx, rate), house.nThresholdM, state,
                                       "bad-house-rate-approver"))
             return false;
+        houseOut = house;
+        return true;
+    }
+
+    if (tx.nHouseOp == HOUSE_OP_ESCROW_MERGE) {
+        // S1X-18 (security: Low; Michael 11-25 yes, with security's additions): value-neutral consolidation of ONE list,
+        // each list into its own kind (RELEASE frees the reserve on recovery; the change stays in the pot), checked by
+        // outpoint membership and failing closed: every escrow input must be on that list, and vout[0] must be the
+        // house's escrow holding exactly their sum. Any status: the money stays where the holders reach it.
+        HouseEscrowMerge m;
+        if (!DecodeHousePayload(tx.vchHousePayload, m))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-payload");
+        CHouse house;
+        if (!fnGetHouse(m.nHouseID, house))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-unknown");
+        std::vector<COutPoint>& vList = m.nList == HOUSE_ESCROW_LIST_RESERVE ? house.vOutReserveLock : house.vOutEscrowChange;
+        std::set<COutPoint> setMerged;
+        CAmount nSum = 0;
+        for (const CTxIn& in : tx.vin) {
+            Coin coin;
+            if (!fnGetProofCoin(in.prevout, coin) || coin.IsSpent()) {
+                // In the pool: a plain fee coin from a pooled parent (an escrow coin can't be one: unconfirmed-credit-
+                // parent). In a block every input is visible, so an unseen one fails closed (UR3-9; security's note 2).
+                if (!fMempool)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-input-unseen");
+                continue;
+            }
+            if (!coin.fHouseEscrow)
+                continue;
+            // Security's note 3: the merged coin carries the escrow tag alone, so an input with any other tag (notes,
+            // issued units, an asset colour) would lose it - refused, never merged.
+            if (coin.fNote || coin.fIssued || coin.nIssuedUnits != 0 || coin.IsAssetColoured() || coin.fBill ||
+                    coin.fBillEscrow || coin.fDeposit || coin.fPoolEscrow || coin.fLpShare || coin.fCustody)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-tagged-input");
+            // The lists are kept sorted (every writer sorts): a binary search, no copy (security's note 4).
+            if (!std::binary_search(vList.begin(), vList.end(), in.prevout))
+                return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-merge-not-listed");
+            setMerged.insert(in.prevout);
+            nSum += coin.out.nValue;
+            if (!MoneyRange(nSum))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-sum");
+        }
+        if (setMerged.size() < 2 || setMerged.size() > MAX_HOUSE_ESCROW_MERGE_INPUTS)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-inputs");
+        if (tx.vout[0].scriptPubKey != HouseEscrowScript(house.houseID) || tx.vout[0].nValue != nSum)
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-output");
+        std::vector<COutPoint> vNext;
+        for (const COutPoint& out : vList)
+            if (!setMerged.count(out))
+                vNext.push_back(out);
+        vNext.push_back(COutPoint(tx.GetHash(), 0));
+        std::sort(vNext.begin(), vNext.end());
+        vList = vNext;
         houseOut = house;
         return true;
     }
@@ -5439,6 +5611,15 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-house-closed");
             if (sw.nUnits != nNoteUnitsIn || house.nMintedUnits < sw.nUnits)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-units");
+            // S1X-31 (run 3 #8; security: Medium; Michael 11-25 "If you need it yes"): no new swap while a REDEEM at
+            // this house would owe the spread, or while it is suspended. A swap exits at par with no spread, and the
+            // house can SWAP_DONE an insider's swap, which is the waiver D-2026-11-05-1 point 3 rules out; at a
+            // Deferred house it also jumps the suspension queue (undemanded notes can't REDEEM there, Q6), so Deferred
+            // is refused even with the till at or above the floor. GoldBrassageAmount is the REDEEM path's own spread
+            // predicate (S1X-8), so the two can't drift. Open swaps settle as before (SWAP_PAY, DONE, CLAIM); the
+            // in-kind exit stays open through REDEEM, with the spread. No ban: the status can move under the wallet.
+            if (chEff == HOUSE_STATUS_DEFERRED || GoldBrassageAmount(house, nHeight, sw.nUnits) > 0)
+                return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-spread-owed");
             if (!FbVerifyStrict(CPubKey(sw.vchHolderPubKey), NoteSwapSigHash(sw, tx), sw.vchHolderSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-sig");
             CCharterToken token;
@@ -5861,18 +6042,18 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // v1.1.0 (D-2026-11-05-1): no spread at an Open house; otherwise the curve on the till (attested sECX at A30,
         // Gold B) against the 2% till floor. The spread is paid in sECX at the house's bid into the escrow pot; a
         // redemption that names no rate pays none (the holder's signature over the outputs protects it).
-        const uint32_t nSpreadBpsOwed = GoldBrassageBps(house, nHeight);
+        // S1X-8: the amount, rounded up once over the exact curve (GoldBrassageAmount), not the floored bps times U.
+        const CAmount amountSpreadOwed = GoldBrassageAmount(house, nHeight, nNoteUnitsIn);
         // SA-N3 (Michael 2026-11-11, second list): at a house that owes a spread, a REDEEM pays it whatever rate it names:
         // naming none (rate 0) is no longer a way around it. The spread is valued at the bound price, so one is needed.
         // (No ban: the house can turn Stressed between the wallet building it and the block.)
-        if (nSpreadBpsOwed > 0 && !nRedeemPrice)
+        if (amountSpreadOwed > 0 && !nRedeemPrice)
             return state.DoS(0, false, REJECT_INVALID, "bad-note-redeem-brassage-no-price");
-        const uint32_t nBrassageBps = nSpreadBpsOwed;
-        const CAmount amountBrassageSpread = HouseBrassageAmount(nNoteUnitsIn, nBrassageBps);   // the sECX output
+        const CAmount amountBrassageSpread = amountSpreadOwed;   // the sECX output
         // What the runner bears, either way (Delta-2): the demanded-note floor deducts it whether it is paid in sECX
         // (price bound) or kept in kind (none bound; review 11-05: deducting only the sECX form made a no-price in-kind
         // discharge impossible from the vaults alone, the cap below being U + I - spread).
-        const CAmount amountSpreadBorne = HouseBrassageAmount(nNoteUnitsIn, nSpreadBpsOwed);
+        const CAmount amountSpreadBorne = amountSpreadOwed;
         CAmount amountInterestOwed = 0;   // the demanded notes' interest, set below (the in-kind cap needs it)
 
         // DEFERRAL INTEREST (3.5 D6; v0.2.18 rate schedule, 10%/yr from block
@@ -6609,7 +6790,7 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             CashuScalar es, ss;
             memcpy(es.data(), e.vchE.data(), 32);
             memcpy(ss.data(), e.vchS.data(), 32);
-            if (!CashuVerifyDLEQ(c.A, B, C, es, ss))
+            if (!FbVerifyDLEQ(c.A, B, C, es, ss))   // cached in mempool scope only
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-dleq");
             CTokenClaim rec;
             rec.nAmount = e.nAmount;
@@ -8289,6 +8470,9 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 // to the pre-op record - so this restores a value, it does not
                 // reconstruct one.
                 bill.nOwnerHouseID = nOwnerHouseID;
+                // S1X-25: only ops 10/11 set it, on a house-held bill (owner != 0), and nothing else writes it while a
+                // house holds the bill, so the pre-op value is 0.
+                bill.nEscrowHouseID = 0;
                 mapBillUndo[bill.nBillID] = bill;
             }
         }
@@ -8751,6 +8935,43 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nDeferRenewals--;
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write house renew undo!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+            else if (tx.nHouseOp == HOUSE_OP_ESCROW_MERGE) {
+                // S1X-18: the merged coin leaves the list and the coins it merged (their undo Coins carry
+                // fHouseEscrow) come back, canonically sorted.
+                HouseEscrowMerge m;
+                CHouse house;
+                if (!DecodeHousePayload(tx.vchHousePayload, m) || !phousetree->GetHouse(m.nHouseID, house)) {
+                    error("DisconnectBlock(): Failed to undo house escrow merge!");
+                    return DISCONNECT_FAILED;
+                }
+                std::vector<COutPoint>& vList = m.nList == HOUSE_ESCROW_LIST_RESERVE ? house.vOutReserveLock
+                                                                                     : house.vOutEscrowChange;
+                const COutPoint outMerged(tx.GetHash(), 0);
+                std::vector<COutPoint> vNext;
+                for (const COutPoint& out : vList)
+                    if (out != outMerged)
+                        vNext.push_back(out);
+                size_t nRestored = 0;
+                if (i > 0) {
+                    const CTxUndo& txundoMerge = blockUndo.vtxundo[i - 1];
+                    for (size_t j2 = 0; j2 < tx.vin.size() && j2 < txundoMerge.vprevout.size(); j2++) {
+                        if (txundoMerge.vprevout[j2].fHouseEscrow) {
+                            vNext.push_back(tx.vin[j2].prevout);
+                            nRestored++;
+                        }
+                    }
+                }
+                if (nRestored < 2 || vNext.size() + 1 != vList.size() + nRestored) {
+                    error("DisconnectBlock(): House escrow merge undo restored a wrong set!");
+                    return DISCONNECT_FAILED;
+                }
+                std::sort(vNext.begin(), vNext.end());
+                vList = vNext;
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write house escrow merge undo!");
                     return DISCONNECT_FAILED;
                 }
             }
@@ -10731,7 +10952,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 // RollforwardBlock's twin). Only a DISCOUNT creates a tagged
                 // output, but the arm is uniform so no future op can be omitted
                 // and silently drop a tag on the replay path.
-                memcpy(&nNewBillID, tx.vchBillPayload.data(), 4);
+                nNewBillID = ReadLE32(tx.vchBillPayload.data());
             }
 
             // THE DUAL-DB CRASH WINDOW. BillDB flushes before HouseDB in two
@@ -11029,6 +11250,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 HouseDefer def;
                 if (DecodeHousePayload(tx.vchHousePayload, def))
                     nNewHouseID = def.nHouseID;
+            } else if (tx.nHouseOp == HOUSE_OP_ESCROW_MERGE) {   // S1X-18
+                HouseEscrowMerge m;
+                if (DecodeHousePayload(tx.vchHousePayload, m))
+                    nNewHouseID = m.nHouseID;
             }
         }
         else if (tx.nVersion == TRANSACTION_HOUSE_VERSION) {
@@ -11166,7 +11391,7 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                     // DEFER's output is the locked till (3.5 D11); it is escrow
                     // custody exactly like a pledge.
                     if (tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT ||
-                            tx.nHouseOp == HOUSE_OP_DEFER)
+                            tx.nHouseOp == HOUSE_OP_DEFER || tx.nHouseOp == HOUSE_OP_ESCROW_MERGE)   // S1X-18
                         nNewHouseID = houseResult.nHouseID;
                 }
             }
@@ -12356,7 +12581,7 @@ static int64_t nTimePostConnect = 0;
  *
  * The block is added to connectTrace if connection succeeds.
  */
-bool CChainState::ConnectTip(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions &disconnectpool)
+bool CChainState::ConnectTip(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions &disconnectpool, bool fInReorg)
 {
     assert(pindexNew->pprev == chainActive.Tip());
     // Read block from disk.
@@ -12416,11 +12641,17 @@ bool CChainState::ConnectTip(CValidationState& state, const CChainParams& chainp
     // SetTip: the sweep evaluates at chainActive.Height()+1, and one block of
     // slack at a boundary is a PERMANENT brick (a failed template means no
     // block, so no later sweep would ever run).
-    EvictStaleHouseNoteOps();
-    EvictStaleRatePosts();   // a block can stale a POST too (its restore's window, a newer post)
-    // The same height-only staleness for withdrawals at nWithdrawalGuardHeight:
-    // a pre-H admission the guard now rejects.
-    EvictUnpayableWithdrawals();
+    // S1X-28 (Claude max run 3 #24; security: Low): not inside a reorg. There the intermediate tips are not where the
+    // pool ends up, the disconnected txs are not back yet, and an op evicted here (a clock-gated protest valid at the
+    // final tip) is in no disconnectpool, so it was lost for good. UpdateMempoolForReorg runs these same three sweeps
+    // once, at the final tip, after the re-adds, on every path out of ActivateBestChainStep that disconnected a block.
+    if (!fInReorg) {
+        EvictStaleHouseNoteOps();
+        EvictStaleRatePosts();   // a block can stale a POST too (its restore's window, a newer post)
+        // The same height-only staleness for withdrawals at nWithdrawalGuardHeight:
+        // a pre-H admission the guard now rejects.
+        EvictUnpayableWithdrawals();
+    }
 
     int64_t nTime6 = GetTimeMicros(); nTimePostConnect += nTime6 - nTime5; nTimeTotal += nTime6 - nTime1;
     LogPrint(BCLog::BENCH, "  - Connect postprocess: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime6 - nTime5) * MILLI, nTimePostConnect * MICRO, nTimePostConnect * MILLI / nBlocksTotal);
@@ -12542,7 +12773,7 @@ bool CChainState::ActivateBestChainStep(CValidationState& state, const CChainPar
 
         // Connect new blocks.
         for (CBlockIndex *pindexConnect : reverse_iterate(vpindexToConnect)) {
-            if (!ConnectTip(state, chainparams, pindexConnect, pindexConnect == pindexMostWork ? pblock : std::shared_ptr<const CBlock>(), connectTrace, disconnectpool)) {
+            if (!ConnectTip(state, chainparams, pindexConnect, pindexConnect == pindexMostWork ? pblock : std::shared_ptr<const CBlock>(), connectTrace, disconnectpool, fBlocksDisconnected)) {
                 if (state.IsInvalid()) {
                     // The block violates a consensus rule.
                     if (!state.CorruptionPossible())
@@ -14766,7 +14997,7 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
                 // is uniform: omit it and a rolled-forward discount puts an
                 // UNTAGGED title into the UTXO set - plain-spendable, and a
                 // coins-vs-BillDB split on the crashed node alone.
-                memcpy(&nBillID, tx->vchBillPayload.data(), 4);
+                nBillID = ReadLE32(tx->vchBillPayload.data());
             }
         }
 
@@ -14792,6 +15023,10 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
                 HouseDefer def;
                 if (DecodeHousePayload(tx->vchHousePayload, def))
                     nHouseID = def.nHouseID;
+            } else if (tx->nHouseOp == HOUSE_OP_ESCROW_MERGE) {   // S1X-18
+                HouseEscrowMerge m;
+                if (DecodeHousePayload(tx->vchHousePayload, m))
+                    nHouseID = m.nHouseID;
             }
         }
 

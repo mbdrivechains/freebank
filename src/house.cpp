@@ -144,18 +144,21 @@ uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, 
     return ss.GetHash();
 }
 
-uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs)
+uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts,
+                          const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/topup");
     HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nPartnerIndex;
+    ss << hashPrevouts;   // S1X-16: a signed approval spends these inputs only (no replay by whoever funds the outputs)
     ss << hashOutputs;
     return ss.GetHash();
 }
 
-uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned char>& vchNewPubKey, const CAmount& amountPledge)
+uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned char>& vchNewPubKey, const CAmount& amountPledge,
+                          uint32_t nExpiryHeight)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/admit");
@@ -163,37 +166,43 @@ uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned cha
     ss << houseID;
     ss << vchNewPubKey;
     ss << amountPledge;
+    ss << nExpiryHeight;  // S1X-16: an approval the partners gave expires
     return ss.GetHash();
 }
 
-uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs)
+uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts,
+                         const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/exit");
     HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nPartnerIndex;
+    ss << hashPrevouts;   // S1X-16: a cancelled exit or expulsion can't be replayed by whoever funds the same outputs
     ss << hashOutputs;   // freshness: a leaked exit sig is not a bearer token
     return ss.GetHash();
 }
 
-uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashOutputs)
+uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/winddown");
     HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
+    ss << hashPrevouts;   // S1X-16: a cancelled wind-down can't be replayed
     ss << hashOutputs;   // freshness: a leaked winddown sig is not replayable
     return ss.GetHash();
 }
 
-uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs)
+uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts,
+                            const uint256& hashOutputs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/reclaim");
     HashNetworkTag(ss);   // UR-ext-13
     ss << houseID;
     ss << nPartnerIndex;
+    ss << hashPrevouts;   // S1X-16: the signature spends exactly these pledges (run 3 #7: a partial reclaim swept any subset)
     ss << hashOutputs;   // binds the reclaim destination
     return ss.GetHash();
 }
@@ -240,6 +249,7 @@ uint256 HouseRateSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseR
     ss << std::string("FreeBankHouse/rate");
     HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
+    ss << rate.houseID;   // S1X-26: the declared id, which no reorg reassigns
     ss << rate.nKind;
     ss << rate.nBid;
     ss << rate.nAsk;
@@ -261,7 +271,7 @@ uint256 HouseCharterSigHash(uint32_t nHouseID, const CTransaction& tx, const Hou
     ss << std::string("FreeBankHouse/charter");
     HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID;
-    ss << unsigned_;
+    ss << unsigned_;      // S1X-26: carries houseID, the declared id
     ss << hPrevouts.GetHash();
     ss << BillHashOutputs(tx);
     return ss.GetHash();
@@ -288,6 +298,7 @@ uint256 HouseAttestChallenge(const uint256& houseID, uint32_t nAsOfHeight,
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankReserveProof");
+    HashNetworkTag(ss);    // S1X-11: like every other FreeBank digest (UR-ext-13); the as-of block hash bound it already
     ss << houseID;         // cross-house proof replay bar
     ss << nAsOfHeight;
     ss << hashAsOfBlock;   // recency: reorg past nAsOfHeight kills every proof
@@ -299,6 +310,7 @@ uint256 HouseAttestProofSetHash(const std::vector<AttestProof>& vProofs)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankHouse/proofset");
+    HashNetworkTag(ss);    // S1X-11
     for (const AttestProof& p : vProofs) {
         ss << p.outpoint;
         ss << p.vchPubKey;   // deliberately NOT vchSig - sigs gathered after the set is fixed
@@ -653,6 +665,27 @@ uint32_t HouseBrassageBps(const CHouse& house)
     return BrassageBpsAt(HouseAttestedRatioBps(house), HOUSE_RESERVE_FLOOR_PCT * 100);
 }
 
+CAmount BrassageAmountAt(uint64_t nUnits, uint32_t nRatio, uint32_t nRho)
+{
+    // S1X-8 (security: Low; Michael 11-25 yes): ONE ceiling division over the exact curve. Flooring the bps
+    // (BrassageBpsAt) and then the amount let a redemption under 25 mg, or one just under the floor, owe nothing, so
+    // splitting a redemption avoided the spread. Here any redemption below the floor owes at least 1 mg.
+    if (nUnits == 0 || nRatio >= nRho)
+        return 0;
+    const uint32_t nTheta = nRho / 4;
+    unsigned __int128 nNum, nDen;
+    if (nRatio <= nTheta) {
+        nNum = (unsigned __int128)nUnits * HOUSE_BRASSAGE_MAX_BPS;
+        nDen = 10000;
+    } else {
+        const unsigned __int128 p = nRho - nRatio, q = nRho - nTheta;   // proximity and span, as BrassageBpsAt
+        nNum = (unsigned __int128)nUnits * HOUSE_BRASSAGE_MAX_BPS * p * p;   // < 2^51 * 2^14 * 2^28 * ... fits 128 bits
+        nDen = (unsigned __int128)10000 * q * q;
+    }
+    const unsigned __int128 amt = (nNum + nDen - 1) / nDen;
+    return amt > (unsigned __int128)MAX_MONEY ? (CAmount)MAX_MONEY : (CAmount)amt;
+}
+
 CAmount HouseBrassageAmount(uint64_t nUnits, uint32_t nBps)
 {
     if (nUnits == 0 || nBps == 0)
@@ -922,9 +955,12 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-payload");
 
         // Either the partner's own signature (voluntary) or an approver set
-        // (expulsion) must be present; both is fine too.
+        // (expulsion) must be present - exactly one (S1X-17: with both, the arm skipped the approvers once the partner
+        // signature verified, so junk approver entries made a new txid with the same effects).
         if (ex.vchPartnerSig.empty() && ex.vApproverIndex.empty())
             return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-noauth");
+        if (!ex.vchPartnerSig.empty() && !(ex.vApproverIndex.empty() && ex.vApproverSig.empty()))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-twoauth");
         if (!CheckApproverShape(ex.vApproverIndex, ex.vApproverSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-approvers");
     }
@@ -975,7 +1011,8 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
             const bool fZeroContract = std::all_of(ch.vchContract.begin(), ch.vchContract.end(),
                                                    [](unsigned char c) { return c == 0; });
             if (ch.nChainID == 0 || ch.vchContract.size() != 20 || fZeroContract || ch.nDecimals > 36 ||
-                    ch.nGramsNum == 0 || ch.nGramsDen == 0 || ch.nRelated > HOUSE_RELATED_YES || ch.nIndex != 0)
+                    ch.nGramsNum == 0 || ch.nGramsDen == 0 || ch.nIndex != 0 ||
+                    ch.nRelated == HOUSE_RELATED_UNDECLARED || ch.nRelated > HOUSE_RELATED_YES)   // CH-N0: 0 is never declared
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-add");
         } else if (ch.nKind == HOUSE_CHARTER_REMOVE || ch.nKind == HOUSE_CHARTER_RELATED) {
             // UR1-1 (switch-on): the op names the token it means (chain id + contract), checked against nIndex in
@@ -984,7 +1021,8 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
                                                    [](unsigned char c) { return c == 0; });
             if (ch.nChainID == 0 || ch.vchContract.size() != 20 || fZeroContract || ch.nDecimals != 0 ||
                     ch.nGramsNum != 0 || ch.nGramsDen != 0 || ch.nRelated > HOUSE_RELATED_YES ||
-                    (ch.nKind == HOUSE_CHARTER_REMOVE && ch.nRelated != 0))
+                    (ch.nKind == HOUSE_CHARTER_REMOVE && ch.nRelated != 0) ||
+                    (ch.nKind == HOUSE_CHARTER_RELATED && ch.nRelated == HOUSE_RELATED_UNDECLARED))   // CH-N0
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-index-op");
         } else {
             return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-kind");
@@ -1061,6 +1099,23 @@ bool CheckHouseTransactionShape(const CTransaction& tx, CValidationState& state)
         // has no end date, so there is nothing to extend. Rejected here,
         // context-free, so it never reaches the mempool or a block.
         return state.DoS(100, false, REJECT_INVALID, "bad-house-renew-retired");
+    }
+    else
+    if (tx.nHouseOp == HOUSE_OP_ESCROW_MERGE) {
+        // S1X-18: the house, the list, and vout[0] escrow-shaped (its exact script and value are contextual); any other
+        // output plain (no stray escrow: it would enter the UTXO set untagged).
+        HouseEscrowMerge m;
+        if (!DecodeHousePayload(tx.vchHousePayload, m) || m.nHouseID == 0 ||
+                (m.nList != HOUSE_ESCROW_LIST_CHANGE && m.nList != HOUSE_ESCROW_LIST_RESERVE))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-payload");
+        if (tx.vout.empty() || !IsHouseEscrowScript(tx.vout[0].scriptPubKey))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-vout");
+        if (!tx.vIssuedOut.empty())   // security's note 3: no annex - the merge moves escrow sECX only
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-annex");
+        for (size_t o = 1; o < tx.vout.size(); o++) {
+            if (IsHouseEscrowScript(tx.vout[o].scriptPubKey))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-stray-escrow");
+        }
     }
     else
     if (tx.nHouseOp == HOUSE_OP_RELEASE) {

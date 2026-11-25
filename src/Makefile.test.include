@@ -68,6 +68,7 @@ BITCOIN_TESTS =\
   test/token_tests.cpp \
   test/deposit_tests.cpp \
   test/pool_tests.cpp \
+  test/pooled_credit_parent_tests.cpp \
   test/units_tests.cpp \
   test/issued_tests.cpp \
   test/houserate_tests.cpp \

@@ -1892,6 +1892,7 @@ static UniValue BillToJSON(const CBill& bill, bool fIncludeBody)
     // the field that discriminates the canonical-minimal encoding - without it
     // the comparison silently cannot see the one field ops 5-8 move.
     obj.pushKV("owner_house_id", (uint64_t)bill.nOwnerHouseID);
+    obj.pushKV("escrow_house_id", (uint64_t)bill.nEscrowHouseID);   // S1X-25: the failed house whose escrow took it (0: none)
     obj.pushKV("issue_txid", bill.txidIssue.ToString());
     obj.pushKV("escrow_outpoint", bill.outEscrow.hash.ToString() + ":" + itostr(bill.outEscrow.n));
     obj.pushKV("title_outpoint", bill.outTitle.hash.ToString() + ":" + itostr(bill.outTitle.n));

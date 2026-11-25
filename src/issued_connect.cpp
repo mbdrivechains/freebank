@@ -702,6 +702,17 @@ uint32_t GoldTillRatioBps(const CHouse& house, int nHeight)
     return bps > 10000 ? 10000 : (uint32_t)bps;
 }
 
+CAmount GoldBrassageAmount(const CHouse& house, int nHeight, uint64_t nUnits)
+{
+    // GoldBrassageBps's cases, the amount rounded up once over the exact curve (S1X-8).
+    if (house.nMintedUnits == 0 || nUnits == 0)
+        return 0;
+    if (HouseEffectiveStatus(house, nHeight) == HOUSE_STATUS_OPEN)
+        return 0;
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
+    return BrassageAmountAt(nUnits, GoldTillRatioBps(house, nHeight), gp.nTillMinBps);
+}
+
 uint32_t GoldBrassageBps(const CHouse& house, int nHeight)
 {
     if (house.nMintedUnits == 0)

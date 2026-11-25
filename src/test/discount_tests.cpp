@@ -645,8 +645,8 @@ static CMutableTransaction MakeHRetire(const Scene& s,
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << h;
     mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
-    BOOST_REQUIRE(s.acceptor.Sign(BillRetireSigHash(s.bill.billID, h.nRateNamed,   // UR1-6
-            BillHashOutputs(CTransaction(mtx))), h.vchAcceptorSig));
+    BOOST_REQUIRE(s.acceptor.Sign(BillRetireSigHash(s.bill.billID, h.nRateNamed,   // UR1-6; S1X-17
+            BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)), true), h.vchAcceptorSig));
     CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
     ss2 << h;
     mtx.vchBillPayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
@@ -790,7 +790,8 @@ static CMutableTransaction MakeHRetireNotes(const Scene& s, uint64_t nUnits,
         pre(h, mtx);
 
     const uint256 sighash = fSignAsOp7
-        ? BillRetireSigHash(s.bill.billID, h.nRateNamed, BillHashOutputs(CTransaction(mtx)))   // UR1-6
+        ? BillRetireSigHash(s.bill.billID, h.nRateNamed, BillTxBindingHash(CTransaction(mtx)),
+                            BillHashOutputs(CTransaction(mtx)), true)   // UR1-6; S1X-17
         : BillHRetireNotesSigHash(h, s.bill.billID, BillHashPrevouts(CTransaction(mtx)),
                                   BillHashOutputs(CTransaction(mtx)));
     BOOST_REQUIRE(s.acceptor.Sign(sighash, h.vchAcceptorSig));
@@ -1039,7 +1040,7 @@ BOOST_AUTO_TEST_CASE(hretire_notes_shape)
     BOOST_CHECK_EQUAL(shape(MakeHRetireNotes(s, (uint64_t)PRICE,
         [](BillHRetireNotes& h, CMutableTransaction&) { h.nOwnerHouseID = 0; })), "bad-bill-hretirenotes-fields");
     CMutableTransaction m = MakeHRetireNotes(s, (uint64_t)PRICE);
-    m.nBillOp = BILL_OP_HCLAIM_ESCROW + 1;
+    m.nBillOp = BILL_OP_TITLE_RELEASE + 1;   // S1X-29: op 12 exists now
     BOOST_CHECK_EQUAL(shape(m), "bad-bill-op");
 }
 
@@ -1083,7 +1084,8 @@ static CMutableTransaction MakeHRetireEscrow(const Scene& s, uint64_t nUnits,
         pre(h, mtx);
     const uint256 hp = BillHashPrevouts(CTransaction(mtx)), ho = BillHashOutputs(CTransaction(mtx));
     BOOST_REQUIRE(s.acceptor.Sign(fSignAsOp9 ? BillHRetireNotesSigHash(h, s.bill.billID, hp, ho)
-                                             : BillHRetireEscrowSigHash(h, s.bill.billID, hp, ho), h.vchAcceptorSig));
+                                             : BillHRetireEscrowSigHash(h, s.bill.billID, BillTxBindingHash(CTransaction(mtx)), ho),
+                                  h.vchAcceptorSig));   // S1X-17: op 10 binds sequences and lock time too
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << h;
     mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
@@ -1266,8 +1268,8 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
             pre(h, mtx);
         h.vApproverIndex.push_back(0);
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(s.partner.Sign(BillClaimSigHash(s.bill.billID,
-                BillHashOutputs(CTransaction(mtx))), sig));
+        BOOST_REQUIRE(s.partner.Sign(BillClaimSigHash(s.bill.billID, BillTxBindingHash(CTransaction(mtx)),
+                BillHashOutputs(CTransaction(mtx)), true), sig));   // S1X-17
         h.vApproverSig.push_back(sig);
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << h;
@@ -1298,8 +1300,8 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
         BillHClaim h;
         BOOST_REQUIRE(DecodeBillPayload(mtx.vchBillPayload, h));
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(s.custody.Sign(BillClaimSigHash(s.bill.billID,
-                BillHashOutputs(CTransaction(mtx))), sig));
+        BOOST_REQUIRE(s.custody.Sign(BillClaimSigHash(s.bill.billID, BillTxBindingHash(CTransaction(mtx)),
+                BillHashOutputs(CTransaction(mtx)), true), sig));   // S1X-17
         h.vApproverSig[0] = sig;
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << h;
@@ -1989,7 +1991,8 @@ BOOST_AUTO_TEST_CASE(shipped_ops_refuse_house_held_bills)
         ss << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
         BOOST_REQUIRE(const_cast<CKey&>(s.acceptor).Sign(
-                BillRetireSigHash(s.bill.billID, r.nRateNamed, BillHashOutputs(CTransaction(mtx))), r.vchAcceptorSig));   // UR1-6
+                BillRetireSigHash(s.bill.billID, r.nRateNamed, BillTxBindingHash(CTransaction(mtx)),
+                                  BillHashOutputs(CTransaction(mtx)), false), r.vchAcceptorSig));   // UR1-6; S1X-17
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
         ss2 << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
@@ -2011,7 +2014,8 @@ BOOST_AUTO_TEST_CASE(shipped_ops_refuse_house_held_bills)
         ss << c;
         mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
         BOOST_REQUIRE(const_cast<CKey&>(s.custody).Sign(
-                BillClaimSigHash(s.bill.billID, BillHashOutputs(CTransaction(mtx))), c.vchHolderSig));
+                BillClaimSigHash(s.bill.billID, BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)), false),
+                c.vchHolderSig));   // S1X-17
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
         ss2 << c;
         mtx.vchBillPayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
@@ -2461,7 +2465,7 @@ BOOST_AUTO_TEST_CASE(ur_ext_11_mint_ceiling_counts_pending_swaps)
     }
 }
 
-// S1X-9 (testing 2026-11-23, s1 measuring run round 3; security: Medium, findings/2026-11-23-s1x-9-match-funding-units):
+// S1X-9 (testing 2026-11-23, s1 measuring run round 3; security: Medium):
 // HouseLoanBookExcess subtracts ActiveEscrow() - sats - from nLoanBookFace - mg since gram notes (bill.amount, bill.h) -
 // so wherever a gram costs more than 1,000 sats the escrow "covers" any book and match funding never binds. The unit
 // tests' house rate (1,000 sats per gram = 1 sat per mg) hid it: there the two units are the same number. This case
@@ -2532,6 +2536,44 @@ BOOST_AUTO_TEST_CASE(s1x_9_match_funding_values_the_escrow_in_mg)
                             std::string("S1X-9 ") + run.name + ": HouseMatchFundingOK (the RPC's matchfundingok) said " +
                             (run.fExpectOk ? "false" : "true"));
     }
+}
+
+
+// S1X-25 (testing 2026-11-25; Claude /code-review max run 3 #17; security 11-25: Medium). FAILED_HOUSE_DESIGN A
+// (bill.h:58-60): once the owning house is Deferred or Insolvent, a house-held bill's money goes into the house's
+// ESCROW, "never to the operator's custody key". Op 11 (HCLAIM_ESCROW) moves the bond there, but it leaves the bill
+// DEFAULTED with owner 0 and the custody key still the holder, and RECOURSE refuses only house-held paper (owner != 0)
+// and pays the holder key. So the discount seller's recourse, the deficiency, goes to the operator's key, outside the
+// noteholders' pot. Fix-agnostic: whether the fix refuses this RECOURSE or routes it to the escrow, a RECOURSE paying
+// the custody key after op 11 must not pass.
+BOOST_AUTO_TEST_CASE(s1x_25_recourse_after_op_11_never_pays_the_custody_key)
+{
+    const int nLate = (int)MATURITY + (int)GRACE + 1;
+    Scene s = MakeHeldScene();
+    BillEndorsement e1;                              // the chain a DISCOUNT leaves: drawer -> seller -> custody
+    e1.vchFrom = Pub(s.drawer);
+    e1.vchTo = Pub(s.seller);
+    e1.nAtHeight = (uint32_t)H - 200;
+    s.bill.vEndorsement.insert(s.bill.vEndorsement.begin(), e1);
+    s.house.status = HOUSE_STATUS_INSOLVENT;
+
+    {   // op 11 at the failed house: anyone moves the bond into its escrow
+        const CMutableTransaction mtx = MakeHClaimEscrow(s);
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_REQUIRE_MESSAGE(RunOp(s, mtx, state, b, h, f, 100000, nLate), "op 11: " + state.GetRejectReason());
+        BOOST_REQUIRE_EQUAL(b.status, BILL_STATUS_DEFAULTED);
+        BOOST_CHECK_EQUAL(b.nOwnerHouseID, 0U);
+        BOOST_CHECK(b.vchHolderPubKey == Pub(s.custody));   // the premise: the operator's custody key is still the holder
+        s.bill = b;
+        if (f) s.house = h;
+    }
+
+    // The discount seller cures the deficiency by RECOURSE. MakeRecourse pays the holder of record: the custody key.
+    const CMutableTransaction mtx = MakeRecourse(s, s.seller, FACE - ESCROW_BOND);
+    CValidationState state; CBill b; CHouse h; bool f = false;
+    const bool fOk = RunOp(s, mtx, state, b, h, f, 100000, nLate);
+    BOOST_CHECK_MESSAGE(!fOk, "S1X-25: after op 11 at a failed house, a RECOURSE of the deficiency paying the operator's "
+                              "custody key was accepted; the money leaves the noteholders' escrow (FAILED_HOUSE_DESIGN A)");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

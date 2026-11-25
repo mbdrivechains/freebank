@@ -17,6 +17,7 @@
 #include <script/standard.h>
 #include <streams.h>
 #include <test/test_bitcoin.h>
+#include <txmempool.h>
 #include <utilstrencodings.h>
 #include <version.h>
 
@@ -107,10 +108,28 @@ BOOST_AUTO_TEST_CASE(bill_sighash_domain_separation)
     const uint256 hashOutputs = uint256S("02");
 
     // Retire and claim messages over identical inputs must differ
-    BOOST_CHECK(BillRetireSigHash(billID, 0, hashOutputs) != BillClaimSigHash(billID, hashOutputs));   // UR1-6: + nRateNamed
+    const uint256 bind = uint256S("05");   // S1X-17: the tx binding
+    BOOST_CHECK(BillRetireSigHash(billID, 0, bind, hashOutputs, false) != BillClaimSigHash(billID, bind, hashOutputs, false));   // UR1-6: + nRateNamed
 
     // hashOutputs must matter (anti-replay: the signature pins the outputs)
-    BOOST_CHECK(BillClaimSigHash(billID, hashOutputs) != BillClaimSigHash(billID, uint256S("03")));
+    BOOST_CHECK(BillClaimSigHash(billID, bind, hashOutputs, false) != BillClaimSigHash(billID, bind, uint256S("03"), false));
+    // S1X-17: so must the binding (inputs, sequences, lock time), and op 3 / 7 and op 4 / 8 each have their own tag
+    BOOST_CHECK(BillClaimSigHash(billID, bind, hashOutputs, false) != BillClaimSigHash(billID, uint256S("06"), hashOutputs, false));
+    BOOST_CHECK(BillClaimSigHash(billID, bind, hashOutputs, false) != BillClaimSigHash(billID, bind, hashOutputs, true));
+    BOOST_CHECK(BillRetireSigHash(billID, 0, bind, hashOutputs, false) != BillRetireSigHash(billID, 0, bind, hashOutputs, true));
+    // BillTxBindingHash moves with nLockTime, an nSequence, or an added input
+    CMutableTransaction m;
+    m.vin.push_back(CTxIn(COutPoint(uint256S("07"), 0)));
+    const uint256 b0 = BillTxBindingHash(CTransaction(m));
+    m.nLockTime = 1;
+    BOOST_CHECK(BillTxBindingHash(CTransaction(m)) != b0);
+    m.nLockTime = 0;
+    m.vin[0].nSequence = 5;
+    BOOST_CHECK(BillTxBindingHash(CTransaction(m)) != b0);
+    m.vin[0].nSequence = CTxIn::SEQUENCE_FINAL;
+    BOOST_CHECK(BillTxBindingHash(CTransaction(m)) == b0);
+    m.vin.push_back(CTxIn(COutPoint(uint256S("08"), 0)));
+    BOOST_CHECK(BillTxBindingHash(CTransaction(m)) != b0);
 }
 
 BOOST_AUTO_TEST_CASE(bill_escrow_script)
@@ -406,6 +425,44 @@ BOOST_AUTO_TEST_CASE(bill_ser_house_held_roundtrip)
     ssLegacy << TestLegacyBill();
     BOOST_CHECK(std::vector<unsigned char>(ssPlain.begin(), ssPlain.end()) ==
                 std::vector<unsigned char>(ssLegacy.begin(), ssLegacy.end()));
+}
+
+// S1X-25: version 4 carries nEscrowHouseID (the failed house whose escrow took the bill). It round-trips, it alone
+// selects the versioned layout, and a version-3 record reads it as 0.
+BOOST_AUTO_TEST_CASE(bill_ser_escrow_house_roundtrip)
+{
+    CBill bill = TestLegacyBill();
+    bill.status = BILL_STATUS_DEFAULTED;
+    bill.nEscrowHouseID = 7;
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << bill;
+    const std::vector<unsigned char> vch(ss.begin(), ss.end());
+    uint32_t nFirst = 0;
+    memcpy(&nFirst, vch.data(), 4);
+    BOOST_CHECK_EQUAL(nFirst, BILL_SER_SENTINEL);
+    BOOST_CHECK_EQUAL(vch[4], 4);
+    CBill back;
+    CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
+    ssIn >> back;
+    BOOST_CHECK_EQUAL(back.nEscrowHouseID, 7u);
+    BOOST_CHECK_EQUAL(back.nOwnerHouseID, 0u);
+    CDataStream ssOut(SER_NETWORK, PROTOCOL_VERSION);
+    ssOut << back;
+    BOOST_CHECK(std::vector<unsigned char>(ssOut.begin(), ssOut.end()) == vch);
+
+    // A version-3 record (no trailing field): the same bytes as a v4 one with 0, version byte 3, last 4 bytes dropped.
+    CBill held = TestLegacyBill();
+    held.nOwnerHouseID = 3;
+    CDataStream ss4(SER_NETWORK, PROTOCOL_VERSION);
+    ss4 << held;
+    std::vector<unsigned char> v3(ss4.begin(), ss4.end());
+    v3[4] = 3;
+    v3.resize(v3.size() - 4);
+    CBill back3;
+    CDataStream ssIn3(v3, SER_NETWORK, PROTOCOL_VERSION);
+    ssIn3 >> back3;
+    BOOST_CHECK_EQUAL(back3.nOwnerHouseID, 3u);
+    BOOST_CHECK_EQUAL(back3.nEscrowHouseID, 0u);
 }
 
 BOOST_AUTO_TEST_CASE(bill_ser_unknown_version_is_hard_failure)
@@ -779,7 +836,7 @@ BOOST_AUTO_TEST_CASE(bill_op_range_and_payload_caps)
         CValidationState state;
         BOOST_CHECK(CheckBillTransactionShape(CTransaction(mtx), state));
     }
-    for (uint8_t op : {(uint8_t)0, (uint8_t)12, (uint8_t)255}) {
+    for (uint8_t op : {(uint8_t)0, (uint8_t)(BILL_OP_TITLE_RELEASE + 1), (uint8_t)255}) {   // S1X-29: op 12 exists now
         CMutableTransaction bad = mtx;
         bad.nBillOp = op;
         CValidationState state;
@@ -1491,20 +1548,10 @@ BOOST_AUTO_TEST_CASE(bill_payload_leading_id_contract)
 // ===========================================================================
 
 namespace {
-template <typename B, typename R, typename H>
-auto UR16RetireDigestImpl(int, const B& billID, const R& nRate, const H& hashOutputs)
-    -> decltype(BillRetireSigHash(billID, nRate, hashOutputs))
+// S1X-17: the retire digest also binds the transaction (BillTxBindingHash) and tells op 3 from op 7.
+uint256 UR16RetireDigest(const uint256& billID, uint64_t nRate, const CTransaction& tx, bool fHouseHeld)
 {
-    return BillRetireSigHash(billID, nRate, hashOutputs);   // the fix
-}
-template <typename B, typename R, typename H>
-uint256 UR16RetireDigestImpl(long, const B& billID, const R&, const H& hashOutputs)
-{
-    return BillRetireSigHash(billID, hashOutputs);          // master: nRateNamed is not in the digest
-}
-uint256 UR16RetireDigest(const uint256& billID, uint64_t nRate, const uint256& hashOutputs)
-{
-    return UR16RetireDigestImpl(0, billID, nRate, hashOutputs);
+    return BillRetireSigHash(billID, nRate, BillTxBindingHash(tx), BillHashOutputs(tx), fHouseHeld);
 }
 
 std::vector<unsigned char> UR16Pub(const CKey& key)
@@ -1564,7 +1611,7 @@ BOOST_AUTO_TEST_CASE(ur1_6_bill_digests_bind_nratenamed)
     const uint256 hp = uint256S("1111");
     const uint256 ho = uint256S("2222");
 
-    BOOST_CHECK_MESSAGE(UR16RetireDigest(billID, 1000, ho) != UR16RetireDigest(billID, 1400, ho),
+    BOOST_CHECK_MESSAGE(UR16RetireDigest(billID, 1000, CTransaction(), false) != UR16RetireDigest(billID, 1400, CTransaction(), false),
                         "UR1-6: the retire digest that ops 3 RETIRE and 7 HRETIRE sign does not bind nRateNamed");
 
     BillRecourse r;
@@ -1620,7 +1667,7 @@ BOOST_AUTO_TEST_CASE(ur1_6_retire_rate_rewrite_breaks_the_signature)
         retire.nBillID = 1;
         retire.nRateNamed = 1000;
         CMutableTransaction mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
-        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1000, BillHashOutputs(CTransaction(mtx))),
+        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1000, CTransaction(mtx), false),
                                        retire.vchAcceptorSig));
         mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
         const std::string strHonest = UR16Run(mtx, bill, nullptr);
@@ -1640,7 +1687,7 @@ BOOST_AUTO_TEST_CASE(ur1_6_retire_rate_rewrite_breaks_the_signature)
         BillRetire named = rewritten;
         named.vchAcceptorSig.clear();
         CMutableTransaction mtx3 = UR16Tx(BILL_OP_RETIRE, named, bill.vchHolderPubKey, nPaid);
-        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1400, BillHashOutputs(CTransaction(mtx3))),
+        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1400, CTransaction(mtx3), false),
                                        named.vchAcceptorSig));
         mtx3 = UR16Tx(BILL_OP_RETIRE, named, bill.vchHolderPubKey, nPaid);
         const std::string strNamed = UR16Run(mtx3, bill, nullptr);
@@ -1677,7 +1724,7 @@ BOOST_AUTO_TEST_CASE(ur1_6_retire_rate_rewrite_breaks_the_signature)
         hr.nPrevLoanWtMatLo = house.nLoanWtMatLo;
         hr.nRateNamed = 1000;
         CMutableTransaction mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
-        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1000, BillHashOutputs(CTransaction(mtx))),
+        BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, 1000, CTransaction(mtx), true),
                                        hr.vchAcceptorSig));
         mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
         const std::string strHonest = UR16Run(mtx, bill, &house);
@@ -1725,7 +1772,7 @@ std::string SAN2Retire(CAmount nEscrow, uint64_t nRate, CAmount nPaid)
     retire.nBillID = 1;
     retire.nRateNamed = nRate;
     CMutableTransaction mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
-    BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, nRate, BillHashOutputs(CTransaction(mtx))),
+    BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, nRate, CTransaction(mtx), false),
                                    retire.vchAcceptorSig));
     mtx = UR16Tx(BILL_OP_RETIRE, retire, bill.vchHolderPubKey, nPaid);
     return UR16Run(mtx, bill, nullptr);
@@ -1832,7 +1879,7 @@ std::string S1X1HRetire(CAmount nEscrow, uint64_t nRate, CAmount nPaid)
     hr.nPrevLoanWtMatLo = house.nLoanWtMatLo;
     hr.nRateNamed = nRate;
     CMutableTransaction mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
-    BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, nRate, BillHashOutputs(CTransaction(mtx))),
+    BOOST_REQUIRE(keyAcceptor.Sign(UR16RetireDigest(bill.billID, nRate, CTransaction(mtx), true),
                                    hr.vchAcceptorSig));
     mtx = UR16Tx(BILL_OP_HRETIRE, hr, bill.vchHolderPubKey, nPaid);
     return UR16Run(mtx, bill, &house);
@@ -1902,6 +1949,146 @@ BOOST_AUTO_TEST_CASE(s1x_1_rigged_reference_still_pays_the_bond_on_hretire)
                                        SAN2Said(r));
     }
     g_nHouseRateTestOverride = nOverridePrev;
+}
+
+
+// S1X-27 (Claude max run 3 #20; security 11-25: Medium): the pool's identity index replaces the scan that decoded every
+// pooled ISSUE for each incoming one. The keys must equal for the same bill (a re-wrapped ISSUE, two ops on one id) and
+// differ across bills and across kinds; the pool must hold a key exactly while a tx carrying it is pooled.
+BOOST_AUTO_TEST_CASE(s1x_27_pooled_identity_keys_bills)
+{
+    BillIssue issue;
+    CKey kD, kA, kH;
+    const CMutableTransaction mtxIssue = MakeIssueTx(issue, kD, kA, kH);
+    std::vector<uint256> vA, vB;
+    PooledIdentityKeys(CTransaction(mtxIssue), vA);
+    BOOST_REQUIRE_EQUAL(vA.size(), 1u);
+
+    // A re-wrap (other funding, other nLockTime) of the same signed payload: the same key.
+    CMutableTransaction mtxRewrap = mtxIssue;
+    mtxRewrap.vin[0].prevout = COutPoint(uint256S("02"), 1);
+    mtxRewrap.nLockTime = 7;
+    PooledIdentityKeys(CTransaction(mtxRewrap), vB);
+    BOOST_REQUIRE_EQUAL(vB.size(), 1u);
+    BOOST_CHECK(vA[0] == vB[0]);
+
+    // Another body: another key.
+    BillIssue issue2 = issue;
+    issue2.vchEncryptedBody.push_back('x');
+    CMutableTransaction mtxOther = mtxIssue;
+    {
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << issue2;
+        mtxOther.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    }
+    PooledIdentityKeys(CTransaction(mtxOther), vB);
+    BOOST_REQUIRE_EQUAL(vB.size(), 1u);
+    BOOST_CHECK(vA[0] != vB[0]);
+
+    // Ops 2-8 key by the raw 4 leading bytes: equal ids share a key, other ids don't, and no op key equals an ISSUE's.
+    auto fnOp = [](uint8_t nOp, uint32_t nBillID) {
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_BILL_VERSION;
+        mtx.nBillOp = nOp;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << nBillID << std::string("rest of the payload");
+        mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("03"), 0)));
+        return mtx;
+    };
+    std::vector<uint256> vOp1, vOp2, vOp3;
+    PooledIdentityKeys(CTransaction(fnOp(BILL_OP_ENDORSE, 42)), vOp1);
+    PooledIdentityKeys(CTransaction(fnOp(BILL_OP_RETIRE, 42)), vOp2);
+    PooledIdentityKeys(CTransaction(fnOp(BILL_OP_RETIRE, 43)), vOp3);
+    BOOST_REQUIRE_EQUAL(vOp1.size(), 1u);
+    BOOST_REQUIRE_EQUAL(vOp2.size(), 1u);
+    BOOST_REQUIRE_EQUAL(vOp3.size(), 1u);
+    BOOST_CHECK(vOp1[0] == vOp2[0]);
+    BOOST_CHECK(vOp1[0] != vOp3[0]);
+    BOOST_CHECK(vOp1[0] != vA[0]);
+
+    // The pool holds a key exactly while a tx carrying it is pooled (counted).
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+    const CTransaction txIssue(mtxIssue), txRewrap(mtxRewrap);
+    BOOST_CHECK(!pool.HaveIdentityKey(vA));
+    {
+        LOCK(pool.cs);
+        pool.addUnchecked(txIssue.GetHash(), entry.FromTx(txIssue));
+    }
+    BOOST_CHECK(pool.HaveIdentityKey(vA));
+    std::vector<uint256> vRe;
+    PooledIdentityKeys(txRewrap, vRe);
+    BOOST_CHECK(pool.HaveIdentityKey(vRe));   // the re-wrap is refused as bill-op-in-mempool
+    BOOST_CHECK(!pool.HaveIdentityKey(vOp1));
+    pool.removeRecursive(txIssue);
+    BOOST_CHECK(!pool.HaveIdentityKey(vA));
+}
+
+
+// S1X-29 (security: Low; Michael 11-25 yes): op 12 TITLE_RELEASE. Shape: the bill id and plain outputs only (no escrow
+// shape). Inputs: exactly one title, of the payload's bill. Context: the bill has ended and no failed house's escrow
+// took it.
+BOOST_AUTO_TEST_CASE(s1x_29_title_release)
+{
+    BillTitleRelease rel;
+    rel.nBillID = 7;
+    auto fnTx = [&](const CScript& scriptOut) {
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_BILL_VERSION;
+        mtx.nBillOp = BILL_OP_TITLE_RELEASE;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << rel;
+        mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("0c"), 0)));
+        mtx.vout.push_back(CTxOut(BILL_TITLE_VALUE - 1000, scriptOut));
+        return mtx;
+    };
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript scriptPlain = GetScriptForDestination(key.GetPubKey().GetID());
+    {
+        CValidationState state;
+        BOOST_CHECK(CheckBillTransactionShape(CTransaction(fnTx(scriptPlain)), state));
+    }
+    {
+        CValidationState state;   // an escrow-shaped output would enter the UTXO set untagged
+        BOOST_CHECK(!CheckBillTransactionShape(CTransaction(fnTx(BillEscrowScript(uint256S("0d")))), state));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-titlerelease-stray-escrow");
+    }
+    {
+        CValidationState state;
+        BOOST_CHECK(!CheckBillTransactionShape(CTransaction(fnTx(HouseEscrowScript(uint256S("0e")))), state));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-titlerelease-stray-escrow");
+    }
+
+    // Context, through CheckBillOperation: a bill record served by id.
+    CBill bill;
+    bill.nBillID = 7;
+    bill.billID = uint256S("0f");
+    auto fnRun = [&](const CBill& b) {
+        auto fnGetBill = [&](uint32_t nID, CBill& out) { if (nID != b.nBillID) return false; out = b; return true; };
+        auto fnHaveBillHash = [](const uint256&) { return false; };
+        auto fnGetHouse = [](uint32_t, CHouse&) { return false; };
+        auto fnGetCoin = [](const COutPoint&, Coin&) { return false; };
+        auto fnGetBlockHash = [](uint32_t, uint256&) { return false; };
+        CBill billOut;
+        CHouse houseOut;
+        bool fHouseChanged = false;
+        CValidationState state;
+        const bool fOk = CheckBillOperation(CTransaction(fnTx(scriptPlain)), state, 1000, 1000, fnGetBill, fnHaveBillHash,
+                                            fnGetHouse, fnGetCoin, fnGetBlockHash, billOut, houseOut, fHouseChanged, false);
+        BOOST_CHECK(!fHouseChanged);
+        return fOk ? std::string() : state.GetRejectReason();
+    };
+    bill.status = BILL_STATUS_ACTIVE;
+    BOOST_CHECK_EQUAL(fnRun(bill), "bad-bill-titlerelease-active");
+    bill.status = BILL_STATUS_RETIRED;
+    BOOST_CHECK_EQUAL(fnRun(bill), "");
+    bill.status = BILL_STATUS_DEFAULTED;
+    BOOST_CHECK_EQUAL(fnRun(bill), "");
+    bill.nEscrowHouseID = 3;   // op 11 at a failed house: its title stays put
+    BOOST_CHECK_EQUAL(fnRun(bill), "bad-bill-titlerelease-escrowed");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

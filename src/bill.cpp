@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <crypto/common.h>   // ReadLE32 (S1X-10)
 #include <bill.h>
 #include <house.h>   // HashNetworkTag (UR-ext-13)
 
@@ -10,6 +11,7 @@
 #include <crypto/sha256.h>
 #include <hash.h>
 #include <note.h>             // NOTE_DUST_VALUE / MAX_NOTE_OUTPUTS / SumNoteUnits
+#include <pool.h>             // IsPoolEscrowScript (S1X-29)
 #include <pubkey.h>
 #include <script/standard.h>
 #include <streams.h>
@@ -60,24 +62,43 @@ uint256 BillHashOutputs(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashOutputs)
+uint256 BillTxBindingHash(const CTransaction& tx)
+{
+    // S1X-17 (security: Low; Michael 11-25 yes): every input (prevout and nSequence) and nLockTime. An escrow-only bill
+    // op has no input signature (the escrow is OP_TRUE), so with outputs alone signed a relayer could change nLockTime
+    // or add an input and relay a new txid with the same effects, orphaning any child of the original.
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankBill/txbind");
+    for (const CTxIn& in : tx.vin) {
+        ss << in.prevout;
+        ss << in.nSequence;
+    }
+    ss << tx.nLockTime;
+    return ss.GetHash();
+}
+
+uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashTxBinding,
+                          const uint256& hashOutputs, bool fHouseHeld)
 {
     CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankBill/retire");
+    // S1X-17: op 7 (house-held) has its own tag, so an op 3 signature never verifies as op 7's or back.
+    ss << std::string(fHouseHeld ? "FreeBankBill/hretire" : "FreeBankBill/retire");
     HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
     ss << nRateNamed;   // UR1-6 (switch-on, Michael 2026-11-10): the rate the payer names is signed too, so no one can
                         // rewrite it under the acceptor's signature (a new txid, the same effects)
+    ss << hashTxBinding;   // S1X-17
     ss << hashOutputs;
     return ss.GetHash();
 }
 
-uint256 BillClaimSigHash(const uint256& billID, const uint256& hashOutputs)
+uint256 BillClaimSigHash(const uint256& billID, const uint256& hashTxBinding, const uint256& hashOutputs, bool fHouseHeld)
 {
     CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankBill/claim");
+    ss << std::string(fHouseHeld ? "FreeBankBill/hclaim" : "FreeBankBill/claim");   // S1X-17: op 8 vs op 4
     HashNetworkTag(ss);   // UR-ext-13
     ss << billID;
+    ss << hashTxBinding;   // S1X-17
     ss << hashOutputs;
     return ss.GetHash();
 }
@@ -228,6 +249,8 @@ void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, BillTagCa
             coin.SetBill(false, 0);
         return;
     }
+    if (tx.nBillOp == BILL_OP_TITLE_RELEASE)
+        return;   // S1X-29: the released value is plain
     if (tx.nBillOp == BILL_OP_DISCOUNT) {
         // vout[0] = the title moving into house custody; vout[1..nNoteOutputs]
         // = the house's OWN notes, minted in this transaction as the
@@ -261,7 +284,7 @@ void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, BillTagCa
     if (tx.nBillOp == BILL_OP_HRETIRE_ESCROW || tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {
         if (n == 0 && tx.vchBillPayload.size() >= 8) {
             uint32_t nHouseID = 0;
-            memcpy(&nHouseID, tx.vchBillPayload.data() + 4, 4);
+            nHouseID = ReadLE32(tx.vchBillPayload.data() + 4);
             if (nHouseID != 0)
                 coin.SetHouseEscrow(nHouseID);
         }
@@ -334,7 +357,7 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
     if (tx.IsCoinBase())
         return state.DoS(100, false, REJECT_INVALID, "bad-bill-coinbase");
 
-    if (tx.nBillOp < BILL_OP_ISSUE || tx.nBillOp > BILL_OP_HCLAIM_ESCROW)
+    if (tx.nBillOp < BILL_OP_ISSUE || tx.nBillOp > BILL_OP_TITLE_RELEASE)
         return state.DoS(100, false, REJECT_INVALID, "bad-bill-op");
 
     // Per-op payload ceilings. Ops 1-4 keep the shipped bound exactly (an ISSUE
@@ -567,6 +590,21 @@ bool CheckBillTransactionShape(const CTransaction& tx, CValidationState& state)
         // vout[0] is the house escrow (the exact script and value are contextual).
         if (tx.vout.empty() || !IsBillEscrowScript(tx.vout[0].scriptPubKey))   // the shared <32-byte id> OP_DROP OP_TRUE shape
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-vout");
+    }
+    else
+    if (tx.nBillOp == BILL_OP_TITLE_RELEASE) {
+        // S1X-29: the bill id, and plain outputs only - no escrow shape, which would enter the UTXO set untagged and
+        // spendable by anyone (security's addition (b), the stray-escrow rule).
+        BillTitleRelease r;
+        if (!DecodeBillPayload(tx.vchBillPayload, r) || r.nBillID == 0)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-payload");
+        if (tx.vout.empty())
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-vout");
+        for (const CTxOut& out : tx.vout) {
+            if (IsBillEscrowScript(out.scriptPubKey) || IsHouseEscrowScript(out.scriptPubKey) ||
+                    IsPoolEscrowScript(out.scriptPubKey) || IsNotePreAuthScript(out.scriptPubKey))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-stray-escrow");
+        }
     }
     else
     if (tx.nBillOp == BILL_OP_HCLAIM_ESCROW) {

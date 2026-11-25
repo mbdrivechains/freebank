@@ -6,12 +6,14 @@
 #include <txmempool.h>
 
 #include <bill.h>
+#include <hash.h>
 #include <house.h>
 #include <issued.h>
 #include <note.h>
 #include <deposit.h>
 #include <pool.h>
 #include <sidechain.h>
+#include <token.h>
 
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
@@ -457,12 +459,23 @@ bool CTxMemPool::addUnchecked(const uint256& hash, const CTxMemPoolEntry &entry,
         }
     }
 
+    // S1X-27: index the bill / REGISTER identity keys
+    std::vector<uint256> vIdKeys;
+    PooledIdentityKeys(tx, vIdKeys);
+    if (!vIdKeys.empty()) {
+        for (const uint256& key : vIdKeys)
+            mapIdentityKeyCount[key]++;
+        nIndexVecUsage += memusage::DynamicUsage(vIdKeys);
+        mapTxIdentityKeys[hash] = std::move(vIdKeys);
+    }
+
     // UR-ext-9: index the withdrawal ids this tx creates
     std::vector<uint256> vWID;
     GetTxWithdrawalIDs(tx, vWID);
     if (!vWID.empty()) {
         for (const uint256& wid : vWID)
             mapWithdrawalTx.emplace(wid, hash);
+        nIndexVecUsage += memusage::DynamicUsage(vWID);
         mapTxWithdrawalIDs[hash] = std::move(vWID);
     }
 
@@ -517,6 +530,16 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
         }
         mapTxMintUnits.erase(itMint);
     }
+    const auto itIdKeys = mapTxIdentityKeys.find(hash);
+    if (itIdKeys != mapTxIdentityKeys.end()) {
+        for (const uint256& key : itIdKeys->second) {
+            const auto itCount = mapIdentityKeyCount.find(key);
+            if (itCount != mapIdentityKeyCount.end() && --itCount->second == 0)
+                mapIdentityKeyCount.erase(itCount);
+        }
+        nIndexVecUsage -= std::min(nIndexVecUsage, memusage::DynamicUsage(itIdKeys->second));
+        mapTxIdentityKeys.erase(itIdKeys);
+    }
     const auto itWID = mapTxWithdrawalIDs.find(hash);
     if (itWID != mapTxWithdrawalIDs.end()) {
         for (const uint256& wid : itWID->second) {
@@ -528,6 +551,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
                     ++itW;
             }
         }
+        nIndexVecUsage -= std::min(nIndexVecUsage, memusage::DynamicUsage(itWID->second));
         mapTxWithdrawalIDs.erase(itWID);
     }
 
@@ -693,6 +717,9 @@ void CTxMemPool::_clear()
     mapSwapTxLock.clear();
     mapSwapLockCount.clear();
     mapTxWithdrawalIDs.clear();
+    mapTxIdentityKeys.clear();
+    mapIdentityKeyCount.clear();
+    nIndexVecUsage = 0;
     mapWithdrawalTx.clear();
     mapTxFreezeTargets.clear();
     mapFreezeTargetCount.clear();
@@ -996,6 +1023,57 @@ bool CTxMemPool::HasNoInputsOf(const CTransaction &tx) const
     return true;
 }
 
+uint256 TokenClaimIdentityKey(uint32_t nHouseID, const uint256& y)
+{
+    CHashWriter hw(SER_GETHASH, 0);
+    hw << std::string("fb-pool-token-claim") << nHouseID << y;
+    return hw.GetHash();
+}
+
+void PooledIdentityKeys(const CTransaction& tx, std::vector<uint256>& vKeys)
+{
+    vKeys.clear();
+    if (tx.nVersion == TRANSACTION_BILL_VERSION) {
+        if (tx.nBillOp == BILL_OP_ISSUE) {
+            BillIssue issue;
+            if (DecodeBillPayload(tx.vchBillPayload, issue)) {
+                CHashWriter hw(SER_GETHASH, 0);
+                hw << std::string("fb-pool-bill-issue") << issue.vchEncryptedBody;
+                vKeys.push_back(hw.GetHash());
+            }
+        } else if (tx.vchBillPayload.size() >= 4) {
+            // The raw little-endian bytes, never a deserialized id (the comparison must not depend on host order).
+            CHashWriter hw(SER_GETHASH, 0);
+            hw << std::string("fb-pool-bill-id");
+            hw.write((const char*)tx.vchBillPayload.data(), 4);
+            vKeys.push_back(hw.GetHash());
+        }
+    } else if (tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
+        // The curve work (one hash-to-curve per entry) happens here once, at add, and once for the incomer.
+        std::set<uint256> setY;
+        uint32_t nHouseID = 0;
+        if (TokenClaimYs(tx, nHouseID, setY)) {
+            for (const uint256& y : setY)
+                vKeys.push_back(TokenClaimIdentityKey(nHouseID, y));
+        }
+    } else if (tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) && tx.nIssuedOp != ISSUED_OP_POOL_SWAP) {
+        CHashWriter hw(SER_GETHASH, 0);
+        hw << std::string("fb-pool-token-lp") << IssuedPoolOpToken(tx);
+        vKeys.push_back(hw.GetHash());
+    } else if (tx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseRegisterOp(tx.nHouseOp)) {
+        HouseRegister reg;
+        uint8_t nFlags = 0;
+        if (DecodeHouseRegisterAny(tx, reg, nFlags)) {
+            CHashWriter hwHouse(SER_GETHASH, 0);
+            hwHouse << std::string("fb-pool-house-id") << HouseIDFromDeclaration(reg, nFlags);
+            vKeys.push_back(hwHouse.GetHash());
+            CHashWriter hwClass(SER_GETHASH, 0);
+            hwClass << std::string("fb-pool-house-class") << reg.strClassID;
+            vKeys.push_back(hwClass.GetHash());
+        }
+    }
+}
+
 CCoinsViewMemPool::CCoinsViewMemPool(CCoinsView* baseIn, const CTxMemPool& mempoolIn) : CCoinsViewBacked(baseIn), mempool(mempoolIn) { }
 
 bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
@@ -1043,7 +1121,7 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
                             outpoint.n < reg.vPartnerPubKey.size())
                         coin.SetHouseEscrow(0);
                 } else if ((ptx->nHouseOp == HOUSE_OP_TOPUP || ptx->nHouseOp == HOUSE_OP_ADMIT ||
-                        ptx->nHouseOp == HOUSE_OP_DEFER) && outpoint.n == 0) {
+                        ptx->nHouseOp == HOUSE_OP_DEFER || ptx->nHouseOp == HOUSE_OP_ESCROW_MERGE) && outpoint.n == 0) {   // S1X-18
                     // DEFER's vout[0] is the locked till (3.5) - escrow like any
                     // pledge, and it must stay tagged while unconfirmed or a
                     // plain tx could sweep it out of the mempool view.
@@ -1127,7 +1205,7 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
 size_t CTxMemPool::DynamicMemoryUsage() const {
     LOCK(cs);
     // Estimate the overhead of mapTx to be 12 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.
-    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::DynamicUsage(mapTxMintUnits) + memusage::DynamicUsage(mapPendingMintUnits) + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxIdentityKeys) + memusage::DynamicUsage(mapIdentityKeyCount) + nIndexVecUsage + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::DynamicUsage(mapTxMintUnits) + memusage::DynamicUsage(mapPendingMintUnits) + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
 }
 
 void CTxMemPool::RemoveStaged(setEntries &stage, bool updateDescendants, MemPoolRemovalReason reason) {

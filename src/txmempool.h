@@ -442,6 +442,16 @@ public:
  * prevent these calculations from being too CPU intensive.
  *
  */
+/** S1X-27: the keys under which two pooled txs could not both enter one block, by identity, for the txs whose identity
+ * exists before connect: a bill ISSUE by its encrypted body (the bill's identity is sha256(body); no dense id exists
+ * until it connects), any other bill op by the dense bill id its payload leads with (the raw 4 bytes), and a house
+ * REGISTER by its declared house id and by its class id, a token CLAIM by (house, Y id) per entry (TokenClaimIdentityKey),
+ * and a token pool's CREATE / ADD / REMOVE by the pool's token. Domain-tagged hashes, so no key of one kind equals another.
+ * Empty for every other tx. ATMP computes the incomer's keys the same way, so the two sides can't drift. */
+void PooledIdentityKeys(const CTransaction& tx, std::vector<uint256>& vKeys);
+/** S1X-27: the identity key of one token (Y id) claimed at a house: a pooled NOTE_OP_TOKEN_CLAIM carries one per entry. */
+uint256 TokenClaimIdentityKey(uint32_t nHouseID, const uint256& y);
+
 class CTxMemPool
 {
 private:
@@ -538,6 +548,15 @@ private:
     // UR-ext-9 (plain v1.2.2): the withdrawal ids each pooled tx creates, kept on add and remove, so ATMP's
     // withdrawal-not-new guard is a lookup instead of a scan of every pooled tx. A multimap: a reorg can return two.
     std::map<uint256 /* txid */, std::vector<uint256> /* withdrawal ids */> mapTxWithdrawalIDs;
+
+    // S1X-27 (Claude max run 3 #20; security 11-25: Medium): the identity keys of each pooled bill op and house
+    // REGISTER (PooledIdentityKeys), kept on add and remove, so ATMP's one-op-per-bill and REGISTER x REGISTER guards
+    // are lookups. Before, every incoming ISSUE decoded every pooled ISSUE (and every REGISTER every pooled REGISTER),
+    // and a zero-fee probe re-wrapping a seen payload paid for that scan before any fee check. Counted: a reorg can
+    // return two.
+    std::map<uint256 /* txid */, std::vector<uint256> /* identity keys */> mapTxIdentityKeys;
+    std::map<uint256 /* identity key */, uint32_t /* pooled txs */> mapIdentityKeyCount;
+    size_t nIndexVecUsage = 0;   // the inner vectors of mapTxIdentityKeys and mapTxWithdrawalIDs (security's nit)
     std::multimap<uint256 /* withdrawal id */, uint256 /* txid */> mapWithdrawalTx;
 
     // UR-ext-8 (plain v1.2.2): the coins each pooled FREEZE/UNFREEZE targets, so ATMP keeps a pooled FREEZE and a
@@ -727,6 +746,16 @@ public:
     {
         LOCK(cs);
         return mapSwapLockCount.count(hashLock);
+    }
+
+    /** S1X-27: does the pool hold a bill op or house REGISTER with one of these identity keys (PooledIdentityKeys)? */
+    bool HaveIdentityKey(const std::vector<uint256>& vKeys) const
+    {
+        LOCK(cs);
+        for (const uint256& key : vKeys)
+            if (mapIdentityKeyCount.count(key))
+                return true;
+        return false;
     }
 
     CTransactionRef get(const uint256& hash) const;

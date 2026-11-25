@@ -212,6 +212,9 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, const
                 // The till locked at DEFER (3.5 D11) is escrow custody too.
                 else if (tx.nHouseOp == HOUSE_OP_DEFER && i == 0)
                     coin.SetHouseEscrow(nHouseID);
+                // S1X-18: the merged coin is escrow of the same house, on the same list.
+                else if (tx.nHouseOp == HOUSE_OP_ESCROW_MERGE && i == 0)
+                    coin.SetHouseEscrow(nHouseID);
             }
 
             ApplyNoteCoinTags(tx, i, coin, true /* fConnected */, (uint32_t)nHeight, &noteTagCache);

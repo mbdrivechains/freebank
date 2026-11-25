@@ -124,6 +124,19 @@ void ArmHouseRateRestore(CUnitsView& units, uint32_t nHouseID, uint32_t nHeight,
     units.Put(HouseRateKey(nHouseID), r);
 }
 
+/** S1X-19 (security: Low; Michael 11-25 yes): the active time a posting takes effect at - its own block's clock. RS-1:
+ * a post at h counts from h+1, whose checks read block h's clock, while nPostActive holds the clock at connect (the
+ * parent's). Dating the post from the parent's clock dropped the old bid from a swap's window for the posting block
+ * when the parent's active time was the window's start. The posting block's record (ClockAtKey) exists once it has
+ * connected; before that (reading in the posting block itself) the stored value is all there is. */
+static int64_t PostEffectiveActive(const CUnitsView& units, uint32_t nPostHeight, int64_t nPostActiveAtConnect)
+{
+    CClockAt at;
+    if (units.Get(ClockAtKey(nPostHeight), at))
+        return at.nActive;
+    return nPostActiveAtConnect;
+}
+
 bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uint64_t nAsk, uint32_t nHeight,
                         int64_t nNow, const Consensus::GramParams& gp, std::string& strReject, int64_t nActiveNow)
 {
@@ -145,6 +158,7 @@ bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uin
     next.nPostHeight = nHeight;
     next.nPostTime = nNow;
     next.nPostActive = nActiveNow;
+    bool fKeepRestore = false;   // S1X-11: whether a pending SETKEY restore survives this post
     if (fFirst) {
         next.nRiseCurStart = nNow;
         next.nRiseCurMin = nBid;
@@ -196,11 +210,17 @@ bool ApplyHouseRatePost(CUnitsView& units, uint32_t nHouseID, uint64_t nBid, uin
         }
         next.nPrevBid = r.nBid;
         next.nPrevAsk = r.nAsk;
-        next.nPrevPostActive = r.nPostActive;
+        next.nPrevPostActive = PostEffectiveActive(units, r.nPostHeight, r.nPostActive);   // S1X-19: when it took effect
         next.nPrevPostTime = r.nPostTime;
+        // S1X-11 (security's counter, adopted; Michael 11-25 yes): the restore survives a re-post or an in-bound rise
+        // (the partners' routine ticker post right after their SETKEY no longer throws it away), and is cleared when it
+        // is used, when W has ended, or by a post that CUTS the bid. Keeping it through a cut would let the rate key
+        // alone cut and snap back within W after any SETKEY - the cut / pay short / recover lever - for one block's
+        // cost; today that needs a second M-of-N SETKEY.
+        fKeepRestore = r.nRestoreUntil != 0 && nNow <= r.nRestoreUntil && !fRestore && nBid >= r.nBid;
     }
-    next.nRestoreMax = 0;      // one-shot: any post clears a pending restore
-    next.nRestoreUntil = 0;
+    next.nRestoreMax = fKeepRestore ? r.nRestoreMax : 0;
+    next.nRestoreUntil = fKeepRestore ? r.nRestoreUntil : 0;
     // Day records: the old rate stayed in effect on every day from its posting, that day included, to now (bounded: no
     // rule reads further back than RATE_DAY_FILL_MAX days). D-2026-11-20-2 (S1X-4): the new rate doesn't enter today's
     // record now - nothing at this height may read it - but when the next post replaces it; until then the window reads
@@ -505,9 +525,12 @@ uint64_t HouseBidAtActive(const CUnitsView& units, uint32_t nHouseID, int64_t nA
         return (r.nPostActive <= nActive && r.nPostActive <= nStartShifted) ? r.nBid : nFallback;
     }
     const int64_t nStart = nActive - WINDOW;
-    if (r.nPostActive <= nActive) {
+    // S1X-19: C counts from the active time it took effect at (its own block's clock); nPrevPostActive was converted
+    // the same way when C was posted.
+    const int64_t nCurEffective = PostEffectiveActive(units, r.nPostHeight, r.nPostActive);
+    if (nCurEffective <= nActive) {
         // C is in effect at nActive; before C (if C came inside the day) P was.
-        if (r.nPostActive <= nStart || r.nPrevBid == 0)
+        if (nCurEffective <= nStart || r.nPrevBid == 0)
             return r.nBid;
         if (r.nPrevPostActive <= nStart)
             return std::max(r.nBid, r.nPrevBid);

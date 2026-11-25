@@ -75,7 +75,17 @@ static const uint8_t HOUSE_OP_RATE          = 19;
 // related-issuer declaration. ADD takes effect at once, REMOVE 30 days after it is posted, RELATED restates the
 // declaration; all approved by the house's M-of-N. The chain checks nothing on Ethereum: the charter is a statement.
 static const uint8_t HOUSE_OP_CHARTER       = 20;
-static const uint8_t HOUSE_OP_MAX           = HOUSE_OP_CHARTER;
+// S1X-18 (security: Low; Michael 11-25 yes): permissionless and value-neutral - spends 2..MAX_HOUSE_ESCROW_MERGE_INPUTS
+// coins of ONE of the house's escrow lists (the brassage/claim change, or the reserve lock) into one escrow output equal
+// to their sum, which replaces them in that list. Each REDEEM's spread and each op 10/11 bill added a coin, only the
+// claims removed any, and settle / CLOSE must spend every listed coin: ~2,430 entries broke the standard weight and
+// ~24,400 the consensus size, locking the residual. It takes the house slot, and in the mempool a pooled MERGE yields
+// to every other op on that house, so it can never keep a DEMAND, PROTEST, CLAIM or discharge out.
+static const uint8_t HOUSE_OP_ESCROW_MERGE  = 21;
+static const uint8_t HOUSE_OP_MAX           = HOUSE_OP_ESCROW_MERGE;
+static const uint8_t HOUSE_ESCROW_LIST_CHANGE  = 0;   // vOutEscrowChange
+static const uint8_t HOUSE_ESCROW_LIST_RESERVE = 1;   // vOutReserveLock
+static const size_t MAX_HOUSE_ESCROW_MERGE_INPUTS = 500;
 static const uint8_t HOUSE_CHARTER_ADD     = 0;
 static const uint8_t HOUSE_CHARTER_REMOVE  = 1;
 static const uint8_t HOUSE_CHARTER_RELATED = 2;
@@ -269,6 +279,8 @@ static const uint32_t HOUSE_BRASSAGE_MAX_BPS = 400;   // 4% at/below theta (OQ-S
 // (NOTE_OP_LOCK was reserved inert).
 // v12 (token holders' claim at a failed house, gateway docs/freebank/TOKEN_CLAIM_DESIGN.md draft 3): the claim
 // totals. A v11 record reads as 0: no claim op existed.
+/** S1X-16: an ADMIT approval names its last valid height, at most this far ahead (about 7 days of 10-minute blocks). */
+static const uint32_t HOUSE_ADMIT_APPROVAL_MAX_BLOCKS = 1008;
 static const uint8_t HOUSE_SER_VERSION = 15;   // 14 = Gold B: one cure per 180 days (nNoCureHeight, D-2026-11-07-3); 15 = UR-ext-12 episode counters
 
 /** One partner's pledge. Solo houses (tiers 0/1) hold exactly one entry. */
@@ -762,8 +774,12 @@ struct HouseAdmit {
     std::vector<unsigned char> vchNewSig;
     std::vector<uint32_t> vApproverIndex;            // strictly ascending
     std::vector<std::vector<unsigned char>> vApproverSig;
+    // S1X-16 (security: Low; Michael 11-25 yes): the last height the approval is good for, signed by the candidate and
+    // the approvers; at most HOUSE_ADMIT_APPROVAL_MAX_BLOCKS ahead. An approval the partners later abandoned could be
+    // used whenever the house was next Open.
+    uint32_t nExpiryHeight;
 
-    HouseAdmit() : nHouseID(0) {}
+    HouseAdmit() : nHouseID(0), nExpiryHeight(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -774,6 +790,7 @@ struct HouseAdmit {
         READWRITE(vchNewSig);
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
+        READWRITE(nExpiryHeight);
     }
 };
 
@@ -1004,6 +1021,28 @@ struct HouseRelease {
 /** CLOSE (v0.2.28): the house id is the whole payload - the outputs are fixed by the rules, and the undo reverts the
  * partner statuses (and a same-block materialization) exactly as the partners' settle's does. */
 
+/** HOUSE_OP_ESCROW_MERGE payload (S1X-18): the house and which escrow list. No signature: the inputs are the house's
+ *  own listed escrow coins, the output is pinned (one escrow coin equal to their sum), the fee comes from plain coins. */
+struct HouseEscrowMerge {
+    uint32_t nHouseID;
+    uint8_t nList;   // HOUSE_ESCROW_LIST_CHANGE / _RESERVE
+
+    HouseEscrowMerge() : nHouseID(0), nList(HOUSE_ESCROW_LIST_CHANGE) {}
+
+    ADD_SERIALIZE_METHODS
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(nHouseID);
+        READWRITE(nList);
+    }
+};
+/** S1X-18: is mtx a pooled-yield ESCROW_MERGE? (A pure byte test, like IsHouseRatePostTx.) */
+inline bool IsHouseEscrowMergeTx(const CTransaction& mtx)
+{
+    return mtx.nVersion == TRANSACTION_HOUSE_VERSION && mtx.nHouseOp == HOUSE_OP_ESCROW_MERGE;
+}
+
 /** HOUSE_OP_RATE payload (Gold B). POST: nBid, nAsk (sats per gram) and vchRateSig, the rate key's signature over
  *  HouseRateSigHash; no approvers, no key. SETKEY: vchRatePubKey (33 bytes, compressed) and the M-of-N approvers over
  *  the same hash; nBid = nAsk = 0, no rate signature. */
@@ -1016,6 +1055,11 @@ struct HouseRate {
     std::vector<unsigned char> vchRateSig;
     std::vector<uint32_t> vApproverIndex;
     std::vector<std::vector<unsigned char>> vApproverSig;
+    // S1X-26 (security: Low; Michael 11-25 yes): the house's declared id (CHouse::houseID), signed with the rest. The
+    // dense nHouseID is assigned at connect, so a reorg that reorders two REGISTERs sharing a rate key could land a
+    // signed op on the other house; CheckHouseOperation refuses one whose houseID isn't that house's. Last in the
+    // payload, so the leading bytes the pool reads (IsHouseRatePostTx, HouseRateOpOf) don't move.
+    uint256 houseID;
 
     HouseRate() : nHouseID(0), nKind(HOUSE_RATE_POST), nBid(0), nAsk(0) {}
 
@@ -1031,6 +1075,7 @@ struct HouseRate {
         READWRITE(vchRateSig);
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
+        READWRITE(houseID);
     }
 };
 
@@ -1049,6 +1094,7 @@ struct HouseCharter {
     uint32_t nIndex;
     std::vector<uint32_t> vApproverIndex;
     std::vector<std::vector<unsigned char>> vApproverSig;
+    uint256 houseID;   // S1X-26: the house's declared id, signed with the rest (HouseRate's note)
 
     HouseCharter() : nHouseID(0), nKind(HOUSE_CHARTER_ADD), nChainID(0), nDecimals(0), nGramsNum(0), nGramsDen(0),
                      nRelated(0), nIndex(0) {}
@@ -1068,6 +1114,7 @@ struct HouseCharter {
         READWRITE(nIndex);
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
+        READWRITE(houseID);
     }
 };
 
@@ -1237,11 +1284,12 @@ uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const House
 std::vector<uint160> HouseOwnKeyIDs(const CHouse& house);
 
 uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, const CAmount& amountPledge);
-uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs);
-uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned char>& vchNewPubKey, const CAmount& amountPledge);
-uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs);
-uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashOutputs);
-uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashOutputs);
+uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned char>& vchNewPubKey, const CAmount& amountPledge,
+                          uint32_t nExpiryHeight);
+uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashOutputs);
 uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
 uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
@@ -1430,6 +1478,9 @@ uint32_t HouseBrassageBps(const CHouse& house);
 
 /** The spread owed on redeeming nUnits at nBps. Floor division; 128-bit. */
 CAmount HouseBrassageAmount(uint64_t nUnits, uint32_t nBps);
+/** S1X-8: the spread nUnits owe at ratio nRatio against floor nRho, rounded UP once over the exact curve (0 at or above
+ *  the floor; the full HOUSE_BRASSAGE_MAX_BPS at or below rho/4; the quadratic between). */
+CAmount BrassageAmountAt(uint64_t nUnits, uint32_t nRatio, uint32_t nRho);
 
 /** Par-eligibility for the settlement layer (Phase A) - pure derivation, no
  * state: effective-Open AND attested ratio at/above the floor AND the

@@ -162,13 +162,16 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
     CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_NOTES, 70, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_NOTES");
     CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_ESCROW, 70, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_ESCROW");
     CheckOp<BillHClaimEscrow>(B, BILL_OP_HCLAIM_ESCROW, 44, [](BillHClaimEscrow&) {}, "BILL HCLAIM_ESCROW");
+    CheckOp<BillTitleRelease>(B, BILL_OP_TITLE_RELEASE, 4, [](BillTitleRelease&) {}, "BILL TITLE_RELEASE");   // S1X-29
 
     CheckOp<HouseRegister>(H, HOUSE_OP_REGISTER, 32, [](HouseRegister& p) { p.vPartnerSig.clear(); }, "HOUSE REGISTER");
     CheckOp<HouseTopup>(H, HOUSE_OP_TOPUP, 10, [](HouseTopup& p) { p.vchSig.clear(); }, "HOUSE TOPUP");
-    CheckOp<HouseAdmit>(H, HOUSE_OP_ADMIT, 16, [](HouseAdmit& p) { p.vchNewSig.clear(); ClearApprovers(p); }, "HOUSE ADMIT");
+    // S1X-16: ADMIT +4 (nExpiryHeight, a bound field: the binding form keeps it)
+    CheckOp<HouseAdmit>(H, HOUSE_OP_ADMIT, 20, [](HouseAdmit& p) { p.vchNewSig.clear(); ClearApprovers(p); }, "HOUSE ADMIT");
     CheckOp<HouseExit>(H, HOUSE_OP_EXIT, 18, [](HouseExit& p) { p.vchPartnerSig.clear(); ClearApprovers(p); }, "HOUSE EXIT");
     CheckOp<HouseWinddown>(H, HOUSE_OP_WINDDOWN, 12, [](HouseWinddown& p) { ClearApprovers(p); }, "HOUSE WINDDOWN");
     CheckOp<HouseReclaim>(H, HOUSE_OP_RECLAIM, 10, [](HouseReclaim& p) { p.vchSig.clear(); }, "HOUSE RECLAIM");
+    CheckOp<HouseEscrowMerge>(H, HOUSE_OP_ESCROW_MERGE, 5, [](HouseEscrowMerge&) {}, "HOUSE ESCROW_MERGE");   // S1X-18
     // UR-ext-12 (switch-on): ATTEST +6 (u32 + 2 u8) and DEFER +10 (2 u32 + 2 u8) bytes of undo priors; Bind strips only
     // the signatures, so the priors are bound like the existing ones.
     CheckOp<HouseAttest>(H, HOUSE_OP_ATTEST, 108, [](HouseAttest& p) { ClearProofs(p.vProofs); ClearApprovers(p); }, "HOUSE ATTEST");
@@ -464,9 +467,9 @@ BOOST_AUTO_TEST_CASE(binding_height_per_network)
     BOOST_CHECK(easynet->GetConsensus().CreditBindingActive(0));
     // ...and credits treasury changes only from its deposit start (L1 2,058 for the v1.2.2 restart; 1,676 at v1.2.0,
     // 1,100 at v1.1.0); every other network from the start. Building the params also checks easynet's genesis hash.
-    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3573);
-    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x1f07c608e9ed748cf2b9fd1e5df27f0ceff46d7d719c7780c4de1c18e2e001bc"));
-    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0a);   // a fresh chain's magic (v1.2.4, D-2026-11-23-1)
+    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3795);   // v1.2.5 restart
+    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0xa49c082c149439615898a5a510661d9229b00e7578bf5df3ee6eb23931273520"));
+    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0b);   // a fresh chain's magic (v1.2.5, D-2026-11-23-1)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nDepositStartL1Height, 0);
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nDepositStartL1Height, 0);
 }
@@ -616,6 +619,23 @@ BOOST_AUTO_TEST_CASE(template_skips_credit_below_binding_height)
     LOCK(mempool.cs);
     BOOST_CHECK(!mempool.exists(ptx->GetHash()));
     mempool.clear();
+}
+
+
+// S1X-5n (security 11-24 nit; Michael 11-25 yes, as a test): InsolvencySwapsSettled reads nSwapDeadlineSecs at
+// GramAt(E). A later schedule entry that SHORTENED it would under-cover swaps opened under the earlier, longer one, so the
+// schedule may never shorten it, on any network. (No rule change: today each network has one entry.)
+BOOST_AUTO_TEST_CASE(s1x_5n_swap_deadline_never_shortens)
+{
+    for (const std::string& chain : {CBaseChainParams::MAIN, CBaseChainParams::BETA, CBaseChainParams::REGTEST,
+                                     CBaseChainParams::EASYNET}) {
+        const auto params = CreateChainParams(chain);
+        const auto& vSched = params->GetConsensus().vGramSchedule;
+        BOOST_REQUIRE_MESSAGE(!vSched.empty(), chain);
+        for (size_t i = 1; i < vSched.size(); i++)
+            BOOST_CHECK_MESSAGE(vSched[i].p.nSwapDeadlineSecs >= vSched[i - 1].p.nSwapDeadlineSecs,
+                                chain + ": a later gram schedule entry shortens nSwapDeadlineSecs");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -662,8 +662,11 @@ static bool WalletPostHouseRate(CWallet* pwallet, std::string& strFail, uint256&
     if (!HouseRateKeyForChecks(nHouseID, vchKey)) { strFail = "The house has no rate key yet (sethouseratekey)"; return false; }
     CKey key;
     if (!pwallet->GetKey(CPubKey(vchKey).GetID(), key)) { strFail = "This wallet doesn't hold the house's rate key"; return false; }
+    CHouse house;
+    if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house"; return false; }
     HouseRate rate;
     rate.nHouseID = nHouseID;
+    rate.houseID = house.houseID;   // S1X-26
     rate.nKind = HOUSE_RATE_POST;
     rate.nBid = nBid;
     rate.nAsk = nAsk;
@@ -697,6 +700,7 @@ static bool WalletSetHouseRateKey(CWallet* pwallet, std::string& strFail, uint25
     if (!pubKey.IsCompressed()) { strFail = "The rate key must be a compressed public key"; return false; }
     HouseRate rate;
     rate.nHouseID = nHouseID;
+    rate.houseID = house.houseID;   // S1X-26
     rate.nKind = HOUSE_RATE_SETKEY;
     rate.vchRatePubKey = std::vector<unsigned char>(pubKey.begin(), pubKey.end());
     return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
@@ -717,6 +721,7 @@ static bool WalletHouseCharter(CWallet* pwallet, std::string& strFail, uint256& 
     AssertLockHeld(pwallet->cs_wallet);
     CHouse house;
     if (!phousetree->GetHouse(op.nHouseID, house)) { strFail = "Unknown house"; return false; }
+    op.houseID = house.houseID;   // S1X-26
     if (op.nKind == HOUSE_CHARTER_REMOVE || op.nKind == HOUSE_CHARTER_RELATED) {
         // UR1-1 (switch-on): name the token at the index, so the signed op can't land on another one if an ADD
         // renumbers the list first (consensus refuses the mismatch).
@@ -1094,11 +1099,11 @@ UniValue gethousecapital(const JSONRPCRequest& request)
 
 uint8_t ParseRelated(const UniValue& v)
 {
+    // CH-N0: a declaration is yes or no; "undeclared" names only the entries admitted before the field (RelatedName).
     const std::string str = v.get_str();
-    if (str == "undeclared") return HOUSE_RELATED_UNDECLARED;
     if (str == "no") return HOUSE_RELATED_NO;
     if (str == "yes") return HOUSE_RELATED_YES;
-    throw JSONRPCError(RPC_INVALID_PARAMETER, "related must be \"yes\", \"no\" or \"undeclared\"");
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "related must be \"yes\" or \"no\"");
 }
 
 const char* RelatedName(uint8_t n)
@@ -1182,7 +1187,7 @@ UniValue addchartertoken(const JSONRPCRequest& request)
         throw std::runtime_error(
             "addchartertoken houseid chain_id \"contract\" decimals grams_num grams_den \"related\" ( fee )\n"
             "\nAdd a gold token (on an Ethereum chain) to the house's charter: the tokens it pays in kind on a swap demand\n"
-            "(GOLD_B.md §2). One token = grams_num / grams_den grams. related: \"yes\", \"no\" or \"undeclared\", the\n"
+            "(GOLD_B.md §2). One token = grams_num / grams_den grams. related: \"yes\" or \"no\" (CH-N0), the\n"
             "partners' declaration whether the token's issuer is related to them. Approved by the M-of-N in this wallet.\n"
             "The chain checks nothing on Ethereum: the charter is the house's statement.\n");
     HouseCharter op;
@@ -1247,7 +1252,7 @@ UniValue setcharterrelated(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 3 || request.params.size() > 4)
         throw std::runtime_error(
             "setcharterrelated houseid index \"related\" ( fee )\n"
-            "\nRestate the partners' related-issuer declaration (\"yes\", \"no\", \"undeclared\") for the charter entry at\n"
+            "\nRestate the partners' related-issuer declaration (\"yes\" or \"no\"; CH-N0) for the charter entry at\n"
             "index. Approved by the M-of-N in this wallet.\n");
     HouseCharter op;
     op.nHouseID = request.params[0].get_int();

@@ -107,6 +107,8 @@ void Strip(HouseRenew& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseRelease& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseMemberOp& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseClose&) {}
+void Strip(HouseEscrowMerge&) {}   // S1X-18: unsigned; the inputs and the output are pinned by consensus
+void Strip(BillTitleRelease&) {}   // S1X-29: the title's own input signature authorises it
 void Strip(HouseRate& p) { p.vchRateSig.clear(); p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 void Strip(HouseCharter& p) { p.vApproverIndex.clear(); p.vApproverSig.clear(); }
 
@@ -204,6 +206,7 @@ void BindBill(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& vc
     case BILL_OP_HRETIRE_NOTES: Bind<BillHRetireNotes>(ss, vch); break;
     case BILL_OP_HRETIRE_ESCROW: Bind<BillHRetireNotes>(ss, vch); break;   // the HRETIRE_NOTES payload
     case BILL_OP_HCLAIM_ESCROW: Bind<BillHClaimEscrow>(ss, vch); break;
+    case BILL_OP_TITLE_RELEASE: Bind<BillTitleRelease>(ss, vch); break;   // S1X-29: no signature field
     default: BindRaw(ss, vch);
     }
 }
@@ -221,6 +224,7 @@ void BindHouse(CHashWriter& ss, uint8_t nOp, const std::vector<unsigned char>& v
     case HOUSE_OP_DEFER: Bind<HouseDefer>(ss, vch); break;
     case HOUSE_OP_RENEW: Bind<HouseRenew>(ss, vch); break;
     case HOUSE_OP_RELEASE: Bind<HouseRelease>(ss, vch); break;
+    case HOUSE_OP_ESCROW_MERGE: Bind<HouseEscrowMerge>(ss, vch); break;   // S1X-18: no signature field
     case HOUSE_OP_REGISTER_MO: Bind<HouseRegisterMO>(ss, vch); break;
     case HOUSE_OP_MEMBER_ADD:
     case HOUSE_OP_MEMBER_REMOVE:

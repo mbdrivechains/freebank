@@ -1122,6 +1122,9 @@ public:
      * authority, no title spend, no holder cooperation - which is the whole point.
      * The payer key is chosen automatically: the first key of the liable set this
      * wallet holds. */
+    /** S1X-29: release the title coin of a bill that has ended (op 12) to a new key of this wallet; the fee comes out
+     *  of the title's own value. */
+    bool ReleaseBillTitle(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee);
     bool RecourseBill(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee,
                       uint32_t nMarginBps = DEFAULT_BILL_RATE_MARGIN_BPS);
     /** Ops 7/8 themselves. Not on the RPC surface - RetireBill/ClaimBillEscrow
@@ -1365,6 +1368,10 @@ public:
     /** Take the locked till back out of consensus custody, once the clause has
      * been lifted (3.5 D11). */
     bool ReleaseReserves(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
+    /** S1X-18: merge up to MAX_HOUSE_ESCROW_MERGE_INPUTS coins of one of a house's escrow lists into one (anyone may;
+     *  the fee comes from this wallet's plain coins). nMergedOut = the coins merged. */
+    bool MergeHouseEscrow(std::string& strFail, uint256& txidOut, size_t& nMergedOut, const uint32_t nHouseID, uint8_t nList,
+                          const CAmount& nFee);
 
     /** Gram-notes release: issued tokens (wallet/issued_wallet.cpp). CreateIssuedToken takes a new issuer key (and a
      *  freeze key if asked) from the keypool and fills them into `create`. Each op funds its outputs and fee from

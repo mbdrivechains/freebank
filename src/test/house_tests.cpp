@@ -21,6 +21,7 @@
 #include <streams.h>
 #include <test/sidechain_test_util.h>   // SideDBScope (the equity proof reads the bill DB)
 #include <test/test_bitcoin.h>
+#include <txmempool.h>
 #include <txdb.h>              // HouseDB (UR-ext-10)
 #include <units.h>             // CUnitsView (S2X-6)
 #include <policy/policy.h>     // IsStandardTx (MM-1)
@@ -128,11 +129,12 @@ BOOST_AUTO_TEST_CASE(house_sighash_domain_separation)
     const uint256 outs = uint256S("cc");
     std::vector<uint256> v;
     v.push_back(HouseRegisterSigHash(h, 0, 1000));
-    v.push_back(HouseTopupSigHash(h, 0, h));
-    v.push_back(HouseAdmitSigHash(h, pk, 1000));
-    v.push_back(HouseExitSigHash(h, 0, outs));
-    v.push_back(HouseWinddownSigHash(h, outs));
-    v.push_back(HouseReclaimSigHash(h, 0, h));
+    const uint256 ins = uint256S("bb");   // S1X-16: the four approval digests bind the inputs
+    v.push_back(HouseTopupSigHash(h, 0, ins, h));
+    v.push_back(HouseAdmitSigHash(h, pk, 1000, 500));
+    v.push_back(HouseExitSigHash(h, 0, ins, outs));
+    v.push_back(HouseWinddownSigHash(h, ins, outs));
+    v.push_back(HouseReclaimSigHash(h, 0, ins, h));
 
     for (size_t i = 0; i < v.size(); i++) {
         for (size_t j = i + 1; j < v.size(); j++)
@@ -140,11 +142,17 @@ BOOST_AUTO_TEST_CASE(house_sighash_domain_separation)
     }
 
     // And distinct from the bill domain (same-family escrow scripts)
-    BOOST_CHECK(HouseWinddownSigHash(h, outs) != HouseExitSigHash(h, 0, outs));
+    BOOST_CHECK(HouseWinddownSigHash(h, ins, outs) != HouseExitSigHash(h, 0, ins, outs));
 
     // Exit/winddown sighashes must actually vary with the output set (freshness)
-    BOOST_CHECK(HouseExitSigHash(h, 0, outs) != HouseExitSigHash(h, 0, uint256S("dd")));
-    BOOST_CHECK(HouseWinddownSigHash(h, outs) != HouseWinddownSigHash(h, uint256S("dd")));
+    BOOST_CHECK(HouseExitSigHash(h, 0, ins, outs) != HouseExitSigHash(h, 0, ins, uint256S("dd")));
+    BOOST_CHECK(HouseWinddownSigHash(h, ins, outs) != HouseWinddownSigHash(h, ins, uint256S("dd")));
+    // S1X-16: and with the inputs (no replay by whoever funds the same outputs), and the admit with its expiry
+    BOOST_CHECK(HouseExitSigHash(h, 0, ins, outs) != HouseExitSigHash(h, 0, uint256S("dd"), outs));
+    BOOST_CHECK(HouseWinddownSigHash(h, ins, outs) != HouseWinddownSigHash(h, uint256S("dd"), outs));
+    BOOST_CHECK(HouseTopupSigHash(h, 0, ins, outs) != HouseTopupSigHash(h, 0, uint256S("dd"), outs));
+    BOOST_CHECK(HouseReclaimSigHash(h, 0, ins, outs) != HouseReclaimSigHash(h, 0, uint256S("dd"), outs));
+    BOOST_CHECK(HouseAdmitSigHash(h, pk, 1000, 500) != HouseAdmitSigHash(h, pk, 1000, 501));
 }
 
 BOOST_AUTO_TEST_CASE(house_escrow_script)
@@ -1251,6 +1259,65 @@ BOOST_AUTO_TEST_CASE(house_reclaim_cannot_steal_escrow)
         CValidationState state; CHouse houseOut;
         BOOST_CHECK(!CheckHouseOperation(CTransaction(mtx), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass, fnGetCoin, GuardNoBlock, houseOut));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-reclaim-sig");
+    }
+}
+
+// S1X-17 (testing 2026-11-25; consensus batch item 6, Michael's yes 11-25). EXIT accepts both authorisation forms and
+// skips the approvers once the partner's own signature verifies, and the digest covers the outputs only, so anyone can
+// add junk approver entries to a signed voluntary EXIT: a new txid for the same exit, orphaning its children. The batch
+// makes it exactly one form (partner-signed: no approver entries). Fix-agnostic: the control must pass before and after.
+BOOST_AUTO_TEST_CASE(s1x_17_exit_takes_exactly_one_authorisation_form)
+{
+    CHouse house = MakeGuardHouse();   // multi-partner, effectively Open at 1000
+    std::vector<CKey> keys(3);
+    house.vPartner.clear();
+    for (int i = 0; i < 3; i++) {
+        keys[i].MakeNewKey(true);
+        const CPubKey pub = keys[i].GetPubKey();
+        HousePartner p;
+        p.vchPubKey.assign(pub.begin(), pub.end());
+        p.amountPledge = HOUSE_MIN_PLEDGE;
+        p.vOutPledge.push_back(COutPoint(uint256S(strprintf("b%d", i)), 0));
+        p.status = HOUSE_PARTNER_ACTIVE;
+        house.vPartner.push_back(p);
+    }
+    house.nThresholdM = 2;   // three active, so one may leave
+    const int nHeight = 1000;
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, nHeight), HOUSE_STATUS_OPEN);
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+
+    auto build = [&](bool fJunkApprover) {
+        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_EXIT, CDataStream(SER_NETWORK, PROTOCOL_VERSION));
+        HouseExit ex;
+        ex.nHouseID = house.nHouseID;
+        ex.nPartnerIndex = 2;
+        BOOST_REQUIRE(keys[2].Sign(HouseExitSigHash(house.houseID, 2, BillHashPrevouts(CTransaction(mtx)),   // S1X-16b
+                                                    BillHashOutputs(CTransaction(mtx))), ex.vchPartnerSig));
+        if (fJunkApprover) {   // what a relayer adds: unsigned by anyone, never checked
+            ex.vApproverIndex.push_back(0);
+            ex.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
+        }
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << ex;
+        mtx.vchHousePayload.assign(ss.begin(), ss.end());
+        return mtx;
+    };
+
+    {   // control: the partner's own signature, no approver entries
+        CValidationState state; CHouse houseOut;
+        BOOST_CHECK_MESSAGE(CheckHouseOperation(CTransaction(build(false)), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
+                                                fnNoCoin, GuardNoBlock, houseOut),
+                            "control: a voluntary EXIT refused: " + state.GetRejectReason());
+    }
+    {
+        const CMutableTransaction a = build(false), b = build(true);
+        BOOST_CHECK(CTransaction(a).GetHash() != CTransaction(b).GetHash());
+        CValidationState state; CHouse houseOut;
+        const bool fOk = CheckHouseOperation(CTransaction(b), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
+                                             fnNoCoin, GuardNoBlock, houseOut);
+        BOOST_CHECK_MESSAGE(!fOk, "S1X-17: a partner-signed EXIT with a junk approver entry added was accepted: same exit, "
+                                  "new txid (anyone can re-wrap it)");
     }
 }
 
@@ -2458,19 +2525,6 @@ BOOST_AUTO_TEST_CASE(ur_ext_12_defer_recover_cycles_cannot_outrun_the_bound)
 // widening - if Michael says no to it, drop case 2.
 // ===========================================================================
 namespace {
-// BillRetireSigHash gains nRateNamed with UR1-6 (agreed 2026-11-10); call whichever form this tree has.
-template <typename B, typename R, typename H>
-auto URX13RetireImpl(int, const B& billID, const R& nRate, const H& hashOutputs)
-    -> decltype(BillRetireSigHash(billID, nRate, hashOutputs))
-{
-    return BillRetireSigHash(billID, nRate, hashOutputs);
-}
-template <typename B, typename R, typename H>
-uint256 URX13RetireImpl(long, const B& billID, const R&, const H& hashOutputs)
-{
-    return BillRetireSigHash(billID, hashOutputs);
-}
-
 typedef std::vector<std::pair<std::string, std::function<uint256()>>> URX13Set;
 
 const uint256 URX13_ID = uint256S("ab13");
@@ -2485,11 +2539,11 @@ URX13Set URX13HouseDigests()
     const CTransaction tx{CMutableTransaction()};
     URX13Set v;
     v.push_back({"HouseRegisterSigHash", [] { return HouseRegisterSigHash(URX13_ID, 0, 100000); }});
-    v.push_back({"HouseTopupSigHash", [] { return HouseTopupSigHash(URX13_ID, 0, URX13_HO); }});
-    v.push_back({"HouseAdmitSigHash", [] { return HouseAdmitSigHash(URX13_ID, URX13_PUB, 100000); }});
-    v.push_back({"HouseExitSigHash", [] { return HouseExitSigHash(URX13_ID, 0, URX13_HO); }});
-    v.push_back({"HouseWinddownSigHash", [] { return HouseWinddownSigHash(URX13_ID, URX13_HO); }});
-    v.push_back({"HouseReclaimSigHash", [] { return HouseReclaimSigHash(URX13_ID, 0, URX13_HO); }});
+    v.push_back({"HouseTopupSigHash", [] { return HouseTopupSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseAdmitSigHash", [] { return HouseAdmitSigHash(URX13_ID, URX13_PUB, 100000, 500); }});
+    v.push_back({"HouseExitSigHash", [] { return HouseExitSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseWinddownSigHash", [] { return HouseWinddownSigHash(URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseReclaimSigHash", [] { return HouseReclaimSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
     v.push_back({"HouseDeferSigHash", [] { return HouseDeferSigHash(URX13_ID, 0, URX13_HO); }});
     v.push_back({"HouseRenewSigHash", [] { return HouseRenewSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
     v.push_back({"HouseReleaseSigHash", [] { return HouseReleaseSigHash(URX13_ID, URX13_HP, URX13_HO); }});
@@ -2508,8 +2562,8 @@ URX13Set URX13OtherDigests()
     v.push_back({"BillIssueSigHash", [] {
         return BillIssueSigHash(URX13_ID, 10000, 546, 8000, 144, URX13_PUB, URX13_PUB2, URX13_PUB, 5); }});
     v.push_back({"BillEndorseSigHash", [] { return BillEndorseSigHash(URX13_ID, URX13_PUB, 100); }});
-    v.push_back({"BillRetireSigHash", [] { return URX13RetireImpl(0, URX13_ID, (uint64_t)1000, URX13_HO); }});
-    v.push_back({"BillClaimSigHash", [] { return BillClaimSigHash(URX13_ID, URX13_HO); }});
+    v.push_back({"BillRetireSigHash", [] { return BillRetireSigHash(URX13_ID, 1000, URX13_HP, URX13_HO, false); }});
+    v.push_back({"BillClaimSigHash", [] { return BillClaimSigHash(URX13_ID, URX13_HP, URX13_HO, false); }});
     v.push_back({"DepositTransferSigHash", [] { return DepositTransferSigHash(1, 100000, 500, 8000, 100, URX13_HO); }});
     v.push_back({"DepositWithdrawSigHash", [] { return DepositWithdrawSigHash(1, 100000, 8000, 100, URX13_HO); }});
     v.push_back({"DepositClaimSigHash", [] { return DepositClaimSigHash(1, 100000, URX13_HO); }});
@@ -2556,6 +2610,9 @@ URX13Set URX13BoundDigests()
     v.push_back({"TokenKeysetSigHash", [] { return TokenKeysetSigHash(NoteTokenKeyset(), URX13_HP); }});
     v.push_back({"TokenPostSigHash", [] { return TokenPostSigHash(NoteTokenPost(), URX13_HP); }});
     v.push_back({"IssuedSigHash", [tx] { return IssuedSigHash(tx); }});
+    // S1X-11: the reserve-proof challenge and the proof-set hash carry the network too.
+    v.push_back({"HouseAttestChallenge", [] { return HouseAttestChallenge(URX13_ID, 100, URX13_HP, COutPoint(URX13_HO, 1)); }});
+    v.push_back({"HouseAttestProofSetHash", [] { return HouseAttestProofSetHash({}); }});
     return v;
 }
 
@@ -3099,7 +3156,7 @@ BOOST_AUTO_TEST_CASE(s2x_6_winddown_refused_while_a_swap_shortfall_is_live)
             mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
             wd.vApproverIndex.push_back(0);
             std::vector<unsigned char> vchSig;
-            BOOST_REQUIRE(keyPartner.Sign(HouseWinddownSigHash(house.houseID, BillHashOutputs(mtx)), vchSig));
+            BOOST_REQUIRE(keyPartner.Sign(HouseWinddownSigHash(house.houseID, BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)), vchSig));
             wd.vApproverSig.push_back(vchSig);
             CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << wd;
             mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
@@ -3125,7 +3182,7 @@ BOOST_AUTO_TEST_CASE(s2x_6_winddown_refused_while_a_swap_shortfall_is_live)
     }
 }
 
-// S1X-6, RECLAIM (security 11-23: Medium; private until fixed; the MINT cases are in note_tests). A tail partner may take
+// S1X-6, RECLAIM (security 11-23: Medium; the MINT cases are in note_tests). A tail partner may take
 // its pledge only while the house's capital still covers notes and deposits (bad-house-reclaim-cap, CapitalCapUnits).
 // A live swap shortfall is still owed at failure (MaterializeInsolvency counts it), so it must use the room as pending
 // swaps do. Capital capacity set to 100,000 mg (the test hook), 90,000 minted: (a) control, nothing owed: the cap passes
@@ -3183,7 +3240,7 @@ BOOST_AUTO_TEST_CASE(s1x_6_reclaim_counts_a_live_shortfall_against_the_capital)
     g_fnCapitalForChecksTestOverride = fnPrev;
 }
 
-// UF4-1, case 5 (security 11-23; private until fixed). A suspended house stays alive only by attesting: it turns
+// UF4-1, case 5 (security 11-23). A suspended house stays alive only by attesting: it turns
 // Insolvent, by height alone, when its silence clock runs out (CheckSilenceClock above). Its ATTEST sent in the last
 // block before that height is valid at the house's own tip, and every peer already one block on refuses it as
 // bad-house-attest-closed. At ban score 100 each of those peers bans the house's node, at the moment its attestation
@@ -3251,7 +3308,7 @@ BOOST_AUTO_TEST_CASE(uf4_1_deferred_house_attest_at_its_silence_deadline_bans_no
 }
 
 // ===========================================================================
-// S1X-3 (security 2026-11-24: re-rated Medium; findings/2026-11-24-s1x-3-recovery-floor.md; private until fixed). A
+// S1X-3 (security 2026-11-24: re-rated Medium). A
 // SWAP moves its units out of nMintedUnits into pending, but the deferral recovery test at ATTEST (validation.cpp
 // ~5110: till >= nMintedUnits x nTillMinBps), GoldParEligible and GoldTillRatioBps (issued_connect.cpp ~624-646) read
 // nMintedUnits alone. In a run, as holders swap, a suspended house recovers on a till sized to the units left, the
@@ -3401,7 +3458,7 @@ BOOST_AUTO_TEST_CASE(s1x_3_recovery_par_and_brassage_count_what_the_house_still_
 // No new #include lines: house_tests.cpp already has houserate.h, issued.h and units.h.
 
 // ---------------------------------------------------------------------------
-// S1X-5, the two house-op snapshot sites (security 2026-11-23: Medium; private until fixed). See the note_tests case
+// S1X-5, the two house-op snapshot sites (security 2026-11-23: Medium). See the note_tests case
 // for the gate and the three checks. Neither site can be held by the S1X-5 gate in practice, so these PIN that and
 // pass on master 71b3558:
 //  - residual settle (insolvent RECLAIM, validation.cpp ~4868): it already refuses while ANY swap is pending
@@ -3516,6 +3573,331 @@ BOOST_AUTO_TEST_CASE(s1x_5_close_is_never_held_by_a_swap_past_the_deadline)
     BOOST_CHECK_MESSAGE(!S1X5HouseEnds(s, "-swaps-pending"), "S1X-5 CLOSE: a swap still pending two years after the "
                         "failure held CLOSE (" + s + "); the gate must open once E + the deadline has passed");
     BOOST_CHECK_EQUAL(s, strControl);
+}
+
+
+// S1X-27: a pooled REGISTER is keyed by its declared house id and by its class id, so a second REGISTER colliding on
+// either is found by one lookup (it was a scan decoding every pooled REGISTER), and a re-wrap is found too.
+BOOST_AUTO_TEST_CASE(s1x_27_pooled_identity_keys_register)
+{
+    HouseRegister regA, regB, regC;
+    std::vector<CKey> vKeyA, vKeyB, vKeyC;
+    const CMutableTransaction mtxA = MakeRegisterTx(regA, vKeyA, HOUSE_TIER_BONDED_SOLO, 1, 1, "clyde");
+    const CMutableTransaction mtxB = MakeRegisterTx(regB, vKeyB, HOUSE_TIER_BONDED_SOLO, 1, 1, "clyde");   // same class
+    const CMutableTransaction mtxC = MakeRegisterTx(regC, vKeyC, HOUSE_TIER_BONDED_SOLO, 1, 1, "tweed");
+    std::vector<uint256> vA, vB, vC, vRe;
+    PooledIdentityKeys(CTransaction(mtxA), vA);
+    PooledIdentityKeys(CTransaction(mtxB), vB);
+    PooledIdentityKeys(CTransaction(mtxC), vC);
+    BOOST_REQUIRE_EQUAL(vA.size(), 2u);
+    BOOST_REQUIRE_EQUAL(vB.size(), 2u);
+    BOOST_REQUIRE_EQUAL(vC.size(), 2u);
+    BOOST_CHECK(vA[0] != vB[0]);   // other partners: other house id
+    BOOST_CHECK(vA[1] == vB[1]);   // same class id
+    BOOST_CHECK(vA[0] != vC[0] && vA[1] != vC[1] && vA[0] != vC[1] && vA[1] != vC[0]);
+    CMutableTransaction mtxRe = mtxA;
+    mtxRe.vin[0].prevout = COutPoint(uint256S("05"), 2);
+    mtxRe.nLockTime = 9;
+    PooledIdentityKeys(CTransaction(mtxRe), vRe);
+    BOOST_CHECK(vRe == vA);
+
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+    const CTransaction txA(mtxA);
+    {
+        LOCK(pool.cs);
+        pool.addUnchecked(txA.GetHash(), entry.FromTx(txA));
+    }
+    BOOST_CHECK(pool.HaveIdentityKey(vB));    // the class collides: house-op-in-mempool
+    BOOST_CHECK(pool.HaveIdentityKey(vRe));   // the re-wrap collides
+    BOOST_CHECK(!pool.HaveIdentityKey(vC));
+    pool.removeRecursive(txA);
+    BOOST_CHECK(!pool.HaveIdentityKey(vB));
+}
+
+
+// S1X-8 (security: Low; Michael 11-25 yes): the spread is one ceiling division over the exact curve. Below the floor
+// every redemption owes at least 1 mg; it is never less than the old floored amount, and never more than it plus 1 mg
+// over the exact rational value.
+BOOST_AUTO_TEST_CASE(s1x_8_brassage_amount_rounds_up_once)
+{
+    const uint32_t nRho = 200;   // the 2% till floor, in bps
+    BOOST_CHECK_EQUAL(BrassageAmountAt(1000000, nRho, nRho), 0);         // at the floor: par
+    BOOST_CHECK_EQUAL(BrassageAmountAt(1000000, nRho + 5, nRho), 0);
+    BOOST_CHECK_EQUAL(BrassageAmountAt(0, 0, nRho), 0);
+    BOOST_CHECK_EQUAL(BrassageAmountAt(1, nRho - 1, nRho), 1);           // 1 mg just under the floor owes 1 mg
+    BOOST_CHECK_EQUAL(HouseBrassageAmount(1, BrassageBpsAt(nRho - 1, nRho)), 0);   // the old rounding owed nothing
+    BOOST_CHECK_EQUAL(BrassageAmountAt(24, 0, nRho), (24 * (int64_t)HOUSE_BRASSAGE_MAX_BPS + 9999) / 10000);
+    for (uint64_t u : {1ULL, 7ULL, 24ULL, 25ULL, 999ULL, 123457ULL, 1000000007ULL}) {
+        for (uint32_t r = 0; r <= nRho + 2; r++) {
+            const CAmount a = BrassageAmountAt(u, r, nRho);
+            BOOST_CHECK(a >= HouseBrassageAmount(u, BrassageBpsAt(r, nRho)));
+            // Against the exact rational value U * MAX * p^2 / (10000 q^2) (or U * MAX / 10000 at or below theta).
+            const uint32_t nTheta = nRho / 4;
+            long double x = 0;
+            if (r < nRho) {
+                if (r <= nTheta) x = (long double)u * HOUSE_BRASSAGE_MAX_BPS / 10000;
+                else {
+                    const long double p = nRho - r, q = nRho - nTheta;
+                    x = (long double)u * HOUSE_BRASSAGE_MAX_BPS * p * p / (10000 * q * q);
+                }
+            }
+            BOOST_CHECK((long double)a >= x - 1e-6);
+            BOOST_CHECK((long double)a < x + 1 + 1e-6);
+            if (r < nRho)
+                BOOST_CHECK(a >= 1);
+        }
+    }
+}
+
+
+// S1X-18 (security: Low; Michael 11-25 yes): ESCROW_MERGE consolidates ONE escrow list into one coin holding exactly the
+// merged sum; every escrow input must be on that list (fail closed), and change never mixes with reserve.
+BOOST_AUTO_TEST_CASE(s1x_18_escrow_merge)
+{
+    CHouse house = MakeGuardHouse();
+    const COutPoint A(uint256S("a1"), 0), B(uint256S("b2"), 1), C(uint256S("c3"), 2), R(uint256S("d4"), 0);
+    const COutPoint N(uint256S("e5"), 0);   // a listed escrow coin that also carries a note tag (security's note 3)
+    house.vOutEscrowChange = {A, B, C, N};
+    std::sort(house.vOutEscrowChange.begin(), house.vOutEscrowChange.end());
+    house.vOutReserveLock = {R};
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnGetCoin = [&](const COutPoint& out, Coin& coin) {
+        if (out == A || out == B || out == C || out == R || out == N) {
+            coin = Coin(CTxOut(out == A ? 1000 : out == B ? 2000 : out == C ? 3000 : 4000, HouseEscrowScript(house.houseID)), 10, false, false, false, uint256());
+            coin.SetHouseEscrow(house.nHouseID);
+            if (out == N)
+                coin.SetNote(house.nHouseID, 5, 0);
+            return true;
+        }
+        coin = Coin(CTxOut(50000, CScript() << OP_TRUE), 10, false, false, false, uint256());   // a plain fee coin
+        return true;
+    };
+    auto build = [&](uint8_t nList, const std::vector<COutPoint>& vIn, CAmount nOut) {
+        HouseEscrowMerge m;
+        m.nHouseID = house.nHouseID;
+        m.nList = nList;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << m;
+        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_ESCROW_MERGE, ss);
+        mtx.vin.clear();
+        for (const COutPoint& o : vIn)
+            mtx.vin.push_back(CTxIn(o));
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("fee"), 0)));
+        mtx.vout.clear();
+        mtx.vout.push_back(CTxOut(nOut, HouseEscrowScript(house.houseID)));
+        return mtx;
+    };
+    auto run = [&](const CMutableTransaction& mtx, CHouse& houseOut) {
+        CValidationState state;
+        const bool fOk = CheckHouseOperation(CTransaction(mtx), state, 1000, fnGetHouse, GuardNoHash, GuardNoClass,
+                                             fnGetCoin, GuardNoBlock, houseOut);
+        return fOk ? std::string() : state.GetRejectReason();
+    };
+    {
+        CHouse out;
+        const CMutableTransaction mtx = build(HOUSE_ESCROW_LIST_CHANGE, {A, B}, 3000);
+        BOOST_CHECK_EQUAL(run(mtx, out), "");
+        std::vector<COutPoint> vWant = {C, N, COutPoint(CTransaction(mtx).GetHash(), 0)};
+        std::sort(vWant.begin(), vWant.end());
+        BOOST_CHECK(out.vOutEscrowChange == vWant);
+        BOOST_CHECK(out.vOutReserveLock == house.vOutReserveLock);   // the other list is untouched
+        CValidationState state;
+        BOOST_CHECK(CheckHouseTransactionShape(CTransaction(mtx), state));
+    }
+    CHouse out;
+    BOOST_CHECK_EQUAL(run(build(HOUSE_ESCROW_LIST_CHANGE, {A, B}, 2999), out), "bad-house-merge-output");   // not the sum
+    BOOST_CHECK_EQUAL(run(build(HOUSE_ESCROW_LIST_CHANGE, {A}, 1000), out), "bad-house-merge-inputs");      // one coin
+    BOOST_CHECK_EQUAL(run(build(HOUSE_ESCROW_LIST_CHANGE, {A, R}, 5000), out), "bad-house-merge-not-listed");   // reserve into change
+    BOOST_CHECK_EQUAL(run(build(HOUSE_ESCROW_LIST_RESERVE, {R, A}, 5000), out), "bad-house-merge-not-listed");  // change into reserve
+    BOOST_CHECK_EQUAL(run(build(HOUSE_ESCROW_LIST_CHANGE, {A, N}, 5000), out), "bad-house-merge-tagged-input");  // a note tag would be lost
+    {   // a stray escrow output beyond vout[0] is refused at the shape
+        CMutableTransaction mtx = build(HOUSE_ESCROW_LIST_CHANGE, {A, B}, 3000);
+        mtx.vout.push_back(CTxOut(10, HouseEscrowScript(house.houseID)));
+        CValidationState state;
+        BOOST_CHECK(!CheckHouseTransactionShape(CTransaction(mtx), state));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-house-merge-stray-escrow");
+    }
+}
+
+// testing (2026-11-25): S1X-18, security's addition (d): a test at CLOSE's weight limit. A CLOSE (and a settle) must spend
+// every coin on the house's escrow lists; each spread-paying REDEEM adds one, and only claims took them off. At 2,500
+// listed change coins a CLOSE's inputs alone weigh past MAX_STANDARD_TX_WEIGHT, so policy would never relay it. MERGEs of
+// up to 500 coins, each a standard transaction, bring the list back to one coin; 501 in one MERGE is refused.
+BOOST_AUTO_TEST_CASE(s1x_18_merges_bring_a_close_back_under_the_weight_limit)
+{
+    CHouse house = MakeGuardHouse();
+    const size_t N = 2500;
+    std::map<COutPoint, CAmount> mapEscrow;   // every escrow coin the checks may read, with its value
+    for (size_t i = 0; i < N; i++) {
+        const COutPoint o(uint256S(strprintf("%x", 0xe00000 + i)), 0);
+        house.vOutEscrowChange.push_back(o);
+        mapEscrow[o] = 1000 + (CAmount)i;
+    }
+    std::sort(house.vOutEscrowChange.begin(), house.vOutEscrowChange.end());
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnGetCoin = [&](const COutPoint& out, Coin& coin) {
+        auto it = mapEscrow.find(out);
+        if (it != mapEscrow.end()) {
+            coin = Coin(CTxOut(it->second, HouseEscrowScript(house.houseID)), 10, false, false, false, uint256());
+            coin.SetHouseEscrow(house.nHouseID);
+            return true;
+        }
+        coin = Coin(CTxOut(50000, CScript() << OP_TRUE), 10, false, false, false, uint256());   // a plain fee coin
+        return true;
+    };
+    const CScript scriptPlain = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x18) << OP_EQUALVERIFY << OP_CHECKSIG;
+    auto closeOf = [&](const std::vector<COutPoint>& vList) {
+        HouseClose cl;
+        cl.nHouseID = house.nHouseID;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << cl;
+        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_CLOSE, ss);
+        mtx.vin.clear();
+        for (const COutPoint& o : vList)
+            mtx.vin.push_back(CTxIn(o));
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("fee"), 0)));
+        mtx.vout.clear();
+        mtx.vout.push_back(CTxOut(100000, scriptPlain));
+        return mtx;
+    };
+    auto mergeOf = [&](const std::vector<COutPoint>& vIn) {
+        HouseEscrowMerge m;
+        m.nHouseID = house.nHouseID;
+        m.nList = HOUSE_ESCROW_LIST_CHANGE;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << m;
+        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_ESCROW_MERGE, ss);
+        mtx.vin.clear();
+        CAmount nSum = 0;
+        for (const COutPoint& o : vIn) {
+            mtx.vin.push_back(CTxIn(o));
+            nSum += mapEscrow.at(o);
+        }
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("fee"), 1)));
+        mtx.vout.clear();
+        mtx.vout.push_back(CTxOut(nSum, HouseEscrowScript(house.houseID)));
+        return mtx;
+    };
+    auto run = [&](const CMutableTransaction& mtx, CHouse& houseOut) {
+        CValidationState state;
+        const bool fOk = CheckHouseOperation(CTransaction(mtx), state, 1000, fnGetHouse, GuardNoHash, GuardNoClass,
+                                             fnGetCoin, GuardNoBlock, houseOut);
+        return fOk ? std::string() : state.GetRejectReason();
+    };
+
+    // The premise: a CLOSE of all 2,500 listed coins is over the standard weight.
+    const int64_t nCloseWeight = GetTransactionWeight(CTransaction(closeOf(house.vOutEscrowChange)));
+    BOOST_REQUIRE_MESSAGE(nCloseWeight >= (int64_t)MAX_STANDARD_TX_WEIGHT,
+                          strprintf("S1X-18 setup: a CLOSE of %u listed coins weighs %d, under the standard %u", N, nCloseWeight,
+                                    MAX_STANDARD_TX_WEIGHT));
+
+    // 501 coins in one MERGE are refused.
+    {
+        CHouse out;
+        const std::vector<COutPoint> v501(house.vOutEscrowChange.begin(), house.vOutEscrowChange.begin() + 501);
+        BOOST_CHECK_EQUAL(run(mergeOf(v501), out), "bad-house-merge-inputs");
+    }
+
+    // MERGEs of 500, each standard and valid, until one coin is left.
+    int nMerges = 0;
+    while (house.vOutEscrowChange.size() > 1) {
+        const size_t n = std::min<size_t>(MAX_HOUSE_ESCROW_MERGE_INPUTS, house.vOutEscrowChange.size());
+        const std::vector<COutPoint> vIn(house.vOutEscrowChange.begin(), house.vOutEscrowChange.begin() + n);
+        const CMutableTransaction mtx = mergeOf(vIn);
+        const CTransaction tx(mtx);
+        std::string strReason;
+        BOOST_CHECK_MESSAGE(IsStandardTx(tx, strReason, true),
+                            strprintf("S1X-18: a MERGE of %u coins is not standard (%s, weight %d)", n, strReason, GetTransactionWeight(tx)));
+        CValidationState state;
+        BOOST_REQUIRE(CheckHouseTransactionShape(tx, state));
+        CHouse out;
+        BOOST_REQUIRE_EQUAL(run(mtx, out), "");
+        BOOST_REQUIRE_EQUAL(out.vOutEscrowChange.size(), house.vOutEscrowChange.size() - n + 1);
+        mapEscrow[COutPoint(tx.GetHash(), 0)] = tx.vout[0].nValue;
+        house = out;
+        BOOST_REQUIRE(++nMerges <= 10);
+    }
+    BOOST_CHECK_EQUAL(nMerges, 6);   // 2,500 -> 2,001 -> 1,502 -> 1,003 -> 504 -> 5 -> 1
+    CAmount nTotal = 0;
+    for (size_t i = 0; i < N; i++)
+        nTotal += 1000 + (CAmount)i;
+    BOOST_CHECK_EQUAL(mapEscrow.at(house.vOutEscrowChange[0]), nTotal);   // nothing left the escrow
+    BOOST_CHECK(GetTransactionWeight(CTransaction(closeOf(house.vOutEscrowChange))) < (int64_t)MAX_STANDARD_TX_WEIGHT / 100);
+}
+
+// testing (2026-11-25): S1X-16a (security: Low; consensus batch fb8146d): an ADMIT approval names its expiry height,
+// signed by the new partner and the approvers, and is refused at any height past it; it may name at most
+// HOUSE_ADMIT_APPROVAL_MAX_BLOCKS ahead. Past the expiry the refusal scores 0 in the mempool (one block can turn it stale
+// with no tx in between, UF4-1) and 100 at connect. The gate s1x_16a_admit_expiry_roundtrip shows it on a node.
+BOOST_AUTO_TEST_CASE(s1x_16a_admit_approval_expires)
+{
+    CHouse house = MakeGuardHouse();   // multi-partner, effectively Open from 1000
+    std::vector<CKey> keys(3);
+    house.vPartner.clear();
+    for (int i = 0; i < 3; i++) {
+        keys[i].MakeNewKey(true);
+        const CPubKey pub = keys[i].GetPubKey();
+        HousePartner p;
+        p.vchPubKey.assign(pub.begin(), pub.end());
+        p.amountPledge = HOUSE_MIN_PLEDGE;
+        p.vOutPledge.push_back(COutPoint(uint256S(strprintf("c%d", i)), 0));
+        p.status = HOUSE_PARTNER_ACTIVE;
+        house.vPartner.push_back(p);
+    }
+    house.nThresholdM = 2;
+    const int H = 1000;
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    CKey keyNew;
+    keyNew.MakeNewKey(true);
+    const CPubKey pubNew = keyNew.GetPubKey();
+
+    auto build = [&](uint32_t nSignedExpiry, uint32_t nPayloadExpiry) {
+        HouseAdmit admit;
+        admit.nHouseID = house.nHouseID;
+        admit.vchNewPubKey.assign(pubNew.begin(), pubNew.end());
+        const uint256 h = HouseAdmitSigHash(house.houseID, admit.vchNewPubKey, HOUSE_MIN_PLEDGE, nSignedExpiry);
+        BOOST_REQUIRE(keyNew.Sign(h, admit.vchNewSig));
+        for (uint32_t i : {0u, 1u}) {
+            std::vector<unsigned char> sig;
+            BOOST_REQUIRE(keys[i].Sign(h, sig));
+            admit.vApproverIndex.push_back(i);
+            admit.vApproverSig.push_back(sig);
+        }
+        admit.nExpiryHeight = nPayloadExpiry;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << admit;
+        CMutableTransaction mtx = MakeHouseOpTx(HOUSE_OP_ADMIT, ss);
+        mtx.vout.clear();
+        mtx.vout.push_back(CTxOut(HOUSE_MIN_PLEDGE, HouseEscrowScript(house.houseID)));
+        return mtx;
+    };
+    struct Verdict { std::string strReason; int nDoS; };
+    auto run = [&](const CMutableTransaction& mtx, int nHeight, bool fMempool) {
+        BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, nHeight), HOUSE_STATUS_OPEN);
+        CValidationState state; CHouse houseOut;
+        const bool fOk = CheckHouseOperation(CTransaction(mtx), state, nHeight, fnGetHouse, GuardNoHash, GuardNoClass,
+                                             fnNoCoin, GuardNoBlock, houseOut, fMempool);
+        Verdict v{fOk ? std::string() : state.GetRejectReason(), 0};
+        state.IsInvalid(v.nDoS);
+        return v;
+    };
+
+    // The boundary: valid in the block at the expiry height, refused in the next.
+    const uint32_t E = H + 144;
+    BOOST_CHECK_EQUAL(run(build(E, E), (int)E, false).strReason, "");
+    for (const bool fMempool : {true, false}) {
+        const Verdict v = run(build(E, E), (int)E + 1, fMempool);
+        BOOST_CHECK_EQUAL(v.strReason, "bad-house-admit-expired");
+        BOOST_CHECK_EQUAL(v.nDoS, fMempool ? 0 : 100);
+    }
+    // The cap: at most HOUSE_ADMIT_APPROVAL_MAX_BLOCKS ahead of the height it is checked at.
+    BOOST_CHECK_EQUAL(run(build(H + HOUSE_ADMIT_APPROVAL_MAX_BLOCKS, H + HOUSE_ADMIT_APPROVAL_MAX_BLOCKS), H, false).strReason, "");
+    BOOST_CHECK_EQUAL(run(build(H + HOUSE_ADMIT_APPROVAL_MAX_BLOCKS + 1, H + HOUSE_ADMIT_APPROVAL_MAX_BLOCKS + 1), H, false).strReason,
+                      "bad-house-admit-expiry-far");
+    // The signatures bind the expiry: a relayer can't extend an approval.
+    BOOST_CHECK_EQUAL(run(build(E, E + 100), (int)E + 1, false).strReason, "bad-house-admit-new-sig");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -612,7 +612,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         if (coin.fHouseEscrow) {
             const bool fReclaim = tx.nVersion == TRANSACTION_HOUSE_VERSION &&
                     (tx.nHouseOp == HOUSE_OP_RECLAIM || tx.nHouseOp == HOUSE_OP_CLOSE);   // v0.2.28: CLOSE takes it all
-            const bool fRelease = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RELEASE;
+            const bool fRelease = tx.nVersion == TRANSACTION_HOUSE_VERSION &&
+                    (tx.nHouseOp == HOUSE_OP_RELEASE || tx.nHouseOp == HOUSE_OP_ESCROW_MERGE);   // S1X-18: the merge
             // v0.2.21: a token COLLECT pays token holders from the same pot.
             const bool fClaim = tx.nVersion == TRANSACTION_NOTE_VERSION &&
                     (tx.nNoteOp == NOTE_OP_CLAIM || tx.nNoteOp == NOTE_OP_TOKEN_COLLECT ||
@@ -940,6 +941,16 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (nBillTitleIn != 0 || nBillEscrowIn != 0)
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-inputs");
         }
+        else if (tx.nBillOp == BILL_OP_TITLE_RELEASE) {
+            // S1X-29: exactly one title (and plain coins); its tag must name the payload's bill (security's (d), the
+            // shared id match below).
+            BillTitleRelease r;
+            if (!DecodeBillPayload(tx.vchBillPayload, r))
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-payload");
+            nBillIDPayload = r.nBillID;
+            if (nBillTitleIn != 1 || nBillEscrowIn != 0)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-inputs");
+        }
         else {
             // Unreachable: CheckTransaction's shape gate rejects every op outside
             // 1..8 before an input is ever looked at. Fail closed regardless -
@@ -972,6 +983,15 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (!DecodeHousePayload(tx.vchHousePayload, cl))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-close-payload");
             if (nHouseEscrowIn != 0 && cl.nHouseID != nHouseIDIn)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-input-id-mismatch");
+        } else if (tx.nHouseOp == HOUSE_OP_ESCROW_MERGE) {
+            // S1X-18: 2..500 of the house's escrow coins (list membership is contextual), plus plain fee coins.
+            HouseEscrowMerge m;
+            if (!DecodeHousePayload(tx.vchHousePayload, m))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-payload");
+            if (nHouseEscrowIn < 2 || nHouseEscrowIn > MAX_HOUSE_ESCROW_MERGE_INPUTS)
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-merge-inputs");
+            if (m.nHouseID != nHouseIDIn)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-input-id-mismatch");
         } else if (tx.nHouseOp == HOUSE_OP_RELEASE) {
             HouseRelease rel;

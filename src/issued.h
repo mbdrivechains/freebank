@@ -450,6 +450,9 @@ bool GoldParEligible(const CHouse& house, int nHeight);
  *  till is attested sECX at A30, Gold B) against the till floor (nTillMinBps, 2%): par at or above the floor, rising to
  *  the full 4% at a quarter of it. Paid in sECX at the house's bid into the escrow pot. */
 uint32_t GoldBrassageBps(const CHouse& house, int nHeight);
+/** S1X-8: the spread nUnits owe at this house now - GoldBrassageBps's cases, the amount rounded up once over the exact
+ *  curve (BrassageAmountAt). What consensus charges; GoldBrassageBps stays for display. */
+CAmount GoldBrassageAmount(const CHouse& house, int nHeight, uint64_t nUnits);
 /** The till / notes ratio, basis points, capped at 10000 (10000 with no notes). */
 uint32_t GoldTillRatioBps(const CHouse& house, int nHeight);
 

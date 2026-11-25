@@ -495,7 +495,7 @@ BOOST_AUTO_TEST_CASE(discharge_brassage_incidence)
     house.status = HOUSE_STATUS_STRESSED;                 // what a below-floor attest produces
     house.nStressSinceHeight = (uint32_t)H - 1;
     BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_STRESSED);
-    const CAmount amountSpread = HouseBrassageAmount(U, GoldBrassageBps(house, H));
+    const CAmount amountSpread = GoldBrassageAmount(house, H, U);   // S1X-8: the consensus amount (rounded up once)
     BOOST_REQUIRE(amountSpread > 0);
     const auto fnCoin = ServeCoin(1, U, NoteDemandTag(D, true), TestCustody(vchKey));
 
@@ -941,7 +941,7 @@ BOOST_AUTO_TEST_CASE(suspended_redeem_runner_bears_brassage)
 
     CHouse house = MakeSuspendedHouse(1, H, 2 * U, (CAmount)(U / 10), S);   // 500 bps < rho
     BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_DEFERRED);
-    const CAmount amountSpread = HouseBrassageAmount(U, GoldBrassageBps(house, H));
+    const CAmount amountSpread = GoldBrassageAmount(house, H, U);   // S1X-8: the consensus amount (rounded up once)
     BOOST_REQUIRE(amountSpread > 0);
     const CAmount I = Interest(U, (uint32_t)H - D);
     BOOST_REQUIRE(I > 0);
@@ -1162,7 +1162,7 @@ BOOST_AUTO_TEST_CASE(demand_plain_members_only_rule)
                                              true, true, true), H, U, house, fnNoCoin), "");
 }
 
-// S1X-14 (security 2026-11-24: Medium; findings/2026-11-24-s1x-14-preauth-replay.md). A pre-auth signature covers
+// S1X-14 (security 2026-11-24: Medium). A pre-auth signature covers
 // only (house, unit vector, payout script), so nothing ties it to ONE demand. A discharge needs no holder signature
 // and the custody script is open, so anyone holding an OLD discharged demand's pre-auth (it is public once that
 // discharge confirms) can discharge a LATER pre-auth demand by the same key, at the same house, for the same total -
@@ -1540,6 +1540,57 @@ BOOST_AUTO_TEST_CASE(s1x_14_an_upgraded_demand_keeps_its_id_through_protest_and_
                         "S1X-14: the upgrade's own pre-auth was refused on its protested coins: " << strUp);
     BOOST_CHECK_EQUAL(CtxReject(ReplayDischargeTx(1, U, pub, payout, vchSigOld, (CAmount)U), (int)(U2 + W), U, house,
                                 fnUpgraded(tagQueueOut)), "bad-note-redeem-discharge-sig-invalid");
+}
+
+namespace {
+// Since S1X-14's fix (13503d2) each demand's coins sit on their own custody script (the demand id). Demand A is the
+// helpers' default id (MakeProtestTx's); demand B spent other coins, so it has its own.
+const uint256 S1X21_ID_B = DemandIdFor(uint256S("b0b0"));
+CScript S1X21CustodyB(const std::vector<unsigned char>& vchKey) { return TestCustody(vchKey, S1X21_ID_B); }
+CMutableTransaction S1X21HolderProtestB(const CKey& key, uint32_t nTagOut, const CHouse& house)
+{
+    return MakeProtestTx(1, 1000000, key, nTagOut, house, true, S1X21_ID_B);
+}
+} // namespace
+
+// S1X-21 (Claude /code-review max run 2, candidate A2-4, 2026-11-24). NoteProtestSigHash covers
+// (network, house, unit vector, outputs) only: not the demand tag and no prevout. A holder's protest of demand A is
+// public once mined, so anyone can replay its signature against the same holder's OTHER lapsed pre-auth demand B of the
+// same size at the same house: copy A's outputs byte for byte (the change goes back to the holder) and write B's tag.
+// Within 180 days of the house's last episode the protest finds no cure, so the house is Insolvent at once
+// (HouseProtestEpisodeStart). The test takes the protest A as built and signed by the holder, changes only the tag in
+// its payload, and spends B's coins. Any refusal passes.
+BOOST_AUTO_TEST_CASE(s1x_21_a_protest_signature_cannot_be_replayed_onto_another_demand)
+{
+    const uint32_t W = Params().GetConsensus().nDemandWindow;
+    const uint32_t DA = 20000, DB = 20010;       // two lapsed pre-auth demands, one key, one house, one size
+    const uint64_t U = 1000000;
+    const int H = (int)(DB + W + 1);
+    CKey key; key.MakeNewKey(true);
+    const CPubKey pub = key.GetPubKey();
+    const std::vector<unsigned char> vchKey(pub.begin(), pub.end());
+    CHouse house = MakeOpenHouse(1, H, 4 * U);
+    house.nEpisodeEndHeight = (uint32_t)H - 100;   // an earlier episode ended 100 blocks ago: no cure inside 180 days
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(house, H), HOUSE_STATUS_OPEN);
+    const uint32_t tagA = NoteDemandTag(DA, true), tagB = NoteDemandTag(DB, true);
+
+    const auto fnCoinB = ServeCoin(1, U, tagB, S1X21CustodyB(vchKey));
+    // Control: the holder's own protest of B is accepted (the protest path is live in this fixture).
+    BOOST_REQUIRE_EQUAL(CtxReject(S1X21HolderProtestB(key, tagB | NOTE_DEMAND_PROTESTED_BIT, house), H, U, house,
+                                  fnCoinB), "");
+
+    // The replay: the holder's protest of A, with only the payload's tag changed to B's.
+    CMutableTransaction replay = MakeProtestTx(1, U, key, tagA | NOTE_DEMAND_PROTESTED_BIT, house);
+    NoteProtest p;
+    { CDataStream ss(replay.vchNotePayload, SER_NETWORK, PROTOCOL_VERSION); ss >> p; }
+    p.nDemandTag = tagB | NOTE_DEMAND_PROTESTED_BIT;
+    { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << p; replay.vchNotePayload.assign(ss.begin(), ss.end()); }
+    CHouse houseOut;
+    const std::string strReplay = CtxReject(replay, H, U, house, fnCoinB, &houseOut);
+    BOOST_CHECK_MESSAGE(!strReplay.empty(),
+        "S1X-21: the holder's protest signature for demand A protested demand B without the holder; the house is now "
+        << (HouseEffectiveStatus(houseOut, H) == HOUSE_STATUS_INSOLVENT ? "Insolvent at once (no cure: an episode ended "
+            "100 blocks before)" : "protested"));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

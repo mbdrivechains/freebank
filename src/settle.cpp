@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <crypto/common.h>   // ReadLE32 (S1X-10)
 #include <settle.h>
 
 #include <consensus/validation.h>
@@ -177,8 +178,8 @@ bool SettleSlotHouses(const CTransaction& tx, std::vector<uint32_t>& vHouse)
         if (p.size() < 8)
             return false;
         uint32_t nA = 0, nB = 0;
-        memcpy(&nA, p.data(), 4);
-        memcpy(&nB, p.data() + 4, 4);
+        nA = ReadLE32(p.data());
+        nB = ReadLE32(p.data() + 4);
         if (nA == 0 || nB == 0)
             return false;
         vHouse = {nA, nB};
@@ -206,7 +207,7 @@ bool SettleSlotHouses(const CTransaction& tx, std::vector<uint32_t>& vHouse)
             return false;
         vHouse.resize(nCount);
         for (size_t i = 0; i < nCount; i++) {
-            memcpy(&vHouse[i], p.data() + nOff + 4 * i, 4);
+            vHouse[i] = ReadLE32(p.data() + nOff + 4 * i);
             if (vHouse[i] == 0) {
                 vHouse.clear();
                 return false;

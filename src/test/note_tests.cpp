@@ -1717,8 +1717,140 @@ BOOST_AUTO_TEST_CASE(testing_sa_n3_stressed_redeem_cannot_skip_brassage)
     g_nHouseRateTestOverride = nOverridePrev;
 }
 
+// testing (2026-11-25): S1X-31 (Claude max run 3 #8; security: Medium; Michael's yes 11-25, "If you need it yes", in
+// gateway docs/security/reviews/2026-11-08-multi-model-review.md): refuse a new SWAP while a REDEEM at that house would
+// owe a spread. At a Stressed house whose till is below the 2% floor, or a suspended (Deferred) one, a holder could leave
+// at par through a SWAP (SWAP_PAY prices at the bid, no spread term) and skip the spread a REDEEM pays into the stayers'
+// pot. FAILS on master (both SWAPs accepted); passes once such a SWAP is refused (any reason). Controls, which hold
+// before and after: a SWAP at the Open house with the same thin till, and at a Stressed house whose till is above the
+// floor (no spread owed), are accepted; at the Stressed house below the floor a REDEEM that names no rate is refused
+// (SA-N3: the spread is owed there). Open swaps settle as now (not exercised here).
+BOOST_AUTO_TEST_CASE(s1x_31_no_new_swap_where_a_redeem_would_owe_a_spread)
+{
+    const uint64_t U = 1000000;
+    const int H = 20000;
+    CKey keyHolder; keyHolder.MakeNewKey(true);
+    const CPubKey pubHolder = keyHolder.GetPubKey();
+    const std::vector<unsigned char> vchHolder(pubHolder.begin(), pubHolder.end());
+    const std::vector<unsigned char> vchP2PKH = ParseHex("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
+
+    // SA-N3's house: a thin till, so a spread is owed once it isn't Open.
+    CHouse base;
+    base.nHouseID = 7;
+    base.houseID = uint256S("5a43");
+    base.nTier = HOUSE_TIER_MULTI_PARTNER;
+    base.nThresholdM = 1;
+    base.strClassID = "s1x31";
+    base.nDenomMgGold = 1000;
+    base.status = HOUSE_STATUS_OPEN;
+    base.nRegisteredHeight = 1000;
+    base.nMintedUnits = 10 * U;
+    base.nLastAttestHeight = H - 10;
+    base.amountLastAttestReserves = 1000;
+    HousePartner p;
+    p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    p.amountPledge = 100 * COIN;
+    p.status = HOUSE_PARTNER_ACTIVE;
+    base.vPartner.push_back(p);
+
+    CHouse hStressedThin = base;                     // an unpaid protest a few blocks ago: Stressed, its cure running
+    hStressedThin.nProtestOpen = 1;
+    hStressedThin.nProtestHeight = H - 5;
+    hStressedThin.nProtestDemandHeight = H - 50;
+    CHouse hStressedRich = hStressedThin;            // the same, its till well above the floor
+    hStressedRich.amountLastAttestReserves = 1000 * COIN;
+    CHouse hDeferred = base;                         // the option clause invoked: suspended
+    hDeferred.nDeferInvokedHeight = H - 100;
+
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(base, H), HOUSE_STATUS_OPEN);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(hStressedThin, H), HOUSE_STATUS_STRESSED);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(hStressedRich, H), HOUSE_STATUS_STRESSED);
+    BOOST_REQUIRE_EQUAL(HouseEffectiveStatus(hDeferred, H), HOUSE_STATUS_DEFERRED);
+    BOOST_REQUIRE_EQUAL(GoldBrassageBps(base, H), 0U);
+    const uint32_t nSpreadBps = GoldBrassageBps(hStressedThin, H);
+    BOOST_REQUIRE_MESSAGE(nSpreadBps > 0, "S1X-31 setup: the Stressed thin-till house owes no spread");
+    BOOST_REQUIRE_MESSAGE(GoldBrassageBps(hStressedRich, H) == 0, "S1X-31 setup: the Stressed rich house owes a spread");
+
+    // The token the swap pays and the chain clock, in a units view (as s1x_15's SWAP section).
+    CUnitsView units(nullptr);
+    CHouseCharter charter;
+    CCharterToken tok;
+    tok.nChainID = 1;
+    tok.vchContract = std::vector<unsigned char>(20, 0xc0);
+    tok.nDecimals = 18;
+    tok.nGramsNum = 1;
+    tok.nGramsDen = 1;
+    tok.nAddedTime = 1;
+    charter.vToken.push_back(tok);
+    units.Put(HouseCharterKey(7), charter);
+    CChainClock clock;
+    clock.nHeight = (uint32_t)(H - 1);
+    clock.nMonoTime = clock.nActiveTime = (int64_t)H * 600;
+    units.Put(ChainClockKey(), clock);
+    UnitsCheckScope scope(&units);
+
+    auto fnNoBlock = [](uint32_t, uint256&) { return false; };
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    auto swapReject = [&](const CHouse& h) {
+        NoteSwap sw;
+        sw.nHouseID = 7;
+        sw.nUnits = U;
+        sw.vchHolderPubKey = vchHolder;
+        sw.nChainID = 1;
+        sw.vchContract = tok.vchContract;
+        sw.vchEthAddress = std::vector<unsigned char>(20, 0xe7);
+        sw.hashLock = uint256S("5131");
+        sw.nRateNamed = 0;   // the unit tests' rate override names the bid
+        sw.vchPayoutScript = vchP2PKH;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_SWAP;
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("5a31"), 0)));
+        mtx.vout.push_back(CTxOut(10000, CScript(vchP2PKH.begin(), vchP2PKH.end())));   // fee change
+        BOOST_REQUIRE(keyHolder.Sign(NoteSwapSigHash(sw, CTransaction(mtx)), sw.vchHolderSig));
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << sw;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        auto fnGetHouse = [&h](uint32_t id, CHouse& out) { if (id != 7) return false; out = h; return true; };
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        return CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnNoCoin, fnNoCoin, fnNoBlock,
+                                  houseOut, fChanged) ? std::string() : state.GetRejectReason();
+    };
+
+    // Controls: no spread owed, so a SWAP is accepted.
+    BOOST_CHECK_MESSAGE(swapReject(base).empty(), "S1X-31 control: a SWAP at the Open house was refused: " + swapReject(base));
+    BOOST_CHECK_MESSAGE(swapReject(hStressedRich).empty(),
+                        "S1X-31 control: a SWAP at a Stressed house above the till floor (no spread owed) was refused: " +
+                        swapReject(hStressedRich));
+    // The rule.
+    BOOST_CHECK_MESSAGE(!swapReject(hStressedThin).empty(),
+                        "S1X-31: a SWAP at a Stressed house that owes a " + std::to_string(nSpreadBps) +
+                        " bps spread was accepted: the holder leaves at the bid and skips the spread a REDEEM pays");
+    BOOST_CHECK_MESSAGE(!swapReject(hDeferred).empty(),
+                        "S1X-31: a SWAP at a Deferred (suspended) house was accepted: the holder leaves at the bid while "
+                        "a REDEEM is suspended");
+
+    // Control: at the Stressed thin-till house a REDEEM owes the spread (SA-N3: one naming no rate is refused).
+    {
+        const uint64_t nOverridePrev = g_nHouseRateTestOverride;
+        g_nHouseRateTestOverride = 0;
+        auto fnNoteCoin = [&](const COutPoint&, Coin& coin) {
+            coin = Coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchHolder)), H - 100, false, false, false, uint256());
+            coin.SetNote(7, U, 0);
+            return true;
+        };
+        auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id != 7) return false; out = hStressedThin; return true; };
+        CMutableTransaction mtx = MakeDemandedRedeemTx(7, U, keyHolder, (CAmount)U);
+        CValidationState state; CHouse houseOut; bool fChanged = false;
+        const bool fOk = CheckNoteOperation(CTransaction(mtx), state, H, U, fnGetHouse, fnNoteCoin, fnNoteCoin, fnNoBlock,
+                                            houseOut, fChanged);
+        g_nHouseRateTestOverride = nOverridePrev;
+        BOOST_CHECK_MESSAGE(!fOk, "S1X-31 control: a REDEEM naming no rate at the Stressed thin-till house was accepted "
+                            "(it owes a " + std::to_string(nSpreadBps) + " bps spread)");
+    }
+}
+
 // ---------------------------------------------------------------------------
-// UF4-1 (ultra on review-fixed/s4, 2026-11-23; private until fixed). A note op's status, height and cap verdicts can
+// UF4-1 (ultra on review-fixed/s4, 2026-11-23). A note op's status, height and cap verdicts can
 // flip from one block to the next with no tx in between: lazy insolvency (nNoCureHeight, window expiry), a deferral,
 // a till cap that moves with height. Two honest nodes one block apart then disagree about the same relayed tx, and
 // net_processing bans the relaying peer for any nDoS > 0 out of AcceptToMemoryPool. So on the mempool path
@@ -1861,7 +1993,7 @@ BOOST_AUTO_TEST_CASE(uf4_1_status_height_and_cap_refusals_ban_no_peer_in_the_mem
 
 
 // ---------------------------------------------------------------------------
-// S1X-6 (s1 measuring run, 2026-11-23; security: Medium, blocks mainnet; private until fixed). A swap paid short drops
+// S1X-6 (s1 measuring run, 2026-11-23; security: Medium, blocks mainnet). A swap paid short drops
 // its whole amount from the house's pending swaps (SwapSettle), so CapitalCapUnits and TillCapUnits give the room
 // back, while the unpaid grams stay in the shortfall ledger and MaterializeInsolvency counts them in nInsolventUnits for
 // the 90-day lapse. A house (its own swap holder: mint, swap, cut the bid, pay short) can re-mint into that room and
@@ -1958,7 +2090,7 @@ BOOST_AUTO_TEST_CASE(s1x_6_live_shortfall_uses_issuing_room_until_it_lapses)
     }
 }
 
-// S1X-5 (security 2026-11-23: Medium; findings/2026-11-23-s1x-5-swap-done-strands-escrow.md; private until fixed).
+// S1X-5 (security 2026-11-23: Medium).
 // MaterializeInsolvency freezes the house's pending swaps into nInsolventUnits at the FIRST waterfall op; a swap still
 // pending then can be DONE afterwards (the holder reveals s), and its share of the pot is then claimed by nobody. The
 // agreed gate (security's shape, freebankd 2026-11-24): before MaterializeInsolvency at each of the six snapshot sites,

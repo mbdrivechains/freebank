@@ -347,8 +347,8 @@ CMutableTransaction BuildHRetire(const World& w, const WBill& wb, const WHouse& 
     mtx.vout.push_back(CTxOut(wb.bill.amount, BillScriptForPubKey(wb.bill.vchHolderPubKey)));
     CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION); ss0 << h;
     SetBillPayload(mtx, ss0);
-    BOOST_REQUIRE(wb.acceptor.Sign(BillRetireSigHash(wb.bill.billID, h.nRateNamed,   // UR1-6
-            BillHashOutputs(CTransaction(mtx))), h.vchAcceptorSig));
+    BOOST_REQUIRE(wb.acceptor.Sign(BillRetireSigHash(wb.bill.billID, h.nRateNamed,   // UR1-6; S1X-17
+            BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)), true), h.vchAcceptorSig));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << h;
     SetBillPayload(mtx, ss);
     return mtx;
@@ -373,7 +373,8 @@ CMutableTransaction BuildHClaim(const World& w, const WBill& wb, const WHouse& w
     mtx.vout.push_back(CTxOut(wb.bill.amountEscrow, BillScriptForPubKey(wh.house.vchRedemptionDestPK)));
     CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION); ss0 << c;
     SetBillPayload(mtx, ss0);
-    const uint256 sighash = BillClaimSigHash(wb.bill.billID, BillHashOutputs(CTransaction(mtx)));
+    const uint256 sighash = BillClaimSigHash(wb.bill.billID, BillTxBindingHash(CTransaction(mtx)),
+                                             BillHashOutputs(CTransaction(mtx)), true);   // S1X-17
     c.vApproverIndex.push_back(0);
     std::vector<unsigned char> vchApprover;
     BOOST_REQUIRE(wh.partner.Sign(sighash, vchApprover));

@@ -16,12 +16,17 @@
 #include <streams.h>
 #include <token.h>
 #include <undo.h>
+#include <test/sidechain_test_util.h>   // SideDBScope (S1X-27 token probe)
 #include <test/test_bitcoin.h>
+#include <txmempool.h>
+#include <utiltime.h>
+#include <validation.h>
 #include <utilstrencodings.h>
 #include <version.h>
 
 #include <secp256k1.h>
 
+#include <algorithm>
 #include <map>
 
 #include <boost/test/unit_test.hpp>
@@ -586,7 +591,7 @@ BOOST_AUTO_TEST_CASE(escrow_change_undo_leaves_the_till_alone)
     BOOST_CHECK(EscrowChangeBeforeOp(house, tx, &undo, 0) == vExpect);
 }
 
-// S4X-1 (external review of s4, Qwen 3.8 flash #1, 2026-11-23; security High; private until fixed). A token CLAIM is
+// S4X-1 (external review of s4, Qwen 3.8 flash #1, 2026-11-23; security High). A token CLAIM is
 // bounded against the house's CONFIRMED claim total only (validation.cpp, NOTE_OP_TOKEN_CLAIM). ConnectBlock adds the
 // block's claims to the house at the flush and, past UINT64_MAX / 2, stops with state.Error("Token claim totals
 // overflow!"): no invalid mark (retried for ever), and TestBlockValidity returns under fJustCheck before the flush, so
@@ -712,7 +717,7 @@ BOOST_AUTO_TEST_CASE(s4x_1_claim_gap_exceeds_a_block_of_the_smallest_entries)
 //   #include <units.h>       // CUnitsView (S1X-5)
 
 // ---------------------------------------------------------------------------
-// S1X-5, token COLLECT (validation.cpp ~6568; security 2026-11-23: Medium; private until fixed). See the note_tests case
+// S1X-5, token COLLECT (validation.cpp ~6568; security 2026-11-23: Medium). See the note_tests case
 // for the gate. COLLECT waits for the token claim window (nTokenClaimWindow, ~4 weeks), far past E + the swap deadline,
 // so the gate can't bind here. PINNED (passes on master 71b3558): the window outlasts the deadline, and at the window's
 // end a swap still pending does not hold the COLLECT. The house is FailedHouse, never materialized (status Open), so
@@ -782,6 +787,285 @@ BOOST_AUTO_TEST_CASE(s1x_5_token_collect_is_never_held_by_a_swap_past_the_deadli
     BOOST_CHECK_MESSAGE(s.find("-swaps-pending") == std::string::npos, "S1X-5 token COLLECT: a swap still pending "
                         "weeks after the failure held the COLLECT (" + s + ")");
     BOOST_CHECK_EQUAL(s, strControl);
+}
+
+// ---------------------------------------------------------------------------
+// S1X-27's TOKEN_CLAIM sibling (security 2026-11-25, Medium under S1X-27): a token CLAIM's admission hashes every entry
+// of every pooled same-house CLAIM to the curve (PooledTokenClaimSharesY) before the fee check. A probe is refused DoS 0
+// and never pays: a copy of a pooled claim's payload on the prober's own fee coin (the entry signatures bind no input),
+// or one fresh token. So each probe costs the node the whole pool. Security asked for the time per probe at 1k and 10k
+// pooled entries on one insolvent house; the times print with --log_level=message. The regression: a probe's cost must
+// not grow with the pool.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct TokenPoolSetup : public TestChain100Setup {
+    sidechain_test::SideDBScope sideDBs;   // ATMP's contextual checks read the house DB (TestingSetup makes none)
+    int nNext = 0;
+    CKey keyAny;
+    std::vector<unsigned char> vchPoint;   // a valid point for the shape check's B_ and C_ (the probes never reach the DLEQ)
+
+    TokenPoolSetup()
+    {
+        keyAny.MakeNewKey(true);
+        vchPoint = V(keyAny.GetPubKey());
+    }
+    COutPoint TipFee()
+    {
+        const COutPoint o(uint256S(strprintf("%x", 0xd0000 + ++nNext)), 0);
+        const CScript spk = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x0e) << OP_EQUALVERIFY << OP_CHECKSIG;
+        pcoinsTip->AddCoin(o, Coin(CTxOut(COIN, spk), chainActive.Height(), false, false, false, uint256()), false);
+        return o;
+    }
+    /** A shape-valid entry: a 64-character secret like a wallet's (hex of 32 random bytes). */
+    TokenClaimEntry Entry64()
+    {
+        TokenClaimEntry e;
+        e.nKeysetID = 1;
+        e.nAmount = 1;
+        const std::string s = HexStr(GetRandHash());
+        e.vchSecret.assign(s.begin(), s.end());
+        e.vchB = vchPoint;
+        e.vchC = vchPoint;
+        e.vchE.assign(32, 1);
+        e.vchS.assign(32, 2);
+        const CScript pay = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 7) << OP_EQUALVERIFY << OP_CHECKSIG;
+        e.vchPayoutScript.assign(pay.begin(), pay.end());
+        e.vchSig.assign(70, 0x30);
+        return e;
+    }
+    CMutableTransaction ClaimTx(const std::vector<TokenClaimEntry>& v, uint32_t nLockTime)
+    {
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
+        mtx.nLockTime = nLockTime;
+        mtx.vin.push_back(CTxIn(TipFee()));
+        mtx.vout.push_back(CTxOut(10000, CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 8) << OP_EQUALVERIFY << OP_CHECKSIG));
+        NoteTokenClaim c;
+        c.nHouseID = 5;
+        c.vEntry = v;
+        SetPayload(mtx, c);
+        return mtx;
+    }
+    /** Pool claims of 64 entries at house 5 until the pool holds nEntries; returns them. */
+    std::vector<CMutableTransaction> FillPool(size_t nEntries)
+    {
+        std::vector<CMutableTransaction> v;
+        TestMemPoolEntryHelper entry;
+        for (size_t n = 0; n < nEntries; n += MAX_TOKEN_CLAIM_ENTRIES) {
+            std::vector<TokenClaimEntry> ve;
+            for (size_t i = 0; i < MAX_TOKEN_CLAIM_ENTRIES && n + i < nEntries; i++)
+                ve.push_back(Entry64());
+            v.push_back(ClaimTx(ve, 0));
+            mempool.addUnchecked(v.back().GetHash(), entry.FromTx(v.back()));
+        }
+        return v;
+    }
+    /** The median wall time (µs) of nRuns ATMP calls; each probe's verdict goes to *pReason (they must all agree). */
+    int64_t MedianProbe(const std::function<CMutableTransaction(int)>& fnProbe, int nRuns, std::string& strReason, int& nDoS)
+    {
+        std::vector<int64_t> v;
+        for (int i = 0; i < nRuns; i++) {
+            const CTransactionRef ptx = MakeTransactionRef(fnProbe(i));
+            CValidationState state;
+            const int64_t t0 = GetTimeMicros();
+            const bool fOk = AcceptToMemoryPool(mempool, state, ptx, nullptr, nullptr, true, 0);
+            v.push_back(GetTimeMicros() - t0);
+            BOOST_REQUIRE_MESSAGE(!fOk, "a probe was accepted");
+            state.IsInvalid(nDoS);
+            strReason = state.GetRejectReason();
+        }
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    }
+};
+
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(s1x_27_token_claim_probe_cost_does_not_grow_with_the_pool, TokenPoolSetup)
+{
+    LOCK(cs_main);
+    // One hash to the curve, for scale.
+    std::vector<TokenClaimEntry> vRef;
+    for (int i = 0; i < 2000; i++)
+        vRef.push_back(Entry64());
+    const int64_t tHash0 = GetTimeMicros();
+    for (const TokenClaimEntry& e : vRef) {
+        CPubKey Y;
+        BOOST_REQUIRE(CashuHashToCurve(e.vchSecret, Y));
+    }
+    const double dHash = double(GetTimeMicros() - tHash0) / vRef.size();
+    BOOST_TEST_MESSAGE(strprintf("S1X-27 token: one hash to the curve %.1f us", dHash));
+
+    const int RUNS = 9;
+    std::string strReason;
+    int nDoS = -1;
+    uint32_t nLock = 1;
+    // Probe B: one fresh token. It shares nothing, so the scan visits every pooled claim before the token checks (here
+    // the house is unknown, so those fail at once: the time is the scan).
+    auto fnFresh = [&](int) { return ClaimTx({Entry64()}, nLock++); };
+    const int64_t tFresh0 = MedianProbe(fnFresh, RUNS, strReason, nDoS);
+    BOOST_TEST_MESSAGE(strprintf("S1X-27 token: fresh-token probe, empty pool: %d us (%s, DoS %d)", tFresh0, strReason, nDoS));
+
+    size_t nPooled = 0;
+    std::vector<CMutableTransaction> vPooled;
+    int64_t tFresh10k = 0;
+    for (const size_t nTarget : {size_t(1024), size_t(10048)}) {
+        const std::vector<CMutableTransaction> vMore = FillPool(nTarget - nPooled);
+        vPooled.insert(vPooled.end(), vMore.begin(), vMore.end());
+        nPooled = nTarget;
+        const int64_t tFresh = MedianProbe(fnFresh, RUNS, strReason, nDoS);
+        BOOST_TEST_MESSAGE(strprintf("S1X-27 token: %u pooled entries (%u claims): fresh-token probe %d us (%s, DoS %d)",
+                                     nPooled, vPooled.size(), tFresh, strReason, nDoS));
+        // Probe A: a pooled claim's payload on the prober's own coin with a fresh nLockTime (where the scan stops depends
+        // on where the copied claim sits in the pool).
+        auto fnCopy = [&](int i) {
+            CMutableTransaction m = vPooled[(i * 7919) % vPooled.size()];
+            m.vin[0] = CTxIn(TipFee());
+            m.nLockTime = nLock++;
+            return m;
+        };
+        const int64_t tCopy = MedianProbe(fnCopy, RUNS, strReason, nDoS);
+        BOOST_TEST_MESSAGE(strprintf("S1X-27 token: %u pooled entries: copy probe %d us (%s, DoS %d)", nPooled, tCopy,
+                                     strReason, nDoS));
+        BOOST_CHECK_EQUAL(strReason, "token-claim-pending");
+        BOOST_CHECK_EQUAL(nDoS, 0);
+        if (nTarget == 10048)
+            tFresh10k = tFresh;
+    }
+    // The fix (security: the pool's identity index) makes a probe one lookup per entry it carries. Allow it 5% of what
+    // hashing the pool costs on this machine, on top of the empty-pool probe.
+    const double dPoolHash = 10048 * dHash;
+    BOOST_CHECK_MESSAGE(tFresh10k - tFresh0 < 0.05 * dPoolHash,
+            strprintf("S1X-27 token: a free probe at 10,048 pooled entries costs %d us more than at none (hashing the "
+                      "pool: %.0f us); the scan grows with the pool", tFresh10k - tFresh0, dPoolHash));
+}
+
+// Security's second question (not rated): a zero-fee CLAIM of 64 real tokens runs the token checks (DLEQ, signatures)
+// before ATMP's fee check refuses it, DoS 0. The cost per probe is flat; this measures it.
+BOOST_AUTO_TEST_CASE(s1x_27_token_claim_dleq_cost_of_a_64_token_claim)
+{
+    FailedHouse f;
+    TestMint mint;
+    mint.k[16] = RandScalar();
+    const std::vector<TokenKey> vKey = mint.Keys();
+    const uint64_t id = TokenKeysetID(vKey);
+    Records rec;
+    CTokenKeyset ks;
+    ks.nHeight = 150;
+    ks.vKey = vKey;
+    rec.keyset[{f.house.nHouseID, id}] = ks;
+    const CScript pay = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 7) << OP_EQUALVERIFY << OP_CHECKSIG;
+    std::vector<TokenClaimEntry> v;
+    for (size_t i = 0; i < MAX_TOKEN_CLAIM_ENTRIES; i++) {
+        const TestMint::Token t = mint.Issue(16, HexStr(GetRandHash()));
+        CTokenMark m;
+        m.nHeight = 180;
+        m.nKeysetID = id;
+        m.nAmount = t.amount;
+        rec.issued[{f.house.nHouseID, V(t.B)}] = m;
+        v.push_back(Entry(f.house.nHouseID, id, t, pay));
+    }
+    CMutableTransaction mtx = NoteOpTx(NOTE_OP_TOKEN_CLAIM);
+    NoteTokenClaim c;
+    c.nHouseID = f.house.nHouseID;
+    c.vEntry = v;
+    SetPayload(mtx, c);
+    const CTransaction tx(mtx);
+    std::vector<int64_t> vT;
+    for (int i = 0; i < 7; i++) {
+        CValidationState state;
+        TokenEffects eff;
+        CHouse out;
+        bool fChanged = false;
+        const int64_t t0 = GetTimeMicros();
+        const bool fOk = CheckTokenOperation(tx, state, f.E + 1, f.Get(), [](const COutPoint&, Coin&) { return false; },
+                                             rec.View(), eff, out, fChanged, true);
+        vT.push_back(GetTimeMicros() - t0);
+        BOOST_REQUIRE_MESSAGE(fOk, "the 64-token claim must pass the token checks: " + state.GetRejectReason());
+    }
+    std::sort(vT.begin(), vT.end());
+    BOOST_TEST_MESSAGE(strprintf("S1X-27 token: CheckTokenOperation on a 64-token claim: median %d us (%.1f us a token)",
+                                 vT[vT.size() / 2], double(vT[vT.size() / 2]) / MAX_TOKEN_CLAIM_ENTRIES));
+}
+
+// S1X-27 (security's sibling, Medium): a pooled token CLAIM is keyed per token by (house, Y id), computed once at add, so
+// the claim guard is one lookup per token instead of a decode and up to 64 hash-to-curve per pooled claim per arrival.
+BOOST_AUTO_TEST_CASE(s1x_27_token_claim_identity_keys)
+{
+    auto fnClaim = [](uint32_t nHouseID, const std::vector<std::string>& vSecret, uint32_t nLockTime) {
+        NoteTokenClaim claim;
+        claim.nHouseID = nHouseID;
+        for (const std::string& str : vSecret) {
+            TokenClaimEntry e;
+            e.vchSecret = std::vector<unsigned char>(str.begin(), str.end());
+            claim.vEntry.push_back(e);
+        }
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << claim;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
+        mtx.vin.push_back(CTxIn(COutPoint(uint256S("07"), 0)));
+        mtx.nLockTime = nLockTime;
+        return CTransaction(mtx);
+    };
+    const CTransaction txA = fnClaim(3, {"secret-a", "secret-b"}, 0);
+    const CTransaction txCopy = fnClaim(3, {"secret-b"}, 5);          // shares secret-b at the same house
+    const CTransaction txOtherHouse = fnClaim(4, {"secret-b"}, 0);    // the same token at another house
+    const CTransaction txFresh = fnClaim(3, {"secret-c"}, 0);
+    std::vector<uint256> vA, vCopy, vOther, vFresh;
+    PooledIdentityKeys(txA, vA);
+    PooledIdentityKeys(txCopy, vCopy);
+    PooledIdentityKeys(txOtherHouse, vOther);
+    PooledIdentityKeys(txFresh, vFresh);
+    BOOST_REQUIRE_EQUAL(vA.size(), 2u);
+    BOOST_REQUIRE_EQUAL(vCopy.size(), 1u);
+    BOOST_CHECK(std::find(vA.begin(), vA.end(), vCopy[0]) != vA.end());
+
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+    {
+        LOCK(pool.cs);
+        pool.addUnchecked(txA.GetHash(), entry.FromTx(txA));
+    }
+    BOOST_CHECK(pool.HaveIdentityKey(vCopy));     // token-claim-pending
+    BOOST_CHECK(!pool.HaveIdentityKey(vOther));   // another house's claim of that Y is not a conflict here
+    BOOST_CHECK(!pool.HaveIdentityKey(vFresh));
+    std::set<uint256> setY;
+    uint32_t nHouse = 0;
+    BOOST_REQUIRE(TokenClaimYs(txCopy, nHouse, setY));
+    BOOST_CHECK(pool.HaveIdentityKey({TokenClaimIdentityKey(nHouse, *setY.begin())}));
+    pool.removeRecursive(txA);
+    BOOST_CHECK(!pool.HaveIdentityKey(vCopy));
+}
+
+
+// Security 11-25 (the DLEQ-before-fee Medium): FbVerifyDLEQ is CashuVerifyDLEQ outside an FbSigCacheScope, and inside
+// one it remembers only DLEQs that verified: a valid one passes twice, a forged one fails every time (never cached).
+BOOST_AUTO_TEST_CASE(dleq_cache_remembers_only_valid_checks)
+{
+    TestMint mint;
+    mint.k[0] = RandScalar();
+    const TestMint::Token t = mint.Issue(0, "dleq-cache-secret");
+    const CPubKey A = MulG(mint.k[0]);
+    CashuScalar sBad = t.s;
+    sBad[31] ^= 1;
+    BOOST_CHECK(!FbSigCacheScopeOpen());
+    BOOST_CHECK(FbVerifyDLEQ(A, t.B, t.C_, t.e, t.s));
+    BOOST_CHECK(!FbVerifyDLEQ(A, t.B, t.C_, t.e, sBad));
+    {
+        FbSigCacheScope scope;
+        BOOST_CHECK(FbVerifyDLEQ(A, t.B, t.C_, t.e, t.s));      // verified, then remembered
+        BOOST_CHECK(FbVerifyDLEQ(A, t.B, t.C_, t.e, t.s));      // from the cache
+        BOOST_CHECK(!FbVerifyDLEQ(A, t.B, t.C_, t.e, sBad));    // a forgery is never remembered
+        BOOST_CHECK(!FbVerifyDLEQ(A, t.B, t.C_, t.e, sBad));
+        BOOST_CHECK(!FbVerifyDLEQ(A, t.C_, t.B, t.e, t.s));     // the key binds the points' roles
+    }
+    BOOST_CHECK(!FbVerifyDLEQ(A, t.B, t.C_, t.e, sBad));         // and outside the scope: the plain check
 }
 
 BOOST_AUTO_TEST_SUITE_END()

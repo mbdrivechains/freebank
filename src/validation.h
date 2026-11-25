@@ -11,6 +11,7 @@
 #endif
 
 #include <amount.h>
+#include <cashu.h>
 #include <coins.h>
 #include <fs.h>
 #include <protocol.h> // For CMessageHeader::MessageStartChars
@@ -352,6 +353,8 @@ void PruneBlockFilesManual(int nManualPruneHeight);
 bool CheckTokenOperationAtTip(const CTransaction& tx, CValidationState& state);
 /** v0.2.21: does a token CLAIM share a token (Y) with a pooled claim of the same house? (The mempool refuses it.) */
 bool TokenClaimConflictsMempool(const CTransaction& tx);
+/** v0.2.21: the tokens (Y ids) a NOTE_OP_TOKEN_CLAIM claims, and its house; false on a bad payload or secret. */
+bool TokenClaimYs(const CTransaction& tx, uint32_t& nHouseID, std::set<uint256>& setY);
 
 /** H1 (stage A, plain v1.2.1): is mtx a house rate POST (HOUSE_OP_RATE, kind POST)? A pooled POST yields to any other op
  *  on its house: ATMP evicts it rather than refuse the op, and the wallet's fail-fast doesn't count it. */
@@ -408,6 +411,9 @@ private:
 };
 /** UR3-4: is an FbSigCacheScope open on this thread? (Unit tests.) */
 bool FbSigCacheScopeOpen();
+/** S1X-30: a token CLAIM's NUT-12 DLEQ check: exactly CashuVerifyDLEQ outside an FbSigCacheScope; inside one, a DLEQ that
+ *  verified is remembered (keyed by a hash of A, B_, C_, e, s) and not verified again (security 11-25). */
+bool FbVerifyDLEQ(const CPubKey& A, const CPubKey& B_, const CPubKey& C_, const CashuScalar& e, const CashuScalar& s);
 /** D-2026-11-11-3: a house rate op (POST or SETKEY) and its house, by byte reads (no decode). False for any other tx. */
 bool HouseRateOpOf(const CTransaction& mtx, uint32_t& nHouseID, bool& fSetKey);
 
@@ -510,6 +516,10 @@ bool ReadBlockFromDisk(CBlock& block, const CDiskBlockPos& pos, const Consensus:
 bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams);
 /** Read a connected block's undo data (rev*.dat); false if absent or corrupt. RPC read path only. */
 bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
+
+/** S1X-23 / S1X-24: does tx spend a pooled tx's house-escrow output, or (a note REDEEM or PROTEST) a pooled tx's note
+ * output? ATMP refuses it (unconfirmed-credit-parent); UpdateMempoolForReorg drops one already pooled. */
+bool SpendsPooledCreditOutput(const CTransaction& tx, const CTxMemPool& pool);
 
 /** Functions for validating blocks and updating the block tree */
 
@@ -738,7 +748,7 @@ static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
 //! requires less (v1.2.3 and older, and builds before S5X-2) keeps its
 //! withdrawal-bundle and deposit entries but loses its verified-BMM ones, so
 //! those blocks are checked again.
-static const int BMM_CACHE_S5X2_MIN_VERSION = 1020400;
+static const int BMM_CACHE_S5X2_MIN_VERSION = 1020500;
 
 void DumpMainBlockCache();
 

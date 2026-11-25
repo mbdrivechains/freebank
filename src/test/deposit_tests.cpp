@@ -1267,7 +1267,7 @@ BOOST_AUTO_TEST_CASE(s2x_2_deposit_rate_has_a_ceiling)
 // (issued.h, for UnitsCheckScope and CreditHashOutputs, is already included.)
 
 // ---------------------------------------------------------------------------
-// S1X-5, deposit CLAIM (security 2026-11-23: Medium; private until fixed). The note_tests case explains the gate and
+// S1X-5, deposit CLAIM (security 2026-11-23: Medium). The note_tests case explains the gate and
 // the three checks; this is the same at the deposit waterfall's snapshot site (validation.cpp ~7048): a house that
 // failed by the stress path and was never materialized, one depositor's correctly signed CLAIM (the sig check precedes
 // the snapshot) with a stray escrow output at vout[0], and another holder's swap opened at E - 10.
