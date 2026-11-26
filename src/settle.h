@@ -98,9 +98,9 @@ static const uint64_t SETTLE_MAX_UNITS = (uint64_t)3 * (uint64_t)MAX_MONEY;
  * DisconnectBlock restores from the payload alone and any replay is
  * structurally invalid.
  *
- * Authorization = four signatures over ONE shared digest (SettleExchangeSigHash:
- * every value field in declaration order, sig/index fields excluded, plus
- * hashPrevouts + hashOutputs): both houses' M-of-N approver quorums
+ * Authorization = four signatures over ONE shared digest (SettleExchangeSigHash,
+ * Stage 0 C1: the whole transaction with the sig/index fields stripped from the
+ * payload): both houses' M-of-N approver quorums
  * (VerifyHouseApprovers - parallel index/sig vectors, the chassis M-of-N form)
  * and both presentment-key holder sigs. Approver indices ride OUTSIDE the
  * digest (chassis form): a sig moved to another index fails ECDSA against that
@@ -172,8 +172,7 @@ uint256 SettleHashPrevouts(const CTransaction& tx);
  * field of the payload in declaration order (sig/index fields excluded),
  * hashPrevouts, hashOutputs. Atomic mutual consent - neither side can alter
  * any term after the other signs. */
-uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevouts,
-                              const uint256& hashOutputs);
+uint256 SettleExchangeSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 
 /** Payload-pure residual band check (consensus s4 check 6; NO DB read - par
  * is 1:1 by canon). For dU = nUnitsANotes - nUnitsBNotes:
@@ -218,7 +217,7 @@ struct SettleNetBundle {
  * Priors as in the exchange (ATTEST pattern): undo restores from the payload alone. A house may join a round only if
  * it has never settled or has attested since its last settle, so every round starts from freshly proven reserves.
  *
- * One digest (SettleNetSigHash) covers every value field plus prevouts and outputs; it is signed by every house's
+ * One digest (SettleNetSigHash, Stage 0 C1: the whole transaction, the signature lists stripped) is signed by every house's
  * M-of-N approvers and by every presenting house's key. vPresentKey[i] is empty for a house that presents nothing. */
 struct SettleNet {
     std::vector<uint32_t> vHouseID;                                  // LEADING; >= 2, strictly ascending
@@ -254,7 +253,7 @@ struct SettleNet {
 
 /** The digest every NET signature covers: domain tag, every value field in declaration order (signatures and
  * approver indices excluded), hashPrevouts, hashOutputs. */
-uint256 SettleNetSigHash(const SettleNet& n, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 SettleNetSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 
 /** Each house's net position and burn (units of its notes presented), parallel to vHouseID. False if a bundle names
  * a house outside the round, or a house's presented or presented-of total leaves SETTLE_MAX_UNITS. */

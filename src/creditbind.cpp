@@ -321,6 +321,22 @@ bool IsCreditBindingVersion(int32_t nVersion)
 
 uint256 CreditBindingHash(const CTransaction& tx)
 {
+    // Stage 0 rule A: one tx's binding is wanted several times (the early input-script check's precomputed data, then
+    // each payload digest: Stage 0 C1's CreditTxSigHash, then the full input check), and it decodes and re-serializes
+    // the payload. A small per-thread cache keyed by txid (which commits to the op, the payload and the annex).
+    static thread_local std::pair<uint256, uint256> s_cache[4];
+    static thread_local unsigned int s_next = 0;
+    const uint256& txid = tx.GetHash();
+    for (const auto& e : s_cache)
+        if (!e.first.IsNull() && e.first == txid)
+            return e.second;
+    const uint256 hash = CreditBindingHashUncached(tx);
+    s_cache[s_next++ % 4] = std::make_pair(txid, hash);
+    return hash;
+}
+
+uint256 CreditBindingHashUncached(const CTransaction& tx)
+{
     CHashWriter ss(SER_GETHASH, 0);
     switch (tx.nVersion) {
     case TRANSACTION_BILL_VERSION: ss << tx.nBillOp; BindBill(ss, tx.nBillOp, tx.vchBillPayload); break;

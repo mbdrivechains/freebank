@@ -47,6 +47,23 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
 
 BOOST_FIXTURE_TEST_SUITE(house_tests, BasicTestingSetup)
 
+// Stage 0 C1 shim for the digest tests: a house tx whose input is hp and whose output pays a script made from ho,
+// carrying the payload (C1 digests take the whole transaction).
+template <typename P>
+static CTransaction C1HouseTx(uint8_t nOp, const P& p, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_HOUSE_VERSION;
+    m.nHouseOp = nOp;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(1000, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    m.vchHousePayload.assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+static CTransaction C1HouseTx(const uint256& hp, const uint256& ho) { return C1HouseTx(HOUSE_OP_TOPUP, HouseTopup(), hp, ho); }
+
 // Build a fully valid REGISTER tx for nPartners partners at the given tier
 static CMutableTransaction MakeRegisterTx(HouseRegister& regOut, std::vector<CKey>& vKey,
                                           uint8_t nTier, uint32_t nThresholdM, size_t nPartners,
@@ -130,11 +147,12 @@ BOOST_AUTO_TEST_CASE(house_sighash_domain_separation)
     std::vector<uint256> v;
     v.push_back(HouseRegisterSigHash(h, 0, 1000));
     const uint256 ins = uint256S("bb");   // S1X-16: the four approval digests bind the inputs
-    v.push_back(HouseTopupSigHash(h, 0, ins, h));
+    const CTransaction t0 = C1HouseTx(ins, outs);   // Stage 0 C1: the tx-class digests take the whole tx
+    v.push_back(HouseTopupSigHash(t0, h));
     v.push_back(HouseAdmitSigHash(h, pk, 1000, 500));
-    v.push_back(HouseExitSigHash(h, 0, ins, outs));
-    v.push_back(HouseWinddownSigHash(h, ins, outs));
-    v.push_back(HouseReclaimSigHash(h, 0, ins, h));
+    v.push_back(HouseExitSigHash(t0, h));
+    v.push_back(HouseWinddownSigHash(t0, h));
+    v.push_back(HouseReclaimSigHash(t0, h));
 
     for (size_t i = 0; i < v.size(); i++) {
         for (size_t j = i + 1; j < v.size(); j++)
@@ -142,16 +160,18 @@ BOOST_AUTO_TEST_CASE(house_sighash_domain_separation)
     }
 
     // And distinct from the bill domain (same-family escrow scripts)
-    BOOST_CHECK(HouseWinddownSigHash(h, ins, outs) != HouseExitSigHash(h, 0, ins, outs));
+    BOOST_CHECK(HouseWinddownSigHash(t0, h) != HouseExitSigHash(t0, h));
 
-    // Exit/winddown sighashes must actually vary with the output set (freshness)
-    BOOST_CHECK(HouseExitSigHash(h, 0, ins, outs) != HouseExitSigHash(h, 0, ins, uint256S("dd")));
-    BOOST_CHECK(HouseWinddownSigHash(h, ins, outs) != HouseWinddownSigHash(h, ins, uint256S("dd")));
-    // S1X-16: and with the inputs (no replay by whoever funds the same outputs), and the admit with its expiry
-    BOOST_CHECK(HouseExitSigHash(h, 0, ins, outs) != HouseExitSigHash(h, 0, uint256S("dd"), outs));
-    BOOST_CHECK(HouseWinddownSigHash(h, ins, outs) != HouseWinddownSigHash(h, uint256S("dd"), outs));
-    BOOST_CHECK(HouseTopupSigHash(h, 0, ins, outs) != HouseTopupSigHash(h, 0, uint256S("dd"), outs));
-    BOOST_CHECK(HouseReclaimSigHash(h, 0, ins, outs) != HouseReclaimSigHash(h, 0, uint256S("dd"), outs));
+    // Exit/winddown digests vary with the output set (freshness), the inputs (S1X-16: no replay by whoever funds the
+    // same outputs) and the house's canonical id
+    const CTransaction tOut = C1HouseTx(ins, uint256S("dd")), tIn = C1HouseTx(uint256S("dd"), outs);
+    BOOST_CHECK(HouseExitSigHash(t0, h) != HouseExitSigHash(tOut, h));
+    BOOST_CHECK(HouseWinddownSigHash(t0, h) != HouseWinddownSigHash(tOut, h));
+    BOOST_CHECK(HouseExitSigHash(t0, h) != HouseExitSigHash(tIn, h));
+    BOOST_CHECK(HouseWinddownSigHash(t0, h) != HouseWinddownSigHash(tIn, h));
+    BOOST_CHECK(HouseTopupSigHash(t0, h) != HouseTopupSigHash(tIn, h));
+    BOOST_CHECK(HouseReclaimSigHash(t0, h) != HouseReclaimSigHash(tIn, h));
+    BOOST_CHECK(HouseReclaimSigHash(t0, h) != HouseReclaimSigHash(t0, uint256S("ab")));
     BOOST_CHECK(HouseAdmitSigHash(h, pk, 1000, 500) != HouseAdmitSigHash(h, pk, 1000, 501));
 }
 
@@ -1021,13 +1041,24 @@ BOOST_AUTO_TEST_CASE(house_attest_hash_helpers)
     const uint256 ps = HouseAttestProofSetHash({p1});
     const uint256 ho = uint256S("ee");
     const uint256 hp = uint256S("dd");
-    const uint256 sh = HouseAttestSigHash(houseA, 100, 5000, ps, hp, ho);
-    BOOST_CHECK(sh != HouseAttestSigHash(houseB, 100, 5000, ps, hp, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 101, 5000, ps, hp, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5001, ps, hp, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, HouseAttestProofSetHash({p3}), hp, ho));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, ps, hp, uint256S("ef")));
-    BOOST_CHECK(sh != HouseAttestSigHash(houseA, 100, 5000, ps, uint256S("de"), ho));   // S1X-35: the prevouts
+    (void)ps;
+    // Stage 0 C1: the payload's fields (as-of, reserves, the proof set without its signatures), the inputs (S1X-35), the
+    // outputs and the house's canonical id
+    HouseAttest a0;
+    a0.nAsOfHeight = 100;
+    a0.amountReserves = 5000;
+    a0.vProofs = {p1};
+    auto fnSh = [&](const HouseAttest& a, const uint256& hpx, const uint256& hox, const uint256& id) {
+        return HouseAttestSigHash(C1HouseTx(HOUSE_OP_ATTEST, a, hpx, hox), id);
+    };
+    const uint256 sh = fnSh(a0, hp, ho, houseA);
+    BOOST_CHECK(sh != fnSh(a0, hp, ho, houseB));
+    { HouseAttest a = a0; a.nAsOfHeight = 101; BOOST_CHECK(sh != fnSh(a, hp, ho, houseA)); }
+    { HouseAttest a = a0; a.amountReserves = 5001; BOOST_CHECK(sh != fnSh(a, hp, ho, houseA)); }
+    { HouseAttest a = a0; a.vProofs = {p3}; BOOST_CHECK(sh != fnSh(a, hp, ho, houseA)); }
+    { HouseAttest a = a0; a.vProofs = {p2}; BOOST_CHECK(sh == fnSh(a, hp, ho, houseA)); }   // a proof's own sig is stripped
+    BOOST_CHECK(sh != fnSh(a0, hp, uint256S("ef"), houseA));
+    BOOST_CHECK(sh != fnSh(a0, uint256S("de"), ho, houseA));   // S1X-35: the prevouts
 }
 
 // Build a shape-valid ATTEST tx around the given payload
@@ -1159,6 +1190,21 @@ static bool GuardNoBlock(uint32_t, uint256&) { return false; }
 
 // An effectively-OPEN multi-partner house: fresh attestation, ample reserves,
 // no stress, not deferring. Partner 0 ACTIVE, partner 1 TAIL and past unlock.
+/** Stage 0 rule A: a tail RECLAIM's signature is checked before its capital read, so a cap case signs: as the guard house's
+ *  tail partner (partner 1), this key. */
+static const CKey& GuardTailKey()
+{
+    static CKey key;
+    if (!key.IsValid())
+        key.MakeNewKey(true);
+    return key;
+}
+static std::vector<unsigned char> GuardTailPub()
+{
+    const CPubKey pub = GuardTailKey().GetPubKey();
+    return std::vector<unsigned char>(pub.begin(), pub.end());
+}
+
 static CHouse MakeGuardHouse()
 {
     CHouse house;
@@ -1180,6 +1226,7 @@ static CHouse MakeGuardHouse()
     p0.status = HOUSE_PARTNER_ACTIVE;
 
     HousePartner p1 = p0;
+    p1.vchPubKey = GuardTailPub();   // Stage 0 rule A: MakeReclaimTx(..., &houseID) signs as this partner
     p1.vOutPledge.clear();
     p1.vOutPledge.push_back(COutPoint(uint256S("a1"), 0));
     p1.status = HOUSE_PARTNER_TAIL;
@@ -1198,7 +1245,8 @@ static Coin GuardEscrowCoin(uint32_t nHouseID, CAmount v)
     return coin;
 }
 
-static CMutableTransaction MakeReclaimTx(uint32_t nHouseID, uint32_t nPartnerIdx, const COutPoint& spend)
+static CMutableTransaction MakeReclaimTx(uint32_t nHouseID, uint32_t nPartnerIdx, const COutPoint& spend,
+                                         const uint256* pSignForHouseID = nullptr)
 {
     HouseReclaim rec;
     rec.nHouseID = nHouseID;
@@ -1207,11 +1255,18 @@ static CMutableTransaction MakeReclaimTx(uint32_t nHouseID, uint32_t nPartnerIdx
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_HOUSE_VERSION;
     mtx.nHouseOp = HOUSE_OP_RECLAIM;
+    mtx.vin.push_back(CTxIn(spend));
+    mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
+    if (pSignForHouseID) {   // signed as the guard house's tail partner (GuardTailKey), Stage 0 C1: the whole tx
+        rec.vchSig.clear();
+        CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION);
+        ss0 << rec;
+        mtx.vchHousePayload = std::vector<unsigned char>(ss0.begin(), ss0.end());
+        BOOST_REQUIRE(GuardTailKey().Sign(HouseReclaimSigHash(CTransaction(mtx), *pSignForHouseID), rec.vchSig));
+    }
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << rec;
     mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
-    mtx.vin.push_back(CTxIn(spend));
-    mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
     return mtx;
 }
 
@@ -1294,8 +1349,8 @@ BOOST_AUTO_TEST_CASE(s1x_17_exit_takes_exactly_one_authorisation_form)
         HouseExit ex;
         ex.nHouseID = house.nHouseID;
         ex.nPartnerIndex = 2;
-        BOOST_REQUIRE(keys[2].Sign(HouseExitSigHash(house.houseID, 2, BillHashPrevouts(CTransaction(mtx)),   // S1X-16b
-                                                    BillHashOutputs(CTransaction(mtx))), ex.vchPartnerSig));
+        { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << ex; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+        BOOST_REQUIRE(keys[2].Sign(HouseExitSigHash(CTransaction(mtx), house.houseID), ex.vchPartnerSig));
         if (fJunkApprover) {   // what a relayer adds: unsigned by anyone, never checked
             ex.vApproverIndex.push_back(0);
             ex.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
@@ -1362,7 +1417,8 @@ BOOST_AUTO_TEST_CASE(house_op_status_guards)
         mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
         def.vApproverIndex.push_back(0);
         std::vector<unsigned char> vchSig;
-        BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)), vchSig));
+        { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << def; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+        BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(CTransaction(mtx), house.houseID), vchSig));
         def.vApproverSig.push_back(vchSig);
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << def;
         mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
@@ -1442,14 +1498,9 @@ BOOST_AUTO_TEST_CASE(house_release_renew_sighash_prevouts_binding)
     const uint256 pvA = uint256S("11");
     const uint256 pvB = uint256S("22");
 
-    BOOST_CHECK(HouseReleaseSigHash(id, pvA, outs) == HouseReleaseSigHash(id, pvA, outs));
-    BOOST_CHECK(HouseReleaseSigHash(id, pvA, outs) != HouseReleaseSigHash(id, pvB, outs));
-
-    // RENEW's index resets to 0 every episode, so the prevouts are what
-    // distinguish one episode's approval from a later one's.
-    BOOST_CHECK(HouseRenewSigHash(id, 0, pvA, outs) != HouseRenewSigHash(id, 0, pvB, outs));
-    // Domain separation between the two ops holds too.
-    BOOST_CHECK(HouseReleaseSigHash(id, pvA, outs) != HouseRenewSigHash(id, 0, pvA, outs));
+    BOOST_CHECK(HouseReleaseSigHash(C1HouseTx(pvA, outs), id) == HouseReleaseSigHash(C1HouseTx(pvA, outs), id));
+    BOOST_CHECK(HouseReleaseSigHash(C1HouseTx(pvA, outs), id) != HouseReleaseSigHash(C1HouseTx(pvB, outs), id));
+    // (RENEW is retired; Stage 0 C4 removed its digest.)
 }
 
 //
@@ -2138,7 +2189,8 @@ BOOST_AUTO_TEST_CASE(testing_ur3_3_stale_prior_does_not_ban_in_mempool)
     mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
     def.vApproverIndex.push_back(0);
     std::vector<unsigned char> vchSig;
-    BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(house.houseID, def.nPrevLastActivation, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)), vchSig));
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << def; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+    BOOST_REQUIRE(keyPartner.Sign(HouseDeferSigHash(CTransaction(mtx), house.houseID), vchSig));
     def.vApproverSig.push_back(vchSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << def;
@@ -2342,10 +2394,8 @@ CMutableTransaction URX12Attest(const CHouse& house, uint32_t nHeight, const CKe
     att.amountReserves = 0;   // zero reserves: the floor is 0 when nothing is minted
     CMutableTransaction mtx = MakeAttestTx(att);
     att.vApproverIndex.push_back(0);
-    att.vApproverSig.push_back(URX12Sign(key, HouseAttestSigHash(house.houseID, att.nAsOfHeight, att.amountReserves,
-                                                                 HouseAttestProofSetHash(att.vProofs),
-                                                                 NoteHashPrevouts(CTransaction(mtx)),
-                                                                 BillHashOutputs(mtx))));
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << att; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+    att.vApproverSig.push_back(URX12Sign(key, HouseAttestSigHash(CTransaction(mtx), house.houseID)));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << att;
     mtx.vchHousePayload.assign(ss.begin(), ss.end());
@@ -2368,9 +2418,8 @@ CMutableTransaction URX12Defer(const CHouse& house, const CKey& key)
     mtx.vout.push_back(CTxOut(std::max<CAmount>(house.amountLastAttestReserves, 1000), HouseEscrowScript(house.houseID)));
     mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
     def.vApproverIndex.push_back(0);
-    def.vApproverSig.push_back(URX12Sign(key, HouseDeferSigHash(house.houseID, def.nPrevLastActivation,
-                                                                NoteHashPrevouts(CTransaction(mtx)),
-                                                                BillHashOutputs(mtx))));
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << def; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+    def.vApproverSig.push_back(URX12Sign(key, HouseDeferSigHash(CTransaction(mtx), house.houseID)));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << def;
     mtx.vchHousePayload.assign(ss.begin(), ss.end());
@@ -2543,43 +2592,43 @@ URX13Set URX13HouseDigests()
     const CTransaction tx{CMutableTransaction()};
     URX13Set v;
     v.push_back({"HouseRegisterSigHash", [] { return HouseRegisterSigHash(URX13_ID, 0, 100000); }});
-    v.push_back({"HouseTopupSigHash", [] { return HouseTopupSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseTopupSigHash", [tx] { return HouseTopupSigHash(tx, URX13_ID); }});
     v.push_back({"HouseAdmitSigHash", [] { return HouseAdmitSigHash(URX13_ID, URX13_PUB, 100000, 500); }});
-    v.push_back({"HouseExitSigHash", [] { return HouseExitSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
-    v.push_back({"HouseWinddownSigHash", [] { return HouseWinddownSigHash(URX13_ID, URX13_HP, URX13_HO); }});
-    v.push_back({"HouseReclaimSigHash", [] { return HouseReclaimSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
-    v.push_back({"HouseDeferSigHash", [] { return HouseDeferSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
-    v.push_back({"HouseRenewSigHash", [] { return HouseRenewSigHash(URX13_ID, 0, URX13_HP, URX13_HO); }});
-    v.push_back({"HouseReleaseSigHash", [] { return HouseReleaseSigHash(URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"HouseExitSigHash", [tx] { return HouseExitSigHash(tx, URX13_ID); }});
+    v.push_back({"HouseWinddownSigHash", [tx] { return HouseWinddownSigHash(tx, URX13_ID); }});
+    v.push_back({"HouseReclaimSigHash", [tx] { return HouseReclaimSigHash(tx, URX13_ID); }});
+    v.push_back({"HouseDeferSigHash", [tx] { return HouseDeferSigHash(tx, URX13_ID); }});
+    v.push_back({"HouseReleaseSigHash", [tx] { return HouseReleaseSigHash(tx, URX13_ID); }});
     v.push_back({"HouseMemberSigHash",
-                 [] { return HouseMemberSigHash(URX13_ID, HOUSE_OP_MEMBER_ADD, HouseMemberOp(), URX13_HP); }});
-    v.push_back({"HouseRateSigHash", [tx] { return HouseRateSigHash(1, tx, HouseRate()); }});
-    v.push_back({"HouseCharterSigHash", [tx] { return HouseCharterSigHash(1, tx, HouseCharter()); }});
-    v.push_back({"HouseAttestSigHash", [] { return HouseAttestSigHash(URX13_ID, 100, 100000, URX13_HP, URX13_HP, URX13_HO); }});
+                 [tx] { return HouseMemberSigHash(tx, URX13_ID); }});
+    v.push_back({"HouseRateSigHash", [tx] { return HouseRateSigHash(tx); }});
+    v.push_back({"HouseCharterSigHash", [tx] { return HouseCharterSigHash(tx); }});
+    v.push_back({"HouseAttestSigHash", [tx] { return HouseAttestSigHash(tx, URX13_ID); }});
     return v;
 }
 
 URX13Set URX13OtherDigests()
 {
+    const CTransaction tx{CMutableTransaction()};   // Stage 0 C1 digests take the tx
     const std::vector<uint64_t> vUnits{100};
     URX13Set v;
     v.push_back({"BillIssueSigHash", [] {
         return BillIssueSigHash(URX13_ID, 10000, 546, 8000, 144, URX13_PUB, URX13_PUB2, URX13_PUB, 5); }});
     v.push_back({"BillEndorseSigHash", [] { return BillEndorseSigHash(URX13_ID, URX13_PUB, URX13_PUB, 100, 0); }});
-    v.push_back({"BillRetireSigHash", [] { return BillRetireSigHash(URX13_ID, 1000, URX13_HP, URX13_HO, false); }});
-    v.push_back({"BillClaimSigHash", [] { return BillClaimSigHash(URX13_ID, URX13_HP, URX13_HO, false); }});
-    v.push_back({"DepositTransferSigHash", [] { return DepositTransferSigHash(1, 100000, 500, 8000, 100, URX13_HO); }});
-    v.push_back({"DepositWithdrawSigHash", [] { return DepositWithdrawSigHash(1, 100000, 8000, 100, URX13_HO); }});
-    v.push_back({"DepositClaimSigHash", [] { return DepositClaimSigHash(1, 100000, URX13_HO); }});
+    v.push_back({"BillRetireSigHash", [tx] { return BillRetireSigHash(tx, URX13_ID, false); }});
+    v.push_back({"BillClaimSigHash", [tx] { return BillClaimSigHash(tx, URX13_ID, false); }});
+    v.push_back({"DepositTransferSigHash", [tx] { return DepositTransferSigHash(tx); }});   // Stage 0 C1
+    v.push_back({"DepositWithdrawSigHash", [tx] { return DepositWithdrawSigHash(tx); }});
+    v.push_back({"DepositClaimSigHash", [tx] { return DepositClaimSigHash(tx); }});
     v.push_back({"DepositPreAuthSigHash",
-                 [] { return DepositPreAuthSigHash(1, 100000, 500, 8000, 100, URX13_SCRIPT); }});
-    v.push_back({"DepositProtestSigHash", [] { return DepositProtestSigHash(1, 100000, 100, 0, URX13_HO); }});
-    v.push_back({"NoteTransferSigHash", [vUnits] { return NoteTransferSigHash(1, vUnits, URX13_HO); }});
-    v.push_back({"NoteRedeemSigHash", [] { return NoteRedeemSigHash(1, 100, URX13_HO); }});
-    v.push_back({"NoteClaimSigHash", [] { return NoteClaimSigHash(1, 100, URX13_HO); }});
-    v.push_back({"NoteDemandSigHash", [vUnits] { return NoteDemandSigHash(1, vUnits, URX13_HO); }});
+                 [] { return DepositPreAuthSigHash(1, 100000, 500, 8000, 100, URX13_SCRIPT, uint256S("d1d")); }});
+    v.push_back({"DepositProtestSigHash", [tx] { return DepositProtestSigHash(tx); }});
+    v.push_back({"NoteTransferSigHash", [tx] { return NoteTransferSigHash(tx); }});   // Stage 0 C1
+    v.push_back({"NoteRedeemSigHash", [tx] { return NoteRedeemSigHash(tx); }});
+    v.push_back({"NoteClaimSigHash", [tx] { return NoteClaimSigHash(tx); }});
+    v.push_back({"NoteDemandSigHash", [tx] { return NoteDemandSigHash(tx); }});
     v.push_back({"NotePreAuthSigHash", [vUnits] { return NotePreAuthSigHash(1, vUnits, URX13_SCRIPT, uint256()); }});
-    v.push_back({"NoteProtestSigHash", [vUnits] { return NoteProtestSigHash(1, vUnits, URX13_HO); }});
+    v.push_back({"NoteProtestSigHash", [tx] { return NoteProtestSigHash(tx); }});
     v.push_back({"TokenClaimSigHash", [] {
         return TokenClaimSigHash(1, uint256S("7713"), URX13_SCRIPT, 10, URX13_SCRIPT); }});
     return v;
@@ -2592,27 +2641,27 @@ URX13Set URX13BoundDigests()
     const CTransaction tx{CMutableTransaction()};
     const std::vector<uint64_t> vUnits{100};
     URX13Set v;
-    v.push_back({"BillDiscountSigHash", [] { return BillDiscountSigHash(BillDiscount(), URX13_ID, URX13_HP, URX13_HO); }});
-    v.push_back({"BillRecourseSigHash", [] { return BillRecourseSigHash(BillRecourse(), URX13_ID, URX13_HP, URX13_HO); }});
+    v.push_back({"BillDiscountSigHash", [tx] { return BillDiscountSigHash(tx, URX13_ID); }});
+    v.push_back({"BillRecourseSigHash", [tx] { return BillRecourseSigHash(tx, URX13_ID); }});
     v.push_back({"BillHRetireNotesSigHash",
-                 [] { return BillHRetireNotesSigHash(BillHRetireNotes(), URX13_ID, URX13_HP, URX13_HO); }});
+                 [tx] { return BillHRetireNotesSigHash(tx, URX13_ID); }});
     v.push_back({"BillHRetireEscrowSigHash",
-                 [] { return BillHRetireEscrowSigHash(BillHRetireNotes(), URX13_ID, URX13_HP, URX13_HO); }});
+                 [tx] { return BillHRetireEscrowSigHash(tx, URX13_ID); }});
     v.push_back({"DepositOriginateSigHash",
-                 [] { return DepositOriginateSigHash(1, {100000}, {500}, {8000}, URX13_HP, URX13_HO); }});
-    v.push_back({"NoteMintSigHash", [vUnits] { return NoteMintSigHash(1, vUnits, URX13_HP, URX13_HO); }});
-    v.push_back({"NoteLockSigHash", [] { return NoteLockSigHash(1, 100, {}, URX13_HP, URX13_HO); }});
-    v.push_back({"NoteUnlockSigHash", [vUnits] { return NoteUnlockSigHash(1, vUnits, URX13_HP, URX13_HO); }});
-    v.push_back({"NoteSwapSigHash", [tx] { return NoteSwapSigHash(NoteSwap(), tx); }});
-    v.push_back({"PoolCreateSigHash", [] { return PoolCreateSigHash(1, 30, 1000, 1000, 0, URX13_HP, URX13_HO); }});
-    v.push_back({"PoolAddLiqSigHash", [] { return PoolAddLiqSigHash(PoolAddLiq(), URX13_HP, URX13_HO); }});
-    v.push_back({"PoolRemoveLiqSigHash", [] { return PoolRemoveLiqSigHash(PoolRemoveLiq(), URX13_HP, URX13_HO); }});
-    v.push_back({"PoolSwapSigHash", [] { return PoolSwapSigHash(PoolSwap(), URX13_HP, URX13_HO); }});
-    v.push_back({"PoolRetireSigHash", [] { return PoolRetireSigHash(PoolRetire(), URX13_HP, URX13_HO); }});
-    v.push_back({"SettleExchangeSigHash", [] { return SettleExchangeSigHash(SettleExchange(), URX13_HP, URX13_HO); }});
-    v.push_back({"SettleNetSigHash", [] { return SettleNetSigHash(SettleNet(), URX13_HP, URX13_HO); }});
-    v.push_back({"TokenKeysetSigHash", [] { return TokenKeysetSigHash(NoteTokenKeyset(), URX13_HP); }});
-    v.push_back({"TokenPostSigHash", [] { return TokenPostSigHash(NoteTokenPost(), URX13_HP); }});
+                 [tx] { return DepositOriginateSigHash(tx); }});   // Stage 0 C1
+    v.push_back({"NoteMintSigHash", [tx] { return NoteMintSigHash(tx); }});
+    v.push_back({"NoteLockSigHash", [tx] { return NoteLockSigHash(tx); }});
+    v.push_back({"NoteUnlockSigHash", [tx] { return NoteUnlockSigHash(tx); }});
+    v.push_back({"NoteSwapSigHash", [tx] { return NoteSwapSigHash(tx); }});
+    v.push_back({"PoolCreateSigHash", [tx] { return PoolCreateSigHash(tx); }});
+    v.push_back({"PoolAddLiqSigHash", [tx] { return PoolAddLiqSigHash(tx); }});
+    v.push_back({"PoolRemoveLiqSigHash", [tx] { return PoolRemoveLiqSigHash(tx); }});
+    v.push_back({"PoolSwapSigHash", [tx] { return PoolSwapSigHash(tx); }});
+    v.push_back({"PoolRetireSigHash", [tx] { return PoolRetireSigHash(tx); }});
+    v.push_back({"SettleExchangeSigHash", [tx] { return SettleExchangeSigHash(tx); }});
+    v.push_back({"SettleNetSigHash", [tx] { return SettleNetSigHash(tx); }});
+    v.push_back({"TokenKeysetSigHash", [tx] { return TokenKeysetSigHash(tx); }});
+    v.push_back({"TokenPostSigHash", [tx] { return TokenPostSigHash(tx); }});
     v.push_back({"IssuedSigHash", [tx] { return IssuedSigHash(tx); }});
     // S1X-11: the reserve-proof challenge and the proof-set hash carry the network too.
     v.push_back({"HouseAttestChallenge", [] { return HouseAttestChallenge(URX13_ID, 100, URX13_HP, COutPoint(URX13_HO, 1)); }});
@@ -3160,7 +3209,8 @@ BOOST_AUTO_TEST_CASE(s2x_6_winddown_refused_while_a_swap_shortfall_is_live)
             mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
             wd.vApproverIndex.push_back(0);
             std::vector<unsigned char> vchSig;
-            BOOST_REQUIRE(keyPartner.Sign(HouseWinddownSigHash(house.houseID, BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)), vchSig));
+            { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << wd; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+            BOOST_REQUIRE(keyPartner.Sign(HouseWinddownSigHash(CTransaction(mtx), house.houseID), vchSig));
             wd.vApproverSig.push_back(vchSig);
             CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << wd;
             mtx.vchHousePayload = std::vector<unsigned char>(ss.begin(), ss.end());
@@ -3228,7 +3278,7 @@ BOOST_AUTO_TEST_CASE(s1x_6_reclaim_counts_a_live_shortfall_against_the_capital)
             if (o == COutPoint(uint256S("a1"), 0)) { coin = GuardEscrowCoin(house.nHouseID, HOUSE_MIN_PLEDGE); return true; }
             return false;
         };
-        CMutableTransaction mtx = MakeReclaimTx(house.nHouseID, 1, COutPoint(uint256S("a1"), 0));
+        CMutableTransaction mtx = MakeReclaimTx(house.nHouseID, 1, COutPoint(uint256S("a1"), 0), &house.houseID);
         CValidationState state; CHouse houseOut;
         CheckHouseOperation(CTransaction(mtx), state, H, fnGetHouse, GuardNoHash, GuardNoClass, fnGetCoin, GuardNoBlock,
                             houseOut);
@@ -3238,8 +3288,9 @@ BOOST_AUTO_TEST_CASE(s1x_6_reclaim_counts_a_live_shortfall_against_the_capital)
                                 "tail partner's pledge left a house whose capital covers 90,000 minted only if what it "
                                 "still owes is ignored (went on to: " + (strReason.empty() ? std::string("accepted") : strReason) + ")");
         else
-            BOOST_CHECK_MESSAGE(strReason == "bad-house-reclaim-sig", std::string("S1X-6 RECLAIM control (") + c.name +
-                                "): want the placeholder-signature refusal after the cap, got " + strReason);
+            // Stage 0 rule A: the partner's signature comes first now, so the case signs; nothing owed, the RECLAIM passes
+            BOOST_CHECK_MESSAGE(strReason.empty(), std::string("S1X-6 RECLAIM control (") + c.name +
+                                "): want the signed RECLAIM to pass the cap, got " + strReason);
     }
     g_fnCapitalForChecksTestOverride = fnPrev;
 }
@@ -3364,8 +3415,8 @@ CMutableTransaction S1X3Release(const CHouse& house, const CKey& key)
     HouseRelease rel;
     rel.nHouseID = house.nHouseID;
     rel.vApproverIndex.push_back(0);
-    rel.vApproverSig.push_back(URX12Sign(key, HouseReleaseSigHash(house.houseID, NoteHashPrevouts(CTransaction(mtx)),
-                                                                   BillHashOutputs(mtx))));
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << rel; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1: sign the finished tx
+    rel.vApproverSig.push_back(URX12Sign(key, HouseReleaseSigHash(CTransaction(mtx), house.houseID)));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << rel;
     mtx.vchHousePayload.assign(ss.begin(), ss.end());
@@ -3919,32 +3970,7 @@ BOOST_AUTO_TEST_CASE(s1x_16a_admit_approval_expires)
 // signature; the same ops signed over their own inputs are accepted).
 // ===========================================================================
 namespace {
-template <typename H>
-auto Run4AttestDigestImpl(const uint256& id, uint32_t nAsOf, const CAmount& amount, const H& proofs, const H& prevouts,
-                          const H& outputs, int) -> decltype(HouseAttestSigHash(id, nAsOf, amount, proofs, prevouts, outputs))
-{
-    return HouseAttestSigHash(id, nAsOf, amount, proofs, prevouts, outputs);
-}
-template <typename H>
-auto Run4AttestDigestImpl(const uint256& id, uint32_t nAsOf, const CAmount& amount, const H& proofs, const H& prevouts,
-                          const H& outputs, long) -> decltype(HouseAttestSigHash(id, nAsOf, amount, proofs, outputs))
-{
-    (void)prevouts;
-    return HouseAttestSigHash(id, nAsOf, amount, proofs, outputs);
-}
-template <typename H>
-auto Run4DeferDigestImpl(const uint256& id, uint32_t nPrev, const H& prevouts, const H& outputs, int)
-    -> decltype(HouseDeferSigHash(id, nPrev, prevouts, outputs))
-{
-    return HouseDeferSigHash(id, nPrev, prevouts, outputs);
-}
-template <typename H>
-auto Run4DeferDigestImpl(const uint256& id, uint32_t nPrev, const H& prevouts, const H& outputs, long)
-    -> decltype(HouseDeferSigHash(id, nPrev, outputs))
-{
-    (void)prevouts;
-    return HouseDeferSigHash(id, nPrev, outputs);
-}
+// Stage 0 C1: the ATTEST and DEFER approvers sign the whole transaction (HouseAttestSigHash / HouseDeferSigHash(tx, id)).
 
 // The ATTEST payload a wallet builds for `house` at nHeight (zero reserves; as-of nHeight - 1), priors from `house`.
 HouseAttest Run4AttestPayload(const CHouse& house, uint32_t nHeight)
@@ -3976,10 +4002,8 @@ CMutableTransaction Run4AttestTx(const CHouse& house, HouseAttest att, const COu
     mtx.vin.push_back(CTxIn(funding));
     if (fSign) {
         att.vApproverIndex.assign(1, 0);
-        att.vApproverSig.assign(1, URX12Sign(key, Run4AttestDigestImpl(house.houseID, att.nAsOfHeight, att.amountReserves,
-                                                                         HouseAttestProofSetHash(att.vProofs),
-                                                                         NoteHashPrevouts(CTransaction(mtx)),
-                                                                         BillHashOutputs(mtx), 0)));
+        { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << att; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }
+        att.vApproverSig.assign(1, URX12Sign(key, HouseAttestSigHash(CTransaction(mtx), house.houseID)));
     }
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << att;
@@ -4006,9 +4030,8 @@ CMutableTransaction Run4DeferTx(const CHouse& house, const COutPoint& funding, c
     mtx.vout.push_back(CTxOut(1 * COIN, GetScriptForDestination(CKeyID())));
     if (fSign) {
         def.vApproverIndex.assign(1, 0);
-        def.vApproverSig.assign(1, URX12Sign(key, Run4DeferDigestImpl(house.houseID, def.nPrevLastActivation,
-                                                                       NoteHashPrevouts(CTransaction(mtx)),
-                                                                       BillHashOutputs(mtx), 0)));
+        { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << def; mtx.vchHousePayload.assign(s0.begin(), s0.end()); }
+        def.vApproverSig.assign(1, URX12Sign(key, HouseDeferSigHash(CTransaction(mtx), house.houseID)));
     } else {
         HouseDefer from;
         CDataStream ssFrom(pSigFrom->vchHousePayload, SER_NETWORK, PROTOCOL_VERSION);
@@ -4212,6 +4235,23 @@ BOOST_AUTO_TEST_CASE(s1x_50_a_failed_house_can_always_close_through_standard_rel
         BOOST_CHECK_MESSAGE(fAny, strprintf("S1X-50 %s (%s): no CLOSE is both valid and standard: %s", c.name, strShape,
                                             strReport));
     }
+}
+
+// S1X-50, the residual settle (testing 2026-11-26; security 11-26 Medium): a RECLAIM at an insolvent house pays each
+// partner's pinned share at P2PKH exactly, the same as CLOSE, so a share below dust made it non-standard too. A
+// policy-level check (the consensus side of RECLAIM is unchanged): a RECLAIM carrying a 300-sat P2PKH share must pass
+// AreFreeBankOutputsStandard. FAILS on master 7f65d2e ("dust").
+BOOST_AUTO_TEST_CASE(s1x_50_a_residual_settle_with_a_sub_dust_share_is_standard)
+{
+    CMutableTransaction mtx = MakeReclaimTx(7, 1, COutPoint(uint256S("a1"), 0));
+    CKey k;
+    k.MakeNewKey(true);
+    const CPubKey pub = k.GetPubKey();
+    mtx.vout.insert(mtx.vout.begin(), CTxOut(300, NoteScriptForPubKey(std::vector<unsigned char>(pub.begin(), pub.end()))));
+    std::string strReason;
+    const bool fStandard = AreFreeBankOutputsStandard(CTransaction(mtx), strReason);
+    BOOST_CHECK_MESSAGE(fStandard, "S1X-50: a residual-settle RECLAIM with a 300-sat partner share is non-standard (" +
+                                   strReason + "), so stock nodes never relay it");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

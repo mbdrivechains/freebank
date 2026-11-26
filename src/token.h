@@ -32,6 +32,8 @@
 #include <set>
 #include <vector>
 
+class CTransaction;   // Stage 0 C1: the token digests take the whole tx
+
 static const uint8_t NOTE_OP_TOKEN_KEYSET  = 9;
 static const uint8_t NOTE_OP_TOKEN_POST    = 10;
 static const uint8_t NOTE_OP_TOKEN_CLAIM   = 11;
@@ -44,6 +46,14 @@ static const uint8_t MAX_TOKEN_AMOUNT_EXP = 50;
 /** Entries per POST (issued + spent), tokens per CLAIM, claims per COLLECT. */
 static const size_t MAX_TOKEN_POST_ENTRIES = 2000;
 static const size_t MAX_TOKEN_CLAIM_ENTRIES = 64;
+/** Stage 0 rule A (security's ruling 2026-11-26, note 2026-11-26-from-security-stage0-a2-rulings): relay takes a claim of
+ *  at most MAX_TOKEN_CLAIM_ENTRIES_RELAY entries and hashes its secrets within 2 x entries + TOKEN_CLAIM_RELAY_EXTRA_TRIES
+ *  hash-to-curve tries in all: at most 96 tries (about 0.64 ms), and an honest 32-entry claim needs 64 +/- 8, so it is
+ *  essentially never refused. The holder's Cashu wallet makes the secrets (a random one needs 2 tries on average), so
+ *  FreeBank's wallet splits a larger claim at 32. Policy only; consensus keeps 64 entries and 2^16 tries per secret. */
+static const size_t MAX_TOKEN_CLAIM_ENTRIES_RELAY = 32;
+static const uint32_t TOKEN_CLAIM_RELAY_EXTRA_TRIES = 32;
+inline uint32_t TokenClaimRelayTryBudget(size_t nEntries) { return 2 * (uint32_t)nEntries + TOKEN_CLAIM_RELAY_EXTRA_TRIES; }
 /** S4X-1 (security High, Michael 2026-11-23 "Yes, build it"): a house's claim total T. A CLAIM is checked against the
  *  CONFIRMED T only (T <= MAX_TOKEN_CLAIM_CONFIRMED_TOTAL - its sum), and ConnectBlock adds the block's claims at the
  *  flush, which stops with a system error past TOKEN_CLAIM_FLUSH_MAX. The gap between them, 3 x 2^61, is about 96
@@ -298,8 +308,8 @@ uint256 TokenYID(const CPubKey& Y);
 /** The point back from its stored form. */
 CPubKey TokenYPoint(const uint256& y);
 
-uint256 TokenKeysetSigHash(const NoteTokenKeyset& ks, const uint256& hashPrevouts);
-uint256 TokenPostSigHash(const NoteTokenPost& post, const uint256& hashPrevouts);
+uint256 TokenKeysetSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 TokenPostSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 /** What a holder signs with P = B_ - Y: the house, the token, and its payout terms. Not bound to the tx, so any
  *  relayer can carry it; a token can be claimed once, so it can't be replayed. */
 uint256 TokenClaimSigHash(uint32_t nHouseID, const uint256& y, const std::vector<unsigned char>& vchPayoutScript,

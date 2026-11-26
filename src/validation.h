@@ -519,7 +519,13 @@ bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
 
 /** S1X-23 / S1X-24: does tx spend a pooled tx's house-escrow output, or (a note REDEEM or PROTEST) a pooled tx's note
  * output? ATMP refuses it (unconfirmed-credit-parent); UpdateMempoolForReorg drops one already pooled. */
-bool SpendsPooledCreditOutput(const CTransaction& tx, const CTxMemPool& pool);
+bool SpendsPooledCreditOutput(const CTransaction& tx, const CTxMemPool& pool, const CCoinsViewCache* pView = nullptr);
+/** Stage 0 rule A: how many of a tx's leading outputs carry a connect-height stamp the mempool can't know (a fresh note
+ *  DEMAND's note outputs, an ORIGINATE's receipts); kept per pooled tx at admission. */
+uint32_t PooledStampedOutputCount(const CTransaction& parent);
+/** Stage 0 rule B2: a tx's token slots (the issuer's MINT / FREEZE / UNFREEZE of a token; a POST per (house, B) and
+ *  (house, Y); a KEYSET per (house, keyset id)), shared by the block rule and the mempool's identity index. */
+void TokenSlotKeys(const CTransaction& tx, std::vector<uint256>& vKeys);
 
 /** Functions for validating blocks and updating the block tree */
 
@@ -748,7 +754,7 @@ static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
 //! requires less (v1.2.3 and older, and builds before S5X-2) keeps its
 //! withdrawal-bundle and deposit entries but loses its verified-BMM ones, so
 //! those blocks are checked again.
-static const int BMM_CACHE_S5X2_MIN_VERSION = 1020600;
+static const int BMM_CACHE_S5X2_MIN_VERSION = 1020700;
 
 void DumpMainBlockCache();
 

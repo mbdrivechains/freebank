@@ -667,9 +667,8 @@ uint256 BillHashOutputs(const CTransaction& tx);
 /** S1X-17: a hash of every input (prevout, nSequence) and nLockTime, so a bill op's payload signature fixes the whole
  *  transaction even when no input carries a signature (an escrow-only CLAIM, HCLAIM, HRETIRE or HRETIRE_ESCROW). */
 uint256 BillTxBindingHash(const CTransaction& tx);
-uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashTxBinding,
-                          const uint256& hashOutputs, bool fHouseHeld);
-uint256 BillClaimSigHash(const uint256& billID, const uint256& hashTxBinding, const uint256& hashOutputs, bool fHouseHeld);
+uint256 BillRetireSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld);   // Stage 0 C1
+uint256 BillClaimSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld);    // Stage 0 C1
 
 /** SHA256d over every input outpoint of tx - bound into the B1 digests (the R-i6
  * rule: bind prevouts wherever a payload signature authorizes a spend). */
@@ -682,15 +681,11 @@ uint256 BillHashPrevouts(const CTransaction& tx);
 // per op carries every authority: for DISCOUNT the seller AND the house quorum
 // sign the same bytes, so neither side can alter any term after the other signs.
 //
-uint256 BillDiscountSigHash(const BillDiscount& x, const uint256& billID,
-                            const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
-                            const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
-                                const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 BillDiscountSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
+uint256 BillRecourseSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
+uint256 BillHRetireNotesSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
 /** Op 10's digest: op 9's fields under its own tag, so neither op's signature verifies as the other's. */
-uint256 BillHRetireEscrowSigHash(const BillHRetireNotes& x, const uint256& billID,
-                                 const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 BillHRetireEscrowSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
 
 /** The escrow output script: <bill_id> OP_DROP OP_TRUE - open at script
  * layer, locked by the consensus spend rules on fBillEscrow coins. */

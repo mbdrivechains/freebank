@@ -251,6 +251,16 @@ static bool WithChecksView(F fn)
     return fn(view);
 }
 
+/** Stage 0 rule B1: the units as of the block's start (UnitsCheckScope::BlockStart), for W and M. */
+template <typename F>
+static bool WithBlockStartView(F fn)
+{
+    if (const CUnitsView* pView = UnitsCheckScope::BlockStart())
+        return fn(*pView);
+    CUnitsView view(punitsdb.get());
+    return fn(view);
+}
+
 bool HouseRateForChecks(uint32_t nHouseID, int nHeight, uint64_t& nBid, uint64_t& nAsk)
 {
     if (g_nHouseRateTestOverride) {
@@ -494,7 +504,7 @@ bool SwapRecordForChecks(const uint256& hashLock, CSwapRecord& rec)
 uint64_t HousePendingSwapUnitsForChecks(uint32_t nHouseID)
 {
     uint64_t n = 0;
-    WithChecksView([&](const CUnitsView& units) { n = HousePendingSwapUnits(units, nHouseID); return true; });
+    WithBlockStartView([&](const CUnitsView& units) { n = HousePendingSwapUnits(units, nHouseID); return true; });   // Stage 0 B1
     return n;
 }
 
@@ -677,6 +687,6 @@ uint64_t HouseLiveShortfallMg(const CUnitsView& units, uint32_t nHouseID, int64_
 uint64_t HouseLiveShortfallMgForChecks(uint32_t nHouseID, int64_t nClockAt, int64_t nLapseClock)
 {
     uint64_t n = 0;
-    WithChecksView([&](const CUnitsView& units) { n = HouseLiveShortfallMg(units, nHouseID, nClockAt, nLapseClock); return true; });
+    WithBlockStartView([&](const CUnitsView& units) { n = HouseLiveShortfallMg(units, nHouseID, nClockAt, nLapseClock); return true; });   // Stage 0 B1
     return n;
 }

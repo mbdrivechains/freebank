@@ -46,7 +46,7 @@ bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& s
         strReject = "bad-house-rate-nokey";
         return false;
     }
-    if (!FbVerifyStrict(CPubKey(vchKey), HouseRateSigHash(rate.nHouseID, tx, rate), rate.vchRateSig)) {
+    if (!FbVerifyStrict(CPubKey(vchKey), HouseRateSigHash(tx), rate.vchRateSig)) {
         strReject = "bad-house-rate-sig";   // e.g. the SETKEY that made this key the rate key was disconnected
         return false;
     }
@@ -110,7 +110,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             std::vector<unsigned char> vchKey;
             if (!units.Get(RateKeyKey(rate.nHouseID), vchKey))
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-rate-nokey");
-            if (!FbVerifyStrict(CPubKey(vchKey), HouseRateSigHash(rate.nHouseID, tx, rate), rate.vchRateSig))
+            if (!FbVerifyStrict(CPubKey(vchKey), HouseRateSigHash(tx), rate.vchRateSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-sig");
             CChainClock clock;
             if (!GetChainClock(units, clock))
@@ -279,7 +279,17 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-mint-token");
         if (!FbVerifyStrict(CPubKey(token.vchIssuerKey), IssuedSigHash(tx), x.vchIssuerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-mint-sig");
-        if (token.nSupply > (uint64_t)MAX_MONEY - x.nUnits)
+        // Stage 0 rule B (security 11-26): the cap reads the supply as of the block's start, so a same-block BURN (which
+        // takes no slot) can't change this MINT's verdict; a block holds one MINT of a token (the issuer's slot), so the
+        // start's supply is at least the block-so-far's, the stricter read. A token created in this block: the so-far
+        // record.
+        uint64_t nSupplyForCap = token.nSupply;
+        if (const CUnitsView* pStart = UnitsCheckScope::BlockStart()) {
+            CIssuedToken tokenStart;
+            if (pStart->Get(IssuedTokenKey(x.tokenID), tokenStart))
+                nSupplyForCap = std::max(nSupplyForCap, tokenStart.nSupply);
+        }
+        if (nSupplyForCap > (uint64_t)MAX_MONEY - x.nUnits)
             return state.DoS(100, false, REJECT_INVALID, "bad-issued-mint-supply");
         token.nSupply += x.nUnits;
         units.Put(IssuedTokenKey(x.tokenID), token);
@@ -476,11 +486,22 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
 
 // The units view the issuing checks read: ConnectBlock's or the mempool's while a scope is open (UnitsCheckScope).
 static const CUnitsView* g_pUnitsCheckView = nullptr;
+static const CUnitsView* g_pUnitsBlockStartView = nullptr;   // Stage 0 rule B1
 
 bool g_fClockRecordMissing = false;
-UnitsCheckScope::UnitsCheckScope(const CUnitsView* pView) : pPrev(g_pUnitsCheckView) { g_pUnitsCheckView = pView; }
-UnitsCheckScope::~UnitsCheckScope() { g_pUnitsCheckView = pPrev; }
+UnitsCheckScope::UnitsCheckScope(const CUnitsView* pView, const CUnitsView* pBlockStart)
+    : pPrev(g_pUnitsCheckView), pPrevBlockStart(g_pUnitsBlockStartView)
+{
+    g_pUnitsCheckView = pView;
+    g_pUnitsBlockStartView = pBlockStart;
+}
+UnitsCheckScope::~UnitsCheckScope()
+{
+    g_pUnitsCheckView = pPrev;
+    g_pUnitsBlockStartView = pPrevBlockStart;
+}
 const CUnitsView* UnitsCheckScope::Current() { return g_pUnitsCheckView; }
+const CUnitsView* UnitsCheckScope::BlockStart() { return g_pUnitsBlockStartView ? g_pUnitsBlockStartView : g_pUnitsCheckView; }
 
 extern std::unique_ptr<CUnitsDB> punitsdb;
 
@@ -619,6 +640,71 @@ bool HouseCapitalForChecks(const CHouse& house, int nHeight, CAmount amountTillS
     }
     cap.nCapacityMg = (uint64_t)std::min<unsigned __int128>(nCapacity, std::numeric_limits<uint64_t>::max());
     return true;
+}
+
+std::string HouseCapsLogFields(const CHouse& house, int nHeight, CAmount amountTillSats)
+{
+    // testing's FB-6 recomputes the caps from these inputs with its own model (security 11-26: comparing consensus's cap
+    // with consensus's owed would pass a wrong formula, the S1X-9 class). The inputs below are the ones
+    // HouseCapitalForChecks and HouseOwedOutsideNotesMg read; the results are theirs (and CapitalCapUnits' and
+    // TillCapUnits' gross figures), so the two can be compared exactly.
+    const Consensus::GramParams& gp = Params().GetConsensus().GramAt(nHeight);
+    const uint64_t nMaxMultiple = std::max<uint64_t>(1, 10000 / std::max<uint32_t>(1, gp.nCapitalMinBps));
+    CChainClock clock;
+    const bool fClock = ChainClockForChecks(clock);
+    uint64_t nBidMax = 0, nAskMax = 0;
+    const bool fRate = HouseRateMaxForChecks(house.nHouseID, nHeight, 30, nBidMax, nAskMax);
+    const uint32_t nToday = fClock ? RateDayOf(clock.nMonoTime) : 0;
+    std::string strTranches;
+    auto fnTranche = [&](uint32_t nPartner, CAmount amount, uint32_t nStart) {
+        if (amount <= 0)
+            return;
+        const uint32_t nClean = std::max({nStart, house.nProtestHeight, house.nDeferEndedHeight});
+        const int64_t nSince = ClockSince(nClean, nHeight);
+        const int64_t nPeriods = gp.nRampPeriodBlocks ? nSince / (int64_t)gp.nRampPeriodBlocks : 63;
+        const uint64_t m = nPeriods >= 16 ? nMaxMultiple : std::min<uint64_t>(nMaxMultiple, (uint64_t)1 << nPeriods);
+        strTranches += strprintf("%s%u:%d:%u:%u:%d:%u", strTranches.empty() ? "" : ",", nPartner, amount, nStart, nClean,
+                                 nSince, m);
+    };
+    for (uint32_t i = 0; i < house.vPartner.size(); i++) {
+        const HousePartner& p = house.vPartner[i];
+        if (p.status != HOUSE_PARTNER_ACTIVE)
+            continue;
+        CAmount covered = 0;
+        for (const CEscrowTranche& tr : house.vEscrowTranche) {
+            if (tr.nPartner != i || covered + tr.amount > p.amountPledge)
+                continue;
+            covered += tr.amount;
+            fnTranche(i, tr.amount, tr.nStartHeight);
+        }
+        fnTranche(i, p.amountPledge - covered, house.nRegisteredHeight);
+    }
+    const int64_t nLapse = (int64_t)gp.nShortfallLapseSecs / 600;
+    const uint64_t nW = HousePendingSwapUnitsForChecks(house.nHouseID);
+    const uint64_t nM = HouseLiveShortfallMgForChecks(house.nHouseID, ClockAtHeight(nHeight), nLapse);
+    const unsigned __int128 nOwedOut = HouseOwedOutsideNotesMg(house, nHeight);
+    CHouseCapital capC, capT;
+    const bool fC = HouseCapitalForChecks(house, nHeight, 0, capC);
+    const bool fT = HouseCapitalForChecks(house, nHeight, amountTillSats, capT);
+    auto fnU128 = [](unsigned __int128 v) {
+        std::string str;
+        do { str.insert(str.begin(), (char)('0' + (int)(v % 10))); v /= 10; } while (v != 0);
+        return str;
+    };
+    return strprintf("clock=%d rate_ok=%d ask30=%u bid30=%u rate_day_first=%u rate_day_last=%u capital_min_bps=%u "
+                     "till_min_bps=%u ramp_period_blocks=%u max_multiple=%u protest_h=%u defer_end_h=%u registered_h=%u "
+                     "tranches=%s minted_mg=%u deposits_mg=%u pending_swaps_mg=%u live_shortfall_mg=%u "
+                     "lapse_clock=%d owed_outside_notes_mg=%s till_sats=%d escrow_mg=%u till_mg=%u "
+                     "capital_capacity_mg=%s capital_owed_mg=%s till_cap_gross_mg=%s till_owed_mg=%s",
+                     fClock ? clock.nMonoTime : -1, fRate ? 1 : 0, nAskMax, nBidMax, nToday >= 30 ? nToday - 30 : 0, nToday,
+                     gp.nCapitalMinBps, gp.nTillMinBps, gp.nRampPeriodBlocks, nMaxMultiple, house.nProtestHeight,
+                     house.nDeferEndedHeight, house.nRegisteredHeight, strTranches.empty() ? "-" : strTranches,
+                     house.nMintedUnits, house.nDepositUnits, nW, nM, nLapse, fnU128(nOwedOut), amountTillSats,
+                     capC.nEscrowMg, capT.nTillMg,
+                     fC ? strprintf("%u", capC.nCapacityMg) : std::string("none"),
+                     fnU128((unsigned __int128)house.nMintedUnits + house.nDepositUnits + nOwedOut),
+                     fT ? strprintf("%u", (uint64_t)((unsigned __int128)capT.nTillMg * 10000 / gp.nTillMinBps)) : std::string("none"),
+                     fnU128((unsigned __int128)house.nMintedUnits + nOwedOut));
 }
 
 bool HouseEscrowMgForChecks(const CHouse& house, int nHeight, uint64_t& nEscrowMg)

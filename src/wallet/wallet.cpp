@@ -270,6 +270,16 @@ void CWallet::DeriveNewChildKey(CWalletDB &walletdb, CKeyMetadata& metadata, CKe
  *  consensus does (validation.cpp MgToSats). */
 /** Gold B (D-2026-11-07-1): the house rate a payload names for the next block - the house's bid in effect (notes,
  *  deposits), or its highest ask of the last 30 days (bills, fAsk30). */
+/** Stage 0 rule C1: write a payload into the transaction (the digest strips its signature fields anyway). Call it once every input, output and nLockTime is in place; then put
+ *  the signatures into the payload and serialize it again (WriteC1Payload). */
+template <typename P>
+static void WriteC1Payload(std::vector<unsigned char>& vchField, const P& payload)
+{
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << payload;
+    vchField.assign(ss.begin(), ss.end());
+}
+
 static bool WalletHouseRate(uint32_t nHouseID, bool fAsk30, uint64_t& nRate, std::string& strFail, uint32_t nAskDays = 30,
                             int nAnchor = 0, uint32_t nDemandHeight = 0)
 {
@@ -3891,8 +3901,8 @@ bool CWallet::RetireBill(std::string& strFail, uint256& txidOut, const uint32_t 
     BillRetire retire;
     retire.nBillID = nBillID;
     retire.nRateNamed = nPrice;
-    const uint256 sighash = BillRetireSigHash(bill.billID, retire.nRateNamed, BillTxBindingHash(CTransaction(mtx)),
-                                              BillHashOutputs(mtx), false);   // UR1-6; S1X-17
+    WriteC1Payload(mtx.vchBillPayload, retire);   // Stage 0 C1: the finished transaction
+    const uint256 sighash = BillRetireSigHash(CTransaction(mtx), bill.billID, false);
     if (!keyAcceptor.Sign(sighash, retire.vchAcceptorSig)) {
         strFail = "Failed to sign bill retirement!";
         return false;
@@ -4003,7 +4013,8 @@ bool CWallet::ClaimBillEscrow(std::string& strFail, uint256& txidOut, const uint
     // The claim signature binds the exact output set
     BillClaim claim;
     claim.nBillID = nBillID;
-    const uint256 sighash = BillClaimSigHash(bill.billID, BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(mtx), false);   // S1X-17
+    WriteC1Payload(mtx.vchBillPayload, claim);   // Stage 0 C1
+    const uint256 sighash = BillClaimSigHash(CTransaction(mtx), bill.billID, false);
     if (!keyHolder.Sign(sighash, claim.vchHolderSig)) {
         strFail = "Failed to sign escrow claim!";
         return false;
@@ -4504,8 +4515,8 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     mint.vUnits.push_back(nUnits);
     mint.nAsOfHeight = nAsOfHeight;
     mint.vReserveProofs = vReserveProofs;
-    if (!SignHouseApprovers(this, house,
-            NoteMintSigHash(nHouseID, mint.vUnits, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+    WriteC1Payload(mtx.vchNotePayload, mint);   // Stage 0 C1: the approvers sign the finished tx
+    if (!SignHouseApprovers(this, house, NoteMintSigHash(CTransaction(mtx)),
             mint.vApproverIndex, mint.vApproverSig, strFail))
         return false;
 
@@ -4646,18 +4657,18 @@ bool CWallet::TransferNote(std::string& strFail, uint256& txidOut, uint32_t nHou
     }
 
     xfer.vchSenderPubKey = chosen[0].vchHolderPubKey;
-    if (!keySender.Sign(NoteTransferSigHash(nHouseID, xfer.vUnits, BillHashOutputs(mtx)), xfer.vchSenderSig)) {
-        strFail = "Failed to sign note transfer!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << xfer;
-    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     // Inputs: the spent note coins (holder-signed) + the funding coins.
     for (const WalletNoteCoin& nc : spend)
         mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1: the sender signs the finished transaction.
+    WriteC1Payload(mtx.vchNotePayload, xfer);
+    if (!keySender.Sign(NoteTransferSigHash(CTransaction(mtx)), xfer.vchSenderSig)) {
+        strFail = "Failed to sign note transfer!"; return false;
+    }
+    WriteC1Payload(mtx.vchNotePayload, xfer);
 
     const CTransaction txToSign = mtx;
     int nIn = 0;
@@ -4794,8 +4805,8 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     lock.vchHolderPubKey = chosen[0].vchHolderPubKey;
-    const uint256 sighash = NoteLockSigHash(nHouseID, lock.nUnits, lock.vChangeUnits,
-                                            NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchNotePayload, lock);   // Stage 0 C1: holder and approvers sign the finished tx
+    const uint256 sighash = NoteLockSigHash(CTransaction(mtx));
     if (!keyHolder.Sign(sighash, lock.vchHolderSig)) { strFail = "Failed to sign the lock as holder!"; return false; }
     if (!pmtxUnsent && !SignHouseApprovers(this, house, sighash, lock.vApproverIndex, lock.vApproverSig, strFail))
         return false;
@@ -4875,8 +4886,8 @@ bool CWallet::ApproveNoteLock(std::string& strFail, CMutableTransaction& mtx, No
     // inputs, outputs), and a lock the holder did not sign would only be refused when sent.
     const CPubKey pubHolder(lock.vchHolderPubKey);
     if (!pubHolder.IsFullyValid()) { strFail = "The lock's holder key is not valid!"; return false; }
-    const uint256 sighash = NoteLockSigHash(lock.nHouseID, lock.nUnits, lock.vChangeUnits,
-                                            NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchNotePayload, lock);   // Stage 0 C1 (the signature fields are stripped from the digest)
+    const uint256 sighash = NoteLockSigHash(CTransaction(mtx));
     if (!pubHolder.Verify(sighash, lock.vchHolderSig)) {
         strFail = "The holder's signature does not cover this lock (changed after signing?)!"; return false;
     }
@@ -4946,8 +4957,8 @@ bool CWallet::UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHous
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    if (!SignHouseApprovers(this, house,
-            NoteUnlockSigHash(nHouseID, unlock.vUnits, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+    WriteC1Payload(mtx.vchNotePayload, unlock);   // Stage 0 C1
+    if (!SignHouseApprovers(this, house, NoteUnlockSigHash(CTransaction(mtx)),
             unlock.vApproverIndex, unlock.vApproverSig, strFail))
         return false;
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -5072,6 +5083,13 @@ bool CWallet::SendFundedNoteOp(std::string& strFail, uint256& txidOut, CMutableT
         if (mtx.nNoteOp == NOTE_OP_TOKEN_CLAIM && TokenClaimConflictsMempool(CTransaction(mtx))) {
             strFail = "Refused: a token in it is already in a pending claim (token-claim-pending)"; return false;
         }
+        // Stage 0 rule B2: one op per token slot in the pool (a POST's (house, B) and (house, Y), a KEYSET's id)
+        std::vector<uint256> vSlotKeys;
+        TokenSlotKeys(CTransaction(mtx), vSlotKeys);
+        if (!vSlotKeys.empty() && mempool.HaveIdentityKey(vSlotKeys)) {
+            strFail = "Refused: a pooled transaction already takes one of its token slots (token-slot-pending); try again "
+                      "after the next block"; return false;
+        }
     }
     const CTransaction txToSign = mtx;
     size_t nIn = nExtra;
@@ -5123,7 +5141,8 @@ bool CWallet::RegisterTokenKeyset(std::string& strFail, uint256& txidOut, uint64
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_TOKEN_KEYSET;
     return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string& strErr) {
-        if (!SignHouseApprovers(this, house, TokenKeysetSigHash(ks, NoteHashPrevouts(CTransaction(m))),
+        WriteC1Payload(m.vchNotePayload, ks);   // Stage 0 C1: the approvers sign the finished tx
+        if (!SignHouseApprovers(this, house, TokenKeysetSigHash(CTransaction(m)),
                 ks.vApproverIndex, ks.vApproverSig, strErr))
             return false;
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
@@ -5153,7 +5172,8 @@ bool CWallet::PostTokens(std::string& strFail, uint256& txidOut, uint32_t nHouse
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_TOKEN_POST;
     return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string& strErr) {
-        if (!keyPosting.Sign(TokenPostSigHash(post, NoteHashPrevouts(CTransaction(m))), post.vchSig)) {
+        WriteC1Payload(m.vchNotePayload, post);   // Stage 0 C1
+        if (!keyPosting.Sign(TokenPostSigHash(CTransaction(m)), post.vchSig)) {
             strErr = "Failed to sign the post!"; return false;
         }
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
@@ -5219,34 +5239,66 @@ bool CWallet::SignTokenClaims(std::string& strFail, uint32_t nHouseID, const std
 }
 
 bool CWallet::RelayTokenClaims(std::string& strFail, uint256& txidOut, uint32_t nHouseID,
-                               const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee)
+                               const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee, std::vector<uint256>* pvTxid)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
-    if (vEntry.empty() || vEntry.size() > MAX_TOKEN_CLAIM_ENTRIES) { strFail = "Claim 1 to 64 tokens per transaction!"; return false; }
+    if (vEntry.empty() || vEntry.size() > MAX_TOKEN_CLAIM_ENTRIES) { strFail = "Claim 1 to 64 tokens at a time!"; return false; }
     BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, cs_wallet);
-    NoteTokenClaim claim;
-    claim.nHouseID = nHouseID;
-    claim.vEntry = vEntry;
-    CMutableTransaction mtx;
-    mtx.nVersion = TRANSACTION_NOTE_VERSION;
-    mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
-    return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string&) {
-        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-        ss << claim;
-        m.vchNotePayload.assign(ss.begin(), ss.end());
-        return true;
-    });
+    // Stage 0 rule A (security's ruling 2026-11-26): relays take at most 32 entries per claim, hashed within 2 x entries
+    // + 32 tries. Split at 32; check each part's tries first (an honest part needs 64 +/- 8 of its 96), rather than send
+    // a claim no relay takes.
+    std::vector<std::vector<TokenClaimEntry>> vPart;
+    for (size_t i = 0; i < vEntry.size(); i += MAX_TOKEN_CLAIM_ENTRIES_RELAY)
+        vPart.emplace_back(vEntry.begin() + i, vEntry.begin() + std::min(vEntry.size(), i + MAX_TOKEN_CLAIM_ENTRIES_RELAY));
+    for (const std::vector<TokenClaimEntry>& part : vPart) {
+        uint32_t nLeft = TokenClaimRelayTryBudget(part.size());
+        for (const TokenClaimEntry& e : part) {
+            CPubKey Y;
+            if (!CashuHashToCurveBudget(e.vchSecret, Y, nLeft)) {
+                strFail = strprintf("These tokens' secrets need more than the %u hash-to-curve tries relays take for a claim "
+                                    "of %u; claim them in smaller groups.", TokenClaimRelayTryBudget(part.size()),
+                                    (unsigned)part.size());
+                return false;
+            }
+        }
+    }
+    for (size_t n = 0; n < vPart.size(); n++) {
+        NoteTokenClaim claim;
+        claim.nHouseID = nHouseID;
+        claim.vEntry = vPart[n];
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
+        uint256 txid;
+        if (!SendFundedNoteOp(strFail, txid, mtx, 0, nFee, [&](CMutableTransaction& m, std::string&) {
+                CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+                ss << claim;
+                m.vchNotePayload.assign(ss.begin(), ss.end());
+                return true;
+            })) {
+            if (n > 0)
+                strFail = strprintf("Part %u of %u of the claim was not sent (%s); the earlier parts were.", (unsigned)(n + 1),
+                                    (unsigned)vPart.size(), strFail);
+            return false;
+        }
+        if (n == 0)
+            txidOut = txid;
+        if (pvTxid)
+            pvTxid->push_back(txid);
+    }
+    return true;
 }
 
 bool CWallet::ClaimTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
-                          const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer, const CAmount& nFee)
+                          const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer, const CAmount& nFee,
+                          std::vector<uint256>* pvTxid)
 {
     std::vector<TokenClaimEntry> vEntry;
     if (!SignTokenClaims(strFail, nHouseID, vProof, scriptPayout, nFeeBps, scriptRelayer, vEntry))
         return false;
-    return RelayTokenClaims(strFail, txidOut, nHouseID, vEntry, nFee);
+    return RelayTokenClaims(strFail, txidOut, nHouseID, vEntry, nFee, pvTxid);   // split at 32 (Stage 0 rule A)
 }
 
 bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, std::vector<uint256>& vY,
@@ -5494,12 +5546,12 @@ bool CWallet::DemandNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     }
 
 
-    if (!keyHolder.Sign(NoteDemandSigHash(nHouseID, dem.vUnits, BillHashOutputs(mtx)), dem.vchHolderSig)) {
+    // Stage 0 C1: the holder signs the finished transaction (its inputs are all in: the demand id read them).
+    WriteC1Payload(mtx.vchNotePayload, dem);
+    if (!keyHolder.Sign(NoteDemandSigHash(CTransaction(mtx)), dem.vchHolderSig)) {
         strFail = "Failed to sign the demand!"; return false;
     }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << dem;
-    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+    WriteC1Payload(mtx.vchNotePayload, dem);
 
     const CTransaction txToSign = mtx;
     int nIn = 0;
@@ -5633,19 +5685,19 @@ bool CWallet::ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHous
         if (!IsDust(out, ::dustRelayFee)) mtx.vout.push_back(out);
     }
 
-    if (!keyHolder.Sign(NoteProtestSigHash(nHouseID, pro.vUnits, BillHashOutputs(mtx)), pro.vchHolderSig)) {
-        strFail = "Failed to sign the protest!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << pro;
-    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
-
     // Custody inputs spend with an EMPTY scriptSig - the payload signature
     // against the embedded keyid is the authority. Only funding inputs sign.
     for (const WalletNoteCoin& nc : spend)
         mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1 (closes the S1X-21 residual and S1X-54's note twin): the protest signs the finished transaction,
+    // its custody inputs included, so it protests only these coins.
+    WriteC1Payload(mtx.vchNotePayload, pro);
+    if (!keyHolder.Sign(NoteProtestSigHash(CTransaction(mtx)), pro.vchHolderSig)) {
+        strFail = "Failed to sign the protest!"; return false;
+    }
+    WriteC1Payload(mtx.vchNotePayload, pro);
 
     const CTransaction txToSign = mtx;
     int nIn = (int)spend.size();
@@ -6100,17 +6152,17 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     redeem.fBrassage = amountSpread > 0 ? 1 : 0;
     redeem.vchHolderPubKey = spend[0].vchHolderPubKey;
     redeem.nRateNamed = nPrice;
-    if (!keyHolder.Sign(NoteRedeemSigHash(nHouseID, U, BillHashOutputs(mtx)), redeem.vchHolderSig)) {
-        strFail = "Failed to sign note redeem!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << redeem;
-    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     for (const WalletNoteCoin& nc : spend)
         mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1 (closes E3 for redeems of custody coins): the holder signs the finished transaction.
+    WriteC1Payload(mtx.vchNotePayload, redeem);
+    if (!keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig)) {
+        strFail = "Failed to sign note redeem!"; return false;
+    }
+    WriteC1Payload(mtx.vchNotePayload, redeem);
 
     const CTransaction txToSign = mtx;
     int nIn = 0;
@@ -6285,12 +6337,6 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     claim.nHouseID = nHouseID;
     claim.fEscrowChange = amountEscrowChange > 0 ? 1 : 0;
     claim.vchHolderPubKey = spend[0].vchHolderPubKey;
-    if (!keyHolder.Sign(NoteClaimSigHash(nHouseID, U, CreditHashOutputs(CTransaction(mtx))), claim.vchHolderSig)) {
-        strFail = "Failed to sign note claim!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << claim;
-    mtx.vchNotePayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     // vin: note coins (holder-signed), escrow coins (empty scriptSig - the
     // consensus guard + payload signature authorize), then fee coins
@@ -6300,6 +6346,12 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
         mtx.vin.push_back(CTxIn(out, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1 (closes E3 for claims of custody coins): the holder signs the finished transaction.
+    WriteC1Payload(mtx.vchNotePayload, claim);
+    if (!keyHolder.Sign(NoteClaimSigHash(CTransaction(mtx)), claim.vchHolderSig)) {
+        strFail = "Failed to sign note claim!"; return false;
+    }
+    WriteC1Payload(mtx.vchNotePayload, claim);
 
     const CTransaction txToSign = mtx;
     int nIn = 0;
@@ -6501,15 +6553,11 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
     org.vPrincipal.push_back(nPrincipal);
     org.vRateBps.push_back(nRateBps);
     org.vMaturityHeight.push_back(nMaturityHeight);
-    if (!SignHouseApprovers(this, house,
-            DepositOriginateSigHash(nHouseID, org.vPrincipal, org.vRateBps, org.vMaturityHeight,
-                DepositHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+    WriteC1Payload(mtx.vchDepositPayload, org);   // Stage 0 C1: the approvers sign the finished transaction
+    if (!SignHouseApprovers(this, house, DepositOriginateSigHash(CTransaction(mtx)),
             org.vApproverIndex, org.vApproverSig, strFail))
         return false;
-
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << org;
-    mtx.vchDepositPayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
+    WriteC1Payload(mtx.vchDepositPayload, org);
 
     const CTransaction txToSign = mtx;
     int nIn = 0;
@@ -6618,18 +6666,17 @@ bool CWallet::TransferDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     xfer.nMaturityHeight = dc.maturityHeight;
     xfer.nOriginationHeight = dc.originationHeight;
     xfer.vchSenderPubKey = dc.vchHolderPubKey;
-    if (!keySender.Sign(DepositTransferSigHash(nHouseID, xfer.nPrincipal, xfer.nRateBps, xfer.nMaturityHeight,
-                xfer.nOriginationHeight, BillHashOutputs(mtx)), xfer.vchSenderSig)) {
-        strFail = "Failed to sign deposit transfer!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << xfer;
-    mtx.vchDepositPayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     // Inputs: the burned receipt (holder-signed) + the funding coins.
     mtx.vin.push_back(CTxIn(dc.outpoint.hash, dc.outpoint.n, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1: the sender signs the finished transaction.
+    WriteC1Payload(mtx.vchDepositPayload, xfer);
+    if (!keySender.Sign(DepositTransferSigHash(CTransaction(mtx)), xfer.vchSenderSig)) {
+        strFail = "Failed to sign deposit transfer!"; return false;
+    }
+    WriteC1Payload(mtx.vchDepositPayload, xfer);
 
     const CTransaction txToSign = mtx;
     SignatureData sigReceipt;
@@ -6744,16 +6791,16 @@ bool CWallet::WithdrawDeposit(std::string& strFail, uint256& txidOut, uint32_t n
     wd.nHouseID = nHouseID;
     wd.vchHolderPubKey = dc.vchHolderPubKey;
     wd.nRateNamed = nPrice;
-    if (!keyHolder.Sign(DepositWithdrawSigHash(nHouseID, dc.principal, dc.maturityHeight, dc.originationHeight, BillHashOutputs(mtx)), wd.vchHolderSig)) {
-        strFail = "Failed to sign the withdrawal!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << wd;
-    mtx.vchDepositPayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     mtx.vin.push_back(CTxIn(dc.outpoint.hash, dc.outpoint.n, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1: the holder signs the finished transaction.
+    WriteC1Payload(mtx.vchDepositPayload, wd);
+    if (!keyHolder.Sign(DepositWithdrawSigHash(CTransaction(mtx)), wd.vchHolderSig)) {
+        strFail = "Failed to sign the withdrawal!"; return false;
+    }
+    WriteC1Payload(mtx.vchDepositPayload, wd);
 
     const CTransaction txToSign = mtx;
     SignatureData sigReceipt;
@@ -6886,14 +6933,17 @@ bool CWallet::DemandDeposit(std::string& strFail, uint256& txidOut, uint32_t nHo
     d.nOriginationHeight = dc.originationHeight;
     d.vchHolderPubKey = dc.vchHolderPubKey;
     d.vchPayoutScript = std::vector<unsigned char>(scriptPayout.begin(), scriptPayout.end());
+    // S1X-53 (Stage 0 C3): the demand's id (this receipt, its terms, the payout) goes into the custody script and the
+    // standing pre-auth.
+    const uint256 demandId = DepositDemandId(dc.outpoint, d);
     if (!keyHolder.Sign(DepositPreAuthSigHash(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight,
-            d.nOriginationHeight, d.vchPayoutScript), d.vchPreAuthSig)) { strFail = "Failed to sign the pre-authorization!"; return false; }
+            d.nOriginationHeight, d.vchPayoutScript, demandId), d.vchPreAuthSig)) { strFail = "Failed to sign the pre-authorization!"; return false; }
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
     mtx.nDepositOp = DEPOSIT_OP_DEMAND;
     mtx.vin.push_back(CTxIn(dc.outpoint, CScript()));
-    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, NotePreAuthScript(dc.vchHolderPubKey)));
+    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, NoteDemandCustodyScript(dc.vchHolderPubKey, demandId)));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << d;
     mtx.vchDepositPayload = std::vector<unsigned char>(ss.begin(), ss.end());
@@ -6945,8 +6995,10 @@ bool CWallet::ProtestDeposit(std::string& strFail, uint256& txidOut, const uint2
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
     mtx.nDepositOp = DEPOSIT_OP_PROTEST;
-    mtx.vin.push_back(CTxIn(out, CScript()));   // custody: <keyid> OP_DROP OP_TRUE, no scriptSig
-    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, NotePreAuthScript(d.vchHolderPubKey)));
+    mtx.vin.push_back(CTxIn(out, CScript()));   // custody: <keyid> OP_DROP <demand id> OP_DROP OP_TRUE, no scriptSig
+    uint256 demandIdCopy;   // S1X-53: the re-issue copies the receipt's demand id
+    if (!NoteCustodyDemandId(coin.out.scriptPubKey, demandIdCopy)) { strFail = "The receipt's custody script carries no demand id!"; return false; }
+    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, NoteDemandCustodyScript(d.vchHolderPubKey, demandIdCopy)));
     // The holder signs the exact output set, so fund first (change included), then sign the payload.
     std::vector<COutput> vCoins;
     AvailableCoins(vCoins, true);
@@ -6963,11 +7015,10 @@ bool CWallet::ProtestDeposit(std::string& strFail, uint256& txidOut, const uint2
     }
     for (const auto& c : setCoins)
         mtx.vin.push_back(CTxIn(c.outpoint.hash, c.outpoint.n, CScript()));
-    if (!keyHolder.Sign(DepositProtestSigHash(pr.nHouseID, pr.nPrincipal, pr.nOriginationHeight, pr.nDemandTag,
-            BillHashOutputs(CTransaction(mtx))), pr.vchHolderSig)) { strFail = "Failed to sign the protest!"; return false; }
-    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-    ss << pr;
-    mtx.vchDepositPayload = std::vector<unsigned char>(ss.begin(), ss.end());
+    // S1X-54 (Stage 0 C1): the protest signs the finished transaction.
+    WriteC1Payload(mtx.vchDepositPayload, pr);
+    if (!keyHolder.Sign(DepositProtestSigHash(CTransaction(mtx)), pr.vchHolderSig)) { strFail = "Failed to sign the protest!"; return false; }
+    WriteC1Payload(mtx.vchDepositPayload, pr);
     const CTransaction txToSign(mtx);
     unsigned int nIn = 1;
     for (const auto& c : setCoins) {
@@ -7184,12 +7235,6 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     clm.nHouseID = nHouseID;
     clm.fEscrowChange = (amountEntitlement > 0 && amountEscrowChange > 0) ? 1 : 0;
     clm.vchHolderPubKey = dc.vchHolderPubKey;
-    if (!keyHolder.Sign(DepositClaimSigHash(nHouseID, dc.principal, CreditHashOutputs(CTransaction(mtx))), clm.vchHolderSig)) {
-        strFail = "Failed to sign the deposit claim!"; return false;
-    }
-    CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
-    ssPayload << clm;
-    mtx.vchDepositPayload = std::vector<unsigned char>(ssPayload.begin(), ssPayload.end());
 
     // vin: the burned receipt (holder-signed), the escrow coins (empty scriptSig
     // - the consensus guard + payload sig authorize), then the fee coins.
@@ -7198,6 +7243,12 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
         mtx.vin.push_back(CTxIn(out, CScript()));
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
+    // Stage 0 C1: the holder signs the finished transaction.
+    WriteC1Payload(mtx.vchDepositPayload, clm);
+    if (!keyHolder.Sign(DepositClaimSigHash(CTransaction(mtx)), clm.vchHolderSig)) {
+        strFail = "Failed to sign the deposit claim!"; return false;
+    }
+    WriteC1Payload(mtx.vchDepositPayload, clm);
 
     const CTransaction txToSign = mtx;
     // A demanded receipt (v0.2.29) sits on the custody script: no scriptSig - the payload signature is its authority.
@@ -7564,8 +7615,8 @@ bool CWallet::CreatePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    const uint256 sighash = PoolCreateSigHash(nPoolID, nFeeBps, nInitNoteUnits, amountInitBtx,
-            nNoteChange, PoolHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchPoolPayload, create);   // Stage 0 C1: the creator and approvers sign the finished tx
+    const uint256 sighash = PoolCreateSigHash(CTransaction(mtx));
     if (!keyCreator.Sign(sighash, create.vchCreatorSig)) { strFail = "Failed to sign as pool creator!"; return false; }
     if (!SignHouseApprovers(this, house, sighash, create.vApproverIndex, create.vApproverSig, strFail))
         return false;
@@ -7681,7 +7732,8 @@ bool CWallet::AddPoolLiquidity(std::string& strFail, uint256& txidOut, uint32_t 
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    if (!keyProvider.Sign(PoolAddLiqSigHash(add, PoolHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+    WriteC1Payload(mtx.vchPoolPayload, add);   // Stage 0 C1
+    if (!keyProvider.Sign(PoolAddLiqSigHash(CTransaction(mtx)),
             add.vchProviderSig)) {
         strFail = "Failed to sign liquidity add!"; return false;
     }
@@ -7825,7 +7877,8 @@ bool CWallet::RemovePoolLiquidity(std::string& strFail, uint256& txidOut, uint32
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    if (!keyProvider.Sign(PoolRemoveLiqSigHash(rem, PoolHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+    WriteC1Payload(mtx.vchPoolPayload, rem);   // Stage 0 C1
+    if (!keyProvider.Sign(PoolRemoveLiqSigHash(CTransaction(mtx)),
             rem.vchProviderSig)) {
         strFail = "Failed to sign liquidity remove!"; return false;
     }
@@ -7932,7 +7985,8 @@ bool CWallet::RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     // Auth: a single non-settled partner triggers when the house is effectively
     // Insolvent (the liveness path - no M-of-N assembly required); otherwise the
     // charter M-of-N approves (valid at any status).
-    const uint256 sighash = PoolRetireSigHash(ret, PoolHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchPoolPayload, ret);   // Stage 0 C1
+    const uint256 sighash = PoolRetireSigHash(CTransaction(mtx));
     if (chEff == HOUSE_STATUS_INSOLVENT) {
         bool fSigned = false;
         for (size_t j = 0; j < house.vPartner.size(); j++) {
@@ -8065,7 +8119,8 @@ bool CWallet::SwapNote(std::string& strFail, uint256& txidOut, uint32_t nPoolID,
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    if (!keyTrader.Sign(PoolSwapSigHash(swap, PoolHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)),
+    WriteC1Payload(mtx.vchPoolPayload, swap);   // Stage 0 C1
+    if (!keyTrader.Sign(PoolSwapSigHash(CTransaction(mtx)),
             swap.vchTraderSig)) {
         strFail = "Failed to sign swap!"; return false;
     }
@@ -8463,8 +8518,8 @@ bool CWallet::SignSettle(std::string& strFail, std::string& strHexTxOut,
     // (the skeleton is final; the initiator's signatures land later - the
     // digest excludes sig fields, and so does the input sighash's payload
     // binding, creditbind.h).
-    const CTransaction ctxDigest(mtx);
-    const uint256 sighash = SettleExchangeSigHash(x, SettleHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
+    WriteC1Payload(mtx.vchSettlePayload, x);   // Stage 0 C1: the signers sign the finished tx (sig fields stripped)
+    const uint256 sighash = SettleExchangeSigHash(CTransaction(mtx));
     {
         std::vector<uint32_t>& vIdx = fOwnIsA ? x.vApproverIndexA : x.vApproverIndexB;
         std::vector<std::vector<unsigned char>>& vSig = fOwnIsA ? x.vApproverSigA : x.vApproverSigB;
@@ -8617,8 +8672,8 @@ bool CWallet::CompleteSettle(std::string& strFail, uint256& txidOut, const std::
 
     // Counter-sign: our quorum + our presenter (we present the OTHER house's
     // issue, so our presenter slot is the ctpy-issued side's key).
-    const CTransaction ctxDigest(mtx);
-    const uint256 sighash = SettleExchangeSigHash(x, SettleHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
+    WriteC1Payload(mtx.vchSettlePayload, x);   // Stage 0 C1: the signers sign the finished tx (sig fields stripped)
+    const uint256 sighash = SettleExchangeSigHash(CTransaction(mtx));
     {
         std::vector<uint32_t>& vIdx = fSignA ? x.vApproverIndexA : x.vApproverIndexB;
         std::vector<std::vector<unsigned char>>& vSig = fSignA ? x.vApproverSigA : x.vApproverSigB;
@@ -9198,7 +9253,8 @@ bool CWallet::SignNetting(std::string& strFail, std::string& strRoundOut, uint25
         n = prev;
     }
 
-    const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchSettlePayload, n);   // Stage 0 C1: the finished tx (the signature lists are stripped)
+    const uint256 sighash = SettleNetSigHash(CTransaction(mtx));
     n.vApproverIndex[nOwn].clear();
     n.vApproverSig[nOwn].clear();
     if (!SignSettleApprovers(this, mapHouse[nOwnHouseID], sighash, n.vApproverIndex[nOwn], n.vApproverSig[nOwn], strFail))
@@ -9670,9 +9726,8 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
 
     // -- our authority: the house quorum over the shared digest ----------------
     {
-        const CTransaction ctxDigest(mtx);
-        const uint256 sighash = BillDiscountSigHash(d, bill.billID,
-                BillHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
+        WriteC1Payload(mtx.vchBillPayload, d);   // Stage 0 C1
+        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), bill.billID);
         if (!SignHouseApprovers(this, house, sighash, d.vApproverIndex, d.vApproverSig, strFail))
             return false;
     }
@@ -9824,9 +9879,8 @@ bool CWallet::CompleteDiscount(std::string& strFail, uint256& txidOut, const std
         strFail = "Failed to sign the endorsement link!"; return false;
     }
     {
-        const CTransaction ctxDigest(mtx);
-        const uint256 sighash = BillDiscountSigHash(d, bill.billID,
-                BillHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest));
+        WriteC1Payload(mtx.vchBillPayload, d);   // Stage 0 C1
+        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), bill.billID);
         if (!keyHolder.Sign(sighash, d.vchSellerSig)) {
             strFail = "Failed to sign the discount!"; return false;
         }
@@ -9992,9 +10046,8 @@ bool CWallet::RecourseBill(std::string& strFail, uint256& txidOut, const uint32_
     r.vchPrevHolderPubKey = bill.vchHolderPubKey;
     r.nRateNamed = nPrice;
     {
-        const CTransaction ctxDigest(mtx);
-        if (!keyPayer.Sign(BillRecourseSigHash(r, bill.billID,
-                BillHashPrevouts(ctxDigest), BillHashOutputs(ctxDigest)), r.vchPayerSig)) {
+        WriteC1Payload(mtx.vchBillPayload, r);   // Stage 0 C1
+        if (!keyPayer.Sign(BillRecourseSigHash(CTransaction(mtx), bill.billID), r.vchPayerSig)) {
             strFail = "Failed to sign the recourse!"; return false;
         }
     }
@@ -10114,8 +10167,8 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
     h.nRateNamed = nPrice;
     // The retire digest (UR1-6: with nRateNamed): cross-op replay is already dead
     // because op 3 rejects house-held bills and op 7 requires them.
-    if (!keyAcceptor.Sign(BillRetireSigHash(bill.billID, h.nRateNamed, BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(mtx), true),
-                          h.vchAcceptorSig)) {   // S1X-17
+    WriteC1Payload(mtx.vchBillPayload, h);   // Stage 0 C1
+    if (!keyAcceptor.Sign(BillRetireSigHash(CTransaction(mtx), bill.billID, true), h.vchAcceptorSig)) {
         strFail = "Failed to sign the house-held retirement!"; return false;
     }
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -10294,10 +10347,10 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     h.nPrevLoanWtMatLo = house.nLoanWtMatLo;
     h.nRateNamed = nPrice;
     {
+        WriteC1Payload(mtx.vchBillPayload, h);   // Stage 0 C1
         const CTransaction ctxDigest(mtx);
-        const uint256 hashPrevouts = BillHashPrevouts(ctxDigest), hashOutputs = BillHashOutputs(ctxDigest);
-        if (!keyAcceptor.Sign(fIntoEscrow ? BillHRetireEscrowSigHash(h, bill.billID, BillTxBindingHash(ctxDigest), hashOutputs)   // S1X-17
-                                          : BillHRetireNotesSigHash(h, bill.billID, hashPrevouts, hashOutputs),
+        if (!keyAcceptor.Sign(fIntoEscrow ? BillHRetireEscrowSigHash(ctxDigest, bill.billID)
+                                          : BillHRetireNotesSigHash(ctxDigest, bill.billID),
                               h.vchAcceptorSig)) {
             strFail = "Failed to sign the retirement in notes!"; return false;
         }
@@ -10463,7 +10516,8 @@ bool CWallet::HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut,
     h.nPrevLoanWtMatLo = house.nLoanWtMatLo;
     // The QUORUM replaces op 4's single holder signature - the custody key alone
     // must never direct the escrow payout, nor take a bill out of the book.
-    if (!SignHouseApprovers(this, house, BillClaimSigHash(bill.billID, BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(mtx), true),   // S1X-17
+    WriteC1Payload(mtx.vchBillPayload, h);   // Stage 0 C1
+    if (!SignHouseApprovers(this, house, BillClaimSigHash(CTransaction(mtx), bill.billID, true),
                             h.vApproverIndex, h.vApproverSig, strFail))
         return false;
 
@@ -10776,7 +10830,8 @@ bool CWallet::HouseMembersOp(std::string& strFail, uint256& txidOut, uint8_t nHo
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     // The approvals bind the inputs (no replay), so they are signed once the inputs are fixed
-    const uint256 sighash = HouseMemberSigHash(house.houseID, nHouseOp, op, NoteHashPrevouts(CTransaction(mtx)));
+    WriteC1Payload(mtx.vchHousePayload, op);   // Stage 0 C1: the approvers sign the finished transaction
+    const uint256 sighash = HouseMemberSigHash(CTransaction(mtx), house.houseID);
     if (!SignHouseApprovers(this, house, sighash, op.vApproverIndex, op.vApproverSig, strFail))
         return false;
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -10894,7 +10949,8 @@ bool CWallet::TopupHouse(std::string& strFail, uint256& txidOut, const uint32_t 
     // S1X-16: the inputs first - the signature binds them
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
-    const uint256 sighash = HouseTopupSigHash(house.houseID, nPartnerIndex, BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchHousePayload, topup);   // Stage 0 C1
+    const uint256 sighash = HouseTopupSigHash(CTransaction(mtx), house.houseID);
     if (!keyPartner.Sign(sighash, topup.vchSig)) {
         strFail = "Failed to sign house top-up!";
         return false;
@@ -11135,7 +11191,8 @@ bool CWallet::ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t
     // S1X-16: the inputs first - the signature binds them
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
-    const uint256 sighash = HouseExitSigHash(house.houseID, nPartnerIndex, BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchHousePayload, ex);   // Stage 0 C1
+    const uint256 sighash = HouseExitSigHash(CTransaction(mtx), house.houseID);
     if (!keyPartner.Sign(sighash, ex.vchPartnerSig)) {
         strFail = "Failed to sign exit!";
         return false;
@@ -11251,7 +11308,8 @@ bool CWallet::WinddownHouse(std::string& strFail, uint256& txidOut, const uint32
     // S1X-16: the inputs first - the signature binds them
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
-    const uint256 sighash = HouseWinddownSigHash(house.houseID, BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchHousePayload, wd);   // Stage 0 C1
+    const uint256 sighash = HouseWinddownSigHash(CTransaction(mtx), house.houseID);
     if (!SignHouseApprovers(this, house, sighash, wd.vApproverIndex, wd.vApproverSig, strFail))
         return false;
 
@@ -11364,16 +11422,11 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    const uint256 hashOutputs = BillHashOutputs(mtx);
-    const uint256 hashPrevouts = NoteHashPrevouts(mtx);
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
     if (fRenew) {
-        HouseRenew ren;
-        ren.nHouseID = nHouseID;
-        const uint256 sighash = HouseRenewSigHash(house.houseID, house.nDeferRenewals, hashPrevouts, hashOutputs);
-        if (!SignHouseApprovers(pwallet, house, sighash, ren.vApproverIndex, ren.vApproverSig, strFail))
-            return false;
-        ssPayload << ren;
+        // RENEW is retired (consensus refuses it; Stage 0 C4 removed its digest).
+        strFail = "RENEW is retired: a deferral is not renewed";
+        return false;
     } else {
         HouseDefer def;
         def.nHouseID = nHouseID;
@@ -11385,7 +11438,8 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
         // Bind the anti-replay anchor (the prior activation height), NOT the
         // invocation height - see HouseDeferSigHash. A crisis tool must not be
         // valid in only one block.
-        const uint256 sighash = HouseDeferSigHash(house.houseID, def.nPrevLastActivation, hashPrevouts, hashOutputs);   // S1X-35
+        WriteC1Payload(mtx.vchHousePayload, def);   // Stage 0 C1: the approvers sign the finished transaction
+        const uint256 sighash = HouseDeferSigHash(CTransaction(mtx), house.houseID);
         if (!SignHouseApprovers(pwallet, house, sighash, def.vApproverIndex, def.vApproverSig, strFail))
             return false;
         ssPayload << def;
@@ -11570,7 +11624,8 @@ bool CWallet::ReleaseReserves(std::string& strFail, uint256& txidOut, const uint
 
     HouseRelease rel;
     rel.nHouseID = nHouseID;
-    const uint256 sighash = HouseReleaseSigHash(house.houseID, NoteHashPrevouts(mtx), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchHousePayload, rel);   // Stage 0 C1
+    const uint256 sighash = HouseReleaseSigHash(CTransaction(mtx), house.houseID);
     if (!SignHouseApprovers(this, house, sighash, rel.vApproverIndex, rel.vApproverSig, strFail))
         return false;
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -11817,8 +11872,8 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
     for (const auto& coin : setCoins)
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
-    const uint256 sighash = HouseAttestSigHash(house.houseID, nAsOfHeight, amountReserves,
-        HouseAttestProofSetHash(att.vProofs), NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    WriteC1Payload(mtx.vchHousePayload, att);   // Stage 0 C1
+    const uint256 sighash = HouseAttestSigHash(CTransaction(mtx), house.houseID);
     if (!SignHouseApprovers(this, house, sighash, att.vApproverIndex, att.vApproverSig, strFail))
         return false;
 
@@ -12022,8 +12077,8 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
         HouseReclaim rec;
         rec.nHouseID = nHouseID;
         rec.nPartnerIndex = nPartnerIndex;
-        const uint256 sighash = HouseReclaimSigHash(house.houseID, nPartnerIndex, BillHashPrevouts(CTransaction(mtx)),
-                                                    CreditHashOutputs(CTransaction(mtx)));
+        WriteC1Payload(mtx.vchHousePayload, rec);   // Stage 0 C1
+        const uint256 sighash = HouseReclaimSigHash(CTransaction(mtx), house.houseID);
         if (!keyPartner.Sign(sighash, rec.vchSig)) {
             strFail = "Failed to sign settle!";
             return false;
@@ -12109,8 +12164,8 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
     HouseReclaim rec;
     rec.nHouseID = nHouseID;
     rec.nPartnerIndex = nPartnerIndex;
-    const uint256 sighash = HouseReclaimSigHash(house.houseID, nPartnerIndex, BillHashPrevouts(CTransaction(mtx)),
-                                                CreditHashOutputs(CTransaction(mtx)));   // S1X-16: the pledges in vin
+    WriteC1Payload(mtx.vchHousePayload, rec);   // Stage 0 C1 (the pledges are in vin)
+    const uint256 sighash = HouseReclaimSigHash(CTransaction(mtx), house.houseID);
     if (!keyPartner.Sign(sighash, rec.vchSig)) {
         strFail = "Failed to sign reclaim!";
         return false;
@@ -14204,7 +14259,8 @@ bool CWallet::SwapNotesInKind(std::string& strFail, uint256& txidOut, uint32_t n
         mtx.vin.push_back(CTxIn(nc.outpoint.hash, nc.outpoint.n, CScript()));
     const CAmount amountDust = (CAmount)spend.size() * NOTE_DUST_VALUE;
     return SendFundedNoteOp(strFail, txidOut, mtx, amountDust, nFee, [&](CMutableTransaction& m, std::string& strErr) {
-        if (!keyHolder.Sign(NoteSwapSigHash(sw, CTransaction(m)), sw.vchHolderSig)) { strErr = "Failed to sign the swap"; return false; }
+        m.vchNotePayload = SerNotePayload(sw);   // Stage 0 C1: the finished tx
+        if (!keyHolder.Sign(NoteSwapSigHash(CTransaction(m)), sw.vchHolderSig)) { strErr = "Failed to sign the swap"; return false; }
         m.vchNotePayload = SerNotePayload(sw);
         const CTransaction txToSign(m);
         for (size_t i = 0; i < spend.size(); i++) {

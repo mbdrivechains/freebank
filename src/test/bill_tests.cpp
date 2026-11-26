@@ -36,6 +36,22 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
 BOOST_FIXTURE_TEST_SUITE(bill_tests, BasicTestingSetup)
 
+// Stage 0 C1 shim for the digest tests: the payload goes into a bill tx whose input is hp and whose output pays a script
+// made from ho, and the digest is taken over that tx (C1 digests take the whole transaction).
+template <typename P>
+static CTransaction C1BillTx(uint8_t nOp, const P& p, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_BILL_VERSION;
+    m.nBillOp = nOp;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(1000, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    m.vchBillPayload.assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
 static std::vector<unsigned char> TestBody()
 {
     const std::string str = "test-bill-encrypted-body";
@@ -107,16 +123,18 @@ BOOST_AUTO_TEST_CASE(bill_sighash_domain_separation)
     const uint256 billID = BillIDFromBody(TestBody());
     const uint256 hashOutputs = uint256S("02");
 
-    // Retire and claim messages over identical inputs must differ
-    const uint256 bind = uint256S("05");   // S1X-17: the tx binding
-    BOOST_CHECK(BillRetireSigHash(billID, 0, bind, hashOutputs, false) != BillClaimSigHash(billID, bind, hashOutputs, false));   // UR1-6: + nRateNamed
-
-    // hashOutputs must matter (anti-replay: the signature pins the outputs)
-    BOOST_CHECK(BillClaimSigHash(billID, bind, hashOutputs, false) != BillClaimSigHash(billID, bind, uint256S("03"), false));
-    // S1X-17: so must the binding (inputs, sequences, lock time), and op 3 / 7 and op 4 / 8 each have their own tag
-    BOOST_CHECK(BillClaimSigHash(billID, bind, hashOutputs, false) != BillClaimSigHash(billID, uint256S("06"), hashOutputs, false));
-    BOOST_CHECK(BillClaimSigHash(billID, bind, hashOutputs, false) != BillClaimSigHash(billID, bind, hashOutputs, true));
-    BOOST_CHECK(BillRetireSigHash(billID, 0, bind, hashOutputs, false) != BillRetireSigHash(billID, 0, bind, hashOutputs, true));
+    // Stage 0 C1: retire and claim digests take the whole tx (and the bill's canonical id); over one tx they differ,
+    // the outputs, the inputs and the lock time matter, and op 3 / 7 and op 4 / 8 each have their own domain.
+    const uint256 bind = uint256S("05");
+    const CTransaction tx0 = C1BillTx(BILL_OP_RETIRE, BillRetire(), bind, hashOutputs);
+    BOOST_CHECK(BillRetireSigHash(tx0, billID, false) != BillClaimSigHash(tx0, billID, false));
+    BOOST_CHECK(BillClaimSigHash(tx0, billID, false) !=
+                BillClaimSigHash(C1BillTx(BILL_OP_RETIRE, BillRetire(), bind, uint256S("03")), billID, false));
+    BOOST_CHECK(BillClaimSigHash(tx0, billID, false) !=
+                BillClaimSigHash(C1BillTx(BILL_OP_RETIRE, BillRetire(), uint256S("06"), hashOutputs), billID, false));
+    BOOST_CHECK(BillClaimSigHash(tx0, billID, false) != BillClaimSigHash(tx0, billID, true));
+    BOOST_CHECK(BillRetireSigHash(tx0, billID, false) != BillRetireSigHash(tx0, billID, true));
+    BOOST_CHECK(BillRetireSigHash(tx0, billID, false) != BillRetireSigHash(tx0, uint256S("0b"), false));   // canonical id
     // BillTxBindingHash moves with nLockTime, an nSequence, or an added input
     CMutableTransaction m;
     m.vin.push_back(CTxIn(COutPoint(uint256S("07"), 0)));
@@ -625,41 +643,41 @@ BOOST_AUTO_TEST_CASE(bill_b1_digests_bind_every_value_field)
     const uint256 billID = uint256S("0a0b");
     const uint256 hp = uint256S("1111");
     const uint256 ho = uint256S("2222");
-    const uint256 base = BillDiscountSigHash(d, billID, hp, ho);
+    const uint256 base = BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), billID);
 
     // Same inputs -> same digest.
-    BOOST_CHECK(BillDiscountSigHash(d, billID, hp, ho) == base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), billID) == base);
 
     // Every value field is bound.
     BillDiscount m = d; m.amountPrice += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.amountFace += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nBillMaturityHeight += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nHouseID += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.vUnits[0] += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.vchCustodyPubKey[0] = 0x03;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nExpiryHeight += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nAsOfHeight += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nPrevMintedUnits += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nPrevLoanBookFace += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nPrevLoanWtMatHi += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
     m = d; m.nPrevLoanWtMatLo += 1;
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
 
     // The tx context is bound.
-    BOOST_CHECK(BillDiscountSigHash(d, uint256S("0a0c"), hp, ho) != base);
-    BOOST_CHECK(BillDiscountSigHash(d, billID, uint256S("1112"), ho) != base);
-    BOOST_CHECK(BillDiscountSigHash(d, billID, hp, uint256S("2223")) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), uint256S("0a0c")) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, uint256S("1112"), ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, uint256S("2223")), billID) != base);
 
     // Signature and approver-index fields are EXCLUDED, so the seller's payload
     // signature survives the house adding its quorum (and vice versa).
@@ -667,21 +685,21 @@ BOOST_AUTO_TEST_CASE(bill_b1_digests_bind_every_value_field)
     m.vchSellerSig = std::vector<unsigned char>(70, 0x30);
     m.vApproverIndex.push_back(0);
     m.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
-    BOOST_CHECK(BillDiscountSigHash(m, billID, hp, ho) == base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) == base);
 
     // Domain separation: the two B1 digests never collide.
     BillRecourse r;
     r.nBillID = 7;
     r.vchPayerPubKey = std::vector<unsigned char>(33, 0x02);
     r.vchPrevHolderPubKey = std::vector<unsigned char>(33, 0x03);
-    const uint256 rbase = BillRecourseSigHash(r, billID, hp, ho);
+    const uint256 rbase = BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, r, hp, ho), billID);
     BOOST_CHECK(rbase != base);
     BillRecourse rm = r; rm.vchPayerPubKey[0] = 0x03;
-    BOOST_CHECK(BillRecourseSigHash(rm, billID, hp, ho) != rbase);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, rm, hp, ho), billID) != rbase);
     rm = r; rm.vchPrevHolderPubKey[0] = 0x02;
-    BOOST_CHECK(BillRecourseSigHash(rm, billID, hp, ho) != rbase);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, rm, hp, ho), billID) != rbase);
     rm = r; rm.vchPayerSig = std::vector<unsigned char>(70, 0x30);
-    BOOST_CHECK(BillRecourseSigHash(rm, billID, hp, ho) == rbase);   // sig excluded
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, rm, hp, ho), billID) == rbase);   // sig excluded
 }
 
 // ===========================================================================
@@ -1554,7 +1572,7 @@ namespace {
 // S1X-17: the retire digest also binds the transaction (BillTxBindingHash) and tells op 3 from op 7.
 uint256 UR16RetireDigest(const uint256& billID, uint64_t nRate, const CTransaction& tx, bool fHouseHeld)
 {
-    return BillRetireSigHash(billID, nRate, BillTxBindingHash(tx), BillHashOutputs(tx), fHouseHeld);
+    return BillRetireSigHash(tx, billID, fHouseHeld);
 }
 
 std::vector<unsigned char> UR16Pub(const CKey& key)
@@ -1614,7 +1632,14 @@ BOOST_AUTO_TEST_CASE(ur1_6_bill_digests_bind_nratenamed)
     const uint256 hp = uint256S("1111");
     const uint256 ho = uint256S("2222");
 
-    BOOST_CHECK_MESSAGE(UR16RetireDigest(billID, 1000, CTransaction(), false) != UR16RetireDigest(billID, 1400, CTransaction(), false),
+    // Stage 0 C1: nRateNamed is a payload field, bound through the binding form.
+    BillRetire rt;
+    rt.nBillID = 7;
+    rt.nRateNamed = 1000;
+    BillRetire rt2 = rt;
+    rt2.nRateNamed = 1400;
+    BOOST_CHECK_MESSAGE(BillRetireSigHash(C1BillTx(BILL_OP_RETIRE, rt, hp, ho), billID, false) !=
+                        BillRetireSigHash(C1BillTx(BILL_OP_RETIRE, rt2, hp, ho), billID, false),
                         "UR1-6: the retire digest that ops 3 RETIRE and 7 HRETIRE sign does not bind nRateNamed");
 
     BillRecourse r;
@@ -1624,7 +1649,7 @@ BOOST_AUTO_TEST_CASE(ur1_6_bill_digests_bind_nratenamed)
     r.nRateNamed = 1000;
     BillRecourse r2 = r;
     r2.nRateNamed = 1400;
-    BOOST_CHECK_MESSAGE(BillRecourseSigHash(r, billID, hp, ho) != BillRecourseSigHash(r2, billID, hp, ho),
+    BOOST_CHECK_MESSAGE(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, r, hp, ho), billID) != BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, r2, hp, ho), billID),
                         "UR1-6: op 6 RECOURSE's digest does not bind nRateNamed");
 
     BillHRetireNotes hn;
@@ -1636,9 +1661,9 @@ BOOST_AUTO_TEST_CASE(ur1_6_bill_digests_bind_nratenamed)
     hn.nRateNamed = 1000;
     BillHRetireNotes hn2 = hn;
     hn2.nRateNamed = 1400;
-    BOOST_CHECK_MESSAGE(BillHRetireNotesSigHash(hn, billID, hp, ho) != BillHRetireNotesSigHash(hn2, billID, hp, ho),
+    BOOST_CHECK_MESSAGE(BillHRetireNotesSigHash(C1BillTx(BILL_OP_HRETIRE_NOTES, hn, hp, ho), billID) != BillHRetireNotesSigHash(C1BillTx(BILL_OP_HRETIRE_NOTES, hn2, hp, ho), billID),
                         "UR1-6: op 9 HRETIRE_NOTES's digest does not bind nRateNamed");
-    BOOST_CHECK_MESSAGE(BillHRetireEscrowSigHash(hn, billID, hp, ho) != BillHRetireEscrowSigHash(hn2, billID, hp, ho),
+    BOOST_CHECK_MESSAGE(BillHRetireEscrowSigHash(C1BillTx(BILL_OP_HRETIRE_ESCROW, hn, hp, ho), billID) != BillHRetireEscrowSigHash(C1BillTx(BILL_OP_HRETIRE_ESCROW, hn2, hp, ho), billID),
                         "UR1-6: op 10 HRETIRE_ESCROW's digest does not bind nRateNamed");
 }
 
@@ -2198,8 +2223,7 @@ BOOST_AUTO_TEST_CASE(s1x_34_a_paid_endorser_keeps_the_bill_after_recourse)
     rec.vchPrevHolderPubKey = vX;
     rec.nRateNamed = 1000;
     CMutableTransaction mtxRec = UR16Tx(BILL_OP_RECOURSE, rec, vX, 10000);
-    BOOST_REQUIRE(keyP.Sign(BillRecourseSigHash(rec, bill.billID, BillHashPrevouts(CTransaction(mtxRec)),
-                                                BillHashOutputs(CTransaction(mtxRec))), rec.vchPayerSig));
+    BOOST_REQUIRE(keyP.Sign(BillRecourseSigHash(CTransaction(mtxRec), bill.billID), rec.vchPayerSig));
     mtxRec = UR16Tx(BILL_OP_RECOURSE, rec, vX, 10000);
     CBill billRecoursed;
     r = Run4BillOp(mtxRec, billEndorsed, 4990, billRecoursed);

@@ -177,6 +177,7 @@ void BlockAssembler::resetBlock()
     inBlock.clear();
     setBlockWithdrawalIDs.clear();
     setBlockRateHouses.clear();
+    setBlockTokenSlots.clear();
     fDeferRateOps = false;
     nRateReservedWeight = 0;
     nIssuedFailed = 0;
@@ -790,7 +791,17 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
     const bool fCreditBinding = chainparams.GetConsensus().CreditBindingActive(nHeight);
     std::set<uint32_t> setPackageRateHouses;
     const bool fRateGuard = gArgs.GetBoolArg("-rateopguard", true);   // -rateopguard=0: regtest, the block-rule gate
+    std::set<uint256> setPackageTokenSlots;
     for (const CTxMemPool::txiter it : package) {
+        // Stage 0 rule B2: one op per token slot per block (CheckBlockCreditSlots); a package taking a slot the template
+        // (or the package itself) already holds waits for the next block.
+        {
+            std::vector<uint256> vSlotKeys;
+            TokenSlotKeys(it->GetTx(), vSlotKeys);
+            for (const uint256& key : vSlotKeys)
+                if (setBlockTokenSlots.count(key) || !setPackageTokenSlots.insert(key).second)
+                    return false;
+        }
         // S1X-4: in the clock and fee-rate passes a package holding a rate op (as the tx or an ancestor) is left for
         // addRateTxs, which adds only the rate op and its ancestors: its descendants wait for the next block, since
         // after the post they could read the new rate where ATMP checked them against the tip's. S1X-33: a SWAP_DONE
@@ -898,6 +909,11 @@ void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
         bool fRateSetKey = false;
         if (HouseRateOpOf(iter->GetTx(), nRateHouse, fRateSetKey))
             setBlockRateHouses.insert(nRateHouse);
+    }
+    {
+        std::vector<uint256> vSlotKeys;
+        TokenSlotKeys(iter->GetTx(), vSlotKeys);   // Stage 0 rule B2
+        setBlockTokenSlots.insert(vSlotKeys.begin(), vSlotKeys.end());
     }
     pblocktemplate->vTxFees.push_back(iter->GetFee());
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());

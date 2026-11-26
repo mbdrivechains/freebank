@@ -1176,14 +1176,16 @@ public:
     bool PostTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nKeysetID,
                     const std::vector<TokenIssued>& vIssued, const std::vector<uint256>& vSpent, const CAmount& nFee);
     bool ClaimTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
-                     const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer, const CAmount& nFee);
+                     const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer, const CAmount& nFee,
+                     std::vector<uint256>* pvTxid = nullptr);
     /** A holder's half (what a phone does itself): each proof signed with its r over the payout terms. No funds. */
     bool SignTokenClaims(std::string& strFail, uint32_t nHouseID, const std::vector<TokenProofIn>& vProof,
                          const CScript& scriptPayout, uint16_t nFeeBps, const CScript& scriptRelayer,
                          std::vector<TokenClaimEntry>& vEntryOut);
-    /** A relayer's half: send signed entries (from any holders) as one claim, paying the fee. */
+    /** A relayer's half: send signed entries (from any holders) as claims of at most 32 entries (relay policy, Stage 0
+     *  rule A), paying the fee for each. txidOut is the first; pvTxid gets every one. */
     bool RelayTokenClaims(std::string& strFail, uint256& txidOut, uint32_t nHouseID,
-                          const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee);
+                          const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee, std::vector<uint256>* pvTxid = nullptr);
     bool CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, std::vector<uint256>& vY,
                        const CAmount& nFee);
     /** Fund and send a v13 note op whose outputs (and any extra inputs, unsigned: escrow) are already set: add this

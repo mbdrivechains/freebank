@@ -466,7 +466,8 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                          const TokenView& view, TokenEffects& eff,
-                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
+                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false,
+                         const std::vector<CPubKey>* pvClaimY = nullptr);   // Stage 0 rule A: ATMP's budgeted Ys
 bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int nHeight,
                            const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                            const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
@@ -1689,22 +1690,27 @@ void EvictUnpayableWithdrawals()
  * origination), which the mempool view cannot know: it sees 0, ConnectBlock the real height, so such a spend fails in
  * every template. ATMP refuses it (unconfirmed-stamp-parent); UpdateMempoolForReorg drops one already pooled when a reorg
  * puts its parent back (UR3-7). Their plain change is not affected. */
+uint32_t PooledStampedOutputCount(const CTransaction& parent)
+{
+    // Stage 0 rule A ("decode once"): computed when the parent enters the pool (CTxMemPool's slot index), so a child
+    // with many inputs off pooled DEMANDs or ORIGINATEs no longer decodes a parent payload per input.
+    if (parent.nVersion == TRANSACTION_NOTE_VERSION && parent.nNoteOp == NOTE_OP_DEMAND) {
+        NoteDemand d;
+        if (DecodeNotePayload(parent.vchNotePayload, d) && d.nPriorDemandHeight == 0)
+            return (uint32_t)std::min<size_t>(d.vUnits.size(), parent.vout.size());
+    } else if (parent.nVersion == TRANSACTION_DEPOSIT_VERSION && parent.nDepositOp == DEPOSIT_OP_ORIGINATE) {
+        DepositOriginate o;
+        if (DecodeDepositPayload(parent.vchDepositPayload, o))
+            return (uint32_t)std::min<size_t>(o.vPrincipal.size(), parent.vout.size());
+    }
+    return 0;
+}
+
 static bool SpendsPooledStampedOutput(const CTransaction& tx, const CTxMemPool& pool)
 {
     for (const CTxIn& txin : tx.vin) {
-        CTransactionRef parent = pool.get(txin.prevout.hash);
-        if (!parent)
-            continue;
-        if (parent->nVersion == TRANSACTION_NOTE_VERSION && parent->nNoteOp == NOTE_OP_DEMAND) {
-            NoteDemand d;
-            if (DecodeNotePayload(parent->vchNotePayload, d) && d.nPriorDemandHeight == 0 &&
-                    txin.prevout.n < d.vUnits.size())
-                return true;
-        } else if (parent->nVersion == TRANSACTION_DEPOSIT_VERSION && parent->nDepositOp == DEPOSIT_OP_ORIGINATE) {
-            DepositOriginate o;
-            if (DecodeDepositPayload(parent->vchDepositPayload, o) && txin.prevout.n < o.vPrincipal.size())
-                return true;
-        }
+        if (pool.IsPooledStampedOutput(txin.prevout))   // Stage 0 rule A: the count kept at the parent's admission
+            return true;
     }
     return false;
 }
@@ -1724,17 +1730,30 @@ static bool SpendsPooledStampedOutput(const CTransaction& tx, const CTxMemPool& 
  * one house the slot already stopped that, except after a COLLECT or SWAP_CLAIM, which take no slot. Every other note op
  * reads its inputs on the mempool view (tx_verify, payload-pure tags) and chains as before. A NEW check that reads an
  * input coin through TipCoin must refuse a coin it can't see, or be listed here. */
-bool SpendsPooledCreditOutput(const CTransaction& tx, const CTxMemPool& pool)
+bool SpendsPooledCreditOutput(const CTransaction& tx, const CTxMemPool& pool, const CCoinsViewCache* pView)
 {
     const bool fReadsNotesAtTip = tx.nVersion == TRANSACTION_NOTE_VERSION &&
             (tx.nNoteOp == NOTE_OP_REDEEM || tx.nNoteOp == NOTE_OP_PROTEST);
+    if (pView) {
+        // Stage 0 rule A: ATMP's view, filled from the mempool view, already holds every input's coin with its pooled
+        // tags; a pooled parent's coin carries MEMPOOL_HEIGHT. No lock and no second lookup per input.
+        for (const CTxIn& txin : tx.vin) {
+            const Coin& coin = pView->AccessCoin(txin.prevout);
+            if (coin.IsSpent() || coin.nHeight != MEMPOOL_HEIGHT)
+                continue;
+            if (coin.fHouseEscrow || (fReadsNotesAtTip && coin.fNote))
+                return true;
+        }
+        return false;
+    }
     CCoinsViewMemPool viewPool(pcoinsTip.get(), pool);   // its pooled-output tags: the payload-pure taggers AddCoins uses
     for (const CTxIn& txin : tx.vin) {
-        if (!pool.exists(txin.prevout.hash))
-            continue;
         Coin coin;
-        if (!viewPool.GetCoin(txin.prevout, coin))
-            continue;
+        // Stage 0 rule A: the pooled parent's coin as tagged at its admission (one lookup; false for a confirmed coin)
+        if (!pool.GetPooledOutCoin(txin.prevout, coin)) {
+            if (!pool.exists(txin.prevout.hash) || !viewPool.GetCoin(txin.prevout, coin))
+                continue;
+        }
         if (coin.fHouseEscrow)
             return true;
         if (fReadsNotesAtTip && coin.fNote)
@@ -1871,6 +1890,53 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, CValidationSt
     return CheckInputs(tx, state, view, true, flags, cacheSigStore, true, txdata);
 }
 
+/** Stage 0 rule A, step 2 (security 2026-11-26): the fee floor proves nothing (CheckTxInputs reads input values, and
+ *  scripts were checked only at CheckInputs, after every FreeBank check), so a probe could name anyone's coin. After the
+ *  floor and before any FreeBank contextual check, verify the script of input nIn now. It is scored as CheckInputs
+ *  scores a failure (mandatory flags: DoS 100; standard-only: non-standard, no ban; a stripped witness: corruption
+ *  possible, no ban), and the signature cache keeps the result for the full check later. */
+static bool CheckInputScriptEarly(const CTransaction& tx, unsigned int nIn, const CCoinsViewCache& view, unsigned int flags,
+                                  PrecomputedTransactionData& txdata, CValidationState& state)
+{
+    const Coin& coin = view.AccessCoin(tx.vin[nIn].prevout);
+    if (coin.IsSpent())
+        return true;   // CheckTxInputs refused it already; nothing to verify here
+    CScriptCheck check(coin.out, tx, nIn, flags, true, &txdata);
+    if (check())
+        return true;
+    if (!tx.HasWitness()) {   // as ATMP's CheckInputs failure: only the witness missing, so the tx may be fine
+        CScriptCheck checkNoWit(coin.out, tx, nIn, flags & ~(SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_CLEANSTACK), true, &txdata);
+        CScriptCheck checkNoClean(coin.out, tx, nIn, flags & ~SCRIPT_VERIFY_CLEANSTACK, true, &txdata);
+        if (checkNoWit() && !checkNoClean())
+            return state.DoS(0, false, REJECT_NONSTANDARD, strprintf("early-input-witness-missing (input %u)", nIn), true);
+    }
+    if (flags & STANDARD_NOT_MANDATORY_VERIFY_FLAGS) {   // the CheckInputs re-run, the credit binding kept
+        const unsigned int flagsMandatory = flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS;
+        CScriptCheck check2(coin.out, tx, nIn, flagsMandatory | (flags & SCRIPT_VERIFY_CREDIT_BINDING), true, &txdata);
+        bool fPolicyOnly = check2();
+        if (!fPolicyOnly && (flags & SCRIPT_VERIFY_CREDIT_BINDING) && IsCreditBindingVersion(tx.nVersion)) {
+            CScriptCheck check3(coin.out, tx, nIn, flagsMandatory, true, &txdata);
+            fPolicyOnly = check3();
+        }
+        if (fPolicyOnly)
+            return state.Invalid(false, REJECT_NONSTANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
+    }
+    return state.DoS(100, false, REJECT_INVALID, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError())));
+}
+
+/** Stage 0 rule A: does input nIn's coin carry a signature? A sig op, or P2SH / a witness program. The families' OP_TRUE
+ *  custody scripts carry none (their spends are restricted by tags), so they are skipped. */
+static bool InputCarriesSignature(const CTransaction& tx, unsigned int nIn, const CCoinsViewCache& view)
+{
+    const Coin& coin = view.AccessCoin(tx.vin[nIn].prevout);
+    if (coin.IsSpent())
+        return false;
+    const CScript& spk = coin.out.scriptPubKey;
+    int nWitVer = 0;
+    std::vector<unsigned char> vWitProg;
+    return spk.IsPayToScriptHash() || spk.IsWitnessProgram(nWitVer, vWitProg) || spk.GetSigOpCount(false) > 0;
+}
+
 static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool& pool, CValidationState& state, const CTransactionRef& ptx,
                               bool* pfMissingInputs, int64_t nAcceptTime, std::list<CTransactionRef>* plTxnReplaced,
                               bool bypass_limits, const CAmount& nAbsurdFee, std::vector<COutPoint>& coins_to_uncache)
@@ -1932,6 +1998,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
     // or pays (it never counts in the BIP125 fee sums); the MERGEs and their descendants leave before addUnchecked.
     const bool fIncomingMergeTx = IsHouseEscrowMergeTx(tx);
     std::set<uint256> setMergeInputYield;
+    // Stage 0 rule G (security 11-26; D-2026-11-26-1): the non-protective holders of a guard a protective incomer needs
+    // (a swap's EXPIRE against its PROTEST, PAY or CLAIM; a bill's ENDORSE or DISCOUNT against its RETIRE or CLAIM).
+    // They leave only once the incomer is in the pool and survived the trim (fnEvictDisplaced below).
+    std::set<uint256> setGuardYield;
     for (const CTxIn &txin : tx.vin)
     {
         auto itConflicting = pool.mapNextTx.find(txin.prevout);
@@ -2032,7 +2102,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                              "spends a note of an unconfirmed demand or a receipt of an unconfirmed deposit; wait for it to confirm");
         // S1X-23 / S1X-24: a pooled escrow output, or a pooled note output under a REDEEM or PROTEST, is invisible to the
         // credit checks below (they read the tip), so the pool would accept what every block refuses.
-        if (SpendsPooledCreditOutput(tx, pool))
+        if (SpendsPooledCreditOutput(tx, pool, &view))   // Stage 0 rule A: the coins ATMP's view already holds
             return state.DoS(0, false, REJECT_NONSTANDARD, "unconfirmed-credit-parent", false,
                              "spends house escrow of an unconfirmed transaction, or redeems or protests notes of one; wait for it to confirm");
         // This tx moves an asset if it is a genesis or spends a coloured coin.
@@ -2249,8 +2319,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // this can only refuse what the later checks refuse too. Those run unchanged.
         // S1X-37 (testing: Medium; security 11-26): a settle round too - its check reads every named house's record,
         // rates and par eligibility, and a zero-fee round could be re-sent with a new nLockTime forever.
-        if (!bypass_limits && ((tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) ||
-                               tx.nVersion == TRANSACTION_SETTLE_VERSION)) {
+        // Stage 0 rule A (testing's proposal 11-26, freebankd's build): every FreeBank op version, one place. Each
+        // family's contextual check below reads records, walks rate days or verifies signatures in proportion to its
+        // payload, so a zero-fee op pays only CheckTxInputs before it is refused; plain txs keep Bitcoin's order.
+        if (!bypass_limits && tx.nVersion >= TRANSACTION_BITASSET_CREATE_VERSION) {
             CAmount nModFeesEarly = nFees;
             pool.ApplyDelta(tx.GetHash(), nModFeesEarly);
             const unsigned int nSizeEarly = GetVirtualTransactionSize(tx);
@@ -2260,6 +2332,26 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                                  strprintf("%d < %d", nModFeesEarly, nPoolFloorEarly));
             if (nModFeesEarly < ::minRelayTxFee.GetFee(nSizeEarly))
                 return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "min relay fee not met");
+
+            // Stage 0 rule A step 2 (security 11-26): one signature-bearing input's script, the first, before any
+            // FreeBank work: a probe on a coin its sender doesn't own is refused here (DoS 100 on a mandatory-flag
+            // failure), and every probe needs a fresh signature (the credit binding covers the payload). One input,
+            // not all: valid scripts plus a bad payload would waste every input's verify at DoS 0. A house REGISTER
+            // verifies EVERY input (the pledges) before its partner signatures, which then keep their score (rule A,
+            // REGISTER counts: a 64-partner probe needs 64 owned pledges, re-signed per probe).
+            unsigned int nEarlyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+            if (!chainparams.RequireStandard())
+                nEarlyFlags = gArgs.GetArg("-promiscuousmempoolflags", nEarlyFlags);
+            PrecomputedTransactionData txdataEarly(tx);
+            const bool fAllInputs = tx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseRegisterOp(tx.nHouseOp);
+            for (unsigned int i = 0; i < tx.vin.size(); i++) {
+                if (!fAllInputs && !InputCarriesSignature(tx, i, view))
+                    continue;
+                if (!CheckInputScriptEarly(tx, i, view, nEarlyFlags, txdataEarly, state))
+                    return false;
+                if (!fAllInputs)
+                    break;
+            }
         }
 
         // Gram-notes release: issued tokens against the units state at the tip, on a view that is dropped. A FREEZE
@@ -2320,6 +2412,20 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             if (pool.HaveIdentityKey(vIdKeys))
                 return state.DoS(0, false, REJECT_INVALID, "issued-pool-lp-op-pending", false,
                                  "this pool already has a liquidity change waiting; try again after the next block");
+        }
+
+        // Stage 0 rule B2: a block holds one op per token slot (the issuer's MINT / FREEZE / UNFREEZE of a token; a POST
+        // per (house, B) and (house, Y); a KEYSET per (house, keyset id)), so the pool holds one too: an index lookup.
+        // A POST's keys (one hash per issued B and spent Y, up to 2,000) are payload work, so rule A checks them after
+        // the posting signature (below, after CheckTokenOperation); every other op here has one key.
+        if (!(tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_POST)) {
+            std::vector<uint256> vSlotKeys;
+            TokenSlotKeys(tx, vSlotKeys);
+            // -tokenslotguard=0 (regtest only) lets a second one in, so a gate can show the template skip it
+            if (!vSlotKeys.empty() && gArgs.GetBoolArg("-tokenslotguard", true) && pool.HaveIdentityKey(vSlotKeys))
+                return state.DoS(0, false, REJECT_DUPLICATE, "token-slot-pending", false,
+                                 "a pooled transaction already takes this token's slot (the issuer's mint or freeze, an "
+                                 "issued or spent mark, or a keyset); try again after the next block");
         }
 
         // The incomer's parent txids, hoisted ONCE for every displacement site
@@ -2486,8 +2592,33 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // by the raw id bytes, the same function for both sides), not a scan that decoded every pooled ISSUE.
             std::vector<uint256> vIdKeys;
             PooledIdentityKeys(tx, vIdKeys);
-            if (pool.HaveIdentityKey(vIdKeys))
-                return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
+            if (pool.HaveIdentityKey(vIdKeys)) {
+                // Stage 0 rule G (S1X-20's family): a protective bill op - the drawee's RETIRE, the holder's CLAIM, and
+                // their house-held forms - is never refused because a non-protective op (ENDORSE, DISCOUNT) of the
+                // same bill holds the guard: the holder yields, after the trim. Any other holder keeps first-seen.
+                const uint8_t op = tx.nBillOp;
+                const bool fProtective = op == BILL_OP_RETIRE || op == BILL_OP_CLAIM || op == BILL_OP_HRETIRE ||
+                                         op == BILL_OP_HCLAIM || op == BILL_OP_HRETIRE_NOTES ||
+                                         op == BILL_OP_HRETIRE_ESCROW || op == BILL_OP_HCLAIM_ESCROW;
+                const std::vector<uint256> vHolders = fProtective ? pool.IdentityKeyHolders(vIdKeys) : std::vector<uint256>();
+                bool fYield = !vHolders.empty();
+                std::set<uint256> setInPrevouts;
+                for (const CTxIn& in : tx.vin)
+                    setInPrevouts.insert(in.prevout.hash);
+                for (const uint256& h : vHolders) {
+                    const CTransactionRef ph = pool.get(h);
+                    CTxMemPool::txiter itH = pool.mapTx.find(h);
+                    if (!ph || itH == pool.mapTx.end() || ph->nVersion != TRANSACTION_BILL_VERSION ||
+                            (ph->nBillOp != BILL_OP_ENDORSE && ph->nBillOp != BILL_OP_DISCOUNT) ||
+                            SpendsPooledOrDescendant(setInPrevouts, pool, itH)) {
+                        fYield = false;
+                        break;
+                    }
+                }
+                if (!fYield)
+                    return state.DoS(0, false, REJECT_DUPLICATE, "bill-op-in-mempool");
+                setGuardYield.insert(vHolders.begin(), vHolders.end());
+            }
         }
 
         // Settle ops (v16, T-s5): contextual admission + the dual-slot guard.
@@ -2516,9 +2647,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             HouseStateKeys keysOurs;
             for (const CHouse& h : vSettleHouses)
                 keysOurs.vSlot.push_back(h.nHouseID);
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
-                if (HouseStateKeysConflict(keysOurs, GetHouseStateKeys(mi->GetTx())) &&
-                        !fnSlotYields(mi, "settle-house-op-in-mempool"))
+            // Stage 0 rule A: by index (HouseStateConflictTxs), not a walk of the pool.
+            for (const uint256& hashConflict : pool.HouseStateConflictTxs(keysOurs.vSlot, keysOurs.nStatusReader)) {
+                CTxMemPool::txiter mi = pool.mapTx.find(hashConflict);
+                if (mi != pool.mapTx.end() && !fnSlotYields(mi, "settle-house-op-in-mempool"))
                     return state.DoS(0, false, REJECT_DUPLICATE, "settle-house-op-in-mempool");
             }
         }
@@ -2537,16 +2669,8 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             nHouseIDNewLE = ReadLE32(tx.vchHousePayload.data());   // shape: the payload decoded, so >= 4 bytes
             // -memberopguard=0 (regtest only) lets a second one in, so a gate can show the block rule refuse it
             const bool fGuard = gArgs.GetBoolArg("-memberopguard", true);
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); fGuard && mi != pool.mapTx.end(); mi++) {
-                const CTransaction& mtx = mi->GetTx();
-                uint32_t nTheirs = 0;
-                if (mtx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseMemberOp(mtx.nHouseOp) &&
-                        mtx.vchHousePayload.size() >= 4) {
-                    nTheirs = ReadLE32(mtx.vchHousePayload.data());
-                    if (nTheirs == nHouseIDNewLE)
-                        return state.DoS(0, false, REJECT_DUPLICATE, "house-member-op-in-mempool");
-                }
-            }
+            if (fGuard && !pool.MemberOpTxs(nHouseIDNewLE).empty())   // Stage 0 rule A: by index
+                return state.DoS(0, false, REJECT_DUPLICATE, "house-member-op-in-mempool");
         }
 
         // D-2026-11-11-3 (R121-R2): a rate op (POST, SETKEY) - checked against the CONFIRMED house record, as its
@@ -2565,10 +2689,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return error("%s: CheckHouseOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
             // -rateopguard=0 (regtest only) lets a second one in, so a gate can show the block rule refuse it
             const bool fGuard = gArgs.GetBoolArg("-rateopguard", true);
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); fGuard && mi != pool.mapTx.end(); mi++) {
+            for (const uint256& hashRate : fGuard ? pool.RateOpTxs(nRateHouseIn) : std::vector<uint256>()) {   // Stage 0 rule A
+                CTxMemPool::txiter mi = pool.mapTx.find(hashRate);
                 uint32_t nTheirs = 0;
                 bool fTheirsSetKey = false;
-                if (!HouseRateOpOf(mi->GetTx(), nTheirs, fTheirsSetKey) || nTheirs != nRateHouseIn)
+                if (mi == pool.mapTx.end() || !HouseRateOpOf(mi->GetTx(), nTheirs, fTheirsSetKey) || nTheirs != nRateHouseIn)
                     continue;
                 if (!fRateSetKeyIn && fTheirsSetKey)
                     return state.DoS(0, false, REJECT_DUPLICATE, "house-rate-setkey-in-mempool");
@@ -2648,26 +2773,91 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 uint256 hashMine;
                 if (!NoteSwapOpHashLock(tx, hashMine))
                     return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-payload");
-                if (pool.HaveSwapLock(hashMine))
-                    return state.DoS(0, false, REJECT_DUPLICATE, "swap-op-pending");
+                if (pool.HaveSwapLock(hashMine)) {
+                    // Stage 0 rule G (S1X-7's family): a protective swap op (the holder's PROTEST, the house's PAY, a
+                    // failed house's CLAIM) is never refused because the lock is held by an EXPIRE, which only fixes
+                    // the bid: the EXPIRE yields, after the trim. Any other holder keeps first-seen.
+                    const bool fProtective = tx.nNoteOp == NOTE_OP_SWAP_PROTEST || tx.nNoteOp == NOTE_OP_SWAP_PAY ||
+                                             tx.nNoteOp == NOTE_OP_SWAP_CLAIM;
+                    const std::vector<uint256> vHolders = fProtective ? pool.SwapLockHolders(hashMine) : std::vector<uint256>();
+                    bool fYield = !vHolders.empty();
+                    std::set<uint256> setInPrevouts;
+                    for (const CTxIn& in : tx.vin)
+                        setInPrevouts.insert(in.prevout.hash);
+                    for (const uint256& h : vHolders) {
+                        const CTransactionRef ph = pool.get(h);
+                        CTxMemPool::txiter itH = pool.mapTx.find(h);
+                        if (!ph || itH == pool.mapTx.end() || ph->nVersion != TRANSACTION_NOTE_VERSION ||
+                                ph->nNoteOp != NOTE_OP_SWAP_EXPIRE || SpendsPooledOrDescendant(setInPrevouts, pool, itH)) {
+                            fYield = false;
+                            break;
+                        }
+                    }
+                    if (!fYield)
+                        return state.DoS(0, false, REJECT_DUPLICATE, "swap-op-pending");
+                    setGuardYield.insert(vHolders.begin(), vHolders.end());
+                }
             }
             if (IsTokenClaimOp(tx.nNoteOp)) {
                 // v0.2.21: a token CLAIM takes no house slot, so two pooled claims must not share a token (Y): the
                 // second would make a block that holds both invalid. Checked before the claim's contextual checks;
                 // the incomer's own TokenClaimYs is curve work (one hash-to-curve per entry, bounded by its size), and
                 // the pooled claims' tokens are one lookup each in the identity index (S1X-27), never re-hashed.
+                std::vector<CPubKey> vClaimY;
                 if (tx.nNoteOp == NOTE_OP_TOKEN_CLAIM) {
-                    std::set<uint256> setMine;
-                    uint32_t nMineHouse = 0;
-                    if (!TokenClaimYs(tx, nMineHouse, setMine))
+                    // Stage 0 rule A (security 11-26): the cheap checks first (the house, its claim window, duplicate
+                    // secrets by bytes), then each secret hashed to the curve ONCE, within a budget of 2 x entries + 32
+                    // tries for the whole tx, at most 32 entries (security's ruling; a secret can be ground to need many,
+                    // each try is a point parse). Over budget is DoS 0: an honest claim from another wallet may need
+                    // more, and its holder splits it.
+                    // The Ys go to CheckTokenOperation, which doesn't hash again.
+                    NoteTokenClaim claimIn;
+                    if (!DecodeNotePayload(tx.vchNotePayload, claimIn))
                         return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payload");
-                    if (TokenClaimYsPooled(pool, nMineHouse, setMine))   // UR3-10: the wallet's test too
+                    CHouse houseClaim;
+                    const int nClaimHeight = GetSpendHeight(view);
+                    if (!fnGetHouse(claimIn.nHouseID, houseClaim))
+                        return state.DoS(0, false, REJECT_INVALID, "bad-note-unknown-house");
+                    const uint32_t nClaimE = HouseInsolventSince(houseClaim, nClaimHeight);
+                    if (nClaimE == 0)
+                        return state.DoS(0, false, REJECT_INVALID, "bad-token-claim-not-insolvent");
+                    if ((uint32_t)nClaimHeight >= ClockDeadlineHeight(nClaimE, Params().GetConsensus().nTokenClaimWindow, nClaimHeight))
+                        return state.DoS(0, false, REJECT_INVALID, "bad-token-claim-window-closed");
+                    if (claimIn.vEntry.size() > MAX_TOKEN_CLAIM_ENTRIES_RELAY)   // security's ruling: 32 entries relayed
+                        return state.DoS(0, false, REJECT_NONSTANDARD, "token-claim-too-many-entries", false,
+                                         strprintf("%u entries, at most %u relayed: split the claim", (unsigned)claimIn.vEntry.size(),
+                                                   (unsigned)MAX_TOKEN_CLAIM_ENTRIES_RELAY));
+                    std::set<std::vector<unsigned char>> setSecret;
+                    for (const TokenClaimEntry& e : claimIn.vEntry) {
+                        if (!setSecret.insert(e.vchSecret).second)
+                            return state.DoS(0, false, REJECT_INVALID, "bad-token-claim-duplicate");
+                    }
+                    const uint32_t nBudget = TokenClaimRelayTryBudget(claimIn.vEntry.size());
+                    uint32_t nTriesLeft = nBudget;
+                    std::set<uint256> setMine;
+                    vClaimY.resize(claimIn.vEntry.size());
+                    for (size_t i = 0; i < claimIn.vEntry.size(); i++) {
+                        if (!CashuHashToCurveBudget(claimIn.vEntry[i].vchSecret, vClaimY[i], nTriesLeft))
+                            return state.DoS(0, false, REJECT_NONSTANDARD, "token-claim-try-budget", false,
+                                             strprintf("the secrets need more than %u hash-to-curve tries; claim fewer tokens per transaction", nBudget));
+                        setMine.insert(TokenYID(vClaimY[i]));
+                    }
+                    if (TokenClaimYsPooled(pool, claimIn.nHouseID, setMine))   // UR3-10: the wallet's test too
                         return state.DoS(0, false, REJECT_DUPLICATE, "token-claim-pending");
                 }
                 TokenEffects eff;   // the mempool records nothing
                 if (!CheckTokenOperation(tx, state, GetSpendHeight(view), fnGetHouse, fnGetCoin, ConfirmedTokenView(),
-                        eff, houseResult, fHouseChanged, true))
+                        eff, houseResult, fHouseChanged, true, vClaimY.empty() ? nullptr : &vClaimY))
                     return error("%s: CheckTokenOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
+                // Stage 0 rule B2 for a POST, after its posting signature (rule A: the keys are payload work).
+                if (tx.nNoteOp == NOTE_OP_TOKEN_POST) {
+                    std::vector<uint256> vSlotKeys;
+                    TokenSlotKeys(tx, vSlotKeys);
+                    if (!vSlotKeys.empty() && gArgs.GetBoolArg("-tokenslotguard", true) && pool.HaveIdentityKey(vSlotKeys))
+                        return state.DoS(0, false, REJECT_DUPLICATE, "token-slot-pending", false,
+                                         "a pooled transaction already takes this token's slot (an issued or spent "
+                                         "mark); try again after the next block");
+                }
             } else if (!CheckNoteOperation(tx, state, GetSpendHeight(view), nNoteUnitsIn, fnGetHouse, fnGetCoin, fnGetCoin, fnGetBlockHash, houseResult, fHouseChanged, true))
                 return error("%s: CheckNoteOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
@@ -2715,7 +2905,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 return error("%s: CheckPoolOperation: %s, %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
 
             const uint32_t nPoolTouched = poolResult.nPoolID;
-            for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+            for (const uint256& hashPoolOp : pool.PoolOpTxs(nPoolTouched)) {   // Stage 0 rule A: by index
+                CTxMemPool::txiter mi = pool.mapTx.find(hashPoolOp);
+                if (mi == pool.mapTx.end())
+                    continue;
                 const CTransaction& mtx = mi->GetTx();
                 if (mtx.nVersion == TRANSACTION_POOL_VERSION && mtx.vchPoolPayload.size() >= 4) {
                     uint32_t nTheirs = 0;
@@ -2769,7 +2962,11 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         {
             const HouseStateKeys keysIn = GetHouseStateKeys(tx);
             if (tx.nVersion != TRANSACTION_SETTLE_VERSION && keysIn.Any()) {
-                for (CTxMemPool::txiter mi = pool.mapTx.begin(); mi != pool.mapTx.end(); mi++) {
+                // Stage 0 rule A (no pool walks): the conflicting pooled txs by index; the check below is the same.
+                for (const uint256& hashConflict : pool.HouseStateConflictTxs(keysIn.vSlot, keysIn.nStatusReader)) {
+                    CTxMemPool::txiter mi = pool.mapTx.find(hashConflict);
+                    if (mi == pool.mapTx.end())
+                        continue;
                     const CTransaction& mtx = mi->GetTx();
                     if (HouseStateKeysConflict(keysIn, GetHouseStateKeys(mtx))) {
                         // Never an op the incomer spends (fnSlotYields checks SpendsPooledOrDescendant: evicting the
@@ -3186,6 +3383,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                 setSlotPaid.insert(hashSlot);
         }
         fnEvictDisplaced(setRatePostYield, MemPoolRemovalReason::EXPIRY, "H1 rate POST yield");
+        fnEvictDisplaced(setGuardYield, MemPoolRemovalReason::EXPIRY, "Stage 0 G guard yield");
         fnEvictDisplaced(setSlotPaid, MemPoolRemovalReason::REPLACED, "UR-ext-2 fee priority");
         if (!pool.exists(hash)) {
             // Can't happen (see above); refuse rather than announce a tx the pool no longer holds.
@@ -3672,7 +3870,7 @@ static bool CheckHouseMemberOperation(const CTransaction& tx, CValidationState& 
     // relay a correctly signed op that a block has just made stale. The cheap count read goes before the signatures.
     if (op.nPrevCount != fnGetCount(op.nHouseID))
         return state.DoS(10, false, REJECT_INVALID, "bad-house-member-prior-count");
-    const uint256 sighash = HouseMemberSigHash(house.houseID, tx.nHouseOp, op, NoteHashPrevouts(tx));
+    const uint256 sighash = HouseMemberSigHash(tx, house.houseID);
     if (!VerifyHouseApprovers(house, op.vApproverIndex, op.vApproverSig, sighash, house.nThresholdM, state,
                               "bad-house-member-approver"))
         return false;
@@ -3733,10 +3931,155 @@ static bool BillVerifyStrict(const std::vector<unsigned char>& vchPubKey,
  * RECOURSE deliberately does not - it mutates no house record at all.
  */
 /** A bill's reference house's failure height, if it has failed (its windows then end there); else 0. */
+/** Stage 0 rule B1 (security's wording: a check that reads state another tx in the same block could write reads it as of
+ *  the block's start): the house record as of the block's start, for the checks that read a house's status without
+ *  taking its slot - a note or deposit DEMAND, a pool CREATE, SWAP_PAY's insolvency check, a bill's reference house.
+ *  ConnectBlock opens a HouseAtBlockStartScope over the house DB (written only at the block's end); elsewhere the
+ *  caller's getter is already that (ATMP reads the confirmed DB, unit tests pass their own records). */
+static thread_local const std::function<bool(uint32_t, CHouse&)>* g_pfnHouseAtBlockStart = nullptr;
+class HouseAtBlockStartScope
+{
+public:
+    explicit HouseAtBlockStartScope(const std::function<bool(uint32_t, CHouse&)>* pfn) : pPrev(g_pfnHouseAtBlockStart)
+    {
+        g_pfnHouseAtBlockStart = pfn;
+    }
+    ~HouseAtBlockStartScope() { g_pfnHouseAtBlockStart = pPrev; }
+    HouseAtBlockStartScope(const HouseAtBlockStartScope&) = delete;
+    HouseAtBlockStartScope& operator=(const HouseAtBlockStartScope&) = delete;
+private:
+    const std::function<bool(uint32_t, CHouse&)>* pPrev;
+};
+static bool HouseAtBlockStart(uint32_t nID, CHouse& house, const std::function<bool(uint32_t, CHouse&)>& fnGetHouse)
+{
+    return g_pfnHouseAtBlockStart ? (*g_pfnHouseAtBlockStart)(nID, house) : fnGetHouse(nID, house);
+}
+
+void TokenSlotKeys(const CTransaction& tx, std::vector<uint256>& vKeys)
+{
+    // Stage 0 rule B2 (security 11-26, Q2, narrowed 11-26 so holders' BURNs don't queue; testing's map P5, O1): the
+    // token slots, shared by the block rule and the mempool identity index (so a template never holds two). The issuer's
+    // ops - MINT, FREEZE, UNFREEZE - share one slot per token (MINT/MINT at the supply cap; FREEZE/FREEZE of a coin; a
+    // FREEZE of a same-block MINT's new coin). A BURN takes none: it spends its own coins, a FREEZE of one of them is the
+    // block's freeze-against-spend rule, and MINT's cap reads supply at the block's start (issued_connect.cpp), so a
+    // same-block BURN can't change a MINT's verdict. Domain-tagged hashes.
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION &&
+            (tx.nIssuedOp == ISSUED_OP_MINT || tx.nIssuedOp == ISSUED_OP_FREEZE || tx.nIssuedOp == ISSUED_OP_UNFREEZE)) {
+        uint256 tokenID;
+        bool fOk = false;
+        if (tx.nIssuedOp == ISSUED_OP_MINT) {
+            IssuedMint m;
+            if ((fOk = DecodeIssuedPayload(tx.vchIssuedPayload, m)))
+                tokenID = m.tokenID;
+        } else {
+            IssuedFreeze f;
+            if ((fOk = DecodeIssuedPayload(tx.vchIssuedPayload, f)))
+                tokenID = f.tokenID;
+        }
+        if (fOk) {
+            CHashWriter hw(SER_GETHASH, 0);
+            hw << std::string("fb-slot-token-issuer") << tokenID;   // the issuer's ops on one token
+            vKeys.push_back(hw.GetHash());
+        }
+    } else if (tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_POST) {
+        NoteTokenPost post;
+        if (DecodeNotePayload(tx.vchNotePayload, post)) {
+            for (const TokenIssued& iss : post.vIssued) {
+                CHashWriter hw(SER_GETHASH, 0);
+                hw << std::string("fb-slot-token-issued") << post.nHouseID << iss.vchB;   // (house, B)
+                vKeys.push_back(hw.GetHash());
+            }
+            for (const uint256& y : post.vSpent) {
+                CHashWriter hw(SER_GETHASH, 0);
+                hw << std::string("fb-slot-token-spent") << post.nHouseID << y;   // (house, Y): its mark too
+                vKeys.push_back(hw.GetHash());
+            }
+        }
+    } else if (tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_TOKEN_KEYSET) {
+        NoteTokenKeyset ks;
+        if (DecodeNotePayload(tx.vchNotePayload, ks)) {
+            CHashWriter hw(SER_GETHASH, 0);
+            hw << std::string("fb-slot-token-keyset") << ks.nHouseID << TokenKeysetID(ks.vKey);   // (house, keyset id)
+            vKeys.push_back(hw.GetHash());
+        }
+    }
+}
+
+/** Stage 0 rule B2 (security's wording 11-26; testing's map): the write-write pairs that block-start reads can't make
+ *  order-free get a consensus slot each, checked over the whole block before any tx connects, so the verdict can't
+ *  depend on tx order:
+ *  - one bill op per bill (P4, S1X-55: CLAIM and RECOURSE of one bill), keyed as the mempool's per-bill guard;
+ *  - one swap op per hash lock (P6);
+ *  - the token slots (TokenSlotKeys: the issuer's ops on a token - MINT, FREEZE, UNFREEZE; a POST per (house, B) and
+ *    (house, Y); a KEYSET per (house, id)), and one LP op (CREATE / ADD / REMOVE) per token pool;
+ *  - FREEZE against a spend: a block may not both FREEZE / UNFREEZE a coin and spend it, in either order (P5).
+ *  The mempool already keeps each pair apart (the per-bill, per-lock and LP guards, UR-ext-8, and the token slots in
+ *  its identity index), so honest templates are unchanged. A bill ISSUE and the ops a slot or block-start read already
+ *  cover are not here. */
+static bool CheckBlockCreditSlots(const CBlock& block, CValidationState& state)
+{
+    std::set<uint256> setKeys;
+    std::map<COutPoint, size_t> mapFreezeTarget;   // target -> the FREEZE / UNFREEZE's index
+    auto fnTake = [&](const uint256& key, const std::string& strReason, size_t i) {
+        if (setKeys.insert(key).second)
+            return true;
+        return state.DoS(100, error("CheckBlockCreditSlots(): tx %u takes a slot another tx in the block holds", (unsigned)i),
+                         REJECT_INVALID, strReason);
+    };
+    for (size_t i = 1; i < block.vtx.size(); i++) {
+        const CTransaction& tx = *block.vtx[i];
+        if (tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp != BILL_OP_ISSUE && tx.vchBillPayload.size() >= 4) {
+            CHashWriter hw(SER_GETHASH, 0);
+            hw << std::string("fb-slot-bill");
+            hw.write((const char*)tx.vchBillPayload.data(), 4);   // every non-ISSUE bill op leads with its bill id
+            if (!fnTake(hw.GetHash(), "bad-blk-bill-slot", i))
+                return false;
+        }
+        uint256 hashLock;
+        if (tx.nVersion == TRANSACTION_NOTE_VERSION && IsNoteSwapOp(tx.nNoteOp) && NoteSwapOpHashLock(tx, hashLock)) {
+            CHashWriter hw(SER_GETHASH, 0);
+            hw << std::string("fb-slot-swap-lock") << hashLock;
+            if (!fnTake(hw.GetHash(), "bad-blk-swap-lock-slot", i))
+                return false;
+        }
+        if (tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) && tx.nIssuedOp != ISSUED_OP_POOL_SWAP) {
+            CHashWriter hw(SER_GETHASH, 0);
+            hw << std::string("fb-slot-token-lp") << IssuedPoolOpToken(tx);
+            if (!fnTake(hw.GetHash(), "bad-blk-token-lp-slot", i))
+                return false;
+        }
+        std::vector<uint256> vTokenKeys;
+        TokenSlotKeys(tx, vTokenKeys);
+        for (const uint256& key : vTokenKeys)
+            if (!fnTake(key, "bad-blk-token-slot", i))
+                return false;
+        if (tx.nVersion == TRANSACTION_TOKEN_VERSION &&
+                (tx.nIssuedOp == ISSUED_OP_FREEZE || tx.nIssuedOp == ISSUED_OP_UNFREEZE)) {
+            IssuedFreeze f;
+            if (DecodeIssuedPayload(tx.vchIssuedPayload, f))
+                for (const COutPoint& o : f.vOutpoint)
+                    mapFreezeTarget.emplace(o, i);
+        }
+    }
+    if (!mapFreezeTarget.empty()) {
+        for (size_t i = 1; i < block.vtx.size(); i++) {
+            for (const CTxIn& in : block.vtx[i]->vin) {
+                const auto it = mapFreezeTarget.find(in.prevout);
+                if (it != mapFreezeTarget.end() && it->second != i)
+                    return state.DoS(100, error("CheckBlockCreditSlots(): tx %u spends a coin tx %u freezes or unfreezes",
+                                                (unsigned)i, (unsigned)it->second),
+                                     REJECT_INVALID, "bad-blk-freeze-spend");
+            }
+        }
+    }
+    return true;
+}
+
 static int RefHouseAnchor(uint32_t nRefHouseID, int nHeight, const std::function<bool(uint32_t, CHouse&)>& fnGetHouse)
 {
     CHouse ref;
-    if (nRefHouseID == 0 || !fnGetHouse(nRefHouseID, ref) || HouseEffectiveStatus(ref, nHeight) != HOUSE_STATUS_INSOLVENT)
+    if (nRefHouseID == 0 || !HouseAtBlockStart(nRefHouseID, ref, fnGetHouse) ||   // Stage 0 B1 (O2)
+            HouseEffectiveStatus(ref, nHeight) != HOUSE_STATUS_INSOLVENT)
         return 0;
     return (int)HouseInsolventSince(ref, nHeight);
 }
@@ -3904,8 +4247,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (bill.nOwnerHouseID != 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-house-held");
 
-        const uint256 sighash = BillRetireSigHash(bill.billID, retire.nRateNamed, BillTxBindingHash(tx), BillHashOutputs(tx),
-                                                  false);   // UR1-6; S1X-17
+        const uint256 sighash = BillRetireSigHash(tx, bill.billID, false);   // Stage 0 C1 (UR1-6; S1X-17)
         if (!FbVerifyStrict(CPubKey(bill.vchAcceptorPubKey), sighash, retire.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-retire-sig");
 
@@ -3949,7 +4291,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // The holder signs the exact output set - where the escrow goes is
         // the holder's choice, the signature is the authorization
-        const uint256 sighash = BillClaimSigHash(bill.billID, BillTxBindingHash(tx), BillHashOutputs(tx), false);   // S1X-17
+        const uint256 sighash = BillClaimSigHash(tx, bill.billID, false);   // Stage 0 C1
         if (!FbVerifyStrict(CPubKey(bill.vchHolderPubKey), sighash, claim.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-claim-sig");
 
@@ -4039,6 +4381,33 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // Gold B (GOLD_B.md §1): issuing needs a rate posted within GramParams::nRateRefreshSecs (review 2026-11-07).
         if (!HouseRateFreshForChecks(house.nHouseID, nHeight, (int64_t)Params().GetConsensus().GramAt(nHeight).nRateRefreshSecs))
             return state.DoS(0, false, REJECT_INVALID, "bad-bill-discount-rate-stale");
+        // Stage 0 rule A: the link and the authorization (25/26) come before the capital read (tranches, rate days)
+        // and the reserve proofs (17-19); their numbers are kept.
+        // -- 25: the link ----------------------------------------------------
+        if (d.endorsement.vchFrom != bill.vchHolderPubKey)
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-not-holder");
+        const uint32_t nAtHeight = d.endorsement.nAtHeight;
+        if (nAtHeight > (uint32_t)nHeight || (uint32_t)nHeight - nAtHeight > BILL_ENDORSE_HEIGHT_SLACK)
+            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-height");
+        // The stored link signature is the CLASSIC endorse digest, so the
+        // endorsement chain stays verifiable from CBill alone by anyone who
+        // never saw the discount payload.
+        if (!BillVerifyStrict(d.endorsement.vchFrom,
+                BillEndorseSigHash(bill.billID, d.endorsement.vchFrom, d.endorsement.vchTo, nAtHeight,
+                                   (uint32_t)bill.vEndorsement.size()),   // S1X-34
+                d.endorsement.vchSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-link-sig");
+
+        // -- 26: authorization - two authorities, ONE shared digest ----------
+        // Seller and house quorum sign the same bytes, so neither side can
+        // alter any term after the other has signed.
+        const uint256 sighashDiscount = BillDiscountSigHash(tx, bill.billID);   // Stage 0 C1
+        if (!BillVerifyStrict(bill.vchHolderPubKey, sighashDiscount, d.vchSellerSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-seller-sig");
+        if (!VerifyHouseApprovers(house, d.vApproverIndex, d.vApproverSig, sighashDiscount,
+                house.nThresholdM, state, "bad-bill-discount-approvers"))
+            return false;
+
         // -- 17: capital cap (CM-2) - the NOTE_OP_MINT conjunct verbatim ---
         const uint64_t nPrice = (uint64_t)d.amountPrice;
         if (house.nMintedUnits > (uint64_t)MAX_MONEY - nPrice ||
@@ -4098,32 +4467,6 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (nTxFee < BillEndorseFeeFloor(bill.vEndorsement.size() + 1))
             return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-fee");
 
-        // -- 25: the link ----------------------------------------------------
-        if (d.endorsement.vchFrom != bill.vchHolderPubKey)
-            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-not-holder");
-        const uint32_t nAtHeight = d.endorsement.nAtHeight;
-        if (nAtHeight > (uint32_t)nHeight || (uint32_t)nHeight - nAtHeight > BILL_ENDORSE_HEIGHT_SLACK)
-            return state.DoS(10, false, REJECT_INVALID, "bad-bill-discount-height");
-        // The stored link signature is the CLASSIC endorse digest, so the
-        // endorsement chain stays verifiable from CBill alone by anyone who
-        // never saw the discount payload.
-        if (!BillVerifyStrict(d.endorsement.vchFrom,
-                BillEndorseSigHash(bill.billID, d.endorsement.vchFrom, d.endorsement.vchTo, nAtHeight,
-                                   (uint32_t)bill.vEndorsement.size()),   // S1X-34
-                d.endorsement.vchSig))
-            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-link-sig");
-
-        // -- 26: authorization - two authorities, ONE shared digest ----------
-        // Seller and house quorum sign the same bytes, so neither side can
-        // alter any term after the other has signed.
-        const uint256 sighashDiscount = BillDiscountSigHash(d, bill.billID,
-                BillHashPrevouts(tx), BillHashOutputs(tx));
-        if (!BillVerifyStrict(bill.vchHolderPubKey, sighashDiscount, d.vchSellerSig))
-            return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-seller-sig");
-        if (!VerifyHouseApprovers(house, d.vApproverIndex, d.vApproverSig, sighashDiscount,
-                house.nThresholdM, state, "bad-bill-discount-approvers"))
-            return false;
-
         billOut = bill;
         billOut.vEndorsement.push_back(d.endorsement);
         billOut.vchHolderPubKey = d.vchCustodyPubKey;
@@ -4179,7 +4522,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         CAmount amountOwed = 0;
         if (fRetire) {
             if (!BillVerifyStrict(bill.vchAcceptorPubKey,
-                    BillHRetireEscrowSigHash(hr, bill.billID, BillTxBindingHash(tx), BillHashOutputs(tx)),   // S1X-17: + nSequence, nLockTime
+                    BillHRetireEscrowSigHash(tx, bill.billID),   // Stage 0 C1
                     hr.vchAcceptorSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretireescrow-sig");
             // Gram-notes release: what's left after the notes burned at par is mg, paid in sECX at the bound price.
@@ -4295,7 +4638,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // entitlement. An sECX repayment never reaches the pot either way.
 
         if (!BillVerifyStrict(bill.vchAcceptorPubKey,
-                BillHRetireNotesSigHash(hn, bill.billID, BillHashPrevouts(tx), BillHashOutputs(tx)),
+                BillHRetireNotesSigHash(tx, bill.billID),   // Stage 0 C1
                 hn.vchAcceptorSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretirenotes-sig");
         // Notes burned at par (1 unit = 1 sat) plus value paid to the current
@@ -4392,7 +4735,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         if (fRetire) {
             if (!BillVerifyStrict(bill.vchAcceptorPubKey,
-                    BillRetireSigHash(bill.billID, hr.nRateNamed, BillTxBindingHash(tx), BillHashOutputs(tx), true),
+                    BillRetireSigHash(tx, bill.billID, true),   // Stage 0 C1
                     hr.vchAcceptorSig))   // UR1-6; S1X-17
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-hretire-sig");
             // Face paid to the current holder - which check 12 pinned to the
@@ -4410,7 +4753,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             // The QUORUM replaces the single holder signature of op 4: the
             // custody key alone must never direct the escrow payout.
             if (!VerifyHouseApprovers(house, hc.vApproverIndex, hc.vApproverSig,
-                    BillClaimSigHash(bill.billID, BillTxBindingHash(tx), BillHashOutputs(tx), true),   // S1X-17
+                    BillClaimSigHash(tx, bill.billID, true),   // Stage 0 C1
                     house.nThresholdM, state, "bad-bill-hclaim-approvers"))
                 return false;
         }
@@ -4530,7 +4873,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // The payer alone. Holder consent is structurally unnecessary: they are
         // being paid at their own key, at or above their best alternative.
         if (!BillVerifyStrict(r.vchPayerPubKey,
-                BillRecourseSigHash(r, bill.billID, BillHashPrevouts(tx), BillHashOutputs(tx)),
+                BillRecourseSigHash(tx, bill.billID),   // Stage 0 C1
                 r.vchPayerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-payer-sig");
 
@@ -4619,8 +4962,10 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         const uint256 declDigest = HouseDeclarationDigest(reg, nFlags);
         for (size_t i = 0; i < reg.vPartnerPubKey.size(); i++) {
             const uint256 sighash = HouseRegisterSigHash(declDigest, i, reg.vPledgeAmount[i]);
+            // Stage 0 rule A: state-free (the declaration and the pledge only), and on the mempool path checked after
+            // every pledge input's script (ATMP), so it keeps its score there.
             if (!FbVerifyStrict(CPubKey(reg.vPartnerPubKey[i]), sighash, reg.vPartnerSig[i]))
-                return state.DoS(100, false, REJECT_INVALID, "bad-house-register-sig");
+                return state.DoSStateIndependent(100, false, REJECT_INVALID, "bad-house-register-sig");
         }
 
         houseOut = CHouse();
@@ -4679,7 +5024,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(100, false, REJECT_INVALID, "bad-house-topup-escrow");
 
         // Signature binds the exact output set (escrow value + destination)
-        const uint256 sighash = HouseTopupSigHash(house.houseID, topup.nPartnerIndex, BillHashPrevouts(tx), BillHashOutputs(tx));
+        const uint256 sighash = HouseTopupSigHash(tx, house.houseID);
         if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, topup.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-topup-sig");
 
@@ -4768,6 +5113,27 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         if (house.ActivePartnerCount() - 1 < (int)house.nThresholdM)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-below-threshold");
 
+        // Voluntary (partner's own signature) OR expulsion (M-of-N approvers) - exactly one (S1X-17; the shape check
+        // refuses both too, this keeps the arm self-contained): a partner-signed exit with approver entries would skip
+        // them below, so junk entries made a new txid.
+        if (!ex.vchPartnerSig.empty() && !(ex.vApproverIndex.empty() && ex.vApproverSig.empty()))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-twoauth");
+        // Binds the output set so a leaked/dropped exit sig is not replayable.
+        const uint256 sighash = HouseExitSigHash(tx, house.houseID);
+        bool fAuthorized = false;
+        if (!ex.vchPartnerSig.empty()) {
+            if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, ex.vchPartnerSig))
+                return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-sig");
+            fAuthorized = true;
+        }
+        if (!fAuthorized) {
+            if (!VerifyHouseApprovers(house, ex.vApproverIndex, ex.vApproverSig, sighash,
+                    house.nThresholdM, state, "bad-house-exit-approver"))
+                return false;
+            fAuthorized = true;
+        }
+
+        // Stage 0 rule A: after the authorization (the capital read walks the tranches and the rate days).
         // D13 cap-consistency (the 3.2 promissory note): an exit moves this
         // pledge out of the ACTIVE cap escrow, and escrow leaving is the only
         // channel that can break the mint invariant N <= lambda*E between
@@ -4780,26 +5146,6 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             houseAfter.vPartner[ex.nPartnerIndex].status = HOUSE_PARTNER_TAIL;
             if (house.nMintedUnits + house.nDepositUnits > CapitalCapUnits(houseAfter, nHeight))
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-exit-cap");
-        }
-
-        // Voluntary (partner's own signature) OR expulsion (M-of-N approvers) - exactly one (S1X-17; the shape check
-        // refuses both too, this keeps the arm self-contained): a partner-signed exit with approver entries would skip
-        // them below, so junk entries made a new txid.
-        if (!ex.vchPartnerSig.empty() && !(ex.vApproverIndex.empty() && ex.vApproverSig.empty()))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-twoauth");
-        // Binds the output set so a leaked/dropped exit sig is not replayable.
-        const uint256 sighash = HouseExitSigHash(house.houseID, ex.nPartnerIndex, BillHashPrevouts(tx), BillHashOutputs(tx));
-        bool fAuthorized = false;
-        if (!ex.vchPartnerSig.empty()) {
-            if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, ex.vchPartnerSig))
-                return state.DoS(100, false, REJECT_INVALID, "bad-house-exit-sig");
-            fAuthorized = true;
-        }
-        if (!fAuthorized) {
-            if (!VerifyHouseApprovers(house, ex.vApproverIndex, ex.vApproverSig, sighash,
-                    house.nThresholdM, state, "bad-house-exit-approver"))
-                return false;
-            fAuthorized = true;
         }
 
         // Tail liability: the pledge stays locked for the tail period and
@@ -4848,7 +5194,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         }
 
         // Binds the output set so a leaked/dropped winddown sig is not replayable.
-        const uint256 sighash = HouseWinddownSigHash(house.houseID, BillHashPrevouts(tx), BillHashOutputs(tx));
+        const uint256 sighash = HouseWinddownSigHash(tx, house.houseID);
         if (!VerifyHouseApprovers(house, wd.vApproverIndex, wd.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-winddown-approver"))
             return false;
@@ -5061,7 +5407,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-no-residual");
 
             // The trigger partner signs the exact (forced) output set
-            const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, BillHashPrevouts(tx), CreditHashOutputs(tx));
+            const uint256 sighash = HouseReclaimSigHash(tx, house.houseID);
             if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, rec.vchSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
 
@@ -5177,6 +5523,12 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-not-own-pledge");
         }
 
+        // The partner signs the whole tx (Stage 0 C1) - destination is their choice. Stage 0 rule A: before the capital
+        // read below (tranches, rate days).
+        const uint256 sighash = HouseReclaimSigHash(tx, house.houseID);
+        if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, rec.vchSig))
+            return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
+
         // D13 cap-consistency at effective Open: after this reclaim the LIVE
         // escrow pot must still support the outstanding notes at the tier cap
         // (tail pledges left the cap math at exit but remain waterfall
@@ -5189,11 +5541,6 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             if (house.nMintedUnits + house.nDepositUnits > CapitalCapUnits(house, nHeight))
                 return state.DoS(0, false, REJECT_INVALID, "bad-house-reclaim-cap");
         }
-
-        // The partner signs the exact output set - destination is their choice
-        const uint256 sighash = HouseReclaimSigHash(house.houseID, rec.nPartnerIndex, BillHashPrevouts(tx), CreditHashOutputs(tx));
-        if (!FbVerifyStrict(CPubKey(partner.vchPubKey), sighash, rec.vchSig))
-            return state.DoS(100, false, REJECT_INVALID, "bad-house-reclaim-sig");
 
         // Prune the reclaimed outpoints (those spent by this tx) from the
         // partner record, and canonicalize the survivors' order so the record
@@ -5263,6 +5610,13 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 att.nPrevEpisodeFloorUsed != house.fEpisodeFloorUsed || att.nPrevDeferInEpisode != house.fDeferInEpisode)
             return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-house-attest-priors");
 
+        // Stage 0 rule A: the approvers first, then the reserve proofs (one signature and a coin read each).
+        // M-of-N approval over the claim + proof set + exact output set
+        const uint256 sighash = HouseAttestSigHash(tx, house.houseID);   // S1X-35
+        if (!VerifyHouseApprovers(house, att.vApproverIndex, att.vApproverSig, sighash,
+                house.nThresholdM, state, "bad-house-attest-approver"))
+            return false;
+
         // Per-proof verification against the PARENT-chain UTXO state (order-
         // independent within a block; the ConnectBlock closure recovers coins
         // spent earlier in the same block from the block's own undo data). The
@@ -5273,13 +5627,6 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             return false;
         if (amountSum != att.amountReserves)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-attest-sum");
-
-        // M-of-N approval over the claim + proof set + exact output set
-        const uint256 sighash = HouseAttestSigHash(house.houseID, att.nAsOfHeight,
-            att.amountReserves, HouseAttestProofSetHash(att.vProofs), NoteHashPrevouts(tx), BillHashOutputs(tx));   // S1X-35
-        if (!VerifyHouseApprovers(house, att.vApproverIndex, att.vApproverSig, sighash,
-                house.nThresholdM, state, "bad-house-attest-approver"))
-            return false;
 
         // ATTEST never starts stress (a till below the floor only stops issuing, R3-4). For a deferred house it is the
         // recovery test: the till this attestation proves (in mg at the house's 30-day highest ask, Gold B) back at the
@@ -5428,8 +5775,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-defer-stray-escrow");
         }
 
-        const uint256 sighash = HouseDeferSigHash(house.houseID, def.nPrevLastActivation, NoteHashPrevouts(tx),
-                                                  BillHashOutputs(tx));   // S1X-35
+        const uint256 sighash = HouseDeferSigHash(tx, house.houseID);   // S1X-35
         if (!VerifyHouseApprovers(house, def.vApproverIndex, def.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-defer-approver"))
             return false;
@@ -5466,7 +5812,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
         if (chEffStatus != HOUSE_STATUS_OPEN && chEffStatus != HOUSE_STATUS_STRESSED &&
                 chEffStatus != HOUSE_STATUS_DEFERRED)
             return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-closed");
-        if (!VerifyHouseApprovers(house, ch.vApproverIndex, ch.vApproverSig, HouseCharterSigHash(ch.nHouseID, tx, ch),
+        if (!VerifyHouseApprovers(house, ch.vApproverIndex, ch.vApproverSig, HouseCharterSigHash(tx),
                                   house.nThresholdM, state, "bad-house-charter-approver"))
             return false;
         houseOut = house;
@@ -5492,7 +5838,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-closed");
         if (rate.nKind == HOUSE_RATE_SETKEY &&
                 !VerifyHouseApprovers(house, rate.vApproverIndex, rate.vApproverSig,
-                                      HouseRateSigHash(rate.nHouseID, tx, rate), house.nThresholdM, state,
+                                      HouseRateSigHash(tx), house.nThresholdM, state,
                                       "bad-house-rate-approver"))
             return false;
         houseOut = house;
@@ -5584,7 +5930,7 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-release-stray-escrow");
         }
 
-        const uint256 sighash = HouseReleaseSigHash(house.houseID, NoteHashPrevouts(tx), BillHashOutputs(tx));
+        const uint256 sighash = HouseReleaseSigHash(tx, house.houseID);
         if (!VerifyHouseApprovers(house, rel.vApproverIndex, rel.vApproverSig, sighash,
                 house.nThresholdM, state, "bad-house-release-approver"))
             return false;
@@ -5660,7 +6006,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             // in-kind exit stays open through REDEEM, with the spread. No ban: the status can move under the wallet.
             if (chEff == HOUSE_STATUS_DEFERRED || GoldBrassageAmount(house, nHeight, sw.nUnits) > 0)
                 return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-spread-owed");
-            if (!FbVerifyStrict(CPubKey(sw.vchHolderPubKey), NoteSwapSigHash(sw, tx), sw.vchHolderSig))
+            if (!FbVerifyStrict(CPubKey(sw.vchHolderPubKey), NoteSwapSigHash(tx), sw.vchHolderSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-sig");
             CCharterToken token;
             if (!HouseCharterTokenForChecks(sw.nHouseID, sw.nChainID, sw.vchContract, clock.nMonoTime, token))
@@ -5711,8 +6057,8 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             {
                 // A failed house's swaps are claimed from its escrow (SWAP_CLAIM), never paid outside the waterfall: a
                 // payment then would also prune the shortfall ledger the snapshot reads (review 2026-11-07).
-                CHouse hPay;
-                if (fnGetHouse(p.nHouseID, hPay) && HouseEffectiveStatus(hPay, nHeight) == HOUSE_STATUS_INSOLVENT)
+                CHouse hPay;   // Stage 0 B1 (P3): the status as of the block's start
+                if (HouseAtBlockStart(p.nHouseID, hPay, fnGetHouse) && HouseEffectiveStatus(hPay, nHeight) == HOUSE_STATUS_INSOLVENT)
                     return state.DoS(0, false, REJECT_INVALID, "bad-note-swap-pay-insolvent");
             }
             uint64_t nBidNow = 0;
@@ -5888,6 +6234,14 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // than stored - cannot issue; only redemption and recovery capital.
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-house-not-open");
+        // House M-of-N authorizes the exact issuance (Stage 0 C1: the whole tx). Binding the inputs makes the approver
+        // signatures tx-unique so a confirmed mint cannot be replayed with fresh funding to re-issue the same notes
+        // without new consent. Stage 0 rule A: before the member reads, the
+        // capital read (tranches, rate days) and the reserve proofs.
+        if (!VerifyHouseApprovers(house, mint.vApproverIndex, mint.vApproverSig,
+                NoteMintSigHash(tx),
+                house.nThresholdM, state, "bad-note-mint-approver"))
+            return false;
         // v0.2.19 members-only: new notes go to members (spec 4.1)
         if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
             return false;
@@ -5931,15 +6285,6 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (house.nMintedUnits + total > reserveCap)
             return state.DoS(100, false, REJECT_INVALID, "bad-note-mint-under-reserved");
 
-        // House M-of-N authorizes the exact issuance (house_id + vUnits +
-        // inputs + outputs). Binding hashPrevouts makes the approver signatures
-        // tx-unique so a confirmed mint cannot be replayed with fresh funding
-        // to re-issue the same notes without new consent.
-        if (!VerifyHouseApprovers(house, mint.vApproverIndex, mint.vApproverSig,
-                NoteMintSigHash(mint.nHouseID, mint.vUnits, NoteHashPrevouts(tx), hashOutputs),
-                house.nThresholdM, state, "bad-note-mint-approver"))
-            return false;
-
         house.nMintedUnits += total;
         houseOut = house;
         fHouseChanged = true;
@@ -5954,7 +6299,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // The sender authorizes the exact split + destinations (this is what
         // binds the trailer payload the legacy input sighash does not cover).
         if (!FbVerifyStrict(CPubKey(xfer.vchSenderPubKey),
-                NoteTransferSigHash(xfer.nHouseID, xfer.vUnits, hashOutputs), xfer.vchSenderSig))
+                NoteTransferSigHash(tx), xfer.vchSenderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-transfer-sig");
         // v0.2.19 members-only: notes pass on only to members, or back to the sender's own key (spec 4.1). The house
         // must be known (fail closed, review F3; notes of a house that does not exist cannot exist).
@@ -6004,6 +6349,32 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         //   the digest verifies against the holder key the burned coins'
         //   custody scripts pin (tx_verify), so only the real authorisation
         //   can move these coins.
+        // Stage 0 rule A (testing's no-signature-input probe, 11-26): ONE pass over the inputs for everything the checks
+        // below read from them - the burned coins' demand id (a discharge), their uniform demand tag and the count of
+        // protested coins - instead of a coin read per input per check.
+        uint256 demandIdBurn;
+        bool fHaveDemandId = false, fBurnCustodyBad = false, fBurnMixedDemand = false;
+        uint32_t nDemandTagIn = 0, nProtestedBurnedIn = 0;
+        for (const CTxIn& in : tx.vin) {
+            Coin coin;
+            if (!fnGetCoin(in.prevout, coin) || !coin.fNote)
+                continue;
+            if (coin.nDemandHeight != 0 && nDemandTagIn == 0)
+                nDemandTagIn = coin.nDemandHeight;   // tx_verify: uniform across inputs (marker normalized for a discharge)
+            if (NoteDemandIsProtested(coin.nDemandHeight))
+                nProtestedBurnedIn++;
+            if (!redeem.fPreAuthDischarge)
+                continue;
+            uint256 id;
+            if (!NoteCustodyDemandId(coin.out.scriptPubKey, id))
+                fBurnCustodyBad = true;
+            else if (fHaveDemandId && id != demandIdBurn)
+                fBurnMixedDemand = true;
+            else {
+                demandIdBurn = id;
+                fHaveDemandId = true;
+            }
+        }
         if (redeem.fPreAuthDischarge) {
             // The vector is re-supplied verbatim because the digest binds the
             // VECTOR, unreconstructable from an unordered burned-coin set.
@@ -6023,20 +6394,10 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sum");
             // S1X-14: the demand these coins belong to. Every burned note coin carries the same demand id (one demand
             // per discharge, as the sum already requires); the standing authorisation must name that id.
-            uint256 demandIdBurn;
-            bool fHaveDemandId = false;
-            for (const CTxIn& in : tx.vin) {
-                Coin coin;
-                if (!fnGetCoin(in.prevout, coin) || !coin.fNote)
-                    continue;
-                uint256 id;
-                if (!NoteCustodyDemandId(coin.out.scriptPubKey, id))
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-custody");
-                if (fHaveDemandId && id != demandIdBurn)
-                    return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-mixed-demand");
-                demandIdBurn = id;
-                fHaveDemandId = true;
-            }
+            if (fBurnCustodyBad)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-custody");
+            if (fBurnMixedDemand)
+                return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-mixed-demand");
             if (!fHaveDemandId)
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-custody");
             if (!FbVerifyStrict(CPubKey(redeem.vchHolderPubKey),
@@ -6045,7 +6406,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-discharge-sig-invalid");
         } else {
             if (!FbVerifyStrict(CPubKey(redeem.vchHolderPubKey),
-                    NoteRedeemSigHash(redeem.nHouseID, nNoteUnitsIn, hashOutputs), redeem.vchHolderSig))
+                    NoteRedeemSigHash(tx), redeem.vchHolderSig))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-redeem-sig");
         }
 
@@ -6117,17 +6478,8 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             // read it raw, which on a pre-auth coin (bit 31 set) made
             // nDemandHeight ~2^31, the accrual window compute as zero, and the
             // interest floor vanish on exactly the coins B3 exists to protect.
-            uint32_t nDemandTag = 0;
-            uint32_t nProtestedBurned = 0;
-            for (const CTxIn& in : tx.vin) {
-                Coin coin;
-                if (!fnGetCoin(in.prevout, coin) || !coin.fNote)
-                    continue;
-                if (coin.nDemandHeight != 0 && nDemandTag == 0)
-                    nDemandTag = coin.nDemandHeight;   // tx_verify: uniform across inputs (marker normalized for a discharge)
-                if (NoteDemandIsProtested(coin.nDemandHeight))
-                    nProtestedBurned++;
-            }
+            const uint32_t nDemandTag = nDemandTagIn;              // the one pass above (Stage 0 rule A)
+            const uint32_t nProtestedBurned = nProtestedBurnedIn;
             const uint32_t nDemandHeight = NoteDemandHeightOf(nDemandTag);
             // v0.2.18 (Q6): a suspended house pays DEMANDED notes only. The
             // demand tag is uniform across a redeem's inputs (tx_verify
@@ -6280,7 +6632,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-payload");
 
         CHouse house;
-        if (!fnGetHouse(dem.nHouseID, house))
+        if (!HouseAtBlockStart(dem.nHouseID, house, fnGetHouse))   // Stage 0 B1 (P3): writes nothing on the house
             return state.DoS(100, false, REJECT_INVALID, "bad-note-unknown-house");
 
         // One op, modes keyed on house status (B3 T-b3; v0.2.18 D-2026-10-02-1):
@@ -6322,7 +6674,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
 
         // The holder authorizes the exact re-issue (units + outputs).
         if (!FbVerifyStrict(CPubKey(dem.vchHolderPubKey),
-                NoteDemandSigHash(dem.nHouseID, dem.vUnits, hashOutputs), dem.vchHolderSig))
+                NoteDemandSigHash(tx), dem.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-demand-sig");
 
         if (dem.fPreAuth) {
@@ -6440,7 +6792,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // coins in custody this signature IS the standing proof - the
         // scriptSig is empty by design.
         if (!FbVerifyStrict(CPubKey(pro.vchHolderPubKey),
-                NoteProtestSigHash(pro.nHouseID, pro.vUnits, hashOutputs), pro.vchHolderSig))
+                NoteProtestSigHash(tx), pro.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-protest-sig");
 
         // Custody preserved, same holder (shape proved custody-SHAPED only). S1X-14: and the same demand - the re-issue
@@ -6511,7 +6863,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // The holder authorizes burning U units AND (hashOutputs) the exact
         // payout + escrow change they computed.
         if (!FbVerifyStrict(CPubKey(claim.vchHolderPubKey),
-                NoteClaimSigHash(claim.nHouseID, nNoteUnitsIn, CreditHashOutputs(tx)), claim.vchHolderSig))
+                NoteClaimSigHash(tx), claim.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-claim-sig");
 
         // First waterfall op materializes: status char + the pro-rata
@@ -6606,7 +6958,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (status != HOUSE_STATUS_OPEN && status != HOUSE_STATUS_STRESSED)
             return state.DoS(10, false, REJECT_INVALID, "bad-note-lock-house-status");
         // Both the holder and the house approve the exact lock (Q1).
-        const uint256 sighash = NoteLockSigHash(lock.nHouseID, lock.nUnits, lock.vChangeUnits, NoteHashPrevouts(tx), hashOutputs);
+        const uint256 sighash = NoteLockSigHash(tx);
         if (!FbVerifyStrict(CPubKey(lock.vchHolderPubKey), sighash, lock.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-sig");
         if (!VerifyHouseApprovers(house, lock.vApproverIndex, lock.vApproverSig, sighash, house.nThresholdM, state,
@@ -6645,7 +6997,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
             return false;
         if (!VerifyHouseApprovers(house, unlock.vApproverIndex, unlock.vApproverSig,
-                NoteUnlockSigHash(unlock.nHouseID, unlock.vUnits, NoteHashPrevouts(tx), hashOutputs),
+                NoteUnlockSigHash(tx),
                 house.nThresholdM, state, "bad-note-unlock-approver"))
             return false;
         house.nTokenUnits -= total;
@@ -6698,11 +7050,11 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                          const TokenView& view, TokenEffects& eff,
-                         CHouse& houseOut, bool& fHouseChanged, bool fMempool)
+                         CHouse& houseOut, bool& fHouseChanged, bool fMempool,
+                         const std::vector<CPubKey>* pvClaimY)
 {
     const MempoolRefusalScoresZero scoreZero(state, fMempool);   // UF4-1: no ban on the mempool path
     fHouseChanged = false;
-    const uint256 hashPrevouts = NoteHashPrevouts(tx);
 
     if (tx.nNoteOp == NOTE_OP_TOKEN_KEYSET) {
         NoteTokenKeyset ks;
@@ -6723,9 +7075,14 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
         // Keys are unique within a keyset (the shape check), not across houses (Michael 2026-10-08, review M1): mint
         // keys are public, so a chain-wide rule would let another house squat a mint's keys. A house that copies
         // another's keys only pays its own backing out to the other's token holders.
-        if (!VerifyHouseApprovers(house, ks.vApproverIndex, ks.vApproverSig, TokenKeysetSigHash(ks, hashPrevouts),
+        if (!VerifyHouseApprovers(house, ks.vApproverIndex, ks.vApproverSig, TokenKeysetSigHash(tx),
                 house.nThresholdM, state, "bad-token-keyset-approver"))
             return false;
+        // Stage 0 rule A: each key a real point (the shape check reads bytes only), after the approvers' signatures.
+        for (const TokenKey& k : ks.vKey) {
+            if (!CPubKey(k.vchPubKey).IsFullyValid())
+                return state.DoSStateIndependent(100, false, REJECT_INVALID, "bad-token-keyset-key");   // after the approvers
+        }
         CTokenKeyset rec;
         rec.nHeight = (uint32_t)nHeight;
         rec.txid = tx.GetHash();
@@ -6750,12 +7107,12 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
         CTokenKeyset ks;
         if (!view.fnGetKeyset(post.nHouseID, post.nKeysetID, ks))
             return state.DoS(10, false, REJECT_INVALID, "bad-token-post-keyset");
-        if (!FbVerifyStrict(CPubKey(ks.vchPostingPubKey), TokenPostSigHash(post, hashPrevouts), post.vchSig))
+        if (!FbVerifyStrict(CPubKey(ks.vchPostingPubKey), TokenPostSigHash(tx), post.vchSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-token-post-sig");
         // S1X-36: each issued B is a real point (the shape check reads its bytes only), checked after the signature.
         for (const TokenIssued& iss : post.vIssued) {
-            if (!CPubKey(iss.vchB).IsFullyValid())
-                return state.DoS(100, false, REJECT_INVALID, "bad-token-post-issued");
+            if (!CPubKey(iss.vchB).IsFullyValid())   // Stage 0 rule A: after the posting key (standing), state-free
+                return state.DoSStateIndependent(100, false, REJECT_INVALID, "bad-token-post-issued");
         }
         CTokenMark mark;
         mark.nHeight = (uint32_t)nHeight;
@@ -6799,7 +7156,10 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
         std::vector<Checked> vChecked;
         std::set<uint256> setY;
         uint64_t nSum = 0;
-        for (const TokenClaimEntry& e : claim.vEntry) {
+        if (pvClaimY && pvClaimY->size() != claim.vEntry.size())
+            return state.Error("CheckTokenOperation: precomputed Ys don't match the claim");
+        for (size_t nEntry = 0; nEntry < claim.vEntry.size(); nEntry++) {
+            const TokenClaimEntry& e = claim.vEntry[nEntry];
             CTokenKeyset ks;
             if (!view.fnGetKeyset(claim.nHouseID, e.nKeysetID, ks) || ks.nHeight >= nE)
                 return state.DoS(10, false, REJECT_INVALID, "bad-token-claim-keyset");
@@ -6808,7 +7168,9 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-amount");
             if (IsTokenConditionSecret(e.vchSecret))
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-condition");
-            if (!CashuHashToCurve(e.vchSecret, c.Y))
+            if (pvClaimY)
+                c.Y = (*pvClaimY)[nEntry];   // Stage 0 rule A: ATMP hashed each secret once, within its try budget
+            else if (!CashuHashToCurve(e.vchSecret, c.Y))
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-secret");
             c.y = TokenYID(c.Y);
             if (!setY.insert(c.y).second)
@@ -6835,17 +7197,20 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
             const TokenClaimEntry& e = claim.vEntry[i];
             const Checked& c = vChecked[i];
             const CPubKey B(e.vchB.begin(), e.vchB.end()), C(e.vchC.begin(), e.vchC.end());
+            // Stage 0 rule A: B and C real points (the shape check reads bytes only); checked after the fee floor.
+            if (!B.IsFullyValid() || !C.IsFullyValid())
+                return state.DoSStateIndependent(100, false, REJECT_INVALID, "bad-token-claim-proof");
             // The holder's signature under P = B_ - Y (private key r): a copier learns the secret, not r.
             CPubKey P;
             if (!CashuPointSub(B, c.Y, P) ||
                     !FbVerifyStrict(P, TokenClaimSigHash(claim.nHouseID, c.y, e.vchPayoutScript, e.nFeeBps, e.vchRelayerScript), e.vchSig))
-                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-sig");
+                return state.DoSStateIndependent(100, false, REJECT_INVALID, "bad-token-claim-sig");
             // The mint signed B_ with the keyset's key for this amount (NUT-12 DLEQ).
             CashuScalar es, ss;
             memcpy(es.data(), e.vchE.data(), 32);
             memcpy(ss.data(), e.vchS.data(), 32);
             if (!FbVerifyDLEQ(c.A, B, C, es, ss))   // cached in mempool scope only
-                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-dleq");
+                return state.DoSStateIndependent(100, false, REJECT_INVALID, "bad-token-claim-dleq");
             CTokenClaim rec;
             rec.nAmount = e.nAmount;
             rec.vchPayoutScript = e.vchPayoutScript;
@@ -7053,8 +7418,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // outputs). Binding DepositHashPrevouts makes a confirmed origination's
         // approver sigs non-replayable with fresh funding (the notes-MINT lesson).
         if (!VerifyHouseApprovers(house, org.vApproverIndex, org.vApproverSig,
-                DepositOriginateSigHash(org.nHouseID, org.vPrincipal, org.vRateBps, org.vMaturityHeight,
-                    DepositHashPrevouts(tx), hashOutputs),
+                DepositOriginateSigHash(tx),   // Stage 0 C1
                 house.nThresholdM, state, "bad-deposit-originate-approver"))
             return false;
 
@@ -7104,8 +7468,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // The sender authorizes the exact terms + destination (hashOutputs). This
         // binds the trailer payload the legacy input sighash does not cover.
         if (!FbVerifyStrict(CPubKey(x.vchSenderPubKey),
-                DepositTransferSigHash(x.nHouseID, x.nPrincipal, x.nRateBps, x.nMaturityHeight,
-                    x.nOriginationHeight, hashOutputs),
+                DepositTransferSigHash(tx),   // Stage 0 C1
                 x.vchSenderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-transfer-sig");
         // v0.2.19 members-only: a receipt passes on only to a member, or back to the sender's own key (spec 4.1). Fail
@@ -7174,8 +7537,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // the P2PKH scriptSig on the burned receipt (SIGHASH_ALL) - both bind the
         // output set, so they never surrender the receipt without the payout.
         if (!FbVerifyStrict(CPubKey(wd.vchHolderPubKey),
-                DepositWithdrawSigHash(wd.nHouseID, receipt.nDepositPrincipal, receipt.nDepositMaturityHeight,
-                    receipt.nDepositOriginationHeight, hashOutputs),
+                DepositWithdrawSigHash(tx),   // Stage 0 C1
                 wd.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-withdraw-sig");
 
@@ -7197,7 +7559,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         if (!DecodeDepositPayload(tx.vchDepositPayload, d))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payload");
         CHouse house;
-        if (!fnGetHouse(d.nHouseID, house))
+        if (!HouseAtBlockStart(d.nHouseID, house, fnGetHouse))   // Stage 0 B1 (P3): writes nothing on the house
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-unknown-house");
         // While the house is Open or Stressed - where it could pay. Suspended, its savers queue behind its noteholders;
         // insolvent, they claim.
@@ -7210,12 +7572,24 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         if (IsLockedScriptFamily(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())) ||
                 !IsHousePayableScript(CScript(d.vchPayoutScript.begin(), d.vchPayoutScript.end())))   // S1X-15
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-payout-script");
-        // Into custody, same holder: the house can pay it alone from now on.
-        if (tx.vout[0].scriptPubKey != NotePreAuthScript(d.vchHolderPubKey))
+        // Into custody, same holder: the house can pay it alone from now on. S1X-53 (Stage 0 C3): the custody script
+        // carries this demand's id, and the standing pre-auth signs it.
+        COutPoint outReceipt;
+        {
+            bool fReceipt = false;
+            for (const CTxIn& in : tx.vin) {
+                Coin c;
+                if (fnGetCoin(in.prevout, c) && c.fDeposit) { outReceipt = in.prevout; fReceipt = true; break; }
+            }
+            if (!fReceipt)
+                return state.DoS(10, false, REJECT_INVALID, "bad-deposit-demand-no-receipt");
+        }
+        const uint256 demandId = DepositDemandId(outReceipt, d);
+        if (tx.vout[0].scriptPubKey != NoteDemandCustodyScript(d.vchHolderPubKey, demandId))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-custody-script");
         if (!FbVerifyStrict(CPubKey(d.vchHolderPubKey),
                 DepositPreAuthSigHash(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight, d.nOriginationHeight,
-                                      d.vchPayoutScript), d.vchPreAuthSig))
+                                      d.vchPayoutScript, demandId), d.vchPreAuthSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demand-preauth-sig");
         // No house state: the demand lives on the coin, and takes no house slot (a willing house can clear any
         // number of demands). It is status-dependent, so the mempool keeps it apart from a pooled op on its house
@@ -7246,19 +7620,33 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         if (pr.nPrevProtestOpen != house.nProtestOpen || pr.nPrevProtestHeight != house.nProtestHeight ||
                 pr.nPrevProtestDemandHeight != house.nProtestDemandHeight)
             return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-prior");   // stale state, not malice
-        if (!FbVerifyStrict(CPubKey(pr.vchHolderPubKey),
-                DepositProtestSigHash(pr.nHouseID, pr.nPrincipal, pr.nOriginationHeight, pr.nDemandTag, hashOutputs),
-                pr.vchHolderSig))
+        // S1X-54 (Stage 0 C1): the protest signs the whole transaction, so it protests only the receipt it spends.
+        if (!FbVerifyStrict(CPubKey(pr.vchHolderPubKey), DepositProtestSigHash(tx), pr.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-sig");
+        // S1X-53: the demand id the spent receipt's custody script carries (tx_verify pinned the one receipt input).
+        uint256 demandIdPro;
+        {
+            bool fId = false;
+            for (const CTxIn& in : tx.vin) {
+                Coin c;
+                if (fnGetCoin(in.prevout, c) && c.fDeposit) {
+                    fId = NoteCustodyDemandId(c.out.scriptPubKey, demandIdPro);
+                    break;
+                }
+            }
+            if (!fId)
+                return state.DoS(10, false, REJECT_INVALID, "bad-deposit-protest-custody");   // e.g. unconfirmed, reorged
+        }
         if (IsLockedScriptFamily(CScript(pr.vchPayoutScript.begin(), pr.vchPayoutScript.end())) ||
                 !IsHousePayableScript(CScript(pr.vchPayoutScript.begin(), pr.vchPayoutScript.end())))   // S1X-15
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-payout-script");
         // The standing authorization, re-stated: whoever later pays reads it from this transaction.
         if (!FbVerifyStrict(CPubKey(pr.vchHolderPubKey),
                 DepositPreAuthSigHash(pr.nHouseID, pr.nPrincipal, pr.nRateBps, pr.nMaturityHeight, pr.nOriginationHeight,
-                                      pr.vchPayoutScript), pr.vchPreAuthSig))
+                                      pr.vchPayoutScript, demandIdPro), pr.vchPreAuthSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-preauth-sig");
-        if (tx.vout[0].scriptPubKey != NotePreAuthScript(pr.vchHolderPubKey))
+        // The re-issue copies the demand id (S1X-53).
+        if (tx.vout[0].scriptPubKey != NoteDemandCustodyScript(pr.vchHolderPubKey, demandIdPro))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-protest-custody-script");
         // Effects: exactly a note protest's (one marked coin) - the house is Stressed from here (HouseStressOrigin).
         const bool fFreshEpisode = house.nProtestOpen == 0;
@@ -7295,11 +7683,15 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
             return state.DoS(10, false, REJECT_INVALID, "bad-deposit-discharge-no-receipt");   // e.g. unconfirmed, reorged
         if (IsLockedScriptFamily(CScript(dc.vchPayoutScript.begin(), dc.vchPayoutScript.end())))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-payout-script");
-        // The holder's standing authorization, made at DEMAND, re-verified against the receipt's own terms.
+        // The holder's standing authorization, made at DEMAND, re-verified against the receipt's own terms and (S1X-53)
+        // the demand id its custody script carries.
+        uint256 demandIdDc;
+        if (!NoteCustodyDemandId(receipt.out.scriptPubKey, demandIdDc))
+            return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-custody");
         if (!FbVerifyStrict(CPubKey(dc.vchHolderPubKey),
                 DepositPreAuthSigHash(dc.nHouseID, receipt.nDepositPrincipal, receipt.nDepositRateBps,
                                       receipt.nDepositMaturityHeight, receipt.nDepositOriginationHeight,
-                                      dc.vchPayoutScript), dc.vchPreAuthSig))
+                                      dc.vchPayoutScript, demandIdDc), dc.vchPreAuthSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-discharge-preauth-sig");
         // WITHDRAW's floor: principal + interest at the receipt's own rate on one continuous clock from origination.
         const uint32_t nBlocks = (uint32_t)ClockSince(receipt.nDepositOriginationHeight, nHeight);   // clock blocks (GOLD_B §6)
@@ -7362,7 +7754,7 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
         // The holder authorizes burning the receipt AND (hashOutputs) the exact
         // payout + escrow change.
         if (!FbVerifyStrict(CPubKey(clm.vchHolderPubKey),
-                DepositClaimSigHash(clm.nHouseID, receipt.nDepositPrincipal, CreditHashOutputs(tx)), clm.vchHolderSig))
+                DepositClaimSigHash(tx), clm.vchHolderSig))   // Stage 0 C1 (closes E3 for demanded receipts)
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-claim-sig");
 
         // First waterfall op materializes: freezes pot, the note snapshot, AND the
@@ -7472,8 +7864,6 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
     // the rule stays plain.
     if (!LaterRuleOn(Params().GetConsensus().nNotePoolTime, nHeight))
         return state.DoS(100, false, REJECT_INVALID, "bad-pool-closed");
-    const uint256 hashOutputs = BillHashOutputs(tx);
-    const uint256 hashPrevouts = PoolHashPrevouts(tx);
 
     if (tx.nPoolOp == POOL_OP_CREATE) {
         PoolCreate create;
@@ -7486,7 +7876,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-already-exists");
 
         CHouse house;
-        if (!fnGetHouse(create.nPoolID, house))
+        if (!HouseAtBlockStart(create.nPoolID, house, fnGetHouse))   // Stage 0 B1 (P3): reads the house, writes none
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-unknown-house");
         // v0.2.19 (spec 4.3): no pool for a members-only or redeem-only house at launch. Every later pool op needs
         // the pool, so this closes every pool and LP-share route.
@@ -7497,9 +7887,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-create-house-not-open");
 
-        const uint256 sighash = PoolCreateSigHash(create.nPoolID, create.nFeeBps,
-                create.nInitNoteUnits, create.amountInitBtx, create.nNoteChangeUnits,
-                hashPrevouts, hashOutputs);
+        const uint256 sighash = PoolCreateSigHash(tx);
         if (!VerifyHouseApprovers(house, create.vApproverIndex, create.vApproverSig,
                 sighash, house.nThresholdM, state, "bad-pool-create-approver"))
             return false;
@@ -7564,7 +7952,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         // (any non-settled partner may trigger) - so insolvency liveness never
         // depends on assembling M-of-N. The M-of-N path is accepted at ANY
         // effective status (operator decision 5).
-        const uint256 sighash = PoolRetireSigHash(ret, hashPrevouts, hashOutputs);
+        const uint256 sighash = PoolRetireSigHash(tx);
         if (!ret.vchTriggerSig.empty()) {
             if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
                 return state.DoS(100, false, REJECT_INVALID, "bad-pool-retire-trigger-not-insolvent");
@@ -7662,7 +8050,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         return state.DoS(100, false, REJECT_INVALID, "bad-pool-wrong-escrow-outpoint");
 
     if (tx.nPoolOp == POOL_OP_ADD_LIQ) {
-        if (!FbVerifyStrict(CPubKey(add.vchProviderPubKey), PoolAddLiqSigHash(add, hashPrevouts, hashOutputs),
+        if (!FbVerifyStrict(CPubKey(add.vchProviderPubKey), PoolAddLiqSigHash(tx),
                 add.vchProviderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-add-sig");
         // The min-rule formula was verified context-free (payload-pure).
@@ -7671,7 +8059,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         pool.nLpSupply += add.nLpMinted;
     }
     else if (tx.nPoolOp == POOL_OP_REMOVE_LIQ) {
-        if (!FbVerifyStrict(CPubKey(rem.vchProviderPubKey), PoolRemoveLiqSigHash(rem, hashPrevouts, hashOutputs),
+        if (!FbVerifyStrict(CPubKey(rem.vchProviderPubKey), PoolRemoveLiqSigHash(tx),
                 rem.vchProviderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-remove-sig");
         // The redeem formula was verified context-free (payload-pure).
@@ -7680,7 +8068,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         pool.nLpSupply -= rem.nBurnLp;
     }
     else { // POOL_OP_SWAP
-        if (!FbVerifyStrict(CPubKey(swap.vchTraderPubKey), PoolSwapSigHash(swap, hashPrevouts, hashOutputs),
+        if (!FbVerifyStrict(CPubKey(swap.vchTraderPubKey), PoolSwapSigHash(tx),
                 swap.vchTraderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-swap-sig");
         // The x*y=k formula needs the pool's STORED fee - the one check that
@@ -7798,9 +8186,7 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     // both houses' M-of-N approver quorums (corporate consent) and both
     // presentment-key holders (coin authority; their P2PKH scriptSigs bind the
     // spend, this sig binds the op semantics - the standard double-binding).
-    const uint256 hashPrevouts = SettleHashPrevouts(tx);
-    const uint256 hashOutputs = BillHashOutputs(tx);
-    const uint256 sighash = SettleExchangeSigHash(x, hashPrevouts, hashOutputs);
+    const uint256 sighash = SettleExchangeSigHash(tx);   // Stage 0 C1
     if (!VerifyHouseApprovers(houseA, x.vApproverIndexA, x.vApproverSigA,
             sighash, houseA.nThresholdM, state, "bad-settle-approver"))
         return false;
@@ -7856,7 +8242,7 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
     }
     // One digest: every house's M-of-N quorum, and every presenting house's key.
     {
-        const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(tx), BillHashOutputs(tx));
+        const uint256 sighash = SettleNetSigHash(tx);
         for (size_t i = 0; i < n.vHouseID.size(); i++) {
             if (!VerifyHouseApprovers(vHouse[i], n.vApproverIndex[i], n.vApproverSig[i],
                     sighash, vHouse[i].nThresholdM, state, "bad-settle-approver"))
@@ -10715,8 +11101,18 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     // Gram-notes release: the units DB, same marker rule. Every units read and write of this block goes through
     // unitsView; it is written with the marker at the end, or dropped (fJustCheck, a replay).
     bool fUnitsDBReplay = false;
+    // Stage 0 D/E (d): the FB6CAPS log line (testing's FB-6), regtest only.
+    const bool fRegtestCapsLog = Params().NetworkIDString() == CBaseChainParams::REGTEST && !fJustCheck;
     CUnitsView unitsView(punitsdb.get());
-    UnitsCheckScope unitsScope(&unitsView);   // issuing checks count gold against the block so far
+    // Stage 0 rule B1: W and M (the swap totals) are read as of the block's start - the units DB, which this block writes
+    // only at its end - so a non-slot writer (SWAP_DONE, SWAP_PAY) can't change a slot-taking reader by its place in the
+    // block. (A replay never runs the house checks: units are written after houses, so a units replay is a house replay.)
+    CUnitsView unitsBlockStart(punitsdb.get());
+    UnitsCheckScope unitsScope(&unitsView, &unitsBlockStart);   // issuing checks count gold against the block so far
+    const std::function<bool(uint32_t, CHouse&)> fnHouseAtBlockStart = [](uint32_t nID, CHouse& house) {
+        return phousetree->GetHouse(nID, house);   // the house DB: this block's changes are staged until its end
+    };
+    HouseAtBlockStartScope houseStartScope(&fnHouseAtBlockStart);   // Stage 0 rule B1
     // v0.2.23: the side DBs save this block as their best block with its effects (synced); the block index saves
     // hourly. Write the index first (the periodic write, early), so that after a hard stop the markers always name a
     // block the node knows. Otherwise VerifyDB's reconnect at startup (check level 4) and every block reconnected from
@@ -10771,6 +11167,10 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
     // Gold B (D-2026-11-07-1): the chain clock advances AFTER this block's transactions (below), so they are judged on the
     // parent's clock - known to the mempool, the template check and connect alike (review 2026-11-07: a block's own time
     // is fixed only after its contents are bid, so a window judged on it could make a mined block invalid).
+
+    // Stage 0 rule B2: the block's consensus slots, over the whole block before any tx connects (order-free).
+    if (!CheckBlockCreditSlots(block, state))
+        return false;
 
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
@@ -11744,6 +12144,59 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
                 !ConnectIssuedTx(tx, view, unitsView, pindex->nHeight, state))
             return error("ConnectBlock(): ConnectIssuedTx on %s failed with %s", tx.GetHash().ToString(),
                          FormatStateMessage(state));
+        // Stage 0 D/E (d), testing's FB-6 (regtest only, a log line): each issuing op's cap inputs and results as it
+        // connects, after its effects, so FB-6 checks every op exactly instead of the tip's figures.
+        if (fRegtestCapsLog && !tx.IsCoinBase()) {
+            const bool fMint = tx.nVersion == TRANSACTION_NOTE_VERSION && tx.nNoteOp == NOTE_OP_MINT;
+            const bool fDiscount = tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp == BILL_OP_DISCOUNT;
+            const bool fOriginate = tx.nVersion == TRANSACTION_DEPOSIT_VERSION && tx.nDepositOp == DEPOSIT_OP_ORIGINATE;
+            const bool fExit = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_EXIT;
+            const bool fReclaim = tx.nVersion == TRANSACTION_HOUSE_VERSION && tx.nHouseOp == HOUSE_OP_RECLAIM;
+            std::vector<uint32_t> vCapsHouse;
+            if ((fMint || fDiscount || fOriginate || fExit || fReclaim) && GetHouseSlotSet(tx, vCapsHouse) && !vCapsHouse.empty()) {
+                CHouse houseCaps;
+                bool fFound = false;
+                const auto itU = mapHouseUpdate.find(vCapsHouse[0]);
+                if (itU != mapHouseUpdate.end()) {
+                    houseCaps = itU->second;
+                    fFound = true;
+                } else {
+                    fFound = phousetree->GetHouse(vCapsHouse[0], houseCaps);
+                }
+                // The till the op's check used: a MINT's or DISCOUNT's own reserve proofs (their coins' value), else
+                // the house's fresh attestation.
+                CAmount amountTill = fFound ? HouseAttestedTillSats(houseCaps, pindex->nHeight) : 0;
+                std::vector<AttestProof> vProofs;
+                if (fMint) {
+                    NoteMint mint;
+                    if (DecodeNotePayload(tx.vchNotePayload, mint))
+                        vProofs = mint.vReserveProofs;
+                } else if (fDiscount) {
+                    BillDiscount d;
+                    if (DecodeBillPayload(tx.vchBillPayload, d))
+                        vProofs = d.vReserveProofs;
+                }
+                if (fMint || fDiscount) {
+                    amountTill = 0;
+                    for (const AttestProof& pr : vProofs) {
+                        const Coin& c = view.AccessCoin(pr.outpoint);
+                        amountTill += c.IsSpent() ? 0 : c.out.nValue;
+                    }
+                }
+                if (fFound) {
+                    const char chEff = HouseEffectiveStatus(houseCaps, pindex->nHeight);   // after the op (testing: RECLAIM
+                    const char* pszEff = chEff == HOUSE_STATUS_OPEN ? "open" :          //  checks only at effective Open)
+                                         chEff == HOUSE_STATUS_STRESSED ? "stressed" :
+                                         chEff == HOUSE_STATUS_DEFERRED ? "deferred" :
+                                         chEff == HOUSE_STATUS_INSOLVENT ? "insolvent" :
+                                         chEff == HOUSE_STATUS_WOUNDDOWN ? "wounddown" : "other";
+                    LogPrintf("FB6CAPS height=%d house=%u op=%s txid=%s effective_status=%s till_source=%s %s\n", pindex->nHeight,
+                              vCapsHouse[0], fMint ? "mint" : fDiscount ? "discount" : fOriginate ? "originate" : fExit ? "exit" : "reclaim",
+                              tx.GetHash().ToString(), pszEff, (fMint || fDiscount) ? "proofs" : "attested",
+                              HouseCapsLogFields(houseCaps, pindex->nHeight, amountTill));
+                }
+            }
+        }
         // R3-12: the queued-demand index - the queued note coins this tx spends leave it (the coins they become join
         // it after the coins update below).
         if (!fUnitsDBReplay)

@@ -223,6 +223,10 @@ private:
     std::set<uint256> setBlockWithdrawalIDs;
     /** D-2026-11-11-3: houses whose rate op (POST or SETKEY) the template already holds (one per house per block) */
     std::set<uint32_t> setBlockRateHouses;
+    /** Stage 0 rule B2: the token slots the template already holds (TokenSlotKeys: one op per slot per block,
+     *  bad-blk-token-slot). The pool holds one per slot; this is the template's own check when it holds more
+     *  (-tokenslotguard=0 on regtest, or a reorg's re-adds). */
+    std::set<uint256> setBlockTokenSlots;
     /** S2X-1: the units state as the template's issued ops leave it, and the coins they read (null: no check, as when
       * the template builds on a block other than the tip, whose state these views don't hold) */
     CUnitsView* pTemplateUnits = nullptr;

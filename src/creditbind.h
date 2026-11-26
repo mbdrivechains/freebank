@@ -33,5 +33,7 @@ bool IsCreditBindingVersion(int32_t nVersion);
 
 /** SHA256d of the op and the payload's binding form; meaningful only when IsCreditBindingVersion(tx.nVersion). */
 uint256 CreditBindingHash(const CTransaction& tx);
+/** The same, computed each time (CreditBindingHash keeps the last few by txid). */
+uint256 CreditBindingHashUncached(const CTransaction& tx);
 
 #endif // BITCOIN_CREDITBIND_H

@@ -4,6 +4,7 @@
 
 #include <crypto/common.h>   // ReadLE32 (S1X-10)
 #include <settle.h>
+#include <issued.h>   // Stage 0 C1: CreditTxSigHash
 
 #include <consensus/validation.h>
 #include <hash.h>
@@ -26,30 +27,10 @@ uint256 SettleHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 SettleExchangeSigHash(const SettleExchange& x, const uint256& hashPrevouts,
-                              const uint256& hashOutputs)
+uint256 SettleExchangeSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankSettle/exchange");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << x.nHouseA;
-    ss << x.nHouseB;
-    ss << x.nMode;
-    ss << x.nUnitsANotes;
-    ss << x.nUnitsBNotes;
-    ss << x.nCountANotes;
-    ss << x.nCountBNotes;
-    ss << x.vchPresentKeyOfANotes;
-    ss << x.vchPresentKeyOfBNotes;
-    ss << x.amountResidual;
-    ss << x.nPrevMintedUnitsA;
-    ss << x.nPrevMintedUnitsB;
-    ss << x.nPrevLastSettleHeightA;
-    ss << x.nPrevLastSettleHeightB;
-    ss << x.nExpiryHeight;
-    ss << hashPrevouts;   // coins consumed on connect - the MINT-replay lesson
-    ss << hashOutputs;    // pins the residual destination + the whole output set
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankSettle/exchange");
 }
 
 bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
@@ -130,21 +111,10 @@ static bool CheckSettleApproverShape(const std::vector<uint32_t>& vIndex,
     return true;
 }
 
-uint256 SettleNetSigHash(const SettleNet& n, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 SettleNetSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankSettle/net");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << n.vHouseID;
-    ss << n.vReceive;
-    ss << n.vPrevMintedUnits;
-    ss << n.vPrevLastSettleHeight;
-    ss << n.vPresentKey;
-    ss << n.vBundle;
-    ss << n.nExpiryHeight;
-    ss << hashPrevouts;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankSettle/net");
 }
 
 bool SettleNetPositions(const SettleNet& n, std::vector<int64_t>& vNet, std::vector<uint64_t>& vBurn)

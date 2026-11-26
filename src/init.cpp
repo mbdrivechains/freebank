@@ -566,6 +566,7 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-memberopguard=0", "Let a second member op for a house into the mempool, to test the block rule (regtest-only)");
         strUsage += HelpMessageOpt("-mintpendingguard=0", "Let MINTs of one token into the mempool past its room together, to test the block template's skip (regtest-only)");
         strUsage += HelpMessageOpt("-rateopguard=0", "Let a second rate op for a house into the mempool and the block template, to test the block rule (regtest-only)");
+        strUsage += HelpMessageOpt("-tokenslotguard=0", "Let a second op in one token slot (an issuer's MINT / FREEZE / UNFREEZE of a token, a POST's issued or spent mark, a keyset) into the mempool, to test the block template's skip (regtest-only)");
     }
     strUsage += HelpMessageOpt("-debug=<category>", strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
         _("If <category> is not supplied or if <category> = 1, output all debugging information.") + " " + _("<category> can be:") + " " + ListLogCategories() + ".");
@@ -1501,6 +1502,10 @@ bool AppInitParameterInteraction()
     // show the block rule (bad-house-rate-multiple-ops) refuse it.
     if (gArgs.IsArgSet("-rateopguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-rateopguard may only be set on regtest."));
+    // Stage 0 rule B2: -tokenslotguard=0 lets a second op in one token slot into the mempool, so a gate can show the
+    // template skip it (and a block holding both refused, bad-blk-token-slot).
+    if (gArgs.IsArgSet("-tokenslotguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
+        return InitError(_("-tokenslotguard may only be set on regtest."));
     // S2X-1: -mintpendingguard=0 lets MINTs past a token's room pool together, so a gate can show the template skip alone.
     if (gArgs.IsArgSet("-mintpendingguard") && chainparams.NetworkIDString() != CBaseChainParams::REGTEST)
         return InitError(_("-mintpendingguard may only be set on regtest."));

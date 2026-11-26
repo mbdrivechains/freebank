@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <token.h>
+#include <issued.h>   // Stage 0 C1: CreditTxSigHash
 #include <house.h>   // HashNetworkTag (UR-ext-13)
 
 #include <crypto/sha256.h>
@@ -57,29 +58,16 @@ CPubKey TokenYPoint(const uint256& y)
     return CPubKey(buf, buf + sizeof(buf));
 }
 
-uint256 TokenKeysetSigHash(const NoteTokenKeyset& ks, const uint256& hashPrevouts)
+uint256 TokenKeysetSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankToken/keyset");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << ks.nHouseID;
-    ss << ks.vchPostingPubKey;
-    ss << ks.vKey;
-    ss << hashPrevouts;   // tx-unique: the approvals can't be replayed
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankToken/keyset");
 }
 
-uint256 TokenPostSigHash(const NoteTokenPost& post, const uint256& hashPrevouts)
+uint256 TokenPostSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankToken/post");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << post.nHouseID;
-    ss << post.nKeysetID;
-    ss << post.vIssued;
-    ss << post.vSpent;
-    ss << hashPrevouts;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankToken/post");
 }
 
 uint256 TokenClaimSigHash(uint32_t nHouseID, const uint256& y, const std::vector<unsigned char>& vchPayoutScript,

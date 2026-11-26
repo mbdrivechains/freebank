@@ -573,7 +573,8 @@ BOOST_AUTO_TEST_CASE(s1x_18_a_release_replaces_a_pooled_opt_out_merge_of_its_coi
         mtx.vout.push_back(CTxOut(nIn - nFee, scriptOut));
         HouseRelease rel;
         rel.nHouseID = OWN;
-        const uint256 h = HouseReleaseSigHash(house.houseID, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)));
+        mtx.vchHousePayload = Enc(rel);   // Stage 0 C1: the approvers sign the finished tx
+        const uint256 h = HouseReleaseSigHash(CTransaction(mtx), house.houseID);
         for (uint32_t i : {0u, 1u}) {
             std::vector<unsigned char> sig;
             BOOST_REQUIRE(keys[i].Sign(h, sig));

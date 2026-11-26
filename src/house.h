@@ -1279,7 +1279,7 @@ bool DecodeHouseRegisterAny(const CTransaction& tx, HouseRegister& reg, uint8_t&
 
 /** What a member op's M-of-N approvers sign: the house, the op, its keyids and priors and count, and the tx's inputs
  * (spec 4.4: no replay). */
-uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const HouseMemberOp& op, const uint256& hashPrevouts);
+uint256 HouseMemberSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
 
 /** The house's own keys, implicit members of a members-only house (spec 4.2): its redemption destination, the key it
  * mints to and presents notes from. Fixed at registration; never stored, so never removable. Partners' personal keys
@@ -1287,24 +1287,22 @@ uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const House
 std::vector<uint160> HouseOwnKeyIDs(const CHouse& house);
 
 uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, const CAmount& amountPledge);
-uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 HouseTopupSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
 uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned char>& vchNewPubKey, const CAmount& amountPledge,
                           uint32_t nExpiryHeight);
-uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashPrevouts,
-                          const uint256& hashOutputs);   // S1X-35: hashPrevouts
-uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 HouseExitSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
+uint256 HouseWinddownSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
+uint256 HouseReclaimSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
+uint256 HouseDeferSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
+uint256 HouseReleaseSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
 /** The till op's approvers sign the house, the prevouts, the outputs, the annex and the vault moves. */
 /** HOUSE_OP_RATE (Gold B): what the rate key (POST) or the approvers (SETKEY) sign - the house, the kind, the rate, the key,
  *  and the transaction's prevouts and outputs (an approval can't be replayed into another transaction). By house number,
  *  which ConnectIssuedTx has without the house record. */
-uint256 HouseRateSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseRate& rate);
+uint256 HouseRateSigHash(const CTransaction& tx);   // Stage 0 C1
 /** HOUSE_OP_CHARTER (Gold B): what the approvers sign - the payload without its signatures, and the transaction's
  *  prevouts and outputs. */
-uint256 HouseCharterSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseCharter& charter);
+uint256 HouseCharterSigHash(const CTransaction& tx);   // Stage 0 C1
 
 /** The per-coin reserve-proof challenge: sha256d over a domain tag, the house
  * identity (cross-house replay bar), the as-of height AND that height's block
@@ -1319,9 +1317,7 @@ uint256 HouseAttestProofSetHash(const std::vector<AttestProof>& vProofs);
 
 /** What the M-of-N approvers sign: house identity, as-of height, the claimed
  * reserve total, the proof set, the carrier tx's inputs (S1X-35) and its exact output set. */
-uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
-                           const CAmount& amountReserves, const uint256& hashProofSet,
-                           const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 HouseAttestSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1
 
 /** Pledge escrow lock: <house_id> OP_DROP OP_TRUE (Bills-D1 family). */
 CScript HouseEscrowScript(const uint256& houseID);

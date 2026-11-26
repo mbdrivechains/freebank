@@ -6,8 +6,10 @@
 #ifndef BITCOIN_TXMEMPOOL_H
 #define BITCOIN_TXMEMPOOL_H
 
+#include <algorithm>
 #include <memory>
 #include <set>
+#include <unordered_map>
 #include <map>
 #include <vector>
 #include <utility>
@@ -570,6 +572,31 @@ private:
     std::map<uint256 /* txid */, std::pair<uint256 /* token */, uint64_t /* units */>> mapTxMintUnits;
     std::map<uint256 /* token */, uint64_t /* units of its pooled MINTs */> mapPendingMintUnits;
 
+    // Stage 0 rule A (security 2026-11-26: "no admission step scans the pool; every guard is an indexed lookup"). The
+    // slots each pooled tx takes, kept on add and remove: the house slots and the house whose status it reads
+    // (GetHouseStateKeys, UR3-8's universal guard and the settle guard), its member-op house, rate-op house and pool.
+    // Before, each slot-taking incomer read every pooled tx's keys (testing: 7.6 ms at 50,000 pooled txs).
+    struct PooledSlots {
+        std::vector<uint32_t> vHouse;   // GetHouseSlotSet
+        uint32_t nReader = 0;           // GetHouseStatusReaderID
+        uint32_t nMember = 0;           // a member op's house
+        uint32_t nRate = 0;             // a rate op's house (HouseRateOpOf)
+        uint32_t nPool = 0;             // a pool op's pool (the leading 4 payload bytes)
+    };
+    std::map<uint256 /* txid */, PooledSlots> mapTxSlots;
+    std::map<uint32_t /* house */, std::set<uint256> /* txids */> mapHouseSlotTxs, mapHouseReaderTxs, mapMemberOpTxs,
+                                                                  mapRateOpTxs;
+    std::map<uint32_t /* pool */, std::set<uint256> /* txids */> mapPoolOpTxs;
+    // Stage 0 rule A ("decode once"): the coins each pooled FreeBank tx makes, tagged once when it enters (the shared
+    // payload-pure taggers, PooledOutputCoin). CCoinsViewMemPool::GetCoin returns these, so a child's input fetch and
+    // SpendsPooledCreditOutput no longer decode the parent's payload per input (testing: 141 ms for 2,400 inputs off
+    // pooled MINTs).
+    std::unordered_map<uint256 /* txid */, std::vector<Coin>, SaltedTxidHasher> mapTxOutCoins;
+    std::unordered_map<uint256 /* txid */, uint32_t /* stamped leading outputs */, SaltedTxidHasher> mapTxStampedOuts;
+    size_t nSlotIndexUsage = 0;   // the inner containers of the two structures above
+    void AddSlotIndex(const CTransaction& tx);
+    void RemoveSlotIndex(const uint256& hash);
+
 public:
     indirectmap<COutPoint, const CTransaction*> mapNextTx;
     std::map<uint256, CAmount> mapDeltas;
@@ -747,6 +774,51 @@ public:
         LOCK(cs);
         return mapSwapLockCount.count(hashLock);
     }
+
+    /** Stage 0 rule G: the pooled txs holding this hash lock. A scan of the swap-op index (pooled swap ops only), run
+     *  only when a protective incomer meets the lock, after the fee floor. */
+    std::vector<uint256> SwapLockHolders(const uint256& hashLock) const
+    {
+        LOCK(cs);
+        std::vector<uint256> v;
+        if (!mapSwapLockCount.count(hashLock))
+            return v;
+        for (const auto& kv : mapSwapTxLock)
+            if (kv.second == hashLock)
+                v.push_back(kv.first);
+        return v;
+    }
+
+    /** Stage 0 rule G: the pooled txs holding any of these identity keys (a scan of the identity index: pooled bill ops
+     *  and REGISTERs only), run only when a protective incomer meets the guard, after the fee floor. */
+    std::vector<uint256> IdentityKeyHolders(const std::vector<uint256>& vKeys) const
+    {
+        LOCK(cs);
+        std::vector<uint256> v;
+        for (const auto& kv : mapTxIdentityKeys) {
+            for (const uint256& key : kv.second) {
+                if (std::find(vKeys.begin(), vKeys.end(), key) != vKeys.end()) {
+                    v.push_back(kv.first);
+                    break;
+                }
+            }
+        }
+        return v;
+    }
+
+    /** Stage 0 rule A: the pooled txs that can't share a block with an incomer taking the house slots vSlot or reading
+     *  house nReader's status (HouseStateKeysConflict, by index): every pooled op taking one of those slots or reading the
+     *  status of a house in vSlot. Two readers never conflict. Sorted, no duplicates. */
+    std::vector<uint256> HouseStateConflictTxs(const std::vector<uint32_t>& vSlot, uint32_t nReader) const;
+    /** Stage 0 rule A: the pooled member ops of house nHouse, rate ops of house nHouse, ops on pool nPool. */
+    std::vector<uint256> MemberOpTxs(uint32_t nHouse) const;
+    std::vector<uint256> RateOpTxs(uint32_t nHouse) const;
+    std::vector<uint256> PoolOpTxs(uint32_t nPool) const;
+    /** Stage 0 rule A: a pooled FreeBank tx's output as tagged at its admission; false if out isn't one (the caller tags
+     *  a plain pooled tx's output itself). */
+    bool GetPooledOutCoin(const COutPoint& out, Coin& coin) const;
+    /** Stage 0 rule A: is out a stamped output of a pooled tx (PooledStampedOutputCount, kept at its admission)? */
+    bool IsPooledStampedOutput(const COutPoint& out) const;
 
     /** S1X-27: does the pool hold a bill op or house REGISTER with one of these identity keys (PooledIdentityKeys)? */
     bool HaveIdentityKey(const std::vector<uint256>& vKeys) const

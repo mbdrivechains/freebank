@@ -14,6 +14,8 @@
 #include <key.h>
 #include <note.h>
 #include <settle.h>     // SettleNet (testing: S1X-37)
+#include <bill.h>       // BillRetire (testing: family A)
+#include <deposit.h>    // DepositWithdraw (testing: family A)
 #include <random.h>
 #include <streams.h>
 #include <token.h>
@@ -21,6 +23,9 @@
 #include <test/sidechain_test_util.h>   // SideDBScope (S1X-27 token probe)
 #include <test/test_bitcoin.h>
 #include <txmempool.h>
+#include <txdb.h>       // HouseDB (s1x_27 under Stage 0 rule A: a live insolvent house)
+#include <keystore.h>   // s1x_37 under Stage 0 rule A: the NET signs its first input
+#include <script/sign.h>
 #include <utiltime.h>
 #include <validation.h>
 #include <utilstrencodings.h>
@@ -40,7 +45,8 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
                          const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                          const std::function<bool(const COutPoint&, Coin&)>& fnGetCoin,
                          const TokenView& view, TokenEffects& eff,
-                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
+                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false,
+                         const std::vector<CPubKey>* pvClaimY = nullptr);   // Stage 0 rule A
 bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state);
 std::vector<COutPoint> EscrowChangeBeforeOp(const CHouse& house, const CTransaction& tx, const CTxUndo* pundo,
                                             uint32_t nChangeVout);
@@ -231,6 +237,18 @@ std::string Run(const CMutableTransaction& mtx, int nHeight, const std::function
 
 } // namespace
 
+// Stage 0 C1 test shim: the transaction with payload p serialized into its op field (a C1 digest takes the whole tx;
+// the payload's signature fields are stripped, so it may be passed before or after they are filled).
+template <typename T, typename P>
+static CTransaction C1With(const T& tx, std::vector<unsigned char> CMutableTransaction::*field, const P& p)
+{
+    CMutableTransaction m(tx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    (m.*field).assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
 BOOST_FIXTURE_TEST_SUITE(token_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(token_helpers)
@@ -408,7 +426,7 @@ BOOST_AUTO_TEST_CASE(token_post_and_keyset_rules)
     CMutableTransaction mtx = NoteOpTx(NOTE_OP_TOKEN_KEYSET);
     ks.vApproverIndex = {0};
     ks.vApproverSig = {std::vector<unsigned char>()};
-    BOOST_REQUIRE(f.keyPartner.Sign(TokenKeysetSigHash(ks, NoteHashPrevouts(CTransaction(mtx))), ks.vApproverSig[0]));
+    BOOST_REQUIRE(f.keyPartner.Sign(TokenKeysetSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, ks)), ks.vApproverSig[0]));
     SetPayload(mtx, ks);
     Records rec;
     TokenEffects eff;
@@ -448,7 +466,7 @@ BOOST_AUTO_TEST_CASE(token_post_and_keyset_rules)
     post.vIssued = {TokenIssued(V(t.B), 2), TokenIssued(V(u.B), 1)};
     post.vSpent = {TokenYID(u.Y)};
     CMutableTransaction mp = NoteOpTx(NOTE_OP_TOKEN_POST);
-    BOOST_REQUIRE(keyPost.Sign(TokenPostSigHash(post, NoteHashPrevouts(CTransaction(mp))), post.vchSig));
+    BOOST_REQUIRE(keyPost.Sign(TokenPostSigHash(C1With(mp, &CMutableTransaction::vchNotePayload, post)), post.vchSig));
     SetPayload(mp, post);
     rec.issued[{5, V(u.B)}] = CTokenMark();   // already posted
     eff = TokenEffects();
@@ -460,10 +478,10 @@ BOOST_AUTO_TEST_CASE(token_post_and_keyset_rules)
     NoteTokenPost p2 = post;
     p2.vIssued = {TokenIssued(V(t.B), 4)};
     CMutableTransaction mp2 = NoteOpTx(NOTE_OP_TOKEN_POST);
-    BOOST_REQUIRE(keyPost.Sign(TokenPostSigHash(p2, NoteHashPrevouts(CTransaction(mp2))), p2.vchSig));
+    BOOST_REQUIRE(keyPost.Sign(TokenPostSigHash(C1With(mp2, &CMutableTransaction::vchNotePayload, p2)), p2.vchSig));
     SetPayload(mp2, p2);
     BOOST_CHECK_EQUAL(Run(mp2, 1010, GetOpen, rec), "bad-token-post-amount");
-    BOOST_REQUIRE(f.keyPartner.Sign(TokenPostSigHash(post, NoteHashPrevouts(CTransaction(mp))), post.vchSig));
+    BOOST_REQUIRE(f.keyPartner.Sign(TokenPostSigHash(C1With(mp, &CMutableTransaction::vchNotePayload, post)), post.vchSig));
     SetPayload(mp, post);
     BOOST_CHECK_EQUAL(Run(mp, 1010, GetOpen, rec), "bad-token-post-sig");
 }
@@ -820,13 +838,45 @@ struct TokenPoolSetup : public TestChain100Setup {
         pcoinsTip->AddCoin(o, Coin(CTxOut(COIN, spk), chainActive.Height(), false, false, false, uint256()), false);
         return o;
     }
+    /** Stage 0 rule A (60e409d): relay checks a claim's house and window first, then hashes its secrets within entries + 32
+     *  tries in all. For S1X-27's probes to reach the pool's identity index again, the pooled claims name a live insolvent
+     *  house (SeedInsolventHouse5) and their secrets map in one try each (a copied 64-entry claim then fits the budget). */
+    bool fOneTrySecrets = false;
+    static bool MapsInOneTry(const std::string& str)
+    {
+        CPubKey Y;
+        uint32_t nTries = 1;
+        return CashuHashToCurveBudget(std::vector<unsigned char>(str.begin(), str.end()), Y, nTries);
+    }
+    CHouse SeedInsolventHouse5()
+    {
+        CHouse house;
+        house.nHouseID = 5;
+        house.houseID = uint256S("f00d");
+        house.nTier = HOUSE_TIER_MULTI_PARTNER;
+        house.nThresholdM = 1;
+        house.strClassID = "mint";
+        house.nDenomMgGold = 1000;
+        house.status = HOUSE_STATUS_INSOLVENT;
+        house.nNoCureHeight = 1;
+        house.nRegisteredHeight = 1;
+        HousePartner partner;
+        partner.vchPubKey = vchPoint;
+        partner.amountPledge = COIN;
+        house.vPartner.push_back(partner);
+        BOOST_REQUIRE(phousetree->WriteHouse(house));
+        BOOST_REQUIRE_MESSAGE(HouseInsolventSince(house, chainActive.Height() + 1) != 0, "S1X-27 setup: house 5 is not insolvent");
+        return house;
+    }
     /** A shape-valid entry: a 64-character secret like a wallet's (hex of 32 random bytes). */
     TokenClaimEntry Entry64()
     {
         TokenClaimEntry e;
         e.nKeysetID = 1;
         e.nAmount = 1;
-        const std::string s = HexStr(GetRandHash());
+        std::string s = HexStr(GetRandHash());
+        while (fOneTrySecrets && !MapsInOneTry(s))
+            s = HexStr(GetRandHash());
         e.vchSecret.assign(s.begin(), s.end());
         e.vchB = vchPoint;
         e.vchC = vchPoint;
@@ -851,14 +901,15 @@ struct TokenPoolSetup : public TestChain100Setup {
         SetPayload(mtx, c);
         return mtx;
     }
-    /** Pool claims of 64 entries at house 5 until the pool holds nEntries; returns them. */
+    /** Pool claims of 32 entries (security's relay cap, ffe871c: a copied claim must be one relay takes) at house 5 until
+     *  the pool holds nEntries; returns them. */
     std::vector<CMutableTransaction> FillPool(size_t nEntries)
     {
         std::vector<CMutableTransaction> v;
         TestMemPoolEntryHelper entry;
-        for (size_t n = 0; n < nEntries; n += MAX_TOKEN_CLAIM_ENTRIES) {
+        for (size_t n = 0; n < nEntries; n += MAX_TOKEN_CLAIM_ENTRIES_RELAY) {
             std::vector<TokenClaimEntry> ve;
-            for (size_t i = 0; i < MAX_TOKEN_CLAIM_ENTRIES && n + i < nEntries; i++)
+            for (size_t i = 0; i < MAX_TOKEN_CLAIM_ENTRIES_RELAY && n + i < nEntries; i++)
                 ve.push_back(Entry64());
             v.push_back(ClaimTx(ve, 0));
             mempool.addUnchecked(v.back().GetHash(), entry.FromTx(v.back()));
@@ -900,13 +951,18 @@ BOOST_FIXTURE_TEST_CASE(s1x_27_token_claim_probe_cost_does_not_grow_with_the_poo
     }
     const double dHash = double(GetTimeMicros() - tHash0) / vRef.size();
     BOOST_TEST_MESSAGE(strprintf("S1X-27 token: one hash to the curve %.1f us", dHash));
+    // Stage 0 rule A: a live insolvent house 5 and one-try secrets, so the probes pass the house, window and try-budget
+    // checks and reach the pool's identity index (with house 5 unknown they stopped at the house, and this test no
+    // longer saw the index at all).
+    SeedInsolventHouse5();
+    fOneTrySecrets = true;
 
     const int RUNS = 9;
     std::string strReason;
     int nDoS = -1;
     uint32_t nLock = 1;
-    // Probe B: one fresh token. It shares nothing, so the scan visits every pooled claim before the token checks (here
-    // the house is unknown, so those fail at once: the time is the scan).
+    // Probe B: one fresh token. It shares nothing, so the scan visits every pooled claim before the token checks (the
+    // keyset is unknown, so those fail at once: the time is the scan).
     auto fnFresh = [&](int) { return ClaimTx({Entry64()}, nLock++); };
     const int64_t tFresh0 = MedianProbe(fnFresh, RUNS, strReason, nDoS);
     BOOST_TEST_MESSAGE(strprintf("S1X-27 token: fresh-token probe, empty pool: %d us (%s, DoS %d)", tFresh0, strReason, nDoS));
@@ -943,6 +999,133 @@ BOOST_FIXTURE_TEST_CASE(s1x_27_token_claim_probe_cost_does_not_grow_with_the_poo
     BOOST_CHECK_MESSAGE(tFresh10k - tFresh0 < 0.05 * dPoolHash,
             strprintf("S1X-27 token: a free probe at 10,048 pooled entries costs %d us more than at none (hashing the "
                       "pool: %.0f us); the scan grows with the pool", tFresh10k - tFresh0, dPoolHash));
+}
+
+// ===========================================================================
+// testing (2026-11-26, Stage 0 family A, after security's TOKEN_CLAIM relay ruling in ffe871c): the costliest refused
+// claim a token HOLDER can send. A holder of 32 real tokens of an insolvent house (in its claim window) signs every entry
+// under P = B_ - Y, and gives the last entry a wrong DLEQ proof. Relay hashes the 32 secrets (one-try here; up to 96 tries
+// in all), reads four records an entry, and CheckTokenOperation verifies 32 holder signatures and 31 DLEQs before the
+// 32nd DLEQ fails (bad-token-claim-dleq, DoS 100 in the code, re-scored 0 on the mempool path by MempoolRefusalScoresZero
+// unless marked state-independent). The DLEQ cache keeps successes across calls, so the FIRST probe pays the 31 DLEQs and
+// each repeat with a fresh payout script (new holder sighashes, re-signed by the holder) pays the 32 signatures again.
+// Security ruled 11-26 (appended to its family-rules note): a token holder's signature has no standing, and
+// bad-token-claim-sig, -dleq and -proof score DoSStateIndependent(100) - each is pure in the tx and the keyset its id
+// names - so a probe costs its sender the connection. Checked here: the refusal scores 100 (FAILS until that lands).
+// The cost is reported. The control: the same claim with the right proof is accepted.
+// ===========================================================================
+BOOST_FIXTURE_TEST_CASE(family_a_cost_token_claim_holder_last_dleq_wrong, TokenPoolSetup)
+{
+    LOCK(cs_main);
+    CHouse house = SeedInsolventHouse5();
+    TestMint mint;
+    mint.k[0] = RandScalar();   // amount 1
+    const std::vector<TokenKey> vKey = mint.Keys();
+    const uint64_t id = TokenKeysetID(vKey);
+    CTokenKeyset ks;
+    ks.nHeight = 0;
+    ks.vchPostingPubKey = vchPoint;
+    ks.vKey = vKey;
+    TokenEffects eff;
+    eff.mapKeyset[std::make_pair((uint32_t)5, id)] = ks;
+    std::vector<TestMint::Token> vTok;
+    while (vTok.size() < MAX_TOKEN_CLAIM_ENTRIES_RELAY) {
+        const std::string str = HexStr(GetRandHash());
+        if (!MapsInOneTry(str))
+            continue;
+        vTok.push_back(mint.Issue(0, str));
+        CTokenMark m;
+        m.nHeight = 0;
+        m.nKeysetID = id;
+        m.nAmount = vTok.back().amount;
+        eff.mapIssued[std::make_pair((uint32_t)5, V(vTok.back().B))] = m;
+    }
+    BOOST_REQUIRE(phousetree->WriteBlockEffects({house}, nullptr, chainActive.Tip()->GetBlockHash(), nullptr, &eff, nullptr));
+
+    CKey keyFund;
+    keyFund.MakeNewKey(true);
+    CBasicKeyStore ksFund;
+    ksFund.AddKey(keyFund);
+    const CScript spkFund = GetScriptForDestination(keyFund.GetPubKey().GetID());
+    auto fnFund = [&]() {
+        const COutPoint o(uint256S(strprintf("%x", 0xdd0000 + ++nNext)), 0);
+        pcoinsTip->AddCoin(o, Coin(CTxOut(COIN, spkFund), chainActive.Height(), false, false, false, uint256()), false);
+        return o;
+    };
+    auto fnProbe = [&](bool fBadLast) {
+        const uint256 r = GetRandHash();
+        const CScript pay = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(r.begin(), r.begin() + 20)
+                                      << OP_EQUALVERIFY << OP_CHECKSIG;   // fresh: every holder sighash is new
+        std::vector<TokenClaimEntry> v;
+        for (const TestMint::Token& t : vTok)
+            v.push_back(Entry(5, id, t, pay));
+        if (fBadLast)
+            v.back().vchS[31] ^= 1;   // the proof's s: the holder's signature doesn't cover it
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_TOKEN_CLAIM;
+        mtx.vin.push_back(CTxIn(fnFund()));
+        mtx.vout.push_back(CTxOut(10000, pay));
+        NoteTokenClaim c;
+        c.nHouseID = 5;
+        c.vEntry = v;
+        SetPayload(mtx, c);
+        BOOST_REQUIRE(SignSignature(ksFund, spkFund, mtx, 0, COIN, SIGHASH_ALL));
+        return mtx;
+    };
+    std::vector<int64_t> vT;
+    std::string strReason;
+    int nDoS = -1;
+    size_t nBytes = 0;
+    for (int i = 0; i < 8; i++) {
+        const CTransactionRef ptx = MakeTransactionRef(fnProbe(true));
+        nBytes = ::GetSerializeSize(*ptx, SER_NETWORK, PROTOCOL_VERSION);
+        CValidationState state;
+        const int64_t t0 = GetTimeMicros();
+        const bool fOk = AcceptToMemoryPool(mempool, state, ptx, nullptr, nullptr, false, 0);
+        vT.push_back(GetTimeMicros() - t0);
+        BOOST_REQUIRE_MESSAGE(!fOk, "the holder probe was accepted");
+        strReason = state.GetRejectReason();
+        nDoS = 0;
+        state.IsInvalid(nDoS);
+        BOOST_CHECK_EQUAL(strReason, "bad-token-claim-dleq");
+    }
+    BOOST_CHECK_MESSAGE(nDoS == 100, strprintf("family A (security 11-26): a holder's claim refused at %s scored DoS %d, "
+                                               "not 100; the refusal is state-independent and must ban", strReason, nDoS));
+    const int64_t tCold = vT[0];
+    std::vector<int64_t> vWarm(vT.begin() + 1, vT.end());
+    std::sort(vWarm.begin(), vWarm.end());
+    // The plain baseline of the same size and shape: an owned signed fund, then an unowned coin, refused at the second
+    // input's script (family_a_cost_tests' PlainMin).
+    std::vector<int64_t> vPlain;
+    for (int i = 0; i < 7; i++) {
+        CMutableTransaction mtx;
+        mtx.nVersion = 2;
+        mtx.vin.push_back(CTxIn(fnFund()));
+        mtx.vin.push_back(CTxIn(TipFee()));
+        const size_t nOut = std::max<size_t>(1, nBytes / 34);
+        for (size_t j = 0; j < nOut; j++)
+            mtx.vout.emplace_back(COIN / 2 / nOut, CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x0b)
+                                                             << OP_EQUALVERIFY << OP_CHECKSIG);
+        BOOST_REQUIRE(SignSignature(ksFund, spkFund, mtx, 0, COIN, SIGHASH_ALL));
+        CValidationState state;
+        const CTransactionRef ptx = MakeTransactionRef(std::move(mtx));
+        const int64_t t0 = GetTimeMicros();
+        AcceptToMemoryPool(mempool, state, ptx, nullptr, nullptr, false, 0);
+        vPlain.push_back(GetTimeMicros() - t0);
+    }
+    const int64_t tPlain = *std::min_element(vPlain.begin(), vPlain.end());
+    BOOST_TEST_MESSAGE(strprintf("family A cost: note TOKEN_CLAIM, a holder's 32 real tokens, the last DLEQ wrong (%u bytes): "
+                                 "first probe %d us (%d over plain), repeats with a fresh payout %d us min, %d us median (%d "
+                                 "over plain); plain %d us; refused %s, DoS %d (no standing: must score 100)", (unsigned)nBytes, tCold, tCold - tPlain, vWarm.front(),
+                                 vWarm[vWarm.size() / 2], vWarm.front() - tPlain, tPlain, strReason, nDoS));
+    // The control: the same claim with every proof right is accepted (so the probe was valid up to the last DLEQ).
+    {
+        CValidationState state;
+        const bool fOk = AcceptToMemoryPool(mempool, state, MakeTransactionRef(fnProbe(false)), nullptr, nullptr, false, 0);
+        BOOST_CHECK_MESSAGE(fOk, "holder probe control: the claim with the right proofs was refused: " + state.GetRejectReason());
+    }
+    mempool.clear();
 }
 
 // Security's second question (not rated): a zero-fee CLAIM of 64 real tokens runs the token checks (DLEQ, signatures)
@@ -1120,9 +1303,11 @@ CMutableTransaction Run4NetRing(TokenPoolSetup& s, size_t H, CAmount nFee)
 {
     SettleNet n;
     std::vector<std::vector<unsigned char>> vKey;
+    CBasicKeyStore keystore;   // Stage 0 rule A step 2: the first note input is signed (below)
     for (size_t i = 0; i < H; i++) {
         CKey k;
         k.MakeNewKey(true);
+        keystore.AddKey(k);
         vKey.push_back(V(k.GetPubKey()));
         n.vHouseID.push_back((uint32_t)(i + 900001));
         n.vReceive.push_back(0);
@@ -1149,8 +1334,10 @@ CMutableTransaction Run4NetRing(TokenPoolSetup& s, size_t H, CAmount nFee)
     mtx.nVersion = TRANSACTION_SETTLE_VERSION;
     mtx.nSettleOp = SETTLE_OP_NET;
     CAmount nIn = 0;
+    std::vector<CScript> vInScript;
     for (const SettleNetBundle& b : n.vBundle) {
         const COutPoint o(uint256S(strprintf("%x", 0x37000000 + ++s.nNext)), 0);
+        vInScript.push_back(NoteScriptForPubKey(vKey[b.nPresenter - 900001]));
         Coin coin(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vKey[b.nPresenter - 900001])), chainActive.Height(), false,
                   false, false, uint256());
         coin.SetNote(b.nIssuer, b.nUnits);
@@ -1165,6 +1352,10 @@ CMutableTransaction Run4NetRing(TokenPoolSetup& s, size_t H, CAmount nFee)
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << n;
     mtx.vchSettlePayload.assign(ss.begin(), ss.end());
+    // Stage 0 rule A step 2 (60e409d): after the floor ATMP verifies the first signature-bearing input's script before
+    // any FreeBank check. The prober owns its coins, so that input is signed (the rest stay unsigned: refused last), and
+    // the probe reaches the settle checks S1X-37 is about.
+    BOOST_REQUIRE(SignSignature(keystore, vInScript[0], mtx, 0, NOTE_DUST_VALUE, SIGHASH_ALL));
     return mtx;
 }
 
@@ -1198,9 +1389,129 @@ BOOST_FIXTURE_TEST_CASE(s1x_37_settle_net_probes_are_refused_before_any_house_is
     BOOST_CHECK_MESSAGE(r == "min relay fee not met" || r == "mempool min fee not met",
                         "S1X-37: a zero-fee NET was refused \"" + r + "\" (DoS " + std::to_string(nDoS) +
                         "), not at the fee floor before the house reads");
-    // And a 100-house NET with a fee is not refused for its size (it reaches the house reads).
+    // And a 100-house NET with a fee is not refused for its size (it reaches the house reads, past the early script check).
     r = Run4Atmp(Run4NetRing(*this, 100, 20000), nDoS);
-    BOOST_CHECK_MESSAGE(r != "settle-net-too-many-houses", "S1X-37 control: a 100-house NET was refused as too many houses");
+    BOOST_CHECK_MESSAGE(r != "settle-net-too-many-houses" && r.find("mandatory-script-verify-flag-failed") != 0,
+                        "S1X-37 control: a 100-house NET was refused \"" + r + "\", not at the house reads");
+}
+
+// ===========================================================================
+// testing (2026-11-26): family A, Stage 0 (Michael 11-26 via the telegram session: a testing regime with a defined end,
+// one daemon-wide rule per bug family; freebankd takes the fix, security's wording in note
+// 2026-11-26-from-security-family-rules: "until the fee floor is met and the authorizing signature verifies, the node
+// does byte-shape work only"). The bypass test: a zero-fee op of each FreeBank tx family, well-formed up to its contextual
+// checks (shape-valid, inputs that pass the input layer, records that don't exist), must be refused AT THE FEE FLOOR,
+// before any contextual read. S1X-30 and S1X-37 did this for TOKEN_CLAIM and settle only; ATMP runs the bill, house, note,
+// deposit and pool checks (validation.cpp ~2419-2715) before the normal fee checks (~2857). FAILS on master for every family
+// not yet covered; passes once freebankd's one early floor covers every FreeBank op version.
+// ===========================================================================
+namespace {
+std::string Run4FeeProbe(TokenPoolSetup& s, CMutableTransaction mtx, const std::vector<std::pair<COutPoint, Coin>>& vCoin)
+{
+    CAmount nIn = 0;
+    for (const auto& c : vCoin) {
+        pcoinsTip->AddCoin(c.first, Coin(c.second), true);
+        mtx.vin.push_back(CTxIn(c.first));
+        nIn += c.second.out.nValue;
+    }
+    const COutPoint fee = s.TipFee();
+    mtx.vin.push_back(CTxIn(fee));
+    nIn += COIN;
+    CAmount nOut = 0;
+    for (const CTxOut& o : mtx.vout)
+        nOut += o.nValue;
+    mtx.vout.emplace_back(nIn - nOut, CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0xa0)
+                                                << OP_EQUALVERIFY << OP_CHECKSIG);   // zero fee: everything back
+    int nDoS = -1;
+    return Run4Atmp(mtx, nDoS);
+}
+template <typename T>
+std::vector<unsigned char> Run4Ser(const T& x)
+{
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << x;
+    return std::vector<unsigned char>(ss.begin(), ss.end());
+}
+COutPoint Run4Out(TokenPoolSetup& s) { return COutPoint(uint256S(strprintf("%x", 0xa1000000 + ++s.nNext)), 0); }
+bool Run4IsFeeFloor(const std::string& r) { return r == "min relay fee not met" || r == "mempool min fee not met"; }
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(family_a_zero_fee_ops_are_refused_at_the_fee_floor_first, TokenPoolSetup)
+{
+    LOCK(cs_main);
+    CKey key;
+    key.MakeNewKey(true);
+    const std::vector<unsigned char> vchKey = V(key.GetPubKey());
+    std::vector<std::pair<std::string, std::string>> vResult;
+
+    // note: a TRANSFER of 1,000 units of house 900099 (no such house).
+    {
+        NoteTransfer t;
+        t.nHouseID = 900099;
+        t.vUnits = {1000};
+        t.nDemandHeight = 0;
+        t.vchSenderPubKey = vchKey;
+        t.vchSenderSig.assign(70, 0x30);
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_NOTE_VERSION;
+        mtx.nNoteOp = NOTE_OP_TRANSFER;
+        mtx.vchNotePayload = Run4Ser(t);
+        mtx.vout.emplace_back(NOTE_DUST_VALUE, NoteScriptForPubKey(vchKey));
+        Coin c(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(vchKey)), chainActive.Height(), false, false, false, uint256());
+        c.SetNote(900099, 1000);
+        vResult.emplace_back("note TRANSFER", Run4FeeProbe(*this, mtx, {{Run4Out(*this), c}}));
+    }
+    // house: a rate POST by house 900099.
+    {
+        HouseRate r;
+        r.nHouseID = 900099;
+        r.nKind = HOUSE_RATE_POST;
+        r.nBid = 100000;
+        r.nAsk = 100000;
+        r.vchRateSig.assign(70, 0x30);
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_HOUSE_VERSION;
+        mtx.nHouseOp = HOUSE_OP_RATE;
+        mtx.vchHousePayload = Run4Ser(r);
+        vResult.emplace_back("house rate POST", Run4FeeProbe(*this, mtx, {}));
+    }
+    // bill: a RETIRE of bill 900099 (no such bill), spending a bill-escrow coin of that id.
+    {
+        BillRetire r;
+        r.nBillID = 900099;
+        r.vchAcceptorSig.assign(70, 0x30);
+        r.nRateNamed = 1000;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_BILL_VERSION;
+        mtx.nBillOp = BILL_OP_RETIRE;
+        mtx.vchBillPayload = Run4Ser(r);
+        mtx.vout.emplace_back(10000, BillScriptForPubKey(vchKey));
+        Coin c(CTxOut(20000, BillEscrowScript(uint256S("b9"))), chainActive.Height(), false, false, false, uint256());
+        c.SetBill(true, 900099);
+        vResult.emplace_back("bill RETIRE", Run4FeeProbe(*this, mtx, {{Run4Out(*this), c}}));
+    }
+
+    // deposit: a WITHDRAW of a 50,000-unit receipt of house 900099 (no such house).
+    {
+        DepositWithdraw w;
+        w.nHouseID = 900099;
+        w.vchHolderPubKey = vchKey;
+        w.vchHolderSig.assign(70, 0x30);
+        w.nRateNamed = 1000;
+        CMutableTransaction mtx;
+        mtx.nVersion = TRANSACTION_DEPOSIT_VERSION;
+        mtx.nDepositOp = DEPOSIT_OP_WITHDRAW;
+        mtx.vchDepositPayload = Run4Ser(w);
+        Coin c(CTxOut(NOTE_DUST_VALUE, DepositScriptForPubKey(vchKey)), chainActive.Height(), false, false, false, uint256());
+        c.SetDeposit(900099, 50000, 500, (uint32_t)chainActive.Height(), 1);
+        vResult.emplace_back("deposit WITHDRAW", Run4FeeProbe(*this, mtx, {{Run4Out(*this), c}}));
+    }
+
+    for (const auto& r : vResult) {
+        BOOST_TEST_MESSAGE("family A probe: zero-fee " + r.first + " -> " + r.second);
+        BOOST_CHECK_MESSAGE(Run4IsFeeFloor(r.second), "family A: a zero-fee " + r.first + " was refused \"" + r.second +
+                                                      "\", not at the fee floor before its contextual checks");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

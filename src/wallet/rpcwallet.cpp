@@ -4618,10 +4618,15 @@ UniValue relaytokenclaims(const JSONRPCRequest& request)
     EnsureWalletIsUnlocked(pwallet);
     uint256 txid;
     std::string strFail;
-    if (!pwallet->RelayTokenClaims(strFail, txid, nHouseID, vEntry, nFee))
+    std::vector<uint256> vTxid;
+    if (!pwallet->RelayTokenClaims(strFail, txid, nHouseID, vEntry, nFee, &vTxid))
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("txid", txid.ToString());
+    UniValue arr(UniValue::VARR);   // Stage 0 rule A: a claim of more than 32 entries goes as several
+    for (const uint256& t : vTxid)
+        arr.push_back(t.ToString());
+    ret.pushKV("txids", arr);
     return ret;
 }
 
@@ -4637,11 +4642,11 @@ UniValue claimtokens(const JSONRPCRequest& request)
             "dleq e, s and r) is signed with its blinding factor r, so nobody who sees the claim can redirect it.\n"
             "This wallet relays it and pays the fee; it may take feebps (basis points) of the payout, paid to\n"
             "relayeraddress at the collect. The payout (ECX from the escrow, after the window) goes to\n"
-            "payoutaddress. Up to 64 proofs.\n"
+            "payoutaddress. Up to 64 proofs, sent as claims of at most 32 (relay policy).\n"
             "\nArguments:\n"
             "2. proofs  [{\"id\":\"keysetid\",\"amount\":n,\"secret\":\"str\",\"C\":\"hex\",\"dleq\":{\"e\":\"hex\",\"s\":\"hex\",\"r\":\"hex\"}},...]\n"
             "\nResult:\n"
-            "{ \"txid\": \"hex\" }\n"
+            "{ \"txid\": \"hex\", \"txids\": [\"hex\",...] }   (txid: the first claim)\n"
             + HelpExampleCli("claimtokens", "1 '[...]' \"Xpayout...\"")
         );
     ObserveSafeMode();
@@ -4654,10 +4659,15 @@ UniValue claimtokens(const JSONRPCRequest& request)
     EnsureWalletIsUnlocked(pwallet);
     uint256 txid;
     std::string strFail;
-    if (!pwallet->ClaimTokens(strFail, txid, nHouseID, vProof, scriptPayout, nFeeBps, scriptRelayer, nFee))
+    std::vector<uint256> vTxid;
+    if (!pwallet->ClaimTokens(strFail, txid, nHouseID, vProof, scriptPayout, nFeeBps, scriptRelayer, nFee, &vTxid))
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("txid", txid.ToString());
+    UniValue arr(UniValue::VARR);   // Stage 0 rule A: a claim of more than 32 proofs goes as several
+    for (const uint256& t : vTxid)
+        arr.push_back(t.ToString());
+    ret.pushKV("txids", arr);
     return ret;
 }
 

@@ -516,6 +516,8 @@ bool IsNoteDemandCustodyScript(const CScript& script);
 bool NoteCustodyDemandId(const CScript& script, uint256& demandId);
 /** Does a custody script (either form) pin this holder key? */
 bool NoteCustodyKeyIs(const CScript& script, const std::vector<unsigned char>& vchPubKey);
+/** The same against a keyid already hashed (Stage 0 rule A: tx_verify hashes the payload key once per tx). */
+bool NoteCustodyKeyIDIs(const CScript& script, const CKeyID& keyid);
 
 /** SHA256d over every input outpoint of tx - the tx-unique element bound into
  * the mint sighash so reused M-of-N approver signatures cannot authorize a
@@ -530,10 +532,10 @@ uint256 NoteHashPrevouts(const CTransaction& tx);
 uint256 NoteDemandId(const CTransaction& tx, const std::vector<uint64_t>& vUnits,
                      const std::vector<unsigned char>& vchPayoutScript);
 
-uint256 NoteMintSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 NoteTransferSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
-uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs);
-uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs);
+uint256 NoteMintSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 NoteTransferSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 NoteRedeemSigHash(const CTransaction& tx);     // Stage 0 C1
+uint256 NoteClaimSigHash(const CTransaction& tx);      // Stage 0 C1
 /** NOTE_OP_SWAP payload (Gold B; leading nHouseID, the slot convention). The holder (vchHolderPubKey, owning every
  *  note input) signs NoteSwapSigHash. nRateNamed: the house's bid in effect (the swap's bid at demand). */
 struct NoteSwap {
@@ -654,26 +656,24 @@ struct NoteSwapClaim {
     }
 };
 /** What the holder signs for a SWAP: the payload without its signature, and the transaction's prevouts and outputs. */
-uint256 NoteSwapSigHash(const NoteSwap& swap, const CTransaction& tx);
+uint256 NoteSwapSigHash(const CTransaction& tx);   // Stage 0 C1
 /** The hash lock a swap op (NOTE_OP_SWAP .. NOTE_OP_SWAP_CLAIM) names, or false if tx isn't one or its payload doesn't
  *  decode. The mempool keeps at most one pooled swap op per hash lock (security stage A N1, 2026-11-08). */
 bool NoteSwapOpHashLock(const CTransaction& tx, uint256& hashLock);
 
-uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
+uint256 NoteDemandSigHash(const CTransaction& tx);   // Stage 0 C1
 /** B3: the STANDING authorisation. Domain-separated from every other note
  * digest because it authorises a payout the holder will not be present to sign,
  * and binds the payout SCRIPT rather than a transaction's outputs - the
  * discharge that satisfies it does not exist yet when this is signed. */
 uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
                            const std::vector<unsigned char>& vchPayoutScript, const uint256& demandId);
-uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs);
+uint256 NoteProtestSigHash(const CTransaction& tx);  // Stage 0 C1 (closes the S1X-21 residual)
 /** v0.2.20 token records. Both bind hashPrevouts (tx-unique: approvals can't be
  * replayed onto a second, differently-funded tx - the MINT rule) and the outputs.
  * The holder and the house's approvers sign the SAME lock digest. */
-uint256 NoteLockSigHash(uint32_t nHouseID, uint64_t nUnits, const std::vector<uint64_t>& vChangeUnits,
-                        const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 NoteUnlockSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
-                          const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 NoteLockSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 NoteUnlockSigHash(const CTransaction& tx);   // Stage 0 C1
 
 /** The scheduled suspension-interest rate (bps/yr) at block nHeight: the last
  * step with nHeight <= the block (v0.2.18). 0 for an empty schedule. */

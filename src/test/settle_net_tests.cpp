@@ -43,6 +43,29 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
                           const std::function<bool(uint32_t, CHouse&)>& fnGetHouse,
                           CHouse& houseAOut, CHouse& houseBOut, bool fMempool = false);
 
+// Stage 0 C1 test shim: the transaction with payload p serialized into its op field (a C1 digest takes the whole tx;
+// the payload's signature fields are stripped, so it may be passed before or after they are filled).
+template <typename T, typename P>
+static CTransaction C1With(const T& tx, std::vector<unsigned char> CMutableTransaction::*field, const P& p)
+{
+    CMutableTransaction m(tx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    (m.*field).assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
+// Stage 0 C1: the NET digest over a tx carrying n, whose input is hp and whose output pays a script made from ho.
+static uint256 C1SettleNetSigHash(const SettleNet& n, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_SETTLE_VERSION;
+    m.nSettleOp = SETTLE_OP_NET;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(1000, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    return SettleNetSigHash(C1With(m, &CMutableTransaction::vchSettlePayload, n));
+}
+
 BOOST_FIXTURE_TEST_SUITE(settle_net_tests, BasicTestingSetup)
 
 static std::vector<unsigned char> PK(const CKey& k)
@@ -130,7 +153,7 @@ struct NetSetup {
 
         if (fSign) {
             const CTransaction ctx(mtx);
-            const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(ctx), BillHashOutputs(ctx));
+            const uint256 sighash = SettleNetSigHash(C1With(ctx, &CMutableTransaction::vchSettlePayload, n));
             for (size_t i = 0; i < 3; i++) {
                 const uint32_t id = n.vHouseID[i];
                 for (size_t k = 0; k < appr.at(id).size(); k++) {
@@ -340,7 +363,7 @@ BOOST_AUTO_TEST_CASE(net_sighash_binds_terms_not_signatures)
     const CMutableTransaction mtx = s.Build(n, s.houses);
     const CTransaction ctx(mtx);
     const uint256 hp = SettleHashPrevouts(ctx), ho = BillHashOutputs(ctx);
-    const uint256 base = SettleNetSigHash(n, hp, ho);
+    const uint256 base = C1SettleNetSigHash(n, hp, ho);
 
     std::vector<std::function<void(SettleNet&)>> vTerm = {
         [](SettleNet& x) { x.vHouseID[2] = 4; },
@@ -356,15 +379,15 @@ BOOST_AUTO_TEST_CASE(net_sighash_binds_terms_not_signatures)
     for (const auto& f : vTerm) {
         SettleNet x = n;
         f(x);
-        BOOST_CHECK(SettleNetSigHash(x, hp, ho) != base);
+        BOOST_CHECK(C1SettleNetSigHash(x, hp, ho) != base);
     }
     SettleNet x = n;
     x.vPresentSig[0].clear();
     x.vApproverIndex[1].clear();
     x.vApproverSig[1].clear();
-    BOOST_CHECK(SettleNetSigHash(x, hp, ho) == base);
-    BOOST_CHECK(SettleNetSigHash(n, uint256S("0x01"), ho) != base);
-    BOOST_CHECK(SettleNetSigHash(n, hp, uint256S("0x01")) != base);
+    BOOST_CHECK(C1SettleNetSigHash(x, hp, ho) == base);
+    BOOST_CHECK(C1SettleNetSigHash(n, uint256S("0x01"), ho) != base);
+    BOOST_CHECK(C1SettleNetSigHash(n, hp, uint256S("0x01")) != base);
 }
 
 /** The input layer: vin[0..3) the three bundles, vin[3] plain funding from house 3. */
@@ -613,7 +636,7 @@ BOOST_AUTO_TEST_CASE(net_full_mesh_24_fits_relay)
     n.vApproverIndex.assign(N, std::vector<uint32_t>());
     n.vApproverSig.assign(N, std::vector<std::vector<unsigned char>>());
     const CTransaction ctx(mtx);
-    const uint256 sighash = SettleNetSigHash(n, SettleHashPrevouts(ctx), BillHashOutputs(ctx));
+    const uint256 sighash = SettleNetSigHash(C1With(ctx, &CMutableTransaction::vchSettlePayload, n));
     for (uint32_t i = 0; i < N; i++) {
         for (uint32_t k = 0; k < 2; k++) {
             std::vector<unsigned char> sig;
@@ -668,7 +691,7 @@ BOOST_AUTO_TEST_CASE(net_then_exchange_cadence)
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("0xb0"), 0)));
         mtx.vout.emplace_back(15000, NoteScriptForPubKey(hs[2].vchRedemptionDestPK));
         const CTransaction ctx(mtx);
-        const uint256 h = SettleExchangeSigHash(x, SettleHashPrevouts(ctx), BillHashOutputs(ctx));
+        const uint256 h = SettleExchangeSigHash(C1With(ctx, &CMutableTransaction::vchSettlePayload, x));
         std::vector<unsigned char> s;
         BOOST_REQUIRE(a1.Sign(h, s)); x.vApproverIndexA = {0}; x.vApproverSigA = {s};
         BOOST_REQUIRE(a2.Sign(h, s)); x.vApproverIndexB = {0}; x.vApproverSigB = {s};

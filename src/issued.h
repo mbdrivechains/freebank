@@ -359,6 +359,20 @@ const CIssuedOut* FindIssuedOut(const CTransaction& tx, uint32_t n);
  *  (BillHashOutputs) AND the annex and vault moves, so a relayer can't move or drop the gold when no input is
  *  script-signed. Used by note CLAIM, deposit CLAIM and RECLAIM. */
 uint256 CreditHashOutputs(const CTransaction& tx);
+
+/** Stage 0 rule C1 (security's wording, note 2026-11-26-from-security-family-rules; design docs-local/drafts/
+ *  STAGE0_BC_DESIGN.md; Michael 2026-11-26 "Yes, build B and C"): the ONE digest every payload tx signature signs. It
+ *  covers the whole transaction except the signatures: a per-op domain string (it also separates roles within one op),
+ *  the network, the version, the op and the payload's binding form (CreditBindingHash: the payload with its signature
+ *  fields and their approver indices stripped, plus the issued annex), every prevout and nSequence and nLockTime
+ *  (BillTxBindingHash), and every output (CreditHashOutputs). A payload signature made with it can never be moved to
+ *  another transaction, nor survive a change to any field it doesn't strip. Standing authorizations (signed before the
+ *  tx exists) are the declared exceptions: IsStandingAuthorizationDomain. */
+uint256 CreditTxSigHash(const CTransaction& tx, const std::string& strDomain);
+/** The same, also binding the canonical id (a bill's billID, a house's houseID) of the record the op acts on: payloads
+ *  name bills and houses by dense id, which a reorg can renumber, so a signature stays with the record it was made for
+ *  (the old per-op digests bound the canonical id for the same reason). */
+uint256 CreditTxSigHash(const CTransaction& tx, const std::string& strDomain, const uint256& canonicalId);
 /** Review round 1b: a script gold can't be paid to - unspendable, or another family's tagged script (house / bill / pool
  *  escrow, issuer or oracle bond, pre-auth custody, a token pool's custody). Annex outputs, pre-auth demands' and token
  *  claims' payout scripts are all refused on these. */
@@ -412,6 +426,9 @@ struct CHouseCapital {
 };
 class CHouse;
 bool HouseCapitalForChecks(const CHouse& house, int nHeight, CAmount amountTillSats, CHouseCapital& cap);
+/** Stage 0 D/E (d), testing's FB-6 (regtest log only): the cap inputs (rate, ramp tranches, owed parts, till) and the
+ *  results HouseCapitalForChecks gives for the house at nHeight, as key=value fields on one line. */
+std::string HouseCapsLogFields(const CHouse& house, int nHeight, CAmount amountTillSats);
 /** S1X-9: the house's active escrow in mg at its highest ask of the last 30 days (HouseCapitalForChecks' nEscrowMg on the
  *  real path, never the test override). False and 0 when the house has no rate. */
 bool HouseEscrowMgForChecks(const CHouse& house, int nHeight, uint64_t& nEscrowMg);
@@ -429,12 +446,19 @@ extern std::function<void(const CHouse&, int, CHouseCapital&)> g_fnCapitalForChe
 class UnitsCheckScope
 {
 public:
-    UnitsCheckScope(const CUnitsView* pView);
+    /** pBlockStart (Stage 0 rule B1): ConnectBlock's view of the units DB as of the block's start (the DB, which the block
+     *  writes only at its end), for the reads that must not depend on where a tx sits in the block. */
+    UnitsCheckScope(const CUnitsView* pView, const CUnitsView* pBlockStart = nullptr);
     ~UnitsCheckScope();
     /** The view in scope, or null outside any scope (Gold B: the house-rate reads use it too). */
     static const CUnitsView* Current();
+    /** Stage 0 rule B1: the block-start view in scope, else Current() (the mempool reads the tip, which is that). The
+     *  swap totals read through it: W (pending swap units) and M (live shortfall), which non-slot ops (SWAP_DONE,
+     *  SWAP_PAY) write inside a block that slot-taking readers (caps, the REDEEM spread, settle par...) then read. */
+    static const CUnitsView* BlockStart();
 private:
     const CUnitsView* pPrev;
+    const CUnitsView* pPrevBlockStart;
 };
 
 /** SA-H3 (Michael 2026-11-11, second list): a clock read for a past height whose record is missing (a damaged units DB)

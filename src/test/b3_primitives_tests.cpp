@@ -111,9 +111,14 @@ BOOST_AUTO_TEST_CASE(preauth_and_protest_digests_are_domain_separated)
     const std::vector<unsigned char> script = Bytes("76a914aabbccddeeff0011223344556677889900aabbcc88ac");
     const uint256 outs = uint256S("beef");
 
-    const uint256 demand  = NoteDemandSigHash(H, vUnits, outs);
+    CMutableTransaction t;   // Stage 0 C1: demand and protest sign the whole transaction
+    t.nVersion = TRANSACTION_NOTE_VERSION;
+    t.nNoteOp = NOTE_OP_PROTEST;
+    t.vin.push_back(CTxIn(COutPoint(outs, 0)));
+    t.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
+    const uint256 demand  = NoteDemandSigHash(CTransaction(t));
     const uint256 preauth = NotePreAuthSigHash(H, vUnits, script, uint256S("d1d"));
-    const uint256 protest = NoteProtestSigHash(H, vUnits, outs);
+    const uint256 protest = NoteProtestSigHash(CTransaction(t));
 
     // THE POINT: a pre-auth signature must not be replayable as a demand
     // signature or vice versa. They authorise different things - one a
@@ -136,8 +141,9 @@ BOOST_AUTO_TEST_CASE(preauth_and_protest_digests_are_domain_separated)
     // satisfies it does not exist when this is signed. Pinning the SCRIPT is
     // what makes a unilateral discharge possible at all.
     BOOST_CHECK_EQUAL(preauth.ToString(), NotePreAuthSigHash(H, vUnits, script, uint256S("d1d")).ToString());
-    // protest binds outputs (it is an ordinary same-tx authorisation)
-    BOOST_CHECK(protest != NoteProtestSigHash(H, vUnits, uint256S("dead")));
+    // protest binds the whole tx (an ordinary same-tx authorisation; C1): another input is another digest
+    t.vin[0].prevout = COutPoint(uint256S("dead"), 0);
+    BOOST_CHECK(protest != NoteProtestSigHash(CTransaction(t)));
 }
 
 // --------------------------------------------------------------- payloads

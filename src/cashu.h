@@ -24,6 +24,10 @@ typedef std::array<unsigned char, 32> CashuScalar;
  *  counter a little-endian uint32 from 0 up to the first valid point. False only if no point is found in 2^16 tries
  *  (probability about 2^-65536). */
 bool CashuHashToCurve(const std::vector<unsigned char>& msg, CPubKey& Y);
+/** Stage 0 rule A (security 2026-11-26): the same, spending at most nTriesLeft counters and taking the ones it used off
+ *  nTriesLeft. False when they run out first (then nTriesLeft is 0): relay's per-tx budget, since a secret can be ground
+ *  to need many tries and each costs a point parse. Consensus keeps the 2^16 bound (CashuHashToCurve). */
+bool CashuHashToCurveBudget(const std::vector<unsigned char>& msg, CPubKey& Y, uint32_t& nTriesLeft);
 
 /** NUT-12 hash_e: SHA256 of the concatenated lowercase hex of each point's uncompressed (65-byte) encoding. False if
  *  a point does not parse. */

@@ -44,6 +44,29 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
 static_assert(SETTLE_MAX_UNITS == POOL_MAX_AMOUNT,
               "SETTLE_MAX_UNITS must equal POOL_MAX_AMOUNT (shared u128 envelope)");
 
+// Stage 0 C1 test shim: the transaction with payload p serialized into its op field (a C1 digest takes the whole tx;
+// the payload's signature fields are stripped, so it may be passed before or after they are filled).
+template <typename T, typename P>
+static CTransaction C1With(const T& tx, std::vector<unsigned char> CMutableTransaction::*field, const P& p)
+{
+    CMutableTransaction m(tx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    (m.*field).assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
+// Stage 0 C1: the exchange's digest over a tx carrying x, whose input is hp and whose output pays a script made from ho.
+static uint256 C1SettleXSigHash(const SettleExchange& x, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_SETTLE_VERSION;
+    m.nSettleOp = SETTLE_OP_EXCHANGE;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(1000, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    return SettleExchangeSigHash(C1With(m, &CMutableTransaction::vchSettlePayload, x));
+}
+
 BOOST_FIXTURE_TEST_SUITE(settle_tests, BasicTestingSetup)
 
 static SettleExchange FilledExchange()
@@ -137,29 +160,29 @@ BOOST_AUTO_TEST_CASE(settle_sighash_vectors)
     const SettleExchange base = FilledExchange();
     const uint256 hp = uint256S("0x1111111111111111111111111111111111111111111111111111111111111111");
     const uint256 ho = uint256S("0x2222222222222222222222222222222222222222222222222222222222222222");
-    const uint256 dBase = SettleExchangeSigHash(base, hp, ho);
+    const uint256 dBase = C1SettleXSigHash(base, hp, ho);
 
     // Deterministic.
-    BOOST_CHECK(SettleExchangeSigHash(base, hp, ho) == dBase);
+    BOOST_CHECK(C1SettleXSigHash(base, hp, ho) == dBase);
 
     // Every VALUE field moves the digest.
     {
-        SettleExchange m = base; m.nHouseA = 3;                    BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase);
+        SettleExchange m = base; m.nHouseA = 3;                    BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase);
     }
-    { SettleExchange m = base; m.nHouseB = 9;                      BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nMode = 0;                        BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nUnitsANotes += 1;                BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nUnitsBNotes += 1;                BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nCountANotes += 1;                BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nCountBNotes += 1;                BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.vchPresentKeyOfANotes[0] ^= 1;    BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.vchPresentKeyOfBNotes[0] ^= 1;    BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.amountResidual += 1;              BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nPrevMintedUnitsA += 1;           BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nPrevMintedUnitsB += 1;           BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nPrevLastSettleHeightA += 1;      BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nPrevLastSettleHeightB += 1;      BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
-    { SettleExchange m = base; m.nExpiryHeight += 1;               BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nHouseB = 9;                      BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nMode = 0;                        BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nUnitsANotes += 1;                BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nUnitsBNotes += 1;                BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nCountANotes += 1;                BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nCountBNotes += 1;                BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.vchPresentKeyOfANotes[0] ^= 1;    BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.vchPresentKeyOfBNotes[0] ^= 1;    BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.amountResidual += 1;              BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nPrevMintedUnitsA += 1;           BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nPrevMintedUnitsB += 1;           BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nPrevLastSettleHeightA += 1;      BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nPrevLastSettleHeightB += 1;      BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
+    { SettleExchange m = base; m.nExpiryHeight += 1;               BOOST_CHECK(C1SettleXSigHash(m, hp, ho) != dBase); }
 
     // SIG/INDEX fields are EXCLUDED: mutating them must NOT move the digest
     // (they authorize the digest; binding them would be circular).
@@ -171,13 +194,13 @@ BOOST_AUTO_TEST_CASE(settle_sighash_vectors)
         m.vApproverSigA = {std::vector<unsigned char>(70, 0xEE)};
         m.vApproverIndexB.clear();
         m.vApproverSigB.clear();
-        BOOST_CHECK(SettleExchangeSigHash(m, hp, ho) == dBase);
+        BOOST_CHECK(C1SettleXSigHash(m, hp, ho) == dBase);
     }
 
     // hashPrevouts and hashOutputs both bind.
     const uint256 hp2 = uint256S("0x3333333333333333333333333333333333333333333333333333333333333333");
-    BOOST_CHECK(SettleExchangeSigHash(base, hp2, ho) != dBase);
-    BOOST_CHECK(SettleExchangeSigHash(base, hp, hp2) != dBase);
+    BOOST_CHECK(C1SettleXSigHash(base, hp2, ho) != dBase);
+    BOOST_CHECK(C1SettleXSigHash(base, hp, hp2) != dBase);
 }
 
 BOOST_AUTO_TEST_CASE(settle_house_ser_v6_migration)
@@ -661,7 +684,7 @@ static CMutableTransaction BuildSignedSettle(SettleExchange& x, const CHouse& hA
     // Digest covers value fields + prevouts + outputs (sig fields excluded),
     // so it is computable before the signatures exist.
     const CTransaction ctx(mtx);
-    const uint256 sighash = SettleExchangeSigHash(x, SettleHashPrevouts(ctx), BillHashOutputs(ctx));
+    const uint256 sighash = SettleExchangeSigHash(C1With(ctx, &CMutableTransaction::vchSettlePayload, x));
     for (size_t i = 0; i < apprA.size(); i++) {
         x.vApproverIndexA.push_back((uint32_t)i);
         x.vApproverSigA.push_back(SignHash(apprA[i], sighash));

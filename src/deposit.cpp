@@ -5,6 +5,7 @@
 #include <deposit.h>
 
 #include <house.h>   // BLOCKS_PER_YEAR (accrued interest denominator)
+#include <issued.h>  // Stage 0 C1: CreditTxSigHash
 #include <note.h>    // v0.2.29: the B3 custody script and demand tag bits, shared with deposits
 
 #include <consensus/validation.h>
@@ -35,82 +36,57 @@ uint256 DepositHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 DepositOriginateSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vPrincipal,
-                                const std::vector<uint32_t>& vRateBps, const std::vector<uint32_t>& vMaturityHeight,
-                                const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 DepositOriginateSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankDeposit/originate");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << vPrincipal;
-    ss << vRateBps;
-    ss << vMaturityHeight;
-    ss << hashPrevouts;   // tx-unique -> the approver sigs are not replayable
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankDeposit/originate");
 }
 
-uint256 DepositTransferSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps,
-                               uint32_t nMaturityHeight, uint32_t nOriginationHeight, const uint256& hashOutputs)
+uint256 DepositTransferSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankDeposit/transfer");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << nPrincipal;
-    ss << nRateBps;
-    ss << nMaturityHeight;
-    ss << nOriginationHeight;   // the immutable terms being reassigned
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankDeposit/transfer");
 }
 
-uint256 DepositWithdrawSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nMaturityHeight,
-                               uint32_t nOriginationHeight, const uint256& hashOutputs)
+uint256 DepositWithdrawSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankDeposit/withdraw");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << nPrincipal;
-    ss << nMaturityHeight;
-    ss << nOriginationHeight;
-    ss << hashOutputs;   // binds the exact payout (principal + accrued)
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankDeposit/withdraw");
 }
 
-uint256 DepositClaimSigHash(uint32_t nHouseID, uint64_t nPrincipal, const uint256& hashOutputs)
+uint256 DepositClaimSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankDeposit/claim");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << nPrincipal;
-    ss << hashOutputs;   // binds payout + escrow change exactly
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankDeposit/claim");
 }
 
 uint256 DepositPreAuthSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight,
-                              uint32_t nOriginationHeight, const std::vector<unsigned char>& vchPayoutScript)
+                              uint32_t nOriginationHeight, const std::vector<unsigned char>& vchPayoutScript,
+                              const uint256& demandId)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankDeposit/preauth");
     HashNetworkTag(ss);   // UR-ext-13
     ss << nHouseID << nPrincipal << nRateBps << nMaturityHeight << nOriginationHeight;
     ss << vchPayoutScript;
+    ss << demandId;   // S1X-53 (Stage 0 C3): this one demand, never another receipt's or a replaced DEMAND's
     return ss.GetHash();
 }
 
-uint256 DepositProtestSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nOriginationHeight, uint32_t nDemandTag,
-                              const uint256& hashOutputs)
+uint256 DepositDemandId(const COutPoint& receipt, const DepositDemand& d)
 {
     CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankDeposit/protest");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID << nPrincipal << nOriginationHeight << nDemandTag;
-    ss << hashOutputs;
+    ss << std::string("FreeBankDeposit/demandid");
+    ss << receipt;   // the receipt this DEMAND spends: another receipt with the same terms is another id
+    ss << d.nHouseID << d.nPrincipal << d.nRateBps << d.nMaturityHeight << d.nOriginationHeight;
+    ss << d.vchPayoutScript;
     return ss.GetHash();
+}
+
+uint256 DepositProtestSigHash(const CTransaction& tx)
+{
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankDeposit/protest");
 }
 
 CAmount DepositMaturityInterest(uint64_t nPrincipal, uint32_t nBlocks, uint32_t nRateBps)

@@ -411,13 +411,11 @@ bool PoolSwapOut(uint64_t nAmountIn, uint64_t nReserveIn, uint64_t nReserveOut,
  * (R-i6: bind prevouts wherever a payload signature is an authorization). */
 uint256 PoolHashPrevouts(const CTransaction& tx);
 
-uint256 PoolCreateSigHash(uint32_t nPoolID, uint32_t nFeeBps, uint64_t nInitNoteUnits,
-                          int64_t amountInitBtx, uint64_t nNoteChangeUnits,
-                          const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 PoolAddLiqSigHash(const PoolAddLiq& add, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 PoolRemoveLiqSigHash(const PoolRemoveLiq& rem, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 PoolSwapSigHash(const PoolSwap& swap, const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 PoolRetireSigHash(const PoolRetire& ret, const uint256& hashPrevouts, const uint256& hashOutputs);
+uint256 PoolCreateSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 PoolAddLiqSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 PoolRemoveLiqSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 PoolSwapSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 PoolRetireSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 
 template <typename T>
 bool DecodePoolPayload(const std::vector<unsigned char>& vch, T& payload);

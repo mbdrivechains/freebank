@@ -308,6 +308,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
     // never satisfy a P2PKH pin or vice versa.
     CScript expectedNoteScript;
     std::vector<unsigned char> vchExpectedNoteKey;   // S1X-14: a note custody coin is pinned by its embedded keyid
+    CKeyID expectedNoteKeyID;
     bool fHaveExpectedNote = false;
     bool fNoteDischarge = false;
     if (tx.nVersion == TRANSACTION_NOTE_VERSION) {
@@ -341,6 +342,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
         if (!vchNoteKey.empty()) {
             expectedNoteScript = NoteScriptForPubKey(vchNoteKey);
             vchExpectedNoteKey = vchNoteKey;
+            expectedNoteKeyID = CPubKey(vchNoteKey).GetID();   // Stage 0 rule A: hashed once per tx, not per input
             fHaveExpectedNote = true;
         }
     }
@@ -732,7 +734,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
             if (fHaveExpectedNote &&
                     !(NoteDemandIsPreAuth(coin.nDemandHeight)
                           ? (IsNoteDemandCustodyScript(coin.out.scriptPubKey) &&
-                             NoteCustodyKeyIs(coin.out.scriptPubKey, vchExpectedNoteKey))
+                             NoteCustodyKeyIDIs(coin.out.scriptPubKey, expectedNoteKeyID))
                           : coin.out.scriptPubKey == expectedNoteScript))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-input-not-holder");
             if (fPoolOpOK) {
@@ -813,9 +815,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, c
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-demanded");
             if (!fDemanded && (tx.nDepositOp == DEPOSIT_OP_PROTEST || tx.nDepositOp == DEPOSIT_OP_DISCHARGE))
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-not-demanded");
-            // Tag-aware holder pin: a demanded receipt on the custody script of the SAME key, any other on its P2PKH.
-            if (fHaveExpectedDeposit && coin.out.scriptPubKey !=
-                    (fDemanded ? NotePreAuthScript(vchDepositHolderKey) : expectedDepositScript))
+            // Tag-aware holder pin: a demanded receipt on the custody script of the SAME key (S1X-53: the form that
+            // carries its demand id), any other on its P2PKH.
+            if (fHaveExpectedDeposit &&
+                    (fDemanded ? !(IsNoteDemandCustodyScript(coin.out.scriptPubKey) &&
+                                   NoteCustodyKeyIs(coin.out.scriptPubKey, vchDepositHolderKey))
+                               : coin.out.scriptPubKey != expectedDepositScript))
                 return state.DoS(100, false, REJECT_INVALID, "bad-deposit-input-not-holder");
             // The payload's terms (and, for PROTEST, the spent tag) are what AddCoins re-tags from: pinned here.
             if (fDepositDemandOp && (coin.nHouseID != depositDemand.nHouseID ||

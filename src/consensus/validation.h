@@ -35,8 +35,20 @@ private:
     unsigned int chRejectCode;
     bool corruptionPossible;
     std::string strDebugMessage;
+    bool fStateIndependent = false;   // Stage 0 rule A: see DoSStateIndependent
 public:
     CValidationState() : mode(MODE_VALID), nDoS(0), chRejectCode(0), corruptionPossible(false) {}
+    /** Stage 0 rule A (security 2026-11-26): a refusal that doesn't depend on chain state (a bad point, a wrong
+     *  signature over state-free bytes), made after a signature with standing verified, or after the inputs that make a
+     *  probe costly (REGISTER's pledges). It keeps its score on the mempool path too: MempoolRefusalScoresZero (UF4-1,
+     *  which exists for tip differences) leaves it, so a key holder's repeats cost peer connections as in Core. */
+    bool DoSStateIndependent(int level, bool ret, unsigned int chRejectCodeIn, const std::string& strRejectReasonIn)
+    {
+        DoS(level, ret, chRejectCodeIn, strRejectReasonIn);
+        fStateIndependent = true;
+        return ret;
+    }
+    bool StateIndependent() const { return fStateIndependent; }
     bool DoS(int level, bool ret = false,
              unsigned int chRejectCodeIn=0, const std::string &strRejectReasonIn="",
              bool corruptionIn=false,
@@ -100,7 +112,7 @@ public:
     MempoolRefusalScoresZero(CValidationState& state, bool fActive) : m_state(state), m_fActive(fActive && state.IsValid()) {}
     ~MempoolRefusalScoresZero()
     {
-        if (!m_fActive || !m_state.IsInvalid())
+        if (!m_fActive || !m_state.IsInvalid() || m_state.StateIndependent())   // Stage 0 rule A: kept
             return;
         CValidationState zero;
         zero.DoS(0, false, m_state.GetRejectCode(), m_state.GetRejectReason(), m_state.CorruptionPossible(),

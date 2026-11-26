@@ -45,6 +45,22 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
 
 BOOST_FIXTURE_TEST_SUITE(discount_tests, BasicTestingSetup)
 
+// Stage 0 C1 shim for the digest tests: the payload goes into a bill tx whose input is hp and whose output pays a script
+// made from ho, and the digest is taken over that tx (C1 digests take the whole transaction).
+template <typename P>
+static CTransaction C1BillTx(uint8_t nOp, const P& p, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_BILL_VERSION;
+    m.nBillOp = nOp;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(1000, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    m.vchBillPayload.assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
 //
 // The scene, throughout: the spec's worked example (PHASE3_9_DISCOUNT.md 2.6).
 // Bill 7, face 40,000,000 sats, escrow bond 8,000,000, maturity H+8640. House 3
@@ -205,8 +221,7 @@ static CMutableTransaction MakeDiscount(const Scene& s, BillDiscount& dOut,
 
     // One shared digest carries both authorities.
     SetPayload(mtx, d);
-    const uint256 sighash = BillDiscountSigHash(d, s.bill.billID,
-            BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)));
+    const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), s.bill.billID);
     BOOST_REQUIRE(s.seller.Sign(sighash, d.vchSellerSig));
     d.vApproverIndex.push_back(0);
     std::vector<unsigned char> vchApprover;
@@ -438,8 +453,7 @@ BOOST_AUTO_TEST_CASE(discount_signature_binding)
         BillDiscount d;
         CMutableTransaction mtx = MakeDiscount(s, d);
         std::vector<unsigned char> sig;
-        const uint256 sighash = BillDiscountSigHash(d, s.bill.billID,
-                BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)));
+        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), s.bill.billID);
         BOOST_REQUIRE(s.stranger.Sign(sighash, sig));
         d.vApproverSig[0] = sig;
         SetPayload(mtx, d);
@@ -646,8 +660,7 @@ static CMutableTransaction MakeHRetire(const Scene& s,
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << h;
     mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
-    BOOST_REQUIRE(s.acceptor.Sign(BillRetireSigHash(s.bill.billID, h.nRateNamed,   // UR1-6; S1X-17
-            BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)), true), h.vchAcceptorSig));
+    BOOST_REQUIRE(s.acceptor.Sign(BillRetireSigHash(CTransaction(mtx), s.bill.billID, true), h.vchAcceptorSig));   // Stage 0 C1
     CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
     ss2 << h;
     mtx.vchBillPayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
@@ -790,11 +803,10 @@ static CMutableTransaction MakeHRetireNotes(const Scene& s, uint64_t nUnits,
     if (pre)
         pre(h, mtx);
 
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << h; mtx.vchBillPayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1
     const uint256 sighash = fSignAsOp7
-        ? BillRetireSigHash(s.bill.billID, h.nRateNamed, BillTxBindingHash(CTransaction(mtx)),
-                            BillHashOutputs(CTransaction(mtx)), true)   // UR1-6; S1X-17
-        : BillHRetireNotesSigHash(h, s.bill.billID, BillHashPrevouts(CTransaction(mtx)),
-                                  BillHashOutputs(CTransaction(mtx)));
+        ? BillRetireSigHash(CTransaction(mtx), s.bill.billID, true)   // another op's domain over the same tx
+        : BillHRetireNotesSigHash(CTransaction(mtx), s.bill.billID);
     BOOST_REQUIRE(s.acceptor.Sign(sighash, h.vchAcceptorSig));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << h;
@@ -1083,9 +1095,9 @@ static CMutableTransaction MakeHRetireEscrow(const Scene& s, uint64_t nUnits,
     mtx.vout.push_back(CTxOut(ESCROW_BOND, GetScriptForDestination(s.acceptor.GetPubKey().GetID())));
     if (pre)
         pre(h, mtx);
-    const uint256 hp = BillHashPrevouts(CTransaction(mtx)), ho = BillHashOutputs(CTransaction(mtx));
-    BOOST_REQUIRE(s.acceptor.Sign(fSignAsOp9 ? BillHRetireNotesSigHash(h, s.bill.billID, hp, ho)
-                                             : BillHRetireEscrowSigHash(h, s.bill.billID, BillTxBindingHash(CTransaction(mtx)), ho),
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << h; mtx.vchBillPayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1
+    BOOST_REQUIRE(s.acceptor.Sign(fSignAsOp9 ? BillHRetireNotesSigHash(CTransaction(mtx), s.bill.billID)   // op 9's domain
+                                             : BillHRetireEscrowSigHash(CTransaction(mtx), s.bill.billID),
                                   h.vchAcceptorSig));   // S1X-17: op 10 binds sequences and lock time too
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << h;
@@ -1268,9 +1280,9 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
         if (pre)
             pre(h, mtx);
         h.vApproverIndex.push_back(0);
+        { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << h; mtx.vchBillPayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(s.partner.Sign(BillClaimSigHash(s.bill.billID, BillTxBindingHash(CTransaction(mtx)),
-                BillHashOutputs(CTransaction(mtx)), true), sig));   // S1X-17
+        BOOST_REQUIRE(s.partner.Sign(BillClaimSigHash(CTransaction(mtx), s.bill.billID, true), sig));
         h.vApproverSig.push_back(sig);
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << h;
@@ -1301,8 +1313,7 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
         BillHClaim h;
         BOOST_REQUIRE(DecodeBillPayload(mtx.vchBillPayload, h));
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(s.custody.Sign(BillClaimSigHash(s.bill.billID, BillTxBindingHash(CTransaction(mtx)),
-                BillHashOutputs(CTransaction(mtx)), true), sig));   // S1X-17
+        BOOST_REQUIRE(s.custody.Sign(BillClaimSigHash(CTransaction(mtx), s.bill.billID, true), sig));   // S1X-17
         h.vApproverSig[0] = sig;
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << h;
@@ -1375,8 +1386,7 @@ static CMutableTransaction MakeRecourse(const Scene& s, const CKey& payer, CAmou
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << r;
     mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
-    const uint256 sighash = BillRecourseSigHash(r, s.bill.billID,
-            BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)));
+    const uint256 sighash = BillRecourseSigHash(CTransaction(mtx), s.bill.billID);
     BOOST_REQUIRE(const_cast<CKey&>(payer).Sign(sighash, r.vchPayerSig));
     CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
     ss2 << r;
@@ -1863,8 +1873,7 @@ BOOST_AUTO_TEST_CASE(recourse_floor_is_a_minimum_not_an_equality)
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
-        const uint256 sighash = BillRecourseSigHash(r, s.bill.billID,
-                BillHashPrevouts(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)));
+        const uint256 sighash = BillRecourseSigHash(CTransaction(mtx), s.bill.billID);
         BOOST_REQUIRE(keyA.Sign(sighash, r.vchPayerSig));
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
         ss2 << r;
@@ -1993,8 +2002,7 @@ BOOST_AUTO_TEST_CASE(shipped_ops_refuse_house_held_bills)
         ss << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
         BOOST_REQUIRE(const_cast<CKey&>(s.acceptor).Sign(
-                BillRetireSigHash(s.bill.billID, r.nRateNamed, BillTxBindingHash(CTransaction(mtx)),
-                                  BillHashOutputs(CTransaction(mtx)), false), r.vchAcceptorSig));   // UR1-6; S1X-17
+                BillRetireSigHash(CTransaction(mtx), s.bill.billID, false), r.vchAcceptorSig));   // UR1-6; S1X-17
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
         ss2 << r;
         mtx.vchBillPayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
@@ -2016,7 +2024,7 @@ BOOST_AUTO_TEST_CASE(shipped_ops_refuse_house_held_bills)
         ss << c;
         mtx.vchBillPayload = std::vector<unsigned char>(ss.begin(), ss.end());
         BOOST_REQUIRE(const_cast<CKey&>(s.custody).Sign(
-                BillClaimSigHash(s.bill.billID, BillTxBindingHash(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)), false),
+                BillClaimSigHash(CTransaction(mtx), s.bill.billID, false),
                 c.vchHolderSig));   // S1X-17
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION);
         ss2 << c;
@@ -2208,31 +2216,37 @@ BOOST_AUTO_TEST_CASE(discount_digest_is_the_ceremony_contract)
     const CMutableTransaction mtx = MakeDiscount(s, d);
     const uint256 hashPrev = BillHashPrevouts(CTransaction(mtx));
     const uint256 hashOut = BillHashOutputs(CTransaction(mtx));
-    const uint256 base = BillDiscountSigHash(d, s.bill.billID, hashPrev, hashOut);
+    const uint256 base = BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, hashOut), s.bill.billID);
 
     // --- EXCLUDED: everything a later round writes ------------------------
     {   // the seller's own signature (written in round 3, after the house signed)
         BillDiscount x = d;
         x.vchSellerSig.assign(70, 0x11);
-        BOOST_CHECK(BillDiscountSigHash(x, s.bill.billID, hashPrev, hashOut) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
     }
     {   // the house quorum's slots (written in round 2, before the seller signs)
         BillDiscount x = d;
         x.vApproverIndex.clear();
         x.vApproverSig.clear();
-        BOOST_CHECK(BillDiscountSigHash(x, s.bill.billID, hashPrev, hashOut) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
     }
     {   // the WHOLE endorsement link - height and signature both, since round 3
         // sets nAtHeight as late as it can to keep the slack window fresh
         BillDiscount x = d;
         x.endorsement.nAtHeight = d.endorsement.nAtHeight + 33;
         x.endorsement.vchSig.assign(71, 0x22);
-        BOOST_CHECK(BillDiscountSigHash(x, s.bill.billID, hashPrev, hashOut) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
     }
-    {   // the reserve proofs, which carry their own per-coin challenge signatures
+    {   // the reserve proofs' own per-coin challenge signatures (Stage 0 C1: the proofs themselves - which coins, which
+        // keys - are bound now; the wallet sets them before the house's approvers sign and never after)
         BillDiscount x = d;
-        x.vReserveProofs.clear();
-        BOOST_CHECK(BillDiscountSigHash(x, s.bill.billID, hashPrev, hashOut) == base);
+        for (AttestProof& p : x.vReserveProofs)
+            p.vchSig.assign(70, 0x44);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
+        BillDiscount y = d;
+        y.vReserveProofs.clear();
+        if (!d.vReserveProofs.empty())
+            BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, y, hashPrev, hashOut), s.bill.billID) != base);
     }
 
     // --- INCLUDED: every term either side relies on -----------------------
@@ -2255,13 +2269,13 @@ BOOST_AUTO_TEST_CASE(discount_digest_is_the_ceremony_contract)
     for (size_t i = 0; i < vMutate.size(); i++) {
         BillDiscount x = d;
         vMutate[i](x);
-        BOOST_CHECK_MESSAGE(BillDiscountSigHash(x, s.bill.billID, hashPrev, hashOut) != base,
+        BOOST_CHECK_MESSAGE(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) != base,
                             "digest ignored value field #" << i << " - it could be altered after signing");
     }
     // ...and the canonical bill identity, the input set and the output set.
-    BOOST_CHECK(BillDiscountSigHash(d, uint256S("b112"), hashPrev, hashOut) != base);
-    BOOST_CHECK(BillDiscountSigHash(d, s.bill.billID, uint256S("aaaa"), hashOut) != base);
-    BOOST_CHECK(BillDiscountSigHash(d, s.bill.billID, hashPrev, uint256S("bbbb")) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, hashOut), uint256S("b112")) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, uint256S("aaaa"), hashOut), s.bill.billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, uint256S("bbbb")), s.bill.billID) != base);
 }
 
 /** The same contract for RECOURSE. One party, but still assemble-then-sign:
@@ -2276,20 +2290,20 @@ BOOST_AUTO_TEST_CASE(recourse_digest_excludes_the_payer_signature)
 
     const uint256 hashPrev = uint256S("1111");
     const uint256 hashOut = uint256S("2222");
-    const uint256 base = BillRecourseSigHash(r, s.bill.billID, hashPrev, hashOut);
+    const uint256 base = BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, r, hashPrev, hashOut), s.bill.billID);
 
     BillRecourse x = r;
     x.vchPayerSig.assign(70, 0x33);
-    BOOST_CHECK(BillRecourseSigHash(x, s.bill.billID, hashPrev, hashOut) == base);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, x, hashPrev, hashOut), s.bill.billID) == base);
 
     x = r; x.nBillID += 1;
-    BOOST_CHECK(BillRecourseSigHash(x, s.bill.billID, hashPrev, hashOut) != base);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, x, hashPrev, hashOut), s.bill.billID) != base);
     x = r; x.vchPayerPubKey[1] ^= 0x01;
-    BOOST_CHECK(BillRecourseSigHash(x, s.bill.billID, hashPrev, hashOut) != base);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, x, hashPrev, hashOut), s.bill.billID) != base);
     x = r; x.vchPrevHolderPubKey[1] ^= 0x01;
-    BOOST_CHECK(BillRecourseSigHash(x, s.bill.billID, hashPrev, hashOut) != base);
-    BOOST_CHECK(BillRecourseSigHash(r, s.bill.billID, uint256S("3333"), hashOut) != base);
-    BOOST_CHECK(BillRecourseSigHash(r, s.bill.billID, hashPrev, uint256S("4444")) != base);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, x, hashPrev, hashOut), s.bill.billID) != base);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, r, uint256S("3333"), hashOut), s.bill.billID) != base);
+    BOOST_CHECK(BillRecourseSigHash(C1BillTx(BILL_OP_RECOURSE, r, hashPrev, uint256S("4444")), s.bill.billID) != base);
 }
 
 /** The round-1 blob is a wallet message, never a consensus object - but it is
@@ -2427,27 +2441,39 @@ BOOST_AUTO_TEST_CASE(ur_ext_11_mint_ceiling_counts_pending_swaps)
         house.nLastAttestHeight = 1000;
         house.amountLastAttestReserves = MAX_MONEY;
         house.nMintedUnits = (uint64_t)MAX_MONEY - nMint - 1000;   // + nMint = MAX_MONEY - 1000
+        CKey keyApprover;
+        keyApprover.MakeNewKey(true);
         HousePartner p;
-        p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+        const CPubKey pubApprover = keyApprover.GetPubKey();
+        p.vchPubKey = std::vector<unsigned char>(pubApprover.begin(), pubApprover.end());
         p.amountPledge = 100 * COIN;
         p.status = HOUSE_PARTNER_ACTIVE;
         house.vPartner.push_back(p);
+        house.nThresholdM = 1;
         URX11Scope scope(5, run.nPending, run.nShortfall, 1000);
 
         NoteMint mint;
         mint.nHouseID = 5;
         mint.vUnits.push_back(nMint);
-        mint.vApproverIndex.push_back(0);
-        mint.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
         CMutableTransaction mtx;
         mtx.nVersion = TRANSACTION_NOTE_VERSION;
         mtx.nNoteOp = NOTE_OP_MINT;
-        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-        ss << mint;
-        mtx.vchNotePayload.assign(ss.begin(), ss.end());
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("11"), 0)));
         mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
                                   NoteScriptForPubKey(std::vector<unsigned char>(pubHolder.begin(), pubHolder.end()))));
+        // Stage 0 rule A: the approvers are checked before the caps, so the MINT is signed (C1: the whole tx).
+        {
+            CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION);
+            ss0 << mint;
+            mtx.vchNotePayload.assign(ss0.begin(), ss0.end());
+            std::vector<unsigned char> vchSig;
+            BOOST_REQUIRE(keyApprover.Sign(NoteMintSigHash(CTransaction(mtx)), vchSig));
+            mint.vApproverIndex.push_back(0);
+            mint.vApproverSig.push_back(vchSig);
+        }
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << mint;
+        mtx.vchNotePayload.assign(ss.begin(), ss.end());
 
         auto fnGetHouse = [&house](uint32_t id, CHouse& out) { if (id != 5) return false; out = house; return true; };
         auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };

@@ -71,9 +71,13 @@ bool NoteCustodyDemandId(const CScript& script, uint256& demandId)
 
 bool NoteCustodyKeyIs(const CScript& script, const std::vector<unsigned char>& vchPubKey)
 {
+    return NoteCustodyKeyIDIs(script, CPubKey(vchPubKey).GetID());
+}
+
+bool NoteCustodyKeyIDIs(const CScript& script, const CKeyID& keyid)
+{
     if (!IsNotePreAuthScript(script))
         return false;
-    const CKeyID keyid = CPubKey(vchPubKey).GetID();
     return memcmp(script.data() + 1, keyid.begin(), 20) == 0;
 }
 
@@ -96,49 +100,28 @@ uint256 NoteDemandId(const CTransaction& tx, const std::vector<uint64_t>& vUnits
     return ss.GetHash();
 }
 
-uint256 NoteMintSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 NoteMintSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/mint");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << vUnits;
-    ss << hashPrevouts;   // tx-unique -> a mint's approver sigs are not replayable
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/mint");
 }
 
-uint256 NoteTransferSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs)
+uint256 NoteTransferSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/transfer");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << vUnits;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/transfer");
 }
 
-uint256 NoteRedeemSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs)
+uint256 NoteRedeemSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/redeem");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << nUnitsBurned;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/redeem");
 }
 
-uint256 NoteClaimSigHash(uint32_t nHouseID, uint64_t nUnitsBurned, const uint256& hashOutputs)
+uint256 NoteClaimSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/claim");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << nUnitsBurned;
-    ss << hashOutputs;   // binds payout + escrow change exactly
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/claim");
 }
 
 bool NoteSwapOpHashLock(const CTransaction& tx, uint256& hashLock)
@@ -156,28 +139,16 @@ bool NoteSwapOpHashLock(const CTransaction& tx, uint256& hashLock)
     return false;
 }
 
-uint256 NoteSwapSigHash(const NoteSwap& swap, const CTransaction& tx)
+uint256 NoteSwapSigHash(const CTransaction& tx)
 {
-    NoteSwap unsigned_ = swap;
-    unsigned_.vchHolderSig.clear();
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/swap");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << unsigned_;
-    ss << NoteHashPrevouts(tx);
-    ss << BillHashOutputs(tx);
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/swap");
 }
 
-uint256 NoteDemandSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs)
+uint256 NoteDemandSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/demand");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << vUnits;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/demand");
 }
 
 uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
@@ -193,42 +164,22 @@ uint256 NotePreAuthSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnit
     return ss.GetHash();
 }
 
-uint256 NoteProtestSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits, const uint256& hashOutputs)
+uint256 NoteProtestSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/protest");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << vUnits;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/protest");
 }
 
-uint256 NoteLockSigHash(uint32_t nHouseID, uint64_t nUnits, const std::vector<uint64_t>& vChangeUnits,
-                        const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 NoteLockSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/lock");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << nUnits;
-    ss << vChangeUnits;
-    ss << hashPrevouts;   // tx-unique -> neither signer's approval is replayable
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/lock");
 }
 
-uint256 NoteUnlockSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vUnits,
-                          const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 NoteUnlockSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankNote/unlock");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << vUnits;
-    ss << hashPrevouts;   // tx-unique -> an unlock's approvals are not replayable
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankNote/unlock");
 }
 
 uint32_t DeferInterestBpsAt(const std::vector<Consensus::DeferInterestStep>& vSchedule, uint32_t nHeight)
@@ -852,8 +803,9 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
             const TokenKey& k = ks.vKey[i];
             if (k.nExp > MAX_TOKEN_AMOUNT_EXP || (i > 0 && k.nExp <= ks.vKey[i - 1].nExp))
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-amounts");
-            // One key per amount: a key listed twice would let a small token claim as a large one.
-            if (!IsValidNotePubKey(k.vchPubKey) || !setKey.insert(k.vchPubKey).second)
+            // One key per amount: a key listed twice would let a small token claim as a large one. Stage 0 rule A
+            // (S1X-36's rule, daemon-wide): bytes only here; each point is parsed after the approvers' signatures.
+            if (!IsNotePubKeyShape(k.vchPubKey) || !setKey.insert(k.vchPubKey).second)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-keyset-key");
         }
         if (!CheckNoteApproverShape(ks.vApproverIndex, ks.vApproverSig))
@@ -891,7 +843,8 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
         for (const TokenClaimEntry& e : claim.vEntry) {
             if (e.vchSecret.empty() || e.vchSecret.size() > MAX_TOKEN_SECRET_SIZE)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-secret");
-            if (!IsValidNotePubKey(e.vchB) || !IsValidNotePubKey(e.vchC) ||
+            // Stage 0 rule A: bytes only; B and C are parsed in the contextual check, after the fee floor.
+            if (!IsNotePubKeyShape(e.vchB) || !IsNotePubKeyShape(e.vchC) ||
                     e.vchE.size() != 32 || e.vchS.size() != 32)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-proof");
             if (e.vchPayoutScript.empty() || e.vchPayoutScript.size() > MAX_TOKEN_PAYOUT_SCRIPT)

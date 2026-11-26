@@ -60,6 +60,7 @@
 #endif
 
 #include <univalue.h>
+#include <limits>
 
 UniValue validateaddress(const JSONRPCRequest& request)
 {
@@ -2558,18 +2559,29 @@ UniValue getcreditaudit(const JSONRPCRequest& request)
             "\nRegtest only (a test hook): per house, what its records say (minted units, deposit units) beside what the\n"
             "UTXO set holds (note units in note coins, demanded among them; escrow coins' value; deposit receipts'\n"
             "principal), and per pool its escrow coins' value. Read from the flushed UTXO set at the tip.\n"
+            "\nStage 0 D/E (security's invariants, FB-6 asserts each pair equal after every block): protest_open beside\n"
+            "protested_utxo (marked note coins + protested deposit receipts in the UTXO set + protested open swaps);\n"
+            "loan_book_face beside book_face_bills (face of the bills it holds); escrow_listed_sats (the outpoints the record\n"
+            "lists: every pledge, the escrow change, the reserve locks) beside escrow_sats (the\n"
+            "escrow-tagged coins); deposit_wtmat beside deposit_wtmat_utxo (sum of principal x maturity over live receipts,\n"
+            "as decimal strings: 128-bit); pending_swaps_mg beside pending_swaps_records_mg (open swap records);\n"
+            "live_shortfall_mg beside live_shortfall_records_mg (swaps paid short within the lapse). D/E (d), at the tip:\n"
+            "capital_capacity_mg / capital_owed_mg and till_cap_gross_mg / till_owed_mg, the issue checks' own numbers.\n"
             "\nResult: {\"height\", \"houses\": [{\"id\", \"minted_units\", \"deposit_units\", \"note_units_utxo\",\n"
-            "         \"demanded_units_utxo\", \"escrow_sats\", \"deposit_principal_utxo\"}], \"pool_escrow_sats\": n,\n"
+            "         \"demanded_units_utxo\", \"escrow_sats\", \"deposit_principal_utxo\", ...the pairs above}],\n"
+            "         \"pool_escrow_sats\": n,\n"
             "         \"pools\": [{\"id\", \"lp_units_utxo\", \"lp_supply\", \"lp_min_locked\", \"escrow_sats\"}]}\n");
     if (Params().NetworkIDString() != CBaseChainParams::REGTEST)
         throw JSONRPCError(RPC_MISC_ERROR, "getcreditaudit is a regtest-only test hook");
     LOCK(cs_main);   // before the flush: side DBs and the UTXO set from one tip (security 11-11)
     FlushStateToDisk();
-    struct Sums { uint64_t nNotes = 0, nDemanded = 0, nDeposit = 0; CAmount nEscrow = 0; };
+    struct Sums { uint64_t nNotes = 0, nDemanded = 0, nDeposit = 0; CAmount nEscrow = 0; uint64_t nProtested = 0;
+                  unsigned __int128 nWtMat = 0; };
     std::map<uint32_t, Sums> mapSums;
     CAmount nPoolEscrow = 0;
     struct PoolSums { uint64_t nLpUnits = 0; CAmount nEscrow = 0; };
     std::map<uint32_t, PoolSums> mapPool;   // pool id (== its house id, pool.h) -> LP units and escrow in the UTXO set
+    std::map<uint32_t, std::map<COutPoint, CAmount>> mapEscrowCoins;   // house -> its escrow-tagged coins in the UTXO set
     {
         std::unique_ptr<CCoinsViewCursor> pcursor(pcoinsdbview->Cursor());
         for (; pcursor->Valid(); pcursor->Next()) {
@@ -2580,11 +2592,21 @@ UniValue getcreditaudit(const JSONRPCRequest& request)
                 mapSums[coin.nHouseID].nNotes += coin.nNoteUnits;
                 if (coin.nDemandHeight != 0)
                     mapSums[coin.nHouseID].nDemanded += coin.nNoteUnits;
+                if (NoteDemandIsProtested(coin.nDemandHeight))
+                    mapSums[coin.nHouseID].nProtested++;   // the counter is per marked coin (D-v)
             }
-            if (coin.fHouseEscrow)
+            if (coin.fHouseEscrow) {
                 mapSums[coin.nHouseID].nEscrow += coin.out.nValue;
-            if (coin.fDeposit)
+                COutPoint key;
+                if (pcursor->GetKey(key))
+                    mapEscrowCoins[coin.nHouseID][key] = coin.out.nValue;   // Stage 0 D/E: the pair by outpoint
+            }
+            if (coin.fDeposit) {
                 mapSums[coin.nHouseID].nDeposit += coin.nDepositPrincipal;
+                mapSums[coin.nHouseID].nWtMat += (unsigned __int128)coin.nDepositPrincipal * coin.nDepositMaturityHeight;
+                if (NoteDemandIsProtested(coin.nDemandHeight))
+                    mapSums[coin.nHouseID].nProtested++;   // one per protested receipt
+            }
             if (coin.fPoolEscrow) {
                 nPoolEscrow += coin.out.nValue;
                 mapPool[coin.nHouseID].nEscrow += coin.out.nValue;
@@ -2593,6 +2615,40 @@ UniValue getcreditaudit(const JSONRPCRequest& request)
                 mapPool[coin.nHouseID].nLpUnits += coin.nLpUnits;
         }
     }
+    // Stage 0 D/E: the book from the bills, the swaps from their records, both from the flushed DBs.
+    std::map<uint32_t, uint64_t> mapBookFace;
+    for (const CBill& bill : pbilltree->GetBills())
+        if (bill.nOwnerHouseID != 0)
+            mapBookFace[bill.nOwnerHouseID] += (uint64_t)bill.amount;
+    const int nNext = chainActive.Height() + 1;
+    const int64_t nClockNext = ClockAtHeight(nNext);
+    const int64_t nLapseClock = (int64_t)Params().GetConsensus().GramAt(nNext).nShortfallLapseSecs / 600;
+    std::map<uint32_t, uint64_t> mapPendingRec, mapShortRec, mapProtestedSwaps;
+    CUnitsView unitsAudit(punitsdb.get());
+    {
+        const UnitsKey prefix(UNITS_SWAP);
+        for (const std::pair<UnitsKey, UnitsValue>& kv : unitsAudit.Scan(prefix, prefix, std::numeric_limits<size_t>::max())) {
+            CSwapRecord r;
+            try {
+                CDataStream ss(kv.second, SER_DISK, CLIENT_VERSION);
+                ss >> r;
+            } catch (const std::exception&) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "unreadable swap record");
+            }
+            if (r.Open())
+                mapPendingRec[r.nHouseID] += r.nUnits;
+            if (r.nStatus == SWAP_PROTESTED)
+                mapProtestedSwaps[r.nHouseID]++;
+            if (r.nShortfallMg > 0 && r.nSettleClock <= nClockNext && r.nSettleClock + nLapseClock >= nClockNext)
+                mapShortRec[r.nHouseID] += r.nShortfallMg;
+        }
+    }
+    auto fnU128 = [](unsigned __int128 v) {
+        if (v == 0) return std::string("0");
+        std::string out;
+        while (v) { out.insert(out.begin(), char('0' + (int)(v % 10))); v /= 10; }
+        return out;
+    };
     UniValue arr(UniValue::VARR);
     for (const CHouse& house : phousetree->GetHouses()) {
         const Sums& s = mapSums[house.nHouseID];
@@ -2604,6 +2660,66 @@ UniValue getcreditaudit(const JSONRPCRequest& request)
         h.pushKV("demanded_units_utxo", s.nDemanded);
         h.pushKV("escrow_sats", s.nEscrow);
         h.pushKV("deposit_principal_utxo", s.nDeposit);
+        // Stage 0 D/E pairs (FB-6: each equal after every block).
+        h.pushKV("protest_open", (uint64_t)house.nProtestOpen);
+        h.pushKV("protested_utxo", s.nProtested + mapProtestedSwaps[house.nHouseID]);
+        h.pushKV("loan_book_face", (uint64_t)house.nLoanBookFace);
+        h.pushKV("book_face_bills", mapBookFace[house.nHouseID]);
+        // Stage 0 D/E (testing 11-26, security: set equality by outpoint): what the record lists - every partner's pledge
+        // outpoints (active and tail), the escrow change and the reserve locks - against the house's escrow-tagged coins.
+        // escrow_listed_sats sums the listed outpoints the UTXO set holds tagged; the two counts are the coins in one set
+        // and not the other (FB-6 asserts both 0).
+        {
+            std::set<COutPoint> setListed;
+            for (const HousePartner& p : house.vPartner)
+                setListed.insert(p.vOutPledge.begin(), p.vOutPledge.end());
+            setListed.insert(house.vOutEscrowChange.begin(), house.vOutEscrowChange.end());
+            setListed.insert(house.vOutReserveLock.begin(), house.vOutReserveLock.end());
+            const std::map<COutPoint, CAmount>& tagged = mapEscrowCoins[house.nHouseID];
+            CAmount nListedSats = 0;
+            uint64_t nListedUntagged = 0, nTaggedUnlisted = 0;
+            for (const COutPoint& o : setListed) {
+                const auto it = tagged.find(o);
+                if (it == tagged.end())
+                    nListedUntagged++;
+                else
+                    nListedSats += it->second;
+            }
+            for (const auto& kv : tagged)
+                if (!setListed.count(kv.first))
+                    nTaggedUnlisted++;
+            h.pushKV("escrow_listed_sats", (int64_t)nListedSats);
+            h.pushKV("escrow_active_sats", (int64_t)house.ActiveEscrow());   // the capital cap's pledges (informative)
+            h.pushKV("escrow_listed_untagged", nListedUntagged);
+            h.pushKV("escrow_tagged_unlisted", nTaggedUnlisted);
+        }
+        h.pushKV("deposit_wtmat", fnU128(((unsigned __int128)house.nDepositWtMatHi << 64) | house.nDepositWtMatLo));
+        h.pushKV("deposit_wtmat_utxo", fnU128(s.nWtMat));
+        h.pushKV("pending_swaps_mg", HousePendingSwapUnits(unitsAudit, house.nHouseID));
+        h.pushKV("pending_swaps_records_mg", mapPendingRec[house.nHouseID]);
+        h.pushKV("live_shortfall_mg", HouseLiveShortfallMg(unitsAudit, house.nHouseID, nClockNext, nLapseClock));
+        h.pushKV("live_shortfall_records_mg", mapShortRec[house.nHouseID]);
+        // Stage 0 D/E (d) (security's invariant; testing's FB-6): the issue checks' own numbers at the tip, after the tip
+        // block - what CapitalCapUnits and TillCapUnits compare. FB-6 asserts capital_owed_mg <= capital_capacity_mg and
+        // till_owed_mg <= till_cap_gross_mg at any block holding a MINT, DISCOUNT, ORIGINATE, EXIT, RECLAIM or SWAP of
+        // the house (rate moves may push a house over passively; that is allowed). The till here is the attested one;
+        // a MINT or DISCOUNT proves its own.
+        {
+            const int nTipH = chainActive.Height();
+            const unsigned __int128 nOwedOut = HouseOwedOutsideNotesMg(house, nTipH);
+            const uint64_t nOwedOut64 = (uint64_t)std::min<unsigned __int128>(nOwedOut, (unsigned __int128)UINT64_MAX);
+            CHouseCapital capC, capT;
+            const bool fC = HouseCapitalForChecks(house, nTipH, 0, capC);
+            const bool fT = HouseCapitalForChecks(house, nTipH, HouseAttestedTillSats(house, nTipH), capT);
+            const Consensus::GramParams& gpA = Params().GetConsensus().GramAt(nTipH);
+            h.pushKV("caps_height", nTipH);
+            h.pushKV("capital_capacity_mg", fC ? UniValue(capC.nCapacityMg) : NullUniValue);
+            h.pushKV("capital_owed_mg", fnU128((unsigned __int128)house.nMintedUnits + house.nDepositUnits + nOwedOut));
+            h.pushKV("till_cap_gross_mg", fT ? UniValue((uint64_t)((unsigned __int128)capT.nTillMg * 10000 / gpA.nTillMinBps))
+                                             : NullUniValue);
+            h.pushKV("till_owed_mg", fnU128((unsigned __int128)house.nMintedUnits + nOwedOut));
+            h.pushKV("owed_outside_notes_mg", nOwedOut64);
+        }
         arr.push_back(h);
     }
     UniValue o(UniValue::VOBJ);

@@ -48,6 +48,18 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 // The J2 displacement whitelist (validation.cpp) - pinned structurally below.
 
+// Stage 0 C1 test shim: the transaction with payload p serialized into its op field (a C1 digest takes the whole tx;
+// the payload's signature fields are stripped, so it may be passed before or after they are filled).
+template <typename T, typename P>
+static CTransaction C1With(const T& tx, std::vector<unsigned char> CMutableTransaction::*field, const P& p)
+{
+    CMutableTransaction m(tx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    (m.*field).assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
 BOOST_FIXTURE_TEST_SUITE(b3_contextual_tests, BasicTestingSetup)
 
 namespace {
@@ -138,7 +150,8 @@ CMutableTransaction MakeDemandTx(uint32_t nHouseID, uint64_t nUnits, const CKey&
         if (!fValidPreAuthSig)
             keyHolder.Sign(NotePreAuthSigHash(nHouseID + 1, d.vUnits, d.vchPayoutScript, demandId), d.vchPreAuthSig);
     }
-    keyHolder.Sign(NoteDemandSigHash(nHouseID, d.vUnits, BillHashOutputs(mtx)), d.vchHolderSig);
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << d; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    keyHolder.Sign(NoteDemandSigHash(CTransaction(mtx)), d.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << d;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -195,7 +208,8 @@ CMutableTransaction MakePlainRedeemTx(uint32_t nHouseID, uint64_t nUnits, const 
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("p1a1"), 0)));
     mtx.vout.push_back(CTxOut(amountPayout, NoteScriptForPubKey(redeem.vchHolderPubKey)));
 
-    keyHolder.Sign(NoteRedeemSigHash(nHouseID, nUnits, BillHashOutputs(mtx)), redeem.vchHolderSig);
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << redeem; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -226,7 +240,8 @@ CMutableTransaction MakeProtestTx(uint32_t nHouseID, uint64_t nUnits, const CKey
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE,
         fCustodyOutputs ? TestCustody(vchKey, demandId) : NoteScriptForPubKey(vchKey)));
 
-    keyHolder.Sign(NoteProtestSigHash(nHouseID, p.vUnits, BillHashOutputs(mtx)), p.vchHolderSig);
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << p; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    keyHolder.Sign(NoteProtestSigHash(CTransaction(mtx)), p.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << p;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -269,7 +284,8 @@ CMutableTransaction MakePlainRedeemSpreadTx(uint32_t nHouseID, uint64_t nUnits, 
     if (amountSpread > 0)
         mtx.vout.push_back(CTxOut(amountSpread, HouseEscrowScript(houseID256)));
 
-    keyHolder.Sign(NoteRedeemSigHash(nHouseID, nUnits, BillHashOutputs(mtx)), redeem.vchHolderSig);
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << redeem; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -373,7 +389,8 @@ BOOST_AUTO_TEST_CASE(demand_preauth_digest_and_custody_pins)
         {
             CDataStream ss(mtx.vchNotePayload, SER_NETWORK, PROTOCOL_VERSION); ss >> d;
         }
-        key.Sign(NoteDemandSigHash(1, d.vUnits, BillHashOutputs(mtx)), d.vchHolderSig);
+        { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << d; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+        key.Sign(NoteDemandSigHash(CTransaction(mtx)), d.vchHolderSig);
         CDataStream ss2(SER_NETWORK, PROTOCOL_VERSION); ss2 << d;
         mtx.vchNotePayload = std::vector<unsigned char>(ss2.begin(), ss2.end());
         BOOST_CHECK_EQUAL(CtxReject(mtx, H, U, house, fnNoCoin), "bad-note-demand-custody-script");
@@ -1128,7 +1145,8 @@ static CMutableTransaction MakePlainDemandTo(uint32_t nHouseID, uint64_t nUnits,
     mtx.nNoteOp = NOTE_OP_DEMAND;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("de3a"), 0)));
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, scriptTo));
-    keyHolder.Sign(NoteDemandSigHash(nHouseID, d.vUnits, BillHashOutputs(mtx)), d.vchHolderSig);
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << d; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    keyHolder.Sign(NoteDemandSigHash(CTransaction(mtx)), d.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << d;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -1347,7 +1365,7 @@ BOOST_AUTO_TEST_CASE(s1x_15_payouts_the_house_cannot_pay_are_refused_at_the_door
             mtx.nNoteOp = NOTE_OP_SWAP;
             mtx.vin.push_back(CTxIn(COutPoint(uint256S("5a0b"), 0)));
             mtx.vout.push_back(CTxOut(10000, CScript(vchP2PKH.begin(), vchP2PKH.end())));   // fee change
-            BOOST_REQUIRE(key.Sign(NoteSwapSigHash(sw, CTransaction(mtx)), sw.vchHolderSig));
+            BOOST_REQUIRE(key.Sign(NoteSwapSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, sw)), sw.vchHolderSig));
             CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << sw;
             mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
             return CtxReject(mtx, H, U, house, fnNoCoin);
@@ -1465,10 +1483,10 @@ BOOST_AUTO_TEST_CASE(s1x_42_a_replaced_demands_signature_does_not_discharge_the_
 
     // DEMAND2 confirmed (its coins carry id2). A discharge carrying DEMAND1's signature (payout1, signed over id1) is
     // refused; DEMAND2's own (payout2, over id2) is accepted.
+    const CPubKey pubHolder = key.GetPubKey();   // one object: begin() and end() of two temporaries is UB (libc++ threw)
+    const std::vector<unsigned char> vchHolder(pubHolder.begin(), pubHolder.end());
     auto fnCoins = [&](const COutPoint&, Coin& coin) {
-        coin = Coin(CTxOut(NOTE_DUST_VALUE, TestCustody(std::vector<unsigned char>(key.GetPubKey().begin(),
-                                                                                   key.GetPubKey().end()), id2)),
-                    (int)D, false, false, false, uint256());
+        coin = Coin(CTxOut(NOTE_DUST_VALUE, TestCustody(vchHolder, id2)), (int)D, false, false, false, uint256());
         coin.SetNote(1, U, NoteDemandTag(D, true));
         return true;
     };

@@ -603,7 +603,7 @@ struct H2Chain {
         r.nKind = HOUSE_RATE_POST;
         r.nBid = r.nAsk = nBid;
         CMutableTransaction mtx = H2RateTx(r, nSeq++);
-        BOOST_REQUIRE(key.Sign(HouseRateSigHash(H2_HOUSE, CTransaction(mtx), r), r.vchRateSig));
+        BOOST_REQUIRE(key.Sign(HouseRateSigHash(CTransaction(mtx)), r.vchRateSig));
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << r;
         mtx.vchHousePayload.assign(ss.begin(), ss.end());

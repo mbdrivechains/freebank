@@ -300,20 +300,22 @@ CScript DepositScriptForPubKey(const std::vector<unsigned char>& vchPubKey);
  * origination. */
 uint256 DepositHashPrevouts(const CTransaction& tx);
 
-uint256 DepositOriginateSigHash(uint32_t nHouseID, const std::vector<uint64_t>& vPrincipal,
-                                const std::vector<uint32_t>& vRateBps, const std::vector<uint32_t>& vMaturityHeight,
-                                const uint256& hashPrevouts, const uint256& hashOutputs);
-uint256 DepositTransferSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps,
-                               uint32_t nMaturityHeight, uint32_t nOriginationHeight, const uint256& hashOutputs);
-uint256 DepositWithdrawSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nMaturityHeight,
-                               uint32_t nOriginationHeight, const uint256& hashOutputs);
-uint256 DepositClaimSigHash(uint32_t nHouseID, uint64_t nPrincipal, const uint256& hashOutputs);
+uint256 DepositOriginateSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 DepositTransferSigHash(const CTransaction& tx);    // Stage 0 C1
+uint256 DepositWithdrawSigHash(const CTransaction& tx);    // Stage 0 C1
+uint256 DepositClaimSigHash(const CTransaction& tx);       // Stage 0 C1
 /** v0.2.29: the holder's standing authorization - (house, terms, payout script), no transaction, so a DISCHARGE built
  * by anyone re-verifies it. */
 uint256 DepositPreAuthSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nRateBps, uint32_t nMaturityHeight,
-                              uint32_t nOriginationHeight, const std::vector<unsigned char>& vchPayoutScript);
-uint256 DepositProtestSigHash(uint32_t nHouseID, uint64_t nPrincipal, uint32_t nOriginationHeight, uint32_t nDemandTag,
-                              const uint256& hashOutputs);
+                              uint32_t nOriginationHeight, const std::vector<unsigned char>& vchPayoutScript,
+                              const uint256& demandId);
+/** S1X-53 (security's counter; Stage 0 C3): a deposit demand's id - H(the receipt the DEMAND spends, its terms, its
+ *  payout). It goes into the custody script at DEMAND, PROTEST copies it, DISCHARGE reads it from the receipt it spends,
+ *  and the standing pre-auth signs it: another receipt's pre-auth (another outpoint) or a replaced DEMAND's (another
+ *  payout) pays nothing. The receipt outpoint rather than every prevout: the wallet funds a DEMAND after the holder has
+ *  signed its pre-auth, and the receipt is what makes the demand unique. */
+uint256 DepositDemandId(const COutPoint& receipt, const DepositDemand& d);
+uint256 DepositProtestSigHash(const CTransaction& tx);     // Stage 0 C1 (closes S1X-54)
 
 /** Accrued interest on a matured receipt: principal held nBlocks at rateBps per
  * year, pro-rated by block (simple, not compounding). 128-bit intermediate

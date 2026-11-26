@@ -126,22 +126,29 @@ BOOST_AUTO_TEST_CASE(deposit_payload_roundtrip)
 
 BOOST_AUTO_TEST_CASE(deposit_sighash_domain_separation)
 {
-    const uint256 pv = uint256S("11"), out = uint256S("22");
-    std::vector<uint64_t> vp{100000};
-    std::vector<uint32_t> vr{500}, vm{120000};
+    // Stage 0 C1: the tx-class deposit digests take the whole transaction; each op keeps its own domain.
+    CMutableTransaction t;
+    t.nVersion = TRANSACTION_DEPOSIT_VERSION;
+    t.nDepositOp = DEPOSIT_OP_TRANSFER;
+    t.vin.push_back(CTxIn(COutPoint(uint256S("11"), 0)));
+    t.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, CScript() << OP_TRUE));
+    const CTransaction tx(t);
     std::vector<uint256> v;
-    v.push_back(DepositOriginateSigHash(1, vp, vr, vm, pv, out));
-    v.push_back(DepositTransferSigHash(1, 100000, 500, 120000, 5000, out));
-    v.push_back(DepositWithdrawSigHash(1, 100000, 120000, 5000, out));
-    v.push_back(DepositClaimSigHash(1, 100000, out));
+    v.push_back(DepositOriginateSigHash(tx));
+    v.push_back(DepositTransferSigHash(tx));
+    v.push_back(DepositWithdrawSigHash(tx));
+    v.push_back(DepositClaimSigHash(tx));
+    v.push_back(DepositProtestSigHash(tx));
     for (size_t i = 0; i < v.size(); i++)
         for (size_t j = i + 1; j < v.size(); j++)
             BOOST_CHECK(v[i] != v[j]);
-    // Sensitive to bound fields
-    BOOST_CHECK(DepositOriginateSigHash(1, vp, vr, vm, pv, out) != DepositOriginateSigHash(2, vp, vr, vm, pv, out));
-    BOOST_CHECK(DepositOriginateSigHash(1, vp, vr, vm, pv, out) != DepositOriginateSigHash(1, vp, vr, vm, uint256S("33"), out));
-    BOOST_CHECK(DepositTransferSigHash(1, 100000, 500, 120000, 5000, out) != DepositTransferSigHash(1, 100000, 500, 120001, 5000, out));
-    BOOST_CHECK(DepositWithdrawSigHash(1, 100000, 120000, 5000, out) != DepositWithdrawSigHash(1, 100000, 120000, 5001, out));
+    // Sensitive to the inputs and outputs (and, through the binding form, every payload field)
+    CMutableTransaction t2 = t;
+    t2.vin[0].prevout = COutPoint(uint256S("33"), 0);
+    BOOST_CHECK(DepositOriginateSigHash(CTransaction(t2)) != DepositOriginateSigHash(tx));
+    t2 = t;
+    t2.vout[0].nValue++;
+    BOOST_CHECK(DepositTransferSigHash(CTransaction(t2)) != DepositTransferSigHash(tx));
 }
 
 BOOST_AUTO_TEST_CASE(deposit_maturity_interest_math)
@@ -444,7 +451,7 @@ BOOST_AUTO_TEST_CASE(deposit_transfer_gate)
 
     // hashOutputs is over vout only (stable across payload/sig), so sign once.
     CMutableTransaction tmp = build(P, M, std::vector<unsigned char>(70, 0x30));
-    const uint256 sighash = DepositTransferSigHash(H, P, R, M, O, BillHashOutputs(CTransaction(tmp)));
+    const uint256 sighash = DepositTransferSigHash(CTransaction(tmp))   /* Stage 0 C1: sig fields stripped */;
     std::vector<unsigned char> sig; BOOST_REQUIRE(keySender.Sign(sighash, sig));
 
     // Positive: matching terms + valid sender sig -> accepted, NO house change.
@@ -508,7 +515,7 @@ BOOST_AUTO_TEST_CASE(deposit_withdraw_gate)
 
     // Sign over the exact payout (>= floor).
     CMutableTransaction tmp = build(due, std::vector<unsigned char>(70, 0x30));
-    const uint256 sighash = DepositWithdrawSigHash(H, P, MAT, ORIG, BillHashOutputs(CTransaction(tmp)));
+    const uint256 sighash = DepositWithdrawSigHash(CTransaction(tmp))   /* Stage 0 C1 */;
     std::vector<unsigned char> sig; BOOST_REQUIRE(keyHolder.Sign(sighash, sig));
 
     // Positive: Open, matured, paid the floor, valid sig -> accepted, D decremented.
@@ -614,7 +621,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
 
     // Sign over a payout == entitlement (par = principal here, since pot >> par).
     CMutableTransaction tmp = build((CAmount)P, std::vector<unsigned char>(70, 0x30));
-    const uint256 sighash = DepositClaimSigHash(H, P, CreditHashOutputs(CTransaction(tmp)));
+    const uint256 sighash = DepositClaimSigHash(CTransaction(tmp))   /* Stage 0 C1 */;
     std::vector<unsigned char> sig; BOOST_REQUIRE(keyHolder.Sign(sighash, sig));
 
     // Not insolvent -> refused (the subordinated waterfall is only at insolvency).
@@ -649,7 +656,7 @@ BOOST_AUTO_TEST_CASE(deposit_claim_gate)
             if (o == rOut) { c = receipt; return true; } if (o == eOut) { c = makeEscrow(2 * (CAmount)P); return true; } return false; };
         // Sign over the larger payout so the sig passes and the entitlement check fires.
         CMutableTransaction t2 = build(2 * (CAmount)P, std::vector<unsigned char>(70, 0x30));
-        const uint256 sh2 = DepositClaimSigHash(H, P, CreditHashOutputs(CTransaction(t2)));
+        const uint256 sh2 = DepositClaimSigHash(CTransaction(t2))   /* Stage 0 C1 */;
         std::vector<unsigned char> s2; BOOST_REQUIRE(keyHolder.Sign(sh2, s2));
         CMutableTransaction mtx = build(2 * (CAmount)P, s2);
         CValidationState state; CHouse houseOut; bool fChanged = false;
@@ -723,13 +730,22 @@ struct DemandScene {
         const CScript sp = DepositScriptForPubKey(pub);
         payout = std::vector<unsigned char>(sp.begin(), sp.end());
     }
+    // S1X-53 (Stage 0 C3): the demand id (the receipt "rc":0, the terms, the payout) the custody script carries and
+    // the pre-auth signs.
+    uint256 DemandId(const std::vector<unsigned char>& vchPayout) const {
+        DepositDemand d;
+        d.nHouseID = H; d.nPrincipal = P; d.nRateBps = R; d.nMaturityHeight = MAT; d.nOriginationHeight = ORIG;
+        d.vchPayoutScript = vchPayout;
+        return DepositDemandId(COutPoint(uint256S("rc"), 0), d);
+    }
+    CScript Custody() const { return NoteDemandCustodyScript(pub, DemandId(payout)); }
     std::vector<unsigned char> PreAuth(const std::vector<unsigned char>& vchPayout) const {
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(key.Sign(DepositPreAuthSigHash(H, P, R, MAT, ORIG, vchPayout), sig));
+        BOOST_REQUIRE(key.Sign(DepositPreAuthSigHash(H, P, R, MAT, ORIG, vchPayout, DemandId(vchPayout)), sig));
         return sig;
     }
     Coin Receipt(uint32_t nTag) const {
-        Coin c(CTxOut(DEPOSIT_DUST_VALUE, nTag ? NotePreAuthScript(pub) : DepositScriptForPubKey(pub)), 60, false,
+        Coin c(CTxOut(DEPOSIT_DUST_VALUE, nTag ? Custody() : DepositScriptForPubKey(pub)), 60, false,
                false, false, uint256());
         c.SetDeposit(H, P, R, MAT, ORIG);
         c.nDemandHeight = nTag;
@@ -777,9 +793,9 @@ static CMutableTransaction MakeProtestTx(const DemandScene& sc, uint32_t nTag, c
     pr.vchPayoutScript = vchPayout.empty() ? sc.payout : vchPayout; pr.vchPreAuthSig = vchPreAuth;
     CMutableTransaction mtx; mtx.nVersion = TRANSACTION_DEPOSIT_VERSION; mtx.nDepositOp = DEPOSIT_OP_PROTEST;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("rc"), 0)));
-    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, scriptCustody.empty() ? NotePreAuthScript(sc.pub) : scriptCustody));
-    BOOST_REQUIRE(sc.key.Sign(DepositProtestSigHash(pr.nHouseID, pr.nPrincipal, pr.nOriginationHeight, pr.nDemandTag,
-                                                    BillHashOutputs(CTransaction(mtx))), pr.vchHolderSig));
+    mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, scriptCustody.empty() ? sc.Custody() : scriptCustody));
+    { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << pr; mtx.vchDepositPayload.assign(s0.begin(), s0.end()); }
+    BOOST_REQUIRE(sc.key.Sign(DepositProtestSigHash(CTransaction(mtx)), pr.vchHolderSig));   // Stage 0 C1
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << pr;
     mtx.vchDepositPayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -809,7 +825,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_gate)
     CHouse house = MakeOpenDepositHouse(sc.H);
     house.nDepositUnits = sc.P;
     const Coin plain = sc.Receipt(0);
-    const CScript custody = NotePreAuthScript(sc.pub);
+    const CScript custody = sc.Custody();
     const std::vector<unsigned char> preauth = sc.PreAuth(sc.payout);
     CHouse out;
     bool fChanged = true;
@@ -824,7 +840,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_gate)
     const std::vector<unsigned char> vEscrow(escrow.begin(), escrow.end());
     BOOST_CHECK_EQUAL(RunDeposit(MakeDemandTx(sc, vEscrow, sc.PreAuth(vEscrow), custody), 1100, house, plain),
                       "bad-deposit-demand-payout-script");
-    BOOST_CHECK_EQUAL(RunDeposit(MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(FreshPubKey())), 1100, house, plain),
+    BOOST_CHECK_EQUAL(RunDeposit(MakeDemandTx(sc, sc.payout, preauth, NoteDemandCustodyScript(FreshPubKey(), sc.DemandId(sc.payout))), 1100, house, plain),
                       "bad-deposit-demand-custody-script");
     const CScript other = DepositScriptForPubKey(FreshPubKey());
     BOOST_CHECK_EQUAL(RunDeposit(MakeDemandTx(sc, sc.payout, sc.PreAuth(std::vector<unsigned char>(other.begin(), other.end())),
@@ -933,7 +949,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_input_layer)
         mtx.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, DepositScriptForPubKey(FreshPubKey())));
         BOOST_CHECK_EQUAL(inputs(mtx, sc.Receipt(nTag)), "bad-deposit-demanded");
     }
-    BOOST_CHECK_EQUAL(inputs(MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(sc.pub)), sc.Receipt(nTag)),
+    BOOST_CHECK_EQUAL(inputs(MakeDemandTx(sc, sc.payout, preauth, sc.Custody()), sc.Receipt(nTag)),
                       "bad-deposit-demanded");
     BOOST_CHECK_EQUAL(inputs(MakeProtestTx(sc, nTag, house, preauth), sc.Receipt(0)), "bad-deposit-not-demanded");
     BOOST_CHECK_EQUAL(inputs(MakeDischargeTx(sc, house, 200000, preauth, DepositScriptForPubKey(sc.pub)), sc.Receipt(0)),
@@ -941,7 +957,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_input_layer)
     // The payload's terms are what AddCoins re-tags from: pinned to the spent receipt.
     {
         Coin r = sc.Receipt(0); r.nDepositPrincipal = sc.P + 1;
-        BOOST_CHECK_EQUAL(inputs(MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(sc.pub)), r),
+        BOOST_CHECK_EQUAL(inputs(MakeDemandTx(sc, sc.payout, preauth, sc.Custody()), r),
                           "bad-deposit-demand-terms-mismatch");
     }
     {
@@ -951,7 +967,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_input_layer)
     // The custody pin: a demanded receipt of ANOTHER key cannot be discharged under this payload's key.
     {
         Coin r = sc.Receipt(nTag);
-        r.out.scriptPubKey = NotePreAuthScript(FreshPubKey());
+        r.out.scriptPubKey = NoteDemandCustodyScript(FreshPubKey(), sc.DemandId(sc.payout));
         BOOST_CHECK_EQUAL(inputs(MakeDischargeTx(sc, house, 200000, preauth, DepositScriptForPubKey(sc.pub)), r),
                           "bad-deposit-input-not-holder");
     }
@@ -966,11 +982,11 @@ BOOST_AUTO_TEST_CASE(deposit_demand_input_layer)
         mtx.vout.push_back(CTxOut(1000, DepositScriptForPubKey(sc.pub)));
         BOOST_CHECK_EQUAL(inputs(mtx, sc.Receipt(nTag)), "OK");
         Coin r = sc.Receipt(nTag);
-        r.out.scriptPubKey = NotePreAuthScript(FreshPubKey());
+        r.out.scriptPubKey = NoteDemandCustodyScript(FreshPubKey(), sc.DemandId(sc.payout));
         BOOST_CHECK_EQUAL(inputs(mtx, r), "bad-deposit-input-not-holder");
     }
     // A plain DEMAND of a plain receipt passes the input layer.
-    BOOST_CHECK_EQUAL(inputs(MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(sc.pub)), sc.Receipt(0)), "OK");
+    BOOST_CHECK_EQUAL(inputs(MakeDemandTx(sc, sc.payout, preauth, sc.Custody()), sc.Receipt(0)), "OK");
 }
 
 namespace {
@@ -998,7 +1014,7 @@ CMutableTransaction Garbled(CMutableTransaction mtx)
 BOOST_AUTO_TEST_CASE(deposit_demand_shape)
 {
     const DemandScene sc;
-    const CScript custody = NotePreAuthScript(sc.pub);
+    const CScript custody = sc.Custody();
     const std::vector<unsigned char> preauth = sc.PreAuth(sc.payout);
     const CHouse house = MakeOpenDepositHouse(sc.H);
     const uint32_t nTag = 1100 | NOTE_DEMAND_PREAUTH_BIT;
@@ -1078,7 +1094,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_context_more)
     const CScript escrow = HouseEscrowScript(house.houseID);
     const std::vector<unsigned char> vEscrow(escrow.begin(), escrow.end());
 
-    BOOST_CHECK_EQUAL(RunDeposit(Garbled(MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(sc.pub))), 1100, house,
+    BOOST_CHECK_EQUAL(RunDeposit(Garbled(MakeDemandTx(sc, sc.payout, preauth, sc.Custody())), 1100, house,
                       sc.Receipt(0)), "bad-deposit-demand-payload");
 
     // PROTEST, as in deposit_protest_gate.
@@ -1095,7 +1111,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_context_more)
         BOOST_CHECK_EQUAL(RunDeposit(m, nAt, h, demanded), "bad-deposit-protest-sig");
         BOOST_CHECK_EQUAL(RunDeposit(MakeProtestTx(sc, nTag, h, sc.PreAuth(vEscrow), vEscrow), nAt, h, demanded),
                           "bad-deposit-protest-payout-script");
-        BOOST_CHECK_EQUAL(RunDeposit(MakeProtestTx(sc, nTag, h, preauth, {}, NotePreAuthScript(FreshPubKey())), nAt, h,
+        BOOST_CHECK_EQUAL(RunDeposit(MakeProtestTx(sc, nTag, h, preauth, {}, NoteDemandCustodyScript(FreshPubKey(), sc.DemandId(sc.payout))), nAt, h,
                           demanded), "bad-deposit-protest-custody-script");
     }
 
@@ -1126,7 +1142,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_addcoins_tags)
     CCoinsView base;
     CCoinsViewCache cache(&base);
 
-    const CTransaction demand(MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(sc.pub)));
+    const CTransaction demand(MakeDemandTx(sc, sc.payout, preauth, sc.Custody()));
     AddCoins(cache, demand, 1100);
     const Coin& cd = cache.AccessCoin(COutPoint(demand.GetHash(), 0));
     BOOST_CHECK(cd.fDeposit);
@@ -1181,7 +1197,7 @@ BOOST_AUTO_TEST_CASE(deposit_demand_input_pins)
 
     // Exactly one receipt: none, or two.
     {
-        CMutableTransaction m = MakeDemandTx(sc, sc.payout, preauth, NotePreAuthScript(sc.pub));
+        CMutableTransaction m = MakeDemandTx(sc, sc.payout, preauth, sc.Custody());
         m.vin[0] = CTxIn(ff);   // a plain coin, not a receipt
         BOOST_CHECK_EQUAL(inputs(m, sc.Receipt(0)), "bad-deposit-demand-inputs");
     }
@@ -1324,7 +1340,8 @@ BOOST_AUTO_TEST_CASE(s1x_5_deposit_claim_waits_for_swaps_pending_at_the_failure)
     mtx.nDepositOp = DEPOSIT_OP_CLAIM;
     mtx.vin.push_back(CTxIn(rOut));
     mtx.vout.push_back(CTxOut((CAmount)P, HouseEscrowScript(house.houseID)));   // stray: refused past the snapshot
-    BOOST_REQUIRE(keyHolder.Sign(DepositClaimSigHash(H, P, CreditHashOutputs(CTransaction(mtx))), clm.vchHolderSig));
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << clm; mtx.vchDepositPayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    BOOST_REQUIRE(keyHolder.Sign(DepositClaimSigHash(CTransaction(mtx)), clm.vchHolderSig));
     { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << clm; mtx.vchDepositPayload.assign(ss.begin(), ss.end()); }
 
     auto verdict = [&](int h, int nSwap, int& nDoS) {
@@ -1390,7 +1407,7 @@ BOOST_AUTO_TEST_CASE(s1x_15_deposit_payouts_the_house_cannot_pay_are_refused)
         BOOST_REQUIRE(!::IsStandard(CScript(vchWitV2.begin(), vchWitV2.end()), t, true));
         BOOST_REQUIRE(!::IsStandard(CScript(vchBareTrue.begin(), vchBareTrue.end()), t, true));
     }
-    const CScript custody = NotePreAuthScript(sc.pub);
+    const CScript custody = sc.Custody();
 
     // DEMAND.
     BOOST_REQUIRE_EQUAL(RunDeposit(MakeDemandTx(sc, sc.payout, sc.PreAuth(sc.payout), custody), 1100, house,
@@ -1414,5 +1431,81 @@ BOOST_AUTO_TEST_CASE(s1x_15_deposit_payouts_the_house_cannot_pay_are_refused)
     }
 }
 
+
+// ===========================================================================
+// testing (2026-11-26): Stage 0 family C (D-2026-11-26-1), found by testing's digest enumeration on master b281fef.
+// Deposits never got S1X-14's and S1X-21's fixes: a demanded receipt sits on NotePreAuthScript(holder), which carries no
+// demand id, and DepositPreAuthSigHash / DepositProtestSigHash bind the receipt's TERMS (house, principal, rate,
+// maturity, origination), not the receipt. Two receipts of one holder with identical terms are easy (one ORIGINATE batch
+// with equal entries: deposit.cpp's ORIGINATE has no uniqueness rule), and then one receipt's signatures work on the
+// other. Security's S1X-14 finding assumed "deposits already bind theirs". Written against master's digests; the fix
+// changes them, so these cases are adapted with it.
+// ===========================================================================
+
+// S1X-53 (proposed id; testing: the S1X-14 class, rating to security): K demands R1 paying S1 and R2 paying S2. A
+// DISCHARGE of R2 carrying R1's pre-auth (payout S1) is accepted, so the payer (the house, or anyone) chooses which of
+// K's payouts R2's money goes to. If S1 was an exchange or one-time address K no longer controls, R2's payment is lost.
+// FAILS on master (the cross discharge is "OK").
+BOOST_AUTO_TEST_CASE(s1x_53_a_deposit_preauth_pays_only_its_own_demand)
+{
+    const DemandScene sc;
+    CHouse house = MakeOpenDepositHouse(sc.H);
+    house.nDepositUnits = 2 * sc.P;
+    house.SetDepositWtMaturity((unsigned __int128)2 * sc.P * sc.MAT);
+    const CScript s1 = DepositScriptForPubKey(FreshPubKey()), s2 = DepositScriptForPubKey(FreshPubKey());
+    const std::vector<unsigned char> v1(s1.begin(), s1.end()), v2(s2.begin(), s2.end());
+    const std::vector<unsigned char> sig1 = sc.PreAuth(v1), sig2 = sc.PreAuth(v2);
+    // Both demands are valid as K made them (R1 at 1000 paying S1, R2 at 1010 paying S2; identical terms).
+    // Stage 0 C3: each demand's custody carries its own demand id (DepositDemandId: the receipt, terms and payout).
+    BOOST_REQUIRE_EQUAL(RunDeposit(MakeDemandTx(sc, v1, sig1, NoteDemandCustodyScript(sc.pub, sc.DemandId(v1))), 1000, house, sc.Receipt(0)), "OK");
+    BOOST_REQUIRE_EQUAL(RunDeposit(MakeDemandTx(sc, v2, sig2, NoteDemandCustodyScript(sc.pub, sc.DemandId(v2))), 1010, house, sc.Receipt(0)), "OK");
+    Coin r2 = sc.Receipt(1010 | NOTE_DEMAND_PREAUTH_BIT);
+    r2.out.scriptPubKey = NoteDemandCustodyScript(sc.pub, sc.DemandId(v2));
+    const int nAt = 1100;
+    const CAmount due = (CAmount)sc.P + DepositMaturityInterest(sc.P, (uint32_t)nAt - sc.ORIG, sc.R);
+    // Control: R2's own authorisation pays R2 to S2.
+    BOOST_CHECK_EQUAL(RunDeposit(MakeDischargeTx(sc, house, due, sig2, s2, v2), nAt, house, r2), "OK");
+    // The cross discharge: R2 paid to S1 with R1's pre-auth.
+    const std::string r = RunDeposit(MakeDischargeTx(sc, house, due, sig1, s1, v1), nAt, house, r2);
+    BOOST_CHECK_MESSAGE(r != "OK", "S1X-53: a DISCHARGE of receipt R2 (demanded to pay S2) carrying R1's pre-auth "
+                                   "was accepted and paid S1: the payer picks which of the holder's payouts gets R2");
+}
+
+// S1X-54 (proposed id; testing: the S1X-21 class, Low): K protests R1. The protest signature binds (house, principal,
+// origination, demand tag, outputs), not the receipt it spends, so the same signed payload re-funded on R2 (identical
+// terms, demanded in the same block) is a valid protest K never made: anyone can start a protest episode on K's behalf at
+// a time of their choosing (just after the house cleared the last one, a fresh episode within the 180-day spacing makes
+// it insolvent at once). FAILS on master (the replay is "OK").
+BOOST_AUTO_TEST_CASE(s1x_54_a_deposit_protest_signature_protests_only_its_own_receipt)
+{
+    const DemandScene sc;
+    CHouse house = MakeOpenDepositHouse(sc.H);
+    house.nDepositUnits = 2 * sc.P;
+    house.SetDepositWtMaturity((unsigned __int128)2 * sc.P * sc.MAT);
+    const uint32_t nTag = 1100 | NOTE_DEMAND_PREAUTH_BIT;
+    const int nAt = 1100 + (int)Params().GetConsensus().nDemandWindow;   // the window has lapsed (deposit_protest_gate)
+    house.nLastAttestHeight = (uint32_t)nAt - 5;                          // Open at the protest
+    const std::vector<unsigned char> preauth = sc.PreAuth(sc.payout);
+    const CMutableTransaction mtxR1 = MakeProtestTx(sc, nTag, house, preauth);   // K's protest, spending R1 at "rc"
+    // The same payload and outputs, on R2 (another outpoint, identical terms and tag), funded by someone else.
+    CMutableTransaction mtxR2 = mtxR1;
+    mtxR2.vin[0] = CTxIn(COutPoint(uint256S("r2"), 0));
+    mtxR2.vin.push_back(CTxIn(COutPoint(uint256S("f2"), 0)));
+    const Coin receipt = sc.Receipt(nTag);
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == house.nHouseID) { out = house; return true; } return false; };
+    auto fnGetCoin = [&](const COutPoint& o, Coin& c) {
+        if (o == COutPoint(uint256S("rc"), 0) || o == COutPoint(uint256S("r2"), 0)) { c = receipt; return true; }
+        return false;
+    };
+    auto run = [&](const CMutableTransaction& m) {
+        CValidationState state; CHouse out; bool fChanged = false;
+        return CheckDepositOperation(CTransaction(m), state, nAt, fnGetHouse, fnGetCoin, out, fChanged)
+                   ? std::string("OK") : state.GetRejectReason();
+    };
+    BOOST_REQUIRE_EQUAL(run(mtxR1), "OK");   // control: K's own protest of R1
+    const std::string r = run(mtxR2);
+    BOOST_CHECK_MESSAGE(r != "OK", "S1X-54: K's protest signature for receipt R1, re-funded on R2 (same terms and tag), "
+                                   "was accepted: a protest K never made");
+}
 
 BOOST_AUTO_TEST_SUITE_END()

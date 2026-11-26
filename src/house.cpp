@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <house.h>
+#include <issued.h>   // Stage 0 C1: CreditTxSigHash
 
 #include <algorithm>
 
@@ -66,19 +67,10 @@ void HashNetworkTag(CHashWriter& ss)
     ss << Params().GenesisBlock().GetHash();
 }
 
-uint256 HouseMemberSigHash(const uint256& houseID, uint8_t nHouseOp, const HouseMemberOp& op, const uint256& hashPrevouts)
+uint256 HouseMemberSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/member");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << nHouseOp;
-    ss << op.nHouseID;
-    ss << op.vKeyID;
-    ss << op.vPrior;
-    ss << op.nPrevCount;
-    ss << hashPrevouts;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/member", houseID);
 }
 
 bool HouseMemberNext(uint8_t nHouseOp, const HouseMemberPrior& cur, uint32_t nH, HouseMemberPrior& next, std::string& strReject)
@@ -144,17 +136,10 @@ uint256 HouseRegisterSigHash(const uint256& declDigest, uint32_t nPartnerIndex, 
     return ss.GetHash();
 }
 
-uint256 HouseTopupSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts,
-                          const uint256& hashOutputs)
+uint256 HouseTopupSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/topup");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << nPartnerIndex;
-    ss << hashPrevouts;   // S1X-16: a signed approval spends these inputs only (no replay by whoever funds the outputs)
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/topup", houseID);
 }
 
 uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned char>& vchNewPubKey, const CAmount& amountPledge,
@@ -170,129 +155,46 @@ uint256 HouseAdmitSigHash(const uint256& houseID, const std::vector<unsigned cha
     return ss.GetHash();
 }
 
-uint256 HouseExitSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts,
-                         const uint256& hashOutputs)
+uint256 HouseExitSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/exit");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << nPartnerIndex;
-    ss << hashPrevouts;   // S1X-16: a cancelled exit or expulsion can't be replayed by whoever funds the same outputs
-    ss << hashOutputs;   // freshness: a leaked exit sig is not a bearer token
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/exit", houseID);
 }
 
-uint256 HouseWinddownSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 HouseWinddownSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/winddown");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << hashPrevouts;   // S1X-16: a cancelled wind-down can't be replayed
-    ss << hashOutputs;   // freshness: a leaked winddown sig is not replayable
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/winddown", houseID);
 }
 
-uint256 HouseReclaimSigHash(const uint256& houseID, uint32_t nPartnerIndex, const uint256& hashPrevouts,
-                            const uint256& hashOutputs)
+uint256 HouseReclaimSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/reclaim");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << nPartnerIndex;
-    ss << hashPrevouts;   // S1X-16: the signature spends exactly these pledges (run 3 #7: a partial reclaim swept any subset)
-    ss << hashOutputs;   // binds the reclaim destination
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/reclaim", houseID);
 }
 
-uint256 HouseDeferSigHash(const uint256& houseID, uint32_t nPrevLastActivation, const uint256& hashPrevouts,
-                          const uint256& hashOutputs)
+uint256 HouseDeferSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/defer");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    // Bind the anti-replay ANCHOR, not the invocation height. Binding the
-    // height would make an invocation valid in exactly ONE block: any mempool
-    // delay would silently invalidate the house's crisis tool at the moment it
-    // needs it. The prior-activation value is what a replay cannot reproduce
-    // (connect requires it to equal the DB, and a DEFER moves it).
-    ss << nPrevLastActivation;
-    ss << hashPrevouts;   // S1X-35: a displaced DEFER can't be re-funded by someone else
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/defer", houseID);
 }
 
-uint256 HouseRenewSigHash(const uint256& houseID, uint32_t nRenewalIndex, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 HouseRateSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/renew");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << nRenewalIndex;   // binds WHICH renewal within an episode
-    // nRenewalIndex resets to 0 at every DEFER, so it alone does NOT distinguish
-    // one episode's renewal from a later episode's - and the escrow coins are
-    // OP_TRUE, so the approver signature is the sole authorization. Bind the tx
-    // prevouts (as MINT does) so an approval cannot be replayed into a different
-    // episode: a replay must spend different (already-consumed) inputs.
-    ss << hashPrevouts;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (the payload carries the house's canonical id, S1X-26).
+    return CreditTxSigHash(tx, "FreeBankHouse/rate");
 }
 
-uint256 HouseRateSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseRate& rate)
+uint256 HouseCharterSigHash(const CTransaction& tx)
 {
-    CHashWriter hPrevouts(SER_GETHASH, 0);
-    for (const CTxIn& in : tx.vin)
-        hPrevouts << in.prevout;
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/rate");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << rate.houseID;   // S1X-26: the declared id, which no reorg reassigns
-    ss << rate.nKind;
-    ss << rate.nBid;
-    ss << rate.nAsk;
-    ss << rate.vchRatePubKey;
-    ss << hPrevouts.GetHash();
-    ss << BillHashOutputs(tx);
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (the payload carries the house's canonical id, S1X-26).
+    return CreditTxSigHash(tx, "FreeBankHouse/charter");
 }
 
-uint256 HouseCharterSigHash(uint32_t nHouseID, const CTransaction& tx, const HouseCharter& charter)
+uint256 HouseReleaseSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter hPrevouts(SER_GETHASH, 0);
-    for (const CTxIn& in : tx.vin)
-        hPrevouts << in.prevout;
-    HouseCharter unsigned_ = charter;
-    unsigned_.vApproverIndex.clear();
-    unsigned_.vApproverSig.clear();
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/charter");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nHouseID;
-    ss << unsigned_;      // S1X-26: carries houseID, the declared id
-    ss << hPrevouts.GetHash();
-    ss << BillHashOutputs(tx);
-    return ss.GetHash();
-}
-
-uint256 HouseReleaseSigHash(const uint256& houseID, const uint256& hashPrevouts, const uint256& hashOutputs)
-{
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/release");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    // The reserve-till coins are OP_TRUE anyone-can-spend, so this approver
-    // signature is the ONLY gate on moving them. Binding only houseID+outputs
-    // leaves it replayable in a later deferral episode against a fresh till.
-    // Bind the tx prevouts (the exact till coins being released) so the approval
-    // is unique to this episode's coins.
-    ss << hashPrevouts;
-    ss << hashOutputs;   // binds where the released till goes
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/release", houseID);
 }
 
 uint256 HouseAttestChallenge(const uint256& houseID, uint32_t nAsOfHeight,
@@ -320,20 +222,10 @@ uint256 HouseAttestProofSetHash(const std::vector<AttestProof>& vProofs)
     return ss.GetHash();
 }
 
-uint256 HouseAttestSigHash(const uint256& houseID, uint32_t nAsOfHeight,
-                           const CAmount& amountReserves, const uint256& hashProofSet,
-                           const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 HouseAttestSigHash(const CTransaction& tx, const uint256& houseID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankHouse/attest");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << houseID;
-    ss << nAsOfHeight;
-    ss << amountReserves;
-    ss << hashProofSet;
-    ss << hashPrevouts;   // S1X-35: a displaced ATTEST can't be re-funded with later priors
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures, and the house's canonical id.
+    return CreditTxSigHash(tx, "FreeBankHouse/attest", houseID);
 }
 
 CScript HouseEscrowScript(const uint256& houseID)

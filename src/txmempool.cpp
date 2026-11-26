@@ -459,6 +459,9 @@ bool CTxMemPool::addUnchecked(const uint256& hash, const CTxMemPoolEntry &entry,
         }
     }
 
+    // Stage 0 rule A: index its slots, and tag a FreeBank tx's outputs once
+    AddSlotIndex(tx);
+
     // S1X-27: index the bill / REGISTER identity keys
     std::vector<uint256> vIdKeys;
     PooledIdentityKeys(tx, vIdKeys);
@@ -530,6 +533,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
         }
         mapTxMintUnits.erase(itMint);
     }
+    RemoveSlotIndex(hash);   // Stage 0 rule A
     const auto itIdKeys = mapTxIdentityKeys.find(hash);
     if (itIdKeys != mapTxIdentityKeys.end()) {
         for (const uint256& key : itIdKeys->second) {
@@ -718,6 +722,15 @@ void CTxMemPool::_clear()
     mapSwapLockCount.clear();
     mapTxWithdrawalIDs.clear();
     mapTxIdentityKeys.clear();
+    mapTxSlots.clear();
+    mapHouseSlotTxs.clear();
+    mapHouseReaderTxs.clear();
+    mapMemberOpTxs.clear();
+    mapRateOpTxs.clear();
+    mapPoolOpTxs.clear();
+    mapTxOutCoins.clear();
+    mapTxStampedOuts.clear();
+    nSlotIndexUsage = 0;
     mapIdentityKeyCount.clear();
     nIndexVecUsage = 0;
     mapWithdrawalTx.clear();
@@ -1072,128 +1085,276 @@ void PooledIdentityKeys(const CTransaction& tx, std::vector<uint256>& vKeys)
             vKeys.push_back(hwClass.GetHash());
         }
     }
+    // Stage 0 rule B2: the token slots the block rule enforces (TokenSlotKeys: the same keys), so the pool holds one op
+    // per slot and a template never two.
+    TokenSlotKeys(tx, vKeys);
 }
 
 CCoinsViewMemPool::CCoinsViewMemPool(CCoinsView* baseIn, const CTxMemPool& mempoolIn) : CCoinsViewBacked(baseIn), mempool(mempoolIn) { }
+
+/** The coin output n of pooled tx makes, with the tags the mempool view gives it: the shared payload-pure taggers, so this
+ *  view cannot drift from AddCoins. Stage 0 rule A: run once per output when a FreeBank tx enters the pool (the result is
+ *  kept, mapTxOutCoins), and for a plain pooled tx on each read (no payload to decode). */
+static Coin PooledOutputCoin(const CTransaction& tx, uint32_t n)
+{
+    Coin coin;
+    coin = Coin(tx.vout[n], MEMPOOL_HEIGHT, false, false, false, uint256());
+
+    // Bill title / escrow outputs MUST stay tagged even while
+    // unconfirmed: the escrow script is spendable by anyone at the
+    // script layer, and only the consensus spend guard (which reads
+    // these tags) stops a plain transaction from taking it. An
+    // untagged mempool coin lets such a spend into the mempool, and
+    // any block that then includes it is invalid at ConnectBlock.
+    //
+    // The bill's dense nBillID is only assigned when the issuing tx
+    // connects, so unconfirmed bill coins carry id 0. Bill operations
+    // therefore cannot spend an unconfirmed bill output either
+    // (bad-bill-input-id-mismatch) - chaining bill ops within the
+    // mempool is unsupported, and fails closed.
+    // The shared payload-pure tagger, so this view cannot drift from
+    // AddCoins. It leaves the bill id at 0, which is exactly the
+    // fail-closed behaviour described above; a DISCOUNT's minted note
+    // outputs get their REAL {house, units} tag from the payload, so
+    // they behave like any other unconfirmed note and can chain.
+    if (tx.nVersion == TRANSACTION_BILL_VERSION)
+        ApplyBillCoinTags(tx, n, coin);
+
+    // House pledge outputs stay tagged while unconfirmed for the same
+    // reason as bills above: only the consensus spend guard protects
+    // the anyone-can-spend escrow script. Unconfirmed pledges carry
+    // id 0, so RECLAIM cannot chain off them - fails closed.
+    if (tx.nVersion == TRANSACTION_HOUSE_VERSION) {
+        if (IsHouseRegisterOp(tx.nHouseOp)) {
+            HouseRegister reg;
+            uint8_t nFlags = 0;
+            if (DecodeHouseRegisterAny(tx, reg, nFlags) &&
+                    n < reg.vPartnerPubKey.size())
+                coin.SetHouseEscrow(0);
+        } else if ((tx.nHouseOp == HOUSE_OP_TOPUP || tx.nHouseOp == HOUSE_OP_ADMIT ||
+                tx.nHouseOp == HOUSE_OP_DEFER || tx.nHouseOp == HOUSE_OP_ESCROW_MERGE) && n == 0) {   // S1X-18
+            // DEFER's vout[0] is the locked till (3.5) - escrow like any
+            // pledge, and it must stay tagged while unconfirmed or a
+            // plain tx could sweep it out of the mempool view.
+            coin.SetHouseEscrow(0);
+        }
+    }
+
+    // Note outputs stay tagged while unconfirmed so a plain spend is
+    // rejected by the guard: the same payload-pure tagger as AddCoins,
+    // so the two views cannot drift (v0.2.19; PROTEST was missing here,
+    // C6 protest-mempool-tag-gap). What is not knowable before connect
+    // fails closed: see ApplyNoteCoinTags.
+    ApplyNoteCoinTags(tx, n, coin, false /* fConnected */, 0);
+
+    // Term-deposit receipts (Phase 3.8) stay tagged while unconfirmed so
+    // a plain spend is rejected by the guard. A TRANSFER's payload carries
+    // the FULL immutable terms (including origination), so an unconfirmed
+    // TRANSFER receipt gets its REAL tag and TRANSFERs chain in the
+    // mempool. An ORIGINATE receipt's origination = the connect height,
+    // which is NOT known here, so it is tagged with origination 0 - a
+    // TRANSFER off it would declare a height that cannot match at connect,
+    // so ORIGINATE->TRANSFER chaining fails closed (like note DEMAND).
+    if (tx.nVersion == TRANSACTION_DEPOSIT_VERSION) {
+        if (tx.nDepositOp == DEPOSIT_OP_ORIGINATE) {
+            DepositOriginate o;
+            if (DecodeDepositPayload(tx.vchDepositPayload, o) && n < o.vPrincipal.size())
+                coin.SetDeposit(o.nHouseID, o.vPrincipal[n], o.vRateBps[n],
+                                o.vMaturityHeight[n], 0);
+        } else if (tx.nDepositOp == DEPOSIT_OP_TRANSFER && n == 0) {
+            DepositTransfer x;
+            if (DecodeDepositPayload(tx.vchDepositPayload, x))
+                coin.SetDeposit(x.nHouseID, x.nPrincipal, x.nRateBps,
+                                x.nMaturityHeight, x.nOriginationHeight);
+        } else if (tx.nDepositOp == DEPOSIT_OP_CLAIM && n == 1) {
+            DepositClaim c;
+            if (DecodeDepositPayload(tx.vchDepositPayload, c) && c.fEscrowChange)
+                coin.SetHouseEscrow(0);
+        } else if (tx.nDepositOp == DEPOSIT_OP_DEMAND && n == 0) {
+            // v0.2.29: the demand height (the connect height) is not known here: the pre-auth bit alone. Nothing
+            // chains off it in the mempool - a PROTEST needs the height, and the deposit checks read confirmed
+            // coins only, so a DISCHARGE waits for the DEMAND to confirm.
+            DepositDemand d;
+            if (DecodeDepositPayload(tx.vchDepositPayload, d)) {
+                coin.SetDeposit(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight, d.nOriginationHeight);
+                coin.nDemandHeight = NOTE_DEMAND_PREAUTH_BIT;
+            }
+        } else if (tx.nDepositOp == DEPOSIT_OP_PROTEST && n == 0) {
+            DepositProtest pr;
+            if (DecodeDepositPayload(tx.vchDepositPayload, pr)) {
+                coin.SetDeposit(pr.nHouseID, pr.nPrincipal, pr.nRateBps, pr.nMaturityHeight, pr.nOriginationHeight);
+                coin.nDemandHeight = pr.nDemandTag | NOTE_DEMAND_PROTESTED_BIT;
+            }
+        }
+    }
+
+    // Pool outputs (Phase 3.7) stay tagged while unconfirmed so a plain
+    // spend is rejected by the guard. Same shared payload-pure tagger as
+    // AddCoins, so the unconfirmed coin gets its REAL tags. Chaining a
+    // second pool op off it is separately blocked by the one-op-per-pool
+    // ATMP guard, so real tags cannot enable a premature chain.
+    if (tx.nVersion == TRANSACTION_POOL_VERSION)
+        ApplyPoolCoinTags(tx, n, coin);
+    // Issued-token units (gram-notes release): an unconfirmed coin carries its annex's units, so a child can
+    // spend it with its units counted.
+    ApplyIssuedCoinTags(tx, n, coin);
+    // A pool's unconfirmed custody pair stays tagged (the next swap can chain on it): the pool script is
+    // anyone-can-spend and the tag its only protection. Untagged here, a plain tx spending it would pass ATMP
+    // and then fail at ConnectBlock, bricking every later template (the DR-2 class). Payload-pure like
+    // AddCoins, so the mempool view and the connect view agree by construction.
+    if (tx.nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(tx.nIssuedOp) && n < 2)
+        coin.SetCustody();
+    return coin;
+}
+
+// ---- Stage 0 rule A: the slot index and the coins tagged at admission ------------------------------------------------
+
+static size_t SlotSetUsage(const std::set<uint256>& set) { return memusage::DynamicUsage(set); }
+
+void CTxMemPool::AddSlotIndex(const CTransaction& tx)
+{
+    const uint256 hash = tx.GetHash();
+    PooledSlots slots;
+    GetHouseSlotSet(tx, slots.vHouse);
+    if (slots.vHouse.empty())
+        GetHouseStatusReaderID(tx, slots.nReader);   // no op is both (GetHouseStateKeys)
+    if (tx.nVersion == TRANSACTION_HOUSE_VERSION && IsHouseMemberOp(tx.nHouseOp) && tx.vchHousePayload.size() >= 4)
+        slots.nMember = ReadLE32(tx.vchHousePayload.data());
+    bool fSetKey = false;
+    uint32_t nRate = 0;
+    if (HouseRateOpOf(tx, nRate, fSetKey))
+        slots.nRate = nRate;
+    if (tx.nVersion == TRANSACTION_POOL_VERSION && tx.vchPoolPayload.size() >= 4)
+        slots.nPool = ReadLE32(tx.vchPoolPayload.data());   // nPoolID leads every pool payload
+    auto fnAdd = [&](std::map<uint32_t, std::set<uint256>>& m, uint32_t n) {
+        if (n == 0)
+            return;
+        std::set<uint256>& set = m[n];
+        nSlotIndexUsage -= std::min(nSlotIndexUsage, SlotSetUsage(set));
+        set.insert(hash);
+        nSlotIndexUsage += SlotSetUsage(set);
+    };
+    for (const uint32_t n : slots.vHouse)
+        fnAdd(mapHouseSlotTxs, n);
+    fnAdd(mapHouseReaderTxs, slots.nReader);
+    fnAdd(mapMemberOpTxs, slots.nMember);
+    fnAdd(mapRateOpTxs, slots.nRate);
+    fnAdd(mapPoolOpTxs, slots.nPool);
+    if (!slots.vHouse.empty() || slots.nReader || slots.nMember || slots.nRate || slots.nPool) {
+        nSlotIndexUsage += memusage::DynamicUsage(slots.vHouse);
+        mapTxSlots[hash] = std::move(slots);
+    }
+    // Decode once: a FreeBank tx's outputs, tagged now. A plain tx's are tagged on read (nothing to decode).
+    if (tx.nVersion >= TRANSACTION_BITASSET_CREATE_VERSION) {
+        std::vector<Coin> vCoin;
+        vCoin.reserve(tx.vout.size());
+        for (uint32_t n = 0; n < tx.vout.size(); n++)
+            vCoin.push_back(PooledOutputCoin(tx, n));
+        size_t nUsage = memusage::DynamicUsage(vCoin);
+        for (const Coin& c : vCoin)
+            nUsage += memusage::DynamicUsage(c.out.scriptPubKey);
+        nSlotIndexUsage += nUsage;
+        mapTxOutCoins[hash] = std::move(vCoin);
+        const uint32_t nStamped = PooledStampedOutputCount(tx);
+        if (nStamped)
+            mapTxStampedOuts[hash] = nStamped;
+    }
+}
+
+void CTxMemPool::RemoveSlotIndex(const uint256& hash)
+{
+    const auto it = mapTxSlots.find(hash);
+    if (it != mapTxSlots.end()) {
+        auto fnDel = [&](std::map<uint32_t, std::set<uint256>>& m, uint32_t n) {
+            if (n == 0)
+                return;
+            const auto itSet = m.find(n);
+            if (itSet == m.end())
+                return;
+            nSlotIndexUsage -= std::min(nSlotIndexUsage, SlotSetUsage(itSet->second));
+            itSet->second.erase(hash);
+            if (itSet->second.empty())
+                m.erase(itSet);
+            else
+                nSlotIndexUsage += SlotSetUsage(itSet->second);
+        };
+        const PooledSlots& slots = it->second;
+        for (const uint32_t n : slots.vHouse)
+            fnDel(mapHouseSlotTxs, n);
+        fnDel(mapHouseReaderTxs, slots.nReader);
+        fnDel(mapMemberOpTxs, slots.nMember);
+        fnDel(mapRateOpTxs, slots.nRate);
+        fnDel(mapPoolOpTxs, slots.nPool);
+        nSlotIndexUsage -= std::min(nSlotIndexUsage, memusage::DynamicUsage(slots.vHouse));
+        mapTxSlots.erase(it);
+    }
+    const auto itCoins = mapTxOutCoins.find(hash);
+    if (itCoins != mapTxOutCoins.end()) {
+        size_t nUsage = memusage::DynamicUsage(itCoins->second);
+        for (const Coin& c : itCoins->second)
+            nUsage += memusage::DynamicUsage(c.out.scriptPubKey);
+        nSlotIndexUsage -= std::min(nSlotIndexUsage, nUsage);
+        mapTxOutCoins.erase(itCoins);
+    }
+    mapTxStampedOuts.erase(hash);
+}
+
+std::vector<uint256> CTxMemPool::HouseStateConflictTxs(const std::vector<uint32_t>& vSlot, uint32_t nReader) const
+{
+    LOCK(cs);
+    std::set<uint256> setTx;
+    auto fnTake = [&](const std::map<uint32_t, std::set<uint256>>& m, uint32_t n) {
+        if (n == 0)
+            return;
+        const auto it = m.find(n);
+        if (it != m.end())
+            setTx.insert(it->second.begin(), it->second.end());
+    };
+    for (const uint32_t n : vSlot) {
+        fnTake(mapHouseSlotTxs, n);     // both take house n's slot
+        fnTake(mapHouseReaderTxs, n);   // the pooled tx reads house n's status
+    }
+    fnTake(mapHouseSlotTxs, nReader);   // the incomer reads the status of a house a pooled tx takes the slot of
+    return std::vector<uint256>(setTx.begin(), setTx.end());
+}
+
+static std::vector<uint256> SlotTxsOf(const std::map<uint32_t, std::set<uint256>>& m, uint32_t n)
+{
+    const auto it = m.find(n);
+    return it == m.end() || n == 0 ? std::vector<uint256>() : std::vector<uint256>(it->second.begin(), it->second.end());
+}
+std::vector<uint256> CTxMemPool::MemberOpTxs(uint32_t nHouse) const { LOCK(cs); return SlotTxsOf(mapMemberOpTxs, nHouse); }
+std::vector<uint256> CTxMemPool::RateOpTxs(uint32_t nHouse) const { LOCK(cs); return SlotTxsOf(mapRateOpTxs, nHouse); }
+std::vector<uint256> CTxMemPool::PoolOpTxs(uint32_t nPool) const { LOCK(cs); return SlotTxsOf(mapPoolOpTxs, nPool); }
+
+bool CTxMemPool::IsPooledStampedOutput(const COutPoint& out) const
+{
+    LOCK(cs);
+    const auto it = mapTxStampedOuts.find(out.hash);
+    return it != mapTxStampedOuts.end() && out.n < it->second;
+}
+
+bool CTxMemPool::GetPooledOutCoin(const COutPoint& out, Coin& coin) const
+{
+    LOCK(cs);
+    const auto it = mapTxOutCoins.find(out.hash);
+    if (it == mapTxOutCoins.end() || out.n >= it->second.size())
+        return false;
+    coin = it->second[out.n];
+    return true;
+}
 
 bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
     // If an entry in the mempool exists, always return that one, as it's guaranteed to never
     // conflict with the underlying cache, and it cannot have pruned entries (as it contains full)
     // transactions. First checking the underlying cache risks returning a pruned entry instead.
+    // Stage 0 rule A: a pooled FreeBank tx's outputs were tagged once at its admission.
+    if (mempool.GetPooledOutCoin(outpoint, coin))
+        return true;
     CTransactionRef ptx = mempool.get(outpoint.hash);
     if (ptx) {
         if (outpoint.n < ptx->vout.size()) {
-            // No asset colour here, by design (v0.2.18, layer-B review B5): a
-            // tx may not spend an output of an unconfirmed asset tx (mempool
-            // acceptance refuses it, "asset-unconfirmed-parent"), so no caller
-            // of this view ever needs an unconfirmed coin's colour.
-            coin = Coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false, false, false, uint256());
-
-            // Bill title / escrow outputs MUST stay tagged even while
-            // unconfirmed: the escrow script is spendable by anyone at the
-            // script layer, and only the consensus spend guard (which reads
-            // these tags) stops a plain transaction from taking it. An
-            // untagged mempool coin lets such a spend into the mempool, and
-            // any block that then includes it is invalid at ConnectBlock.
-            //
-            // The bill's dense nBillID is only assigned when the issuing tx
-            // connects, so unconfirmed bill coins carry id 0. Bill operations
-            // therefore cannot spend an unconfirmed bill output either
-            // (bad-bill-input-id-mismatch) - chaining bill ops within the
-            // mempool is unsupported, and fails closed.
-            // The shared payload-pure tagger, so this view cannot drift from
-            // AddCoins. It leaves the bill id at 0, which is exactly the
-            // fail-closed behaviour described above; a DISCOUNT's minted note
-            // outputs get their REAL {house, units} tag from the payload, so
-            // they behave like any other unconfirmed note and can chain.
-            if (ptx->nVersion == TRANSACTION_BILL_VERSION)
-                ApplyBillCoinTags(*ptx, outpoint.n, coin);
-
-            // House pledge outputs stay tagged while unconfirmed for the same
-            // reason as bills above: only the consensus spend guard protects
-            // the anyone-can-spend escrow script. Unconfirmed pledges carry
-            // id 0, so RECLAIM cannot chain off them - fails closed.
-            if (ptx->nVersion == TRANSACTION_HOUSE_VERSION) {
-                if (IsHouseRegisterOp(ptx->nHouseOp)) {
-                    HouseRegister reg;
-                    uint8_t nFlags = 0;
-                    if (DecodeHouseRegisterAny(*ptx, reg, nFlags) &&
-                            outpoint.n < reg.vPartnerPubKey.size())
-                        coin.SetHouseEscrow(0);
-                } else if ((ptx->nHouseOp == HOUSE_OP_TOPUP || ptx->nHouseOp == HOUSE_OP_ADMIT ||
-                        ptx->nHouseOp == HOUSE_OP_DEFER || ptx->nHouseOp == HOUSE_OP_ESCROW_MERGE) && outpoint.n == 0) {   // S1X-18
-                    // DEFER's vout[0] is the locked till (3.5) - escrow like any
-                    // pledge, and it must stay tagged while unconfirmed or a
-                    // plain tx could sweep it out of the mempool view.
-                    coin.SetHouseEscrow(0);
-                }
-            }
-
-            // Note outputs stay tagged while unconfirmed so a plain spend is
-            // rejected by the guard: the same payload-pure tagger as AddCoins,
-            // so the two views cannot drift (v0.2.19; PROTEST was missing here,
-            // C6 protest-mempool-tag-gap). What is not knowable before connect
-            // fails closed: see ApplyNoteCoinTags.
-            ApplyNoteCoinTags(*ptx, outpoint.n, coin, false /* fConnected */, 0);
-
-            // Term-deposit receipts (Phase 3.8) stay tagged while unconfirmed so
-            // a plain spend is rejected by the guard. A TRANSFER's payload carries
-            // the FULL immutable terms (including origination), so an unconfirmed
-            // TRANSFER receipt gets its REAL tag and TRANSFERs chain in the
-            // mempool. An ORIGINATE receipt's origination = the connect height,
-            // which is NOT known here, so it is tagged with origination 0 - a
-            // TRANSFER off it would declare a height that cannot match at connect,
-            // so ORIGINATE->TRANSFER chaining fails closed (like note DEMAND).
-            if (ptx->nVersion == TRANSACTION_DEPOSIT_VERSION) {
-                if (ptx->nDepositOp == DEPOSIT_OP_ORIGINATE) {
-                    DepositOriginate o;
-                    if (DecodeDepositPayload(ptx->vchDepositPayload, o) && outpoint.n < o.vPrincipal.size())
-                        coin.SetDeposit(o.nHouseID, o.vPrincipal[outpoint.n], o.vRateBps[outpoint.n],
-                                        o.vMaturityHeight[outpoint.n], 0);
-                } else if (ptx->nDepositOp == DEPOSIT_OP_TRANSFER && outpoint.n == 0) {
-                    DepositTransfer x;
-                    if (DecodeDepositPayload(ptx->vchDepositPayload, x))
-                        coin.SetDeposit(x.nHouseID, x.nPrincipal, x.nRateBps,
-                                        x.nMaturityHeight, x.nOriginationHeight);
-                } else if (ptx->nDepositOp == DEPOSIT_OP_CLAIM && outpoint.n == 1) {
-                    DepositClaim c;
-                    if (DecodeDepositPayload(ptx->vchDepositPayload, c) && c.fEscrowChange)
-                        coin.SetHouseEscrow(0);
-                } else if (ptx->nDepositOp == DEPOSIT_OP_DEMAND && outpoint.n == 0) {
-                    // v0.2.29: the demand height (the connect height) is not known here: the pre-auth bit alone. Nothing
-                    // chains off it in the mempool - a PROTEST needs the height, and the deposit checks read confirmed
-                    // coins only, so a DISCHARGE waits for the DEMAND to confirm.
-                    DepositDemand d;
-                    if (DecodeDepositPayload(ptx->vchDepositPayload, d)) {
-                        coin.SetDeposit(d.nHouseID, d.nPrincipal, d.nRateBps, d.nMaturityHeight, d.nOriginationHeight);
-                        coin.nDemandHeight = NOTE_DEMAND_PREAUTH_BIT;
-                    }
-                } else if (ptx->nDepositOp == DEPOSIT_OP_PROTEST && outpoint.n == 0) {
-                    DepositProtest pr;
-                    if (DecodeDepositPayload(ptx->vchDepositPayload, pr)) {
-                        coin.SetDeposit(pr.nHouseID, pr.nPrincipal, pr.nRateBps, pr.nMaturityHeight, pr.nOriginationHeight);
-                        coin.nDemandHeight = pr.nDemandTag | NOTE_DEMAND_PROTESTED_BIT;
-                    }
-                }
-            }
-
-            // Pool outputs (Phase 3.7) stay tagged while unconfirmed so a plain
-            // spend is rejected by the guard. Same shared payload-pure tagger as
-            // AddCoins, so the unconfirmed coin gets its REAL tags. Chaining a
-            // second pool op off it is separately blocked by the one-op-per-pool
-            // ATMP guard, so real tags cannot enable a premature chain.
-            if (ptx->nVersion == TRANSACTION_POOL_VERSION)
-                ApplyPoolCoinTags(*ptx, outpoint.n, coin);
-            // Issued-token units (gram-notes release): an unconfirmed coin carries its annex's units, so a child can
-            // spend it with its units counted.
-            ApplyIssuedCoinTags(*ptx, outpoint.n, coin);
-            // A pool's unconfirmed custody pair stays tagged (the next swap can chain on it): the pool script is
-            // anyone-can-spend and the tag its only protection. Untagged here, a plain tx spending it would pass ATMP
-            // and then fail at ConnectBlock, bricking every later template (the DR-2 class). Payload-pure like
-            // AddCoins, so the mempool view and the connect view agree by construction.
-            if (ptx->nVersion == TRANSACTION_TOKEN_VERSION && IsIssuedPoolOp(ptx->nIssuedOp) && outpoint.n < 2)
-                coin.SetCustody();
-
+            coin = PooledOutputCoin(*ptx, outpoint.n);
             return true;
         } else {
             return false;
@@ -1205,7 +1366,7 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
 size_t CTxMemPool::DynamicMemoryUsage() const {
     LOCK(cs);
     // Estimate the overhead of mapTx to be 12 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.
-    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxIdentityKeys) + memusage::DynamicUsage(mapIdentityKeyCount) + nIndexVecUsage + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::DynamicUsage(mapTxMintUnits) + memusage::DynamicUsage(mapPendingMintUnits) + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 12 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + memusage::DynamicUsage(mapLinks) + memusage::DynamicUsage(vTxHashes) + memusage::DynamicUsage(mapSwapTxLock) + memusage::DynamicUsage(mapSwapLockCount) + memusage::DynamicUsage(mapTxWithdrawalIDs) + memusage::DynamicUsage(mapTxIdentityKeys) + memusage::DynamicUsage(mapIdentityKeyCount) + nIndexVecUsage + memusage::DynamicUsage(mapTxFreezeTargets) + memusage::DynamicUsage(mapFreezeTargetCount) + memusage::DynamicUsage(mapTxMintUnits) + memusage::DynamicUsage(mapPendingMintUnits) + memusage::DynamicUsage(mapTxSlots) + memusage::DynamicUsage(mapHouseSlotTxs) + memusage::DynamicUsage(mapHouseReaderTxs) + memusage::DynamicUsage(mapMemberOpTxs) + memusage::DynamicUsage(mapRateOpTxs) + memusage::DynamicUsage(mapPoolOpTxs) + memusage::DynamicUsage(mapTxOutCoins) + memusage::DynamicUsage(mapTxStampedOuts) + nSlotIndexUsage + memusage::MallocUsage(sizeof(std::pair<const uint256, uint256>) + 4 * sizeof(void*)) * mapWithdrawalTx.size() + cachedInnerUsage;
 }
 
 void CTxMemPool::RemoveStaged(setEntries &stage, bool updateDescendants, MemPoolRemovalReason reason) {

@@ -39,6 +39,32 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
                         const std::function<bool(uint32_t, uint256&)>& fnGetBlockHash,
                         CHouse& houseOut, bool& fHouseChanged, bool fMempool = false);
 
+// Stage 0 C1 test shim: the transaction with payload p serialized into its op field (a C1 digest takes the whole tx;
+// the payload's signature fields are stripped, so it may be passed before or after they are filled).
+template <typename T, typename P>
+static CTransaction C1With(const T& tx, std::vector<unsigned char> CMutableTransaction::*field, const P& p)
+{
+    CMutableTransaction m(tx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    (m.*field).assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
+// Stage 0 C1: a MINT tx for house nHouse minting vU, whose input is hp and whose output pays a script made from ho.
+static uint256 C1MintSigHash(uint32_t nHouse, const std::vector<uint64_t>& vU, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_NOTE_VERSION;
+    m.nNoteOp = NOTE_OP_MINT;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(NOTE_DUST_VALUE, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    NoteMint mi;
+    mi.nHouseID = nHouse;
+    mi.vUnits = vU;
+    return NoteMintSigHash(C1With(m, &CMutableTransaction::vchNotePayload, mi));
+}
+
 BOOST_FIXTURE_TEST_SUITE(note_tests, BasicTestingSetup)
 
 static std::vector<unsigned char> FreshPubKey(CKey& key)
@@ -51,6 +77,21 @@ static std::vector<unsigned char> FreshPubKey(CKey& key)
 // A valid MINT tx: one note output of `units` to a holder, approver sig present.
 // nAsOfHeight seeds the R-i7 reserve-proof recency field (0 by default; the proof
 // set is empty unless a caller fills it).
+/** Stage 0 rule A: a MINT's approvers are checked before its caps, so the test MINTs are signed: by this key, the first
+ *  partner of the houses the cap tests build (MintApproverPub). */
+static const CKey& MintApproverKey()
+{
+    static CKey key;
+    if (!key.IsValid())
+        key.MakeNewKey(true);
+    return key;
+}
+static std::vector<unsigned char> MintApproverPub()
+{
+    const CPubKey pub = MintApproverKey().GetPubKey();
+    return std::vector<unsigned char>(pub.begin(), pub.end());
+}
+
 static CMutableTransaction MakeMintTx(uint32_t nHouseID, uint64_t units, uint32_t nAsOfHeight = 0)
 {
     CKey keyHolder;
@@ -60,17 +101,24 @@ static CMutableTransaction MakeMintTx(uint32_t nHouseID, uint64_t units, uint32_
     mint.nHouseID = nHouseID;
     mint.vUnits.push_back(units);
     mint.nAsOfHeight = nAsOfHeight;
-    mint.vApproverIndex.push_back(0);
-    mint.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
 
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_MINT;
+    mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(pubHolder)));
+    {   // Stage 0 C1: the approver signs the whole tx (the approver fields are stripped)
+        CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION);
+        ss0 << mint;
+        mtx.vchNotePayload = std::vector<unsigned char>(ss0.begin(), ss0.end());
+        std::vector<unsigned char> vchSig;
+        BOOST_REQUIRE(MintApproverKey().Sign(NoteMintSigHash(CTransaction(mtx)), vchSig));
+        mint.vApproverIndex.push_back(0);
+        mint.vApproverSig.push_back(vchSig);
+    }
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << mint;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
-    mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
-    mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(pubHolder)));
     return mtx;
 }
 
@@ -80,19 +128,42 @@ BOOST_AUTO_TEST_CASE(note_sighash_domain_separation)
     const uint256 outs = uint256S("aa");
     const uint256 prev = uint256S("dd");
     std::vector<uint256> v;
-    v.push_back(NoteMintSigHash(1, u, prev, outs));
-    v.push_back(NoteTransferSigHash(1, u, outs));
-    v.push_back(NoteRedeemSigHash(1, 150, outs));
+    // Stage 0 C1: the tx-class digests take the whole transaction; each op keeps its own domain.
+    CMutableTransaction t;
+    t.nVersion = TRANSACTION_NOTE_VERSION;
+    t.nNoteOp = NOTE_OP_TRANSFER;
+    t.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    t.vout.push_back(CTxOut(NOTE_DUST_VALUE, CScript() << OP_TRUE));
+    NoteTransfer xf;
+    xf.nHouseID = 1;
+    xf.vUnits = u;
+    xf.vchSenderPubKey = std::vector<unsigned char>(33, 0x02);
+    { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << xf; t.vchNotePayload.assign(ss.begin(), ss.end()); }
+    const CTransaction tx(t);
+    v.push_back(C1MintSigHash(1, u, prev, outs));
+    v.push_back(NoteTransferSigHash(tx));
+    v.push_back(NoteRedeemSigHash(tx));
+    v.push_back(NoteClaimSigHash(tx));
+    v.push_back(NoteDemandSigHash(tx));
+    v.push_back(NoteProtestSigHash(tx));
     for (size_t i = 0; i < v.size(); i++)
         for (size_t j = i + 1; j < v.size(); j++)
             BOOST_CHECK(v[i] != v[j]);
+    // C1 binds every field but the signatures: a payload field, an output, an input's sequence, nLockTime.
+    const uint256 h0 = NoteTransferSigHash(tx);
+    { CMutableTransaction m = t; NoteTransfer x2 = xf; x2.vUnits[0]++; CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << x2;
+      m.vchNotePayload.assign(ss.begin(), ss.end()); BOOST_CHECK(NoteTransferSigHash(CTransaction(m)) != h0); }
+    { CMutableTransaction m = t; m.vout[0].nValue++; BOOST_CHECK(NoteTransferSigHash(CTransaction(m)) != h0); }
+    { CMutableTransaction m = t; m.vin[0].nSequence--; BOOST_CHECK(NoteTransferSigHash(CTransaction(m)) != h0); }
+    { CMutableTransaction m = t; m.nLockTime = 7; BOOST_CHECK(NoteTransferSigHash(CTransaction(m)) != h0); }
+    { CMutableTransaction m = t; NoteTransfer x2 = xf; x2.vchSenderSig.assign(70, 0x30); CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+      ss << x2; m.vchNotePayload.assign(ss.begin(), ss.end()); BOOST_CHECK(NoteTransferSigHash(CTransaction(m)) == h0); }
 
     // Sensitive to every bound field, including the input set (replay guard)
-    BOOST_CHECK(NoteMintSigHash(1, u, prev, outs) != NoteMintSigHash(2, u, prev, outs));
-    BOOST_CHECK(NoteMintSigHash(1, u, prev, outs) != NoteMintSigHash(1, {100, 51}, prev, outs));
-    BOOST_CHECK(NoteMintSigHash(1, u, prev, outs) != NoteMintSigHash(1, u, prev, uint256S("bb")));
-    BOOST_CHECK(NoteMintSigHash(1, u, prev, outs) != NoteMintSigHash(1, u, uint256S("ee"), outs));
-    BOOST_CHECK(NoteRedeemSigHash(1, 150, outs) != NoteRedeemSigHash(1, 151, outs));
+    BOOST_CHECK(C1MintSigHash(1, u, prev, outs) != C1MintSigHash(2, u, prev, outs));
+    BOOST_CHECK(C1MintSigHash(1, u, prev, outs) != C1MintSigHash(1, {100, 51}, prev, outs));
+    BOOST_CHECK(C1MintSigHash(1, u, prev, outs) != C1MintSigHash(1, u, prev, uint256S("bb")));
+    BOOST_CHECK(C1MintSigHash(1, u, prev, outs) != C1MintSigHash(1, u, uint256S("ee"), outs));
 }
 
 BOOST_AUTO_TEST_CASE(note_sum_units)
@@ -249,15 +320,15 @@ BOOST_AUTO_TEST_CASE(note_mint_sig_binding)
     std::vector<uint64_t> u{100};
     const uint256 outs = uint256S("aa");
     const uint256 prev = uint256S("dd");
-    const uint256 sighash = NoteMintSigHash(1, u, prev, outs);
+    const uint256 sighash = C1MintSigHash(1, u, prev, outs);
     std::vector<unsigned char> sig;
     BOOST_REQUIRE(key.Sign(sighash, sig));
     BOOST_CHECK(key.GetPubKey().Verify(sighash, sig));
-    BOOST_CHECK(!key.GetPubKey().Verify(NoteMintSigHash(1, {101}, prev, outs), sig));
-    BOOST_CHECK(!key.GetPubKey().Verify(NoteMintSigHash(1, u, prev, uint256S("bb")), sig));
-    BOOST_CHECK(!key.GetPubKey().Verify(NoteMintSigHash(2, u, prev, outs), sig));
+    BOOST_CHECK(!key.GetPubKey().Verify(C1MintSigHash(1, {101}, prev, outs), sig));
+    BOOST_CHECK(!key.GetPubKey().Verify(C1MintSigHash(1, u, prev, uint256S("bb")), sig));
+    BOOST_CHECK(!key.GetPubKey().Verify(C1MintSigHash(2, u, prev, outs), sig));
     // Different input set (hashPrevouts) breaks the sig -> mint replay defeated
-    BOOST_CHECK(!key.GetPubKey().Verify(NoteMintSigHash(1, u, uint256S("ee"), outs), sig));
+    BOOST_CHECK(!key.GetPubKey().Verify(C1MintSigHash(1, u, uint256S("ee"), outs), sig));
 }
 
 // Interest over nBlocks at the network schedule (10%/yr from block 0).
@@ -395,12 +466,9 @@ BOOST_AUTO_TEST_CASE(note_demand_shape)
         CValidationState s2;
         BOOST_CHECK(!CheckNoteTransactionShape(CTransaction(MakeDemandTx(bad2)), s2));
     }
-    // The demand sighash is its own domain and binds units + outputs
-    const uint256 outs = uint256S("aa");
-    BOOST_CHECK(NoteDemandSigHash(1, {1000}, outs) != NoteRedeemSigHash(1, 1000, outs));
-    BOOST_CHECK(NoteDemandSigHash(1, {1000}, outs) != NoteDemandSigHash(2, {1000}, outs));
-    BOOST_CHECK(NoteDemandSigHash(1, {1000}, outs) != NoteDemandSigHash(1, {1001}, outs));
-    BOOST_CHECK(NoteDemandSigHash(1, {1000}, outs) != NoteDemandSigHash(1, {1000}, uint256S("bb")));
+    // The demand digest is its own domain (Stage 0 C1: over the whole transaction).
+    const CTransaction txd(MakeDemandTx(dem));
+    BOOST_CHECK(NoteDemandSigHash(txd) != NoteRedeemSigHash(txd));
 }
 
 BOOST_AUTO_TEST_CASE(claim_sats_entitlement_math)
@@ -471,12 +539,16 @@ BOOST_AUTO_TEST_CASE(note_residual_share_math)
 
 BOOST_AUTO_TEST_CASE(note_claim_sig_binding)
 {
-    // Claim sighash: distinct domain from redeem; binds house, U, outputs
-    const uint256 outs = uint256S("aa");
-    BOOST_CHECK(NoteClaimSigHash(1, 150, outs) != NoteRedeemSigHash(1, 150, outs));
-    BOOST_CHECK(NoteClaimSigHash(1, 150, outs) != NoteClaimSigHash(2, 150, outs));
-    BOOST_CHECK(NoteClaimSigHash(1, 150, outs) != NoteClaimSigHash(1, 151, outs));
-    BOOST_CHECK(NoteClaimSigHash(1, 150, outs) != NoteClaimSigHash(1, 150, uint256S("bb")));
+    // Claim digest: a distinct domain from redeem, over the whole transaction (Stage 0 C1).
+    CMutableTransaction t;
+    t.nVersion = TRANSACTION_NOTE_VERSION;
+    t.nNoteOp = NOTE_OP_CLAIM;
+    t.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
+    t.vout.push_back(CTxOut(1000, CScript() << OP_TRUE));
+    const CTransaction tx(t);
+    BOOST_CHECK(NoteClaimSigHash(tx) != NoteRedeemSigHash(tx));
+    t.vout[0].nValue++;
+    BOOST_CHECK(NoteClaimSigHash(CTransaction(t)) != NoteClaimSigHash(tx));
 }
 
 // A shape-valid CLAIM tx around the given payload
@@ -656,7 +728,8 @@ BOOST_AUTO_TEST_CASE(note_redeem_rejected_while_deferred)
     mtx.nNoteOp = NOTE_OP_REDEEM;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
     mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(redeem.vchHolderPubKey)));
-    BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(1, 100, BillHashOutputs(mtx)), redeem.vchHolderSig));
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << redeem; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig));
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
 
@@ -706,7 +779,8 @@ BOOST_AUTO_TEST_CASE(uf4_1_state_verdicts_score_zero_in_the_mempool)
         mtx.nNoteOp = NOTE_OP_REDEEM;
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
         mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(redeem.vchHolderPubKey)));
-        BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(1, 100, BillHashOutputs(mtx)), redeem.vchHolderSig));
+        { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << redeem; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+        BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig));
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
         mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
         check(mtx, &deferred, 100, "bad-note-redeem-deferred");
@@ -798,7 +872,7 @@ BOOST_AUTO_TEST_CASE(note_mint_rho_liveness_gate)
                                                  // under-reserved case below isolates
                                                  // the LIVENESS half: proven = 0.
     HousePartner p;
-    p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    p.vchPubKey = MintApproverPub();             // Stage 0 rule A: MakeMintTx's approver
     p.amountPledge = 100 * COIN;                 // ample capital cap
     p.status = HOUSE_PARTNER_ACTIVE;
     house.vPartner.push_back(p);
@@ -844,7 +918,8 @@ static CMutableTransaction MakeDemandedRedeemTx(uint32_t nHouseID, uint64_t nUni
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("d0d0"), 0)));
     mtx.vout.push_back(CTxOut(amountPayout, NoteScriptForPubKey(redeem.vchHolderPubKey)));
 
-    keyHolder.Sign(NoteRedeemSigHash(nHouseID, nUnits, BillHashOutputs(mtx)), redeem.vchHolderSig);
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << redeem; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig);
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
     mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
     return mtx;
@@ -1217,8 +1292,7 @@ static CMutableTransaction MakeLockTx(const TokenHouse& t, uint64_t nUnits, uint
         lock.vChangeUnits.push_back(nIn - nUnits);
         mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(t.pubHolder)));
     }
-    const uint256 h = NoteLockSigHash(lock.nHouseID, lock.nUnits, lock.vChangeUnits,
-                                      NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    const uint256 h = NoteLockSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, lock));   // Stage 0 C1
     BOOST_REQUIRE((fGoodHolder ? t.keyHolder : t.keyOther).Sign(h, lock.vchHolderSig));
     std::vector<unsigned char> sig;
     BOOST_REQUIRE((fGoodHouse ? t.keyPartner : t.keyOther).Sign(h, sig));
@@ -1240,8 +1314,7 @@ static CMutableTransaction MakeUnlockTx(const TokenHouse& t, uint64_t nUnits, bo
     mtx.nNoteOp = NOTE_OP_UNLOCK;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("0c"), 0)));   // fee
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(t.pubHolder)));
-    const uint256 h = NoteUnlockSigHash(unlock.nHouseID, unlock.vUnits,
-                                        NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    const uint256 h = NoteUnlockSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, unlock));   // Stage 0 C1
     std::vector<unsigned char> sig;
     BOOST_REQUIRE((fGoodHouse ? t.keyPartner : t.keyOther).Sign(h, sig));
     unlock.vApproverIndex.push_back(0);
@@ -1492,9 +1565,9 @@ BOOST_AUTO_TEST_CASE(note_lock_approvals_outside_input_sighash)
     }
 
     // The payload's own digest is what binds the lock: it changes with the outputs.
-    const uint256 d0 = NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx));
+    const uint256 d0 = NoteLockSigHash(CTransaction(mtx));
     mtx.vout[0].nValue += 1;
-    BOOST_CHECK(NoteLockSigHash(1, 1000, {}, NoteHashPrevouts(CTransaction(mtx)), BillHashOutputs(mtx)) != d0);
+    BOOST_CHECK(NoteLockSigHash(CTransaction(mtx)) != d0);
 }
 
 // testing (2026-11-10): UR1-7 (ultra s1 #7; Michael signed it off 2026-11-10, freebank
@@ -1807,7 +1880,7 @@ BOOST_AUTO_TEST_CASE(s1x_31_no_new_swap_where_a_redeem_would_owe_a_spread)
         mtx.nNoteOp = NOTE_OP_SWAP;
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("5a31"), 0)));
         mtx.vout.push_back(CTxOut(10000, CScript(vchP2PKH.begin(), vchP2PKH.end())));   // fee change
-        BOOST_REQUIRE(keyHolder.Sign(NoteSwapSigHash(sw, CTransaction(mtx)), sw.vchHolderSig));
+        BOOST_REQUIRE(keyHolder.Sign(NoteSwapSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, sw)), sw.vchHolderSig));
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << sw;
         mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
         auto fnGetHouse = [&h](uint32_t id, CHouse& out) { if (id != 7) return false; out = h; return true; };
@@ -1887,7 +1960,7 @@ static CHouse MakeOpenMintHouse()
     house.nLastAttestHeight = 1000;
     house.amountLastAttestReserves = 100 * COIN;
     HousePartner p;
-    p.vchPubKey = std::vector<unsigned char>(33, 0x02);
+    p.vchPubKey = MintApproverPub();   // Stage 0 rule A: MakeMintTx's approver
     p.amountPledge = 100 * COIN;
     p.status = HOUSE_PARTNER_ACTIVE;
     house.vPartner.push_back(p);
@@ -1981,7 +2054,8 @@ BOOST_AUTO_TEST_CASE(uf4_1_status_height_and_cap_refusals_ban_no_peer_in_the_mem
         mtx.nNoteOp = NOTE_OP_REDEEM;
         mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
         mtx.vout.push_back(CTxOut(100, NoteScriptForPubKey(redeem.vchHolderPubKey)));
-        BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(1, 100, BillHashOutputs(mtx)), redeem.vchHolderSig));
+        { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << redeem; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+        BOOST_REQUIRE(keyHolder.Sign(NoteRedeemSigHash(CTransaction(mtx)), redeem.vchHolderSig));
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << redeem;
         mtx.vchNotePayload = std::vector<unsigned char>(ss.begin(), ss.end());
         const NoteVerdict pool = CheckNoteVerdict(mtx, house, 1600, 100, true, fnNoBlock, fnNoCoin);
@@ -2203,7 +2277,8 @@ BOOST_AUTO_TEST_CASE(s1x_5_note_claim_waits_for_swaps_pending_at_the_failure)
     mtx.nNoteOp = NOTE_OP_CLAIM;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("01"), 0)));
     mtx.vout.push_back(CTxOut(100, HouseEscrowScript(house.houseID)));
-    BOOST_REQUIRE(key.Sign(NoteClaimSigHash(1, 100, CreditHashOutputs(CTransaction(mtx))), c.vchHolderSig));
+    { CDataStream sC1(SER_NETWORK, PROTOCOL_VERSION); sC1 << c; mtx.vchNotePayload.assign(sC1.begin(), sC1.end()); }   // Stage 0 C1
+    BOOST_REQUIRE(key.Sign(NoteClaimSigHash(CTransaction(mtx)), c.vchHolderSig));
     { CDataStream ss(SER_NETWORK, PROTOCOL_VERSION); ss << c; mtx.vchNotePayload.assign(ss.begin(), ss.end()); }
 
     auto verdict = [&](int h, int nSwap, int& nDoS) {

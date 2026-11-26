@@ -6,6 +6,7 @@
 
 #include <asset.h>
 #include <bill.h>
+#include <creditbind.h>
 #include <coins.h>
 #include <consensus/validation.h>
 #include <hash.h>
@@ -163,18 +164,8 @@ bool IssuedSumAnnex(const CTransaction& tx, std::map<uint256, uint64_t>& mapUnit
 
 uint256 IssuedSigHash(const CTransaction& tx)
 {
-    CHashWriter hPrevouts(SER_GETHASH, 0);
-    for (const CTxIn& in : tx.vin)
-        hPrevouts << in.prevout;
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBank issued token op v1");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << tx.nIssuedOp;
-    ss << IssuedPayloadSigForm(tx);
-    ss << hPrevouts.GetHash();
-    ss << BillHashOutputs(tx);
-    ss << tx.vIssuedOut;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBank issued token op v1");
 }
 
 const CIssuedOut* FindIssuedOut(const CTransaction& tx, uint32_t n)
@@ -458,6 +449,26 @@ uint256 CreditHashOutputs(const CTransaction& tx)
     ss << std::string("FreeBank/credit-outputs");
     ss << BillHashOutputs(tx);
     ss << tx.vIssuedOut;
+    return ss.GetHash();
+}
+
+uint256 CreditTxSigHash(const CTransaction& tx, const std::string& strDomain)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << strDomain;
+    HashNetworkTag(ss);
+    ss << tx.nVersion;
+    ss << CreditBindingHash(tx);   // the op, the payload without its signature fields, the issued annex
+    ss << BillTxBindingHash(tx);   // every prevout and nSequence, and nLockTime
+    ss << CreditHashOutputs(tx);   // every output (and the annex again: harmless)
+    return ss.GetHash();
+}
+
+uint256 CreditTxSigHash(const CTransaction& tx, const std::string& strDomain, const uint256& canonicalId)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << CreditTxSigHash(tx, strDomain);
+    ss << canonicalId;
     return ss.GetHash();
 }
 

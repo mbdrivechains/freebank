@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <pool.h>
+#include <issued.h>   // Stage 0 C1: CreditTxSigHash
 #include <house.h>   // HashNetworkTag (UR-ext-13)
 
 #include <coins.h>
@@ -50,93 +51,34 @@ uint256 PoolHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 PoolCreateSigHash(uint32_t nPoolID, uint32_t nFeeBps, uint64_t nInitNoteUnits,
-                          int64_t amountInitBtx, uint64_t nNoteChangeUnits,
-                          const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 PoolCreateSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankPool/create");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << nPoolID;
-    ss << nFeeBps;
-    ss << nInitNoteUnits;
-    ss << amountInitBtx;
-    ss << nNoteChangeUnits;
-    ss << hashPrevouts;   // tx-unique -> neither the charter nor the seed is replayable
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankPool/create");
 }
 
-uint256 PoolAddLiqSigHash(const PoolAddLiq& add, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 PoolAddLiqSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankPool/add");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << add.nPoolID;
-    ss << add.nPriorNoteReserve;
-    ss << add.amountPriorBtxReserve;
-    ss << add.nPriorLpSupply;
-    ss << add.nAddNoteUnits;
-    ss << add.amountAddBtx;
-    ss << add.nLpMinted;
-    ss << add.nNoteChangeUnits;
-    ss << hashPrevouts;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankPool/add");
 }
 
-uint256 PoolRemoveLiqSigHash(const PoolRemoveLiq& rem, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 PoolRemoveLiqSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankPool/remove");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << rem.nPoolID;
-    ss << rem.nPriorNoteReserve;
-    ss << rem.amountPriorBtxReserve;
-    ss << rem.nPriorLpSupply;
-    ss << rem.nBurnLp;
-    ss << rem.nNoteOut;
-    ss << rem.amountBtxOut;
-    ss << rem.nLpChangeUnits;
-    ss << hashPrevouts;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankPool/remove");
 }
 
-uint256 PoolSwapSigHash(const PoolSwap& swap, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 PoolSwapSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankPool/swap");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << swap.nPoolID;
-    ss << swap.nPriorNoteReserve;
-    ss << swap.amountPriorBtxReserve;
-    ss << swap.nPriorLpSupply;
-    ss << swap.nDirection;
-    ss << swap.nAmountIn;
-    ss << swap.nMinOut;
-    ss << swap.nAmountOut;
-    ss << swap.nNoteChangeUnits;
-    ss << hashPrevouts;
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankPool/swap");
 }
 
-uint256 PoolRetireSigHash(const PoolRetire& ret, const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 PoolRetireSigHash(const CTransaction& tx)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankPool/retire");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << ret.nPoolID;
-    ss << ret.nPriorNoteReserve;
-    ss << ret.amountPriorBtxReserve;
-    ss << ret.nPriorLpSupply;
-    ss << ret.nFeeBps;
-    ss << ret.nCreateHeight;
-    ss << ret.nTriggerPartnerIndex;   // 0 on the M-of-N path; the trigger signer on the insolvency path
-    ss << hashPrevouts;
-    ss << hashOutputs;                 // pins the forced floor-BTX payout (vout[0]) and the whole output set
-    return ss.GetHash();
+    // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
+    return CreditTxSigHash(tx, "FreeBankPool/retire");
 }
 
 template <typename T>

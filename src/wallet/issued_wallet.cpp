@@ -670,8 +670,9 @@ static bool WalletPostHouseRate(CWallet* pwallet, std::string& strFail, uint256&
     rate.nKind = HOUSE_RATE_POST;
     rate.nBid = nBid;
     rate.nAsk = nAsk;
-    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
-        if (!key.Sign(HouseRateSigHash(nHouseID, tx, rate), rate.vchRateSig))
+    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction&, CMutableTransaction& m) {
+        m.vchHousePayload = EncodeIssued(rate);   // Stage 0 C1: the finished transaction
+        if (!key.Sign(HouseRateSigHash(CTransaction(m)), rate.vchRateSig))
             return false;
         m.vchHousePayload = EncodeIssued(rate);
         return true;
@@ -703,8 +704,9 @@ static bool WalletSetHouseRateKey(CWallet* pwallet, std::string& strFail, uint25
     rate.houseID = house.houseID;   // S1X-26
     rate.nKind = HOUSE_RATE_SETKEY;
     rate.vchRatePubKey = std::vector<unsigned char>(pubKey.begin(), pubKey.end());
-    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
-        const uint256 h = HouseRateSigHash(nHouseID, tx, rate);
+    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction&, CMutableTransaction& m) {
+        m.vchHousePayload = EncodeIssued(rate);   // Stage 0 C1
+        const uint256 h = HouseRateSigHash(CTransaction(m));
         rate.vApproverIndex = vIdx;
         rate.vApproverSig.assign(vKey.size(), {});
         for (size_t i = 0; i < vKey.size(); i++)
@@ -736,8 +738,9 @@ static bool WalletHouseCharter(CWallet* pwallet, std::string& strFail, uint256& 
     std::vector<uint32_t> vIdx;
     std::vector<CKey> vKey;
     if (!WalletHouseApproved(pwallet, strFail, house, vIdx, vKey)) return false;
-    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_CHARTER, nFee, [&](const CTransaction& tx, CMutableTransaction& m) {
-        const uint256 h = HouseCharterSigHash(op.nHouseID, tx, op);
+    return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_CHARTER, nFee, [&](const CTransaction&, CMutableTransaction& m) {
+        m.vchHousePayload = EncodeIssued(op);   // Stage 0 C1
+        const uint256 h = HouseCharterSigHash(CTransaction(m));
         op.vApproverIndex = vIdx;
         op.vApproverSig.assign(vKey.size(), {});
         for (size_t i = 0; i < vKey.size(); i++)

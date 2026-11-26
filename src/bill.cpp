@@ -4,6 +4,7 @@
 
 #include <crypto/common.h>   // ReadLE32 (S1X-10)
 #include <bill.h>
+#include <issued.h>   // Stage 0 C1: CreditTxSigHash
 #include <house.h>   // HashNetworkTag (UR-ext-13)
 
 #include <coins.h>            // Coin, for the shared payload-pure output tagger
@@ -80,30 +81,17 @@ uint256 BillTxBindingHash(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 BillRetireSigHash(const uint256& billID, uint64_t nRateNamed, const uint256& hashTxBinding,
-                          const uint256& hashOutputs, bool fHouseHeld)
+uint256 BillRetireSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    // S1X-17: op 7 (house-held) has its own tag, so an op 3 signature never verifies as op 7's or back.
-    ss << std::string(fHouseHeld ? "FreeBankBill/hretire" : "FreeBankBill/retire");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << billID;
-    ss << nRateNamed;   // UR1-6 (switch-on, Michael 2026-11-10): the rate the payer names is signed too, so no one can
-                        // rewrite it under the acceptor's signature (a new txid, the same effects)
-    ss << hashTxBinding;   // S1X-17
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1 (closes UR1-6 / S1X-17 structurally): the whole transaction except the signatures, and the bill's
+    // canonical id. Op 7 (house-held) keeps its own domain, so an op 3 signature never verifies as op 7's or back.
+    return CreditTxSigHash(tx, fHouseHeld ? "FreeBankBill/hretire" : "FreeBankBill/retire", billID);
 }
 
-uint256 BillClaimSigHash(const uint256& billID, const uint256& hashTxBinding, const uint256& hashOutputs, bool fHouseHeld)
+uint256 BillClaimSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string(fHouseHeld ? "FreeBankBill/hclaim" : "FreeBankBill/claim");   // S1X-17: op 8 vs op 4
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << billID;
-    ss << hashTxBinding;   // S1X-17
-    ss << hashOutputs;
-    return ss.GetHash();
+    // Stage 0 rule C1: op 8 vs op 4 by domain.
+    return CreditTxSigHash(tx, fHouseHeld ? "FreeBankBill/hclaim" : "FreeBankBill/claim", billID);
 }
 
 uint256 BillHashPrevouts(const CTransaction& tx)
@@ -114,83 +102,27 @@ uint256 BillHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 BillDiscountSigHash(const BillDiscount& x, const uint256& billID,
-                            const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 BillDiscountSigHash(const CTransaction& tx, const uint256& billID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankBill/discount");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << x.nBillID;
-    ss << billID;                 // canonical identity - immune to dense-id renumbering
-    ss << x.nHouseID;
-    ss << x.amountPrice;
-    ss << x.amountFace;           // both parties sign the face they are trading
-    ss << x.nBillMaturityHeight;
-    ss << x.nNoteOutputs;
-    ss << x.vUnits;
-    ss << x.vchCustodyPubKey;
-    ss << x.nExpiryHeight;
-    ss << x.nAsOfHeight;
-    ss << x.nPrevMintedUnits;
-    ss << x.nPrevLoanBookFace;
-    ss << x.nPrevLoanWtMatHi;
-    ss << x.nPrevLoanWtMatLo;
-    // The reserve proofs and the endorsement link ride OUTSIDE this digest: the
-    // proofs carry their own per-coin challenge signatures, and the link carries
-    // the classic BillEndorseSigHash by the same seller.
-    ss << hashPrevouts;           // R-i6 - the sig authorizes consuming the title
-    ss << hashOutputs;            // pins the title destination and every note output
-    return ss.GetHash();
+    // Stage 0 rule C1: the seller and the house's approvers sign the whole transaction. The reserve proofs carry their
+    // own per-coin challenge signatures, and the endorsement link carries its standing BillEndorseSigHash; the binding
+    // form strips their signature fields and the link's height (bound by the link's own signature), nothing else.
+    return CreditTxSigHash(tx, "FreeBankBill/discount", billID);
 }
 
-uint256 BillRecourseSigHash(const BillRecourse& x, const uint256& billID,
-                            const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 BillRecourseSigHash(const CTransaction& tx, const uint256& billID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << std::string("FreeBankBill/recourse");
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << x.nBillID;
-    ss << billID;
-    ss << x.vchPayerPubKey;
-    ss << x.vchPrevHolderPubKey;
-    ss << x.nRateNamed;           // UR1-6 (switch-on)
-    ss << hashPrevouts;
-    ss << hashOutputs;            // pins the payment to the holder
-    return ss.GetHash();
+    return CreditTxSigHash(tx, "FreeBankBill/recourse", billID);   // Stage 0 rule C1
 }
 
-static uint256 BillHRetireTaggedSigHash(const std::string& strTag, const BillHRetireNotes& x, const uint256& billID,
-                                        const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 BillHRetireNotesSigHash(const CTransaction& tx, const uint256& billID)
 {
-    CHashWriter ss(SER_GETHASH, 0);
-    ss << strTag;   // its own tag per op: an op 7 retire sig never verifies here, nor op 9's as op 10's
-    HashNetworkTag(ss);   // UR-ext-13
-    ss << x.nBillID;
-    ss << billID;
-    ss << x.nOwnerHouseID;
-    ss << x.amountFace;
-    ss << x.nBillMaturityHeight;
-    ss << x.nUnitsBurned;
-    ss << x.nPrevMintedUnits;
-    ss << x.nPrevLoanBookFace;
-    ss << x.nPrevLoanWtMatHi;
-    ss << x.nPrevLoanWtMatLo;
-    ss << x.nRateNamed;           // UR1-6 (switch-on)
-    ss << hashPrevouts;           // R-i6: the acceptor authorizes exactly these notes and this escrow
-    ss << hashOutputs;            // pins the sECX part (custody key for op 9, the house escrow for op 10)
-    return ss.GetHash();
+    return CreditTxSigHash(tx, "FreeBankBill/hretire-notes", billID);   // Stage 0 rule C1
 }
 
-uint256 BillHRetireNotesSigHash(const BillHRetireNotes& x, const uint256& billID,
-                                const uint256& hashPrevouts, const uint256& hashOutputs)
+uint256 BillHRetireEscrowSigHash(const CTransaction& tx, const uint256& billID)
 {
-    return BillHRetireTaggedSigHash("FreeBankBill/hretire-notes", x, billID, hashPrevouts, hashOutputs);
-}
-
-uint256 BillHRetireEscrowSigHash(const BillHRetireNotes& x, const uint256& billID,
-                                 const uint256& hashPrevouts, const uint256& hashOutputs)
-{
-    return BillHRetireTaggedSigHash("FreeBankBill/hretire-escrow", x, billID, hashPrevouts, hashOutputs);
+    return CreditTxSigHash(tx, "FreeBankBill/hretire-escrow", billID);   // Stage 0 rule C1: op 10's own domain
 }
 
 CScript BillEscrowScript(const uint256& billID)

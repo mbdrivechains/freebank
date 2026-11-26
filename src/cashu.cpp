@@ -85,11 +85,20 @@ bool VerifyDLEQ(const secp256k1_pubkey& A, const secp256k1_pubkey& B_, const sec
 
 bool CashuHashToCurve(const std::vector<unsigned char>& msg, CPubKey& Y)
 {
+    uint32_t nTries = 65536;
+    return CashuHashToCurveBudget(msg, Y, nTries);
+}
+
+bool CashuHashToCurveBudget(const std::vector<unsigned char>& msg, CPubKey& Y, uint32_t& nTriesLeft)
+{
     static const std::string DOMAIN_SEPARATOR = "Secp256k1_HashToCurve_Cashu_";
     unsigned char msgHash[CSHA256::OUTPUT_SIZE];
     CSHA256().Write((const unsigned char*)DOMAIN_SEPARATOR.data(), DOMAIN_SEPARATOR.size())
              .Write(msg.data(), msg.size()).Finalize(msgHash);
     for (uint32_t counter = 0; counter < 65536; counter++) {
+        if (nTriesLeft == 0)
+            return false;
+        nTriesLeft--;
         unsigned char ctr[4] = {(unsigned char)(counter & 0xff), (unsigned char)((counter >> 8) & 0xff),
                                 (unsigned char)((counter >> 16) & 0xff), (unsigned char)((counter >> 24) & 0xff)};
         unsigned char cand[33];

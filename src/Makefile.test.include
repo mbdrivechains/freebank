@@ -102,6 +102,10 @@ BITCOIN_TESTS =\
   test/net_tests.cpp \
   test/netbase_tests.cpp \
   test/pegbind_tests.cpp \
+  test/order_permutation_tests.cpp \
+  test/family_a_cost_tests.cpp \
+  test/family_a_cost_house_tests.cpp \
+  test/family_a_cost_nosig_tests.cpp \
   test/pmt_tests.cpp \
   test/policyestimator_tests.cpp \
   test/prevector_tests.cpp \

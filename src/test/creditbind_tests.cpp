@@ -151,6 +151,9 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
     CheckOp<BillClaim>(B, BILL_OP_CLAIM, 6, [](BillClaim& p) { p.vchHolderSig.clear(); }, "BILL CLAIM");
     CheckOp<BillDiscount>(B, BILL_OP_DISCOUNT, 142, [](BillDiscount& p) {
         ClearProofs(p.vReserveProofs);
+        // The one stripped field that isn't a signature or an approver index (security's Stage 0 review, 11-26): the
+        // seller sets the link's height in round 3, after the house signed; the seller's own link signature binds it
+        // (BillEndorseSigHash covers nAtHeight), and consensus bounds it (BILL_ENDORSE_HEIGHT_SLACK).
         p.endorsement.nAtHeight = 0;
         p.endorsement.vchSig.clear();
         p.vchSellerSig.clear();
@@ -467,9 +470,9 @@ BOOST_AUTO_TEST_CASE(binding_height_per_network)
     BOOST_CHECK(easynet->GetConsensus().CreditBindingActive(0));
     // ...and credits treasury changes only from its deposit start (L1 2,058 for the v1.2.2 restart; 1,676 at v1.2.0,
     // 1,100 at v1.1.0); every other network from the start. Building the params also checks easynet's genesis hash.
-    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3896);   // v1.2.6 restart
-    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x75c478c230b3e2e213ee81074065cf73efea1f80636eee16b1081b03f20ff3cc"));
-    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0c);   // a fresh chain's magic (v1.2.6, D-2026-11-23-1)
+    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3975);   // v1.2.7 restart
+    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0xe457ddc1b3fe7954f1ce26f7797469854c722b4d3574ea8d37017feab2801c7a"));
+    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0d);   // a fresh chain's magic (v1.2.7, D-2026-11-23-1)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nDepositStartL1Height, 0);
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nDepositStartL1Height, 0);
 }

@@ -45,6 +45,30 @@ struct NotePoolsOpenSetup : public BasicTestingSetup {
     ~NotePoolsOpenSetup() { SetNotePoolTime(Consensus::LATER_RULE_NEVER); }
 };
 
+// Stage 0 C1 test shim: the transaction with payload p serialized into its op field (a C1 digest takes the whole tx;
+// the payload's signature fields are stripped, so it may be passed before or after they are filled).
+template <typename T, typename P>
+static CTransaction C1With(const T& tx, std::vector<unsigned char> CMutableTransaction::*field, const P& p)
+{
+    CMutableTransaction m(tx);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << p;
+    (m.*field).assign(ss.begin(), ss.end());
+    return CTransaction(m);
+}
+
+// Stage 0 C1: a pool tx with op nOp and payload p, whose input is hp and whose output pays a script made from ho.
+template <typename P>
+static CTransaction C1PoolTx(uint8_t nOp, const P& p, const uint256& hp, const uint256& ho)
+{
+    CMutableTransaction m;
+    m.nVersion = TRANSACTION_POOL_VERSION;
+    m.nPoolOp = nOp;
+    m.vin.push_back(CTxIn(COutPoint(hp, 0)));
+    m.vout.push_back(CTxOut(POOL_DUST_VALUE, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
+    return C1With(m, &CMutableTransaction::vchPoolPayload, p);
+}
+
 BOOST_FIXTURE_TEST_SUITE(pool_tests, NotePoolsOpenSetup)
 
 //
@@ -506,38 +530,42 @@ BOOST_AUTO_TEST_CASE(pool_sighash_domains)
     swap.nPoolID = 1;
 
     // Domain separation: identical fields, four distinct hashes.
-    const uint256 h1 = PoolCreateSigHash(1, 30, 0, 0, 0, hp, ho);
-    const uint256 h2 = PoolAddLiqSigHash(add, hp, ho);
-    const uint256 h3 = PoolRemoveLiqSigHash(rem, hp, ho);
-    const uint256 h4 = PoolSwapSigHash(swap, hp, ho);
+    PoolCreate create;
+    create.nPoolID = 1;
+    create.nFeeBps = 30;
+    // Stage 0 C1: each digest takes the whole tx (payload, inputs, outputs); same payload fields, distinct domains
+    const uint256 h1 = PoolCreateSigHash(C1PoolTx(POOL_OP_CREATE, create, hp, ho));
+    const uint256 h2 = PoolAddLiqSigHash(C1PoolTx(POOL_OP_ADD_LIQ, add, hp, ho));
+    const uint256 h3 = PoolRemoveLiqSigHash(C1PoolTx(POOL_OP_REMOVE_LIQ, rem, hp, ho));
+    const uint256 h4 = PoolSwapSigHash(C1PoolTx(POOL_OP_SWAP, swap, hp, ho));
     BOOST_CHECK(h1 != h2 && h1 != h3 && h1 != h4 && h2 != h3 && h2 != h4 && h3 != h4);
 
     // Prior-binding: any prior field change moves the swap sighash.
     PoolSwap swapMut = swap;
     swapMut.nPriorNoteReserve = 1;
-    BOOST_CHECK(PoolSwapSigHash(swapMut, hp, ho) != h4);
+    BOOST_CHECK(PoolSwapSigHash(C1PoolTx(POOL_OP_SWAP, swapMut, hp, ho)) != h4);
     swapMut = swap;
     swapMut.nMinOut = 1;
-    BOOST_CHECK(PoolSwapSigHash(swapMut, hp, ho) != h4);
-    BOOST_CHECK(PoolSwapSigHash(swap, uint256S("0x03"), ho) != h4);
-    BOOST_CHECK(PoolSwapSigHash(swap, hp, uint256S("0x03")) != h4);
+    BOOST_CHECK(PoolSwapSigHash(C1PoolTx(POOL_OP_SWAP, swapMut, hp, ho)) != h4);
+    BOOST_CHECK(PoolSwapSigHash(C1PoolTx(POOL_OP_SWAP, swap, uint256S("0x03"), ho)) != h4);
+    BOOST_CHECK(PoolSwapSigHash(C1PoolTx(POOL_OP_SWAP, swap, hp, uint256S("0x03"))) != h4);
 
     // RETIRE is a fifth distinct domain, and binds every payload field.
     PoolRetire ret;
     ret.nPoolID = 1;
-    const uint256 h5 = PoolRetireSigHash(ret, hp, ho);
+    const uint256 h5 = PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, hp, ho));
     BOOST_CHECK(h5 != h1 && h5 != h2 && h5 != h3 && h5 != h4);
     PoolRetire retMut = ret;
     retMut.nPriorNoteReserve = 1;
-    BOOST_CHECK(PoolRetireSigHash(retMut, hp, ho) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho)) != h5);
     retMut = ret;
     retMut.nTriggerPartnerIndex = 1;
-    BOOST_CHECK(PoolRetireSigHash(retMut, hp, ho) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho)) != h5);
     retMut = ret;
     retMut.nCreateHeight = 1;
-    BOOST_CHECK(PoolRetireSigHash(retMut, hp, ho) != h5);
-    BOOST_CHECK(PoolRetireSigHash(ret, uint256S("0x03"), ho) != h5);
-    BOOST_CHECK(PoolRetireSigHash(ret, hp, uint256S("0x03")) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho)) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, uint256S("0x03"), ho)) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, hp, uint256S("0x03"))) != h5);
 }
 
 BOOST_AUTO_TEST_CASE(pool_shape_create)
@@ -1454,8 +1482,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_create)
     mtx.vout.emplace_back(POOL_DUST_VALUE, PoolScriptForPubKey(create.vchCreatorPubKey));
 
     // Sign over the REAL prevouts/outputs (payload is outside both hashes).
-    const uint256 sighash = PoolCreateSigHash(7, create.nFeeBps, create.nInitNoteUnits,
-            create.amountInitBtx, 0, PoolHashPrevouts(CTransaction(mtx)), BillHashOutputs(CTransaction(mtx)));
+    const uint256 sighash = PoolCreateSigHash(C1With(mtx, &CMutableTransaction::vchPoolPayload, create));
     create.vchCreatorSig = SignHash(creatorKey, sighash);
     create.vApproverIndex = {0};
     create.vApproverSig = {SignHash(partnerKey, sighash)};
@@ -1554,8 +1581,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_add_remove_swap)
     mtxA.vout.emplace_back(POOL_DUST_VALUE, PoolEscrowScript(7));
     mtxA.vout.emplace_back(100100, PoolEscrowScript(7));
     mtxA.vout.emplace_back(POOL_DUST_VALUE, PoolScriptForPubKey(userPubV));
-    add.vchProviderSig = SignHash(userKey, PoolAddLiqSigHash(add,
-            PoolHashPrevouts(CTransaction(mtxA)), BillHashOutputs(CTransaction(mtxA))));
+    add.vchProviderSig = SignHash(userKey, PoolAddLiqSigHash(C1With(mtxA, &CMutableTransaction::vchPoolPayload, add)));
     mtxA.vchPoolPayload = EncodePoolPayload(add);
 
     CPool poolOut;
@@ -1615,8 +1641,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_add_remove_swap)
     mtxS.vout.emplace_back(POOL_DUST_VALUE, PoolEscrowScript(7));
     mtxS.vout.emplace_back(100000 - 987, PoolEscrowScript(7));
     mtxS.vout.emplace_back(987, PoolScriptForPubKey(userPubV));
-    swap.vchTraderSig = SignHash(userKey, PoolSwapSigHash(swap,
-            PoolHashPrevouts(CTransaction(mtxS)), BillHashOutputs(CTransaction(mtxS))));
+    swap.vchTraderSig = SignHash(userKey, PoolSwapSigHash(C1With(mtxS, &CMutableTransaction::vchPoolPayload, swap)));
     mtxS.vchPoolPayload = EncodePoolPayload(swap);
 
     BOOST_CHECK_EQUAL(PoolCtxReject(mtxS, 1100, fnGetPool, fnNoHouse, poolOut), "OK");
@@ -1630,8 +1655,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_add_remove_swap)
     CMutableTransaction mtxSBad = mtxS;
     mtxSBad.vout[1] = CTxOut(100000 - 986, PoolEscrowScript(7));
     mtxSBad.vout[2] = CTxOut(986, PoolScriptForPubKey(userPubV));
-    swapBad.vchTraderSig = SignHash(userKey, PoolSwapSigHash(swapBad,
-            PoolHashPrevouts(CTransaction(mtxSBad)), BillHashOutputs(CTransaction(mtxSBad))));
+    swapBad.vchTraderSig = SignHash(userKey, PoolSwapSigHash(C1With(mtxSBad, &CMutableTransaction::vchPoolPayload, swapBad)));
     mtxSBad.vchPoolPayload = EncodePoolPayload(swapBad);
     BOOST_CHECK_EQUAL(PoolCtxReject(mtxSBad, 1100, fnGetPool, fnNoHouse, poolOut), "bad-pool-swap-formula");
 
@@ -1657,8 +1681,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_add_remove_swap)
     mtxS2.vout.emplace_back(POOL_DUST_VALUE, PoolEscrowScript(7));
     mtxS2.vout.emplace_back(101000, PoolEscrowScript(7));
     mtxS2.vout.emplace_back(POOL_DUST_VALUE, PoolScriptForPubKey(userPubV));
-    swap2.vchTraderSig = SignHash(userKey, PoolSwapSigHash(swap2,
-            PoolHashPrevouts(CTransaction(mtxS2)), BillHashOutputs(CTransaction(mtxS2))));
+    swap2.vchTraderSig = SignHash(userKey, PoolSwapSigHash(C1With(mtxS2, &CMutableTransaction::vchPoolPayload, swap2)));
     mtxS2.vchPoolPayload = EncodePoolPayload(swap2);
 
     BOOST_CHECK_EQUAL(PoolCtxReject(mtxS2, 1100, fnGetPool, fnNoHouse, poolOut), "OK");
@@ -1687,8 +1710,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_add_remove_swap)
     mtxR.vout.emplace_back(95000, PoolEscrowScript(7));
     mtxR.vout.emplace_back(POOL_DUST_VALUE, PoolScriptForPubKey(userPubV));
     mtxR.vout.emplace_back(5000, PoolScriptForPubKey(userPubV));
-    rem.vchProviderSig = SignHash(userKey, PoolRemoveLiqSigHash(rem,
-            PoolHashPrevouts(CTransaction(mtxR)), BillHashOutputs(CTransaction(mtxR))));
+    rem.vchProviderSig = SignHash(userKey, PoolRemoveLiqSigHash(C1With(mtxR, &CMutableTransaction::vchPoolPayload, rem)));
     mtxR.vchPoolPayload = EncodePoolPayload(rem);
 
     BOOST_CHECK_EQUAL(PoolCtxReject(mtxR, 1100, fnGetPool, fnNoHouse, poolOut), "OK");
@@ -1753,8 +1775,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
     tmpl.nCreateHeight = 500;
 
     const CMutableTransaction mtxTmpl = buildRetire(tmpl);
-    const uint256 sighash = PoolRetireSigHash(tmpl,
-            PoolHashPrevouts(CTransaction(mtxTmpl)), BillHashOutputs(CTransaction(mtxTmpl)));
+    const uint256 sighash = PoolRetireSigHash(C1With(mtxTmpl, &CMutableTransaction::vchPoolPayload, tmpl));
 
     // --- M-of-N happy path (valid at effective Open) ---
     PoolRetire mn = tmpl;
@@ -1818,8 +1839,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
         CMutableTransaction bad = buildRetire(mn);
         bad.vout[0] = CTxOut(5000, PoolScriptForPubKey(PoolFreshPubKey()));
         PoolRetire r = mn;
-        r.vApproverSig = {SignHash(partnerKey, PoolRetireSigHash(r,
-                PoolHashPrevouts(CTransaction(bad)), BillHashOutputs(CTransaction(bad))))};
+        r.vApproverSig = {SignHash(partnerKey, PoolRetireSigHash(C1With(bad, &CMutableTransaction::vchPoolPayload, r)))};
         bad.vchPoolPayload = EncodePoolPayload(r);
         BOOST_CHECK_EQUAL(PoolCtxRetire(bad, 1100, fnGetPool, fnGetHouse, houseOut, fRetired), "bad-pool-retire-payout");
     }
@@ -1827,8 +1847,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
     // --- Single-partner path: rejected at effective Open, accepted at Insolvent ---
     PoolRetire sp = tmpl;
     sp.nTriggerPartnerIndex = 0;
-    sp.vchTriggerSig = SignHash(partnerKey, PoolRetireSigHash(sp,
-            PoolHashPrevouts(CTransaction(mtxTmpl)), BillHashOutputs(CTransaction(mtxTmpl))));
+    sp.vchTriggerSig = SignHash(partnerKey, PoolRetireSigHash(C1With(mtxTmpl, &CMutableTransaction::vchPoolPayload, sp)));
     const CMutableTransaction spTx = buildRetire(sp);
     BOOST_CHECK_EQUAL(PoolCtxRetire(spTx, 1100, fnGetPool, fnGetHouse, houseOut, fRetired),
                       "bad-pool-retire-trigger-not-insolvent");
