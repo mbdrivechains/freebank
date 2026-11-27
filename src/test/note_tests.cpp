@@ -62,7 +62,7 @@ static uint256 C1MintSigHash(uint32_t nHouse, const std::vector<uint64_t>& vU, c
     NoteMint mi;
     mi.nHouseID = nHouse;
     mi.vUnits = vU;
-    return NoteMintSigHash(C1With(m, &CMutableTransaction::vchNotePayload, mi));
+    return NoteMintSigHash(C1With(m, &CMutableTransaction::vchNotePayload, mi), uint256S("f00d"));
 }
 
 BOOST_FIXTURE_TEST_SUITE(note_tests, BasicTestingSetup)
@@ -112,7 +112,7 @@ static CMutableTransaction MakeMintTx(uint32_t nHouseID, uint64_t units, uint32_
         ss0 << mint;
         mtx.vchNotePayload = std::vector<unsigned char>(ss0.begin(), ss0.end());
         std::vector<unsigned char> vchSig;
-        BOOST_REQUIRE(MintApproverKey().Sign(NoteMintSigHash(CTransaction(mtx)), vchSig));
+        BOOST_REQUIRE(MintApproverKey().Sign(NoteMintSigHash(CTransaction(mtx), uint256S("f00d")), vchSig));
         mint.vApproverIndex.push_back(0);
         mint.vApproverSig.push_back(vchSig);
     }
@@ -1292,7 +1292,7 @@ static CMutableTransaction MakeLockTx(const TokenHouse& t, uint64_t nUnits, uint
         lock.vChangeUnits.push_back(nIn - nUnits);
         mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(t.pubHolder)));
     }
-    const uint256 h = NoteLockSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, lock));   // Stage 0 C1
+    const uint256 h = NoteLockSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, lock), t.house.houseID);   // Stage 0 C1
     BOOST_REQUIRE((fGoodHolder ? t.keyHolder : t.keyOther).Sign(h, lock.vchHolderSig));
     std::vector<unsigned char> sig;
     BOOST_REQUIRE((fGoodHouse ? t.keyPartner : t.keyOther).Sign(h, sig));
@@ -1314,7 +1314,7 @@ static CMutableTransaction MakeUnlockTx(const TokenHouse& t, uint64_t nUnits, bo
     mtx.nNoteOp = NOTE_OP_UNLOCK;
     mtx.vin.push_back(CTxIn(COutPoint(uint256S("0c"), 0)));   // fee
     mtx.vout.push_back(CTxOut(NOTE_DUST_VALUE, NoteScriptForPubKey(t.pubHolder)));
-    const uint256 h = NoteUnlockSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, unlock));   // Stage 0 C1
+    const uint256 h = NoteUnlockSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, unlock), t.house.houseID);   // Stage 0 C1
     std::vector<unsigned char> sig;
     BOOST_REQUIRE((fGoodHouse ? t.keyPartner : t.keyOther).Sign(h, sig));
     unlock.vApproverIndex.push_back(0);
@@ -1565,9 +1565,9 @@ BOOST_AUTO_TEST_CASE(note_lock_approvals_outside_input_sighash)
     }
 
     // The payload's own digest is what binds the lock: it changes with the outputs.
-    const uint256 d0 = NoteLockSigHash(CTransaction(mtx));
+    const uint256 d0 = NoteLockSigHash(CTransaction(mtx), uint256S("f00d"));
     mtx.vout[0].nValue += 1;
-    BOOST_CHECK(NoteLockSigHash(CTransaction(mtx)) != d0);
+    BOOST_CHECK(NoteLockSigHash(CTransaction(mtx), uint256S("f00d")) != d0);
 }
 
 // testing (2026-11-10): UR1-7 (ultra s1 #7; Michael signed it off 2026-11-10, freebank

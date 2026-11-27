@@ -258,6 +258,12 @@ inline UnitsKey HouseCharterKey(uint32_t nHouseID) { return UnitsKey(UNITS_CHART
 inline UnitsKey HouseRateKey(uint32_t nHouseID) { return UnitsKey(UNITS_HOUSE_RATE).U32(nHouseID); }
 inline UnitsKey RateDayKey(uint32_t nHouseID, uint32_t nDay) { return UnitsKey(UNITS_RATE_DAY).U32(nHouseID).U32(nDay); }
 inline UnitsKey RateKeyKey(uint32_t nHouseID) { return UnitsKey(UNITS_RATE_KEY).U32(nHouseID); }
+/** R5-6 (D-2026-11-27-2 (2)): op counts a displaced op can't be mined after. A SETKEY names the key count (SETKEYs only), so
+ *  only a newer SETKEY makes it stale - the rate key can't make the partners' recovery stale by posting (security 11-27).
+ *  A POST names the post count (POSTs and SETKEYs), so a newer POST or a SETKEY makes it stale. Charter ops: their own. */
+inline UnitsKey HouseRateKeySeqKey(uint32_t nHouseID) { return UnitsKey(UNITS_RATE_KEY_SEQ).U32(nHouseID); }
+inline UnitsKey HouseRatePostSeqKey(uint32_t nHouseID) { return UnitsKey(UNITS_RATE_POST_SEQ).U32(nHouseID); }
+inline UnitsKey HouseCharterSeqKey(uint32_t nHouseID) { return UnitsKey(UNITS_CHARTER_SEQ).U32(nHouseID); }
 
 inline uint32_t RateDayOf(int64_t nTime) { return nTime <= 0 ? 0 : (uint32_t)(nTime / RATE_DAY_SECONDS); }
 
@@ -336,6 +342,10 @@ bool HouseRateMaxForChecks(uint32_t nHouseID, int nHeight, uint32_t nDays, uint6
 bool ChainClockForChecks(CChainClock& clock);
 /** The house's registered rate key (HOUSE_OP_RATE SETKEY), or false when none is set. */
 bool HouseRateKeyForChecks(uint32_t nHouseID, std::vector<unsigned char>& vchPubKey);
+/** R5-6: the counts at the tip (0 before the first): what a SETKEY / a POST / a charter op names. */
+uint64_t HouseRateKeySeqForChecks(uint32_t nHouseID);
+uint64_t HouseRatePostSeqForChecks(uint32_t nHouseID);
+uint64_t HouseCharterSeqForChecks(uint32_t nHouseID);
 /** The window maxima as they stood at block nAnchorHeight (its monotone time): a failed house's 30/90-day windows end at
  *  its failure E, never later (an insolvent house can't post, so a window running on would only lose its highs). */
 bool HouseRateMaxAtForChecks(uint32_t nHouseID, int nAnchorHeight, uint32_t nDays, uint64_t& nMaxBid, uint64_t& nMaxAsk);

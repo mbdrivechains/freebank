@@ -1827,9 +1827,14 @@ BOOST_AUTO_TEST_CASE(house_collection_gate)
     const uint32_t nE = HouseInsolventSince(house, 1000000);
     BOOST_REQUIRE(nE != 0);
     const uint32_t nWin = Params().GetConsensus().nCollectWindow;
+    const uint32_t nBack = Params().GetConsensus().nCollectBackstop;
     house.nLoanBookFace = 5000;                  // the book has not run off
     BOOST_CHECK(!HouseCollectionDone(house, (int)(nE + nWin - 1)));
-    BOOST_CHECK(HouseCollectionDone(house, (int)(nE + nWin)));
+    // TG-2 (D-2026-11-27-1): a bill still in the book holds payouts past the window (it paid here before), up to the
+    // backstop.
+    BOOST_CHECK(!HouseCollectionDone(house, (int)(nE + nWin)));
+    BOOST_CHECK(!HouseCollectionDone(house, (int)(nE + nWin + nBack - 1)));
+    BOOST_CHECK(HouseCollectionDone(house, (int)(nE + nWin + nBack)));
     house.nLoanBookFace = 0;                     // ...or it has: payouts open at once
     BOOST_CHECK(HouseCollectionDone(house, (int)nE));
     BOOST_CHECK(!HouseCollectionDone(MakeGuardHouse(), 1000));   // not insolvent: never
@@ -1956,16 +1961,18 @@ BOOST_AUTO_TEST_CASE(house_one_cure_per_180_days)
         CHouse h = house;
         const uint32_t nH2 = nPaid + HOUSE_CURE_SPACING_BLOCKS - 1;
         HouseProtestEpisodeStart(h, nH2);
-        BOOST_CHECK_EQUAL(h.nNoCureHeight, nH2);
+        // R5-4 (D-2026-11-27-2 (3)): insolvent from the block AFTER the protest, for every reader.
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, nH2 + 1);
         BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2 - 1), HOUSE_STATUS_OPEN);
-        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2), HOUSE_STATUS_INSOLVENT);
-        BOOST_CHECK_EQUAL(HouseInsolventSince(h, nH2 + 10), nH2);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2), HOUSE_STATUS_OPEN);
+        BOOST_CHECK_EQUAL(HouseEffectiveStatus(h, nH2 + 1), HOUSE_STATUS_INSOLVENT);
+        BOOST_CHECK_EQUAL(HouseInsolventSince(h, nH2 + 10), nH2 + 1);
     }
     // 180 days after the START but not the end: still no cure (precision 2).
     {
         CHouse h = house;
         HouseProtestEpisodeStart(h, nH1 + HOUSE_CURE_SPACING_BLOCKS);
-        BOOST_CHECK_EQUAL(h.nNoCureHeight, nH1 + HOUSE_CURE_SPACING_BLOCKS);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, nH1 + HOUSE_CURE_SPACING_BLOCKS + 1);   // R5-4: the next block
     }
     // 180 days after the episode's end, a protest is a fresh cure.
     {
@@ -2034,7 +2041,7 @@ BOOST_AUTO_TEST_CASE(clock_windows_count_time)
     {
         CHouse h = house;
         HouseProtestEpisodeStart(h, 2000 + 8639);
-        BOOST_CHECK_EQUAL(h.nNoCureHeight, 2000u + 8639);
+        BOOST_CHECK_EQUAL(h.nNoCureHeight, 2000u + 8639 + 1);   // R5-4: the next block
     }
     {
         CHouse h = house;
@@ -2127,7 +2134,7 @@ BOOST_AUTO_TEST_CASE(cure_continues_after_recovery)
     g.nProtestOpen = 0;
     HouseDischargeMaybeEndsEpisode(g, 320);
     HouseProtestEpisodeStart(g, 320 + HOUSE_CURE_SPACING_BLOCKS - 1);
-    BOOST_CHECK_EQUAL(g.nNoCureHeight, 320u + HOUSE_CURE_SPACING_BLOCKS - 1);
+    BOOST_CHECK_EQUAL(g.nNoCureHeight, 320u + HOUSE_CURE_SPACING_BLOCKS);   // R5-4: the next block
     CHouse g2 = h;
     g2.nProtestOpen = 0;
     HouseDischargeMaybeEndsEpisode(g2, 320);
@@ -2613,7 +2620,7 @@ URX13Set URX13OtherDigests()
     const std::vector<uint64_t> vUnits{100};
     URX13Set v;
     v.push_back({"BillIssueSigHash", [] {
-        return BillIssueSigHash(URX13_ID, 10000, 546, 8000, 144, URX13_PUB, URX13_PUB2, URX13_PUB, 5); }});
+        return BillIssueSigHash(URX13_ID, 10000, 546, 8000, 144, URX13_PUB, URX13_PUB2, URX13_PUB, 5, uint256()); }});
     v.push_back({"BillEndorseSigHash", [] { return BillEndorseSigHash(URX13_ID, URX13_PUB, URX13_PUB, 100, 0); }});
     v.push_back({"BillRetireSigHash", [tx] { return BillRetireSigHash(tx, URX13_ID, false); }});
     v.push_back({"BillClaimSigHash", [tx] { return BillClaimSigHash(tx, URX13_ID, false); }});
@@ -2641,26 +2648,26 @@ URX13Set URX13BoundDigests()
     const CTransaction tx{CMutableTransaction()};
     const std::vector<uint64_t> vUnits{100};
     URX13Set v;
-    v.push_back({"BillDiscountSigHash", [tx] { return BillDiscountSigHash(tx, URX13_ID); }});
+    v.push_back({"BillDiscountSigHash", [tx] { return BillDiscountSigHash(tx, URX13_ID, uint256()); }});
     v.push_back({"BillRecourseSigHash", [tx] { return BillRecourseSigHash(tx, URX13_ID); }});
     v.push_back({"BillHRetireNotesSigHash",
                  [tx] { return BillHRetireNotesSigHash(tx, URX13_ID); }});
     v.push_back({"BillHRetireEscrowSigHash",
                  [tx] { return BillHRetireEscrowSigHash(tx, URX13_ID); }});
     v.push_back({"DepositOriginateSigHash",
-                 [tx] { return DepositOriginateSigHash(tx); }});   // Stage 0 C1
-    v.push_back({"NoteMintSigHash", [tx] { return NoteMintSigHash(tx); }});
-    v.push_back({"NoteLockSigHash", [tx] { return NoteLockSigHash(tx); }});
-    v.push_back({"NoteUnlockSigHash", [tx] { return NoteUnlockSigHash(tx); }});
+                 [tx] { return DepositOriginateSigHash(tx, uint256()); }});   // Stage 0 C1
+    v.push_back({"NoteMintSigHash", [tx] { return NoteMintSigHash(tx, uint256()); }});
+    v.push_back({"NoteLockSigHash", [tx] { return NoteLockSigHash(tx, uint256()); }});
+    v.push_back({"NoteUnlockSigHash", [tx] { return NoteUnlockSigHash(tx, uint256()); }});
     v.push_back({"NoteSwapSigHash", [tx] { return NoteSwapSigHash(tx); }});
-    v.push_back({"PoolCreateSigHash", [tx] { return PoolCreateSigHash(tx); }});
+    v.push_back({"PoolCreateSigHash", [tx] { return PoolCreateSigHash(tx, uint256()); }});
     v.push_back({"PoolAddLiqSigHash", [tx] { return PoolAddLiqSigHash(tx); }});
     v.push_back({"PoolRemoveLiqSigHash", [tx] { return PoolRemoveLiqSigHash(tx); }});
     v.push_back({"PoolSwapSigHash", [tx] { return PoolSwapSigHash(tx); }});
-    v.push_back({"PoolRetireSigHash", [tx] { return PoolRetireSigHash(tx); }});
-    v.push_back({"SettleExchangeSigHash", [tx] { return SettleExchangeSigHash(tx); }});
-    v.push_back({"SettleNetSigHash", [tx] { return SettleNetSigHash(tx); }});
-    v.push_back({"TokenKeysetSigHash", [tx] { return TokenKeysetSigHash(tx); }});
+    v.push_back({"PoolRetireSigHash", [tx] { return PoolRetireSigHash(tx, uint256()); }});
+    v.push_back({"SettleExchangeSigHash", [tx] { return SettleExchangeSigHash(tx, uint256()); }});
+    v.push_back({"SettleNetSigHash", [tx] { return SettleNetSigHash(tx, uint256()); }});
+    v.push_back({"TokenKeysetSigHash", [tx] { return TokenKeysetSigHash(tx, uint256()); }});
     v.push_back({"TokenPostSigHash", [tx] { return TokenPostSigHash(tx); }});
     v.push_back({"IssuedSigHash", [tx] { return IssuedSigHash(tx); }});
     // S1X-11: the reserve-proof challenge and the proof-set hash carry the network too.
@@ -2935,10 +2942,10 @@ BOOST_AUTO_TEST_CASE(ur_ext_12_precision2_spacing_from_the_end)
         h.nEpisodeEndHeight = 2000;
         CHouse a = h;
         HouseProtestEpisodeStart(a, 1000 + HOUSE_CURE_SPACING_BLOCKS);
-        BOOST_CHECK_EQUAL(a.nNoCureHeight, 1000u + HOUSE_CURE_SPACING_BLOCKS);
+        BOOST_CHECK_EQUAL(a.nNoCureHeight, 1000u + HOUSE_CURE_SPACING_BLOCKS + 1);   // R5-4: the next block
         CHouse b = h;
         HouseProtestEpisodeStart(b, 2000 + HOUSE_CURE_SPACING_BLOCKS - 1);
-        BOOST_CHECK_EQUAL(b.nNoCureHeight, 2000u + HOUSE_CURE_SPACING_BLOCKS - 1);
+        BOOST_CHECK_EQUAL(b.nNoCureHeight, 2000u + HOUSE_CURE_SPACING_BLOCKS);   // R5-4: the next block
         CHouse c = h;
         HouseProtestEpisodeStart(c, 2000 + HOUSE_CURE_SPACING_BLOCKS);
         BOOST_CHECK_EQUAL(c.nNoCureHeight, 0u);
@@ -4252,6 +4259,162 @@ BOOST_AUTO_TEST_CASE(s1x_50_a_residual_settle_with_a_sub_dust_share_is_standard)
     const bool fStandard = AreFreeBankOutputsStandard(CTransaction(mtx), strReason);
     BOOST_CHECK_MESSAGE(fStandard, "S1X-50: a residual-settle RECLAIM with a 300-sat partner share is non-standard (" +
                                    strReason + "), so stock nodes never relay it");
+}
+
+// testing 2026-11-27, R5-13 (s1 Claude max run 5 #13; security 11-27: Medium only if a probe costs over 1 ms at ~25k
+// listed outpoints, "please measure"). vOutEscrowChange / vOutReserveLock have no cap, and every no-slot tx on a house
+// (DEMAND, pool CREATE, token ops, note TRANSFER) and the per-tip sweep re-read the whole record through
+// HouseDB::GetHouse, which deserializes it uncached. This measures one GetHouse of a record holding 25,000 listed
+// outpoints from an in-memory LevelDB (a lower bound: on disk it costs more) and checks security's 1 ms line.
+BOOST_AUTO_TEST_CASE(r5_13_house_record_read_cost_at_25k_listed_outpoints)
+{
+    LOCK(cs_main);
+    HouseDB db(8 << 20, true, true);   // in-memory
+    CHouse h = MakeGuardHouse();
+    h.nHouseID = 1;
+    h.houseID = uint256S("13a1");
+    h.strClassID = "r5-13";
+    for (uint32_t i = 0; i < 25000; i++)
+        h.vOutEscrowChange.push_back(COutPoint(ArithToUint256(arith_uint256(i + 1)), i % 4));
+    const uint32_t nLast = 1;
+    BOOST_REQUIRE(db.WriteBlockEffects({h}, &nLast, uint256S("13b1")));
+    CHouse out;
+    BOOST_REQUIRE(db.GetHouse(1, out));
+    BOOST_REQUIRE_EQUAL(out.vOutEscrowChange.size(), 25000U);
+    const int N = 200;
+    const int64_t t0 = GetTimeMicros();
+    for (int i = 0; i < N; i++) {
+        CHouse r;
+        BOOST_REQUIRE(db.GetHouse(1, r));
+    }
+    const int64_t nPer = (GetTimeMicros() - t0) / N;
+    BOOST_TEST_MESSAGE("R5-13: one GetHouse of a record with 25,000 listed outpoints takes " << nPer << " us (in-memory)");
+    BOOST_CHECK_MESSAGE(nPer <= 1000, "R5-13: one GetHouse of a record with 25,000 listed outpoints takes " +
+        std::to_string(nPer) + " us, over security's 1 ms line; every no-slot tx on the house and the per-tip sweep pay it");
+}
+
+// testing 2026-11-27, R5-13's fix (freebankd mb/run5 1a8fc272): HouseDB::GetHouse keeps decoded records (LRU, bounded by
+// HOUSE_CACHE_MAX_BYTES), cleared by every house write and stage commit, bypassed inside a disconnect stage. GetHouse is
+// the record ConnectBlock reads, so a stale entry would be a node-local consensus split, not just a policy slip. These pin
+// the cache to the database: every write path, the stage's three outcomes, copies independent of the cache, the bound.
+static CHouse R513House(uint32_t nID, uint32_t nOutpoints)
+{
+    CHouse h = MakeGuardHouse();
+    h.nHouseID = nID;
+    h.houseID = ArithToUint256(arith_uint256(0x513000 + nID));
+    h.strClassID = "r5-13-" + std::to_string(nID);
+    for (uint32_t i = 0; i < nOutpoints; i++)
+        h.vOutEscrowChange.push_back(COutPoint(ArithToUint256(arith_uint256(((uint64_t)nID << 32) + i + 1)), i % 4));
+    return h;
+}
+
+BOOST_AUTO_TEST_CASE(r5_13_house_cache_matches_the_database_after_every_write)
+{
+    LOCK(cs_main);
+    HouseDB db(8 << 20, true, true);
+    CHouse h = R513House(1, 25000);
+    uint32_t nLast = 1;
+    BOOST_REQUIRE(db.WriteBlockEffects({h}, &nLast, uint256S("13d1")));
+    CHouse r;
+    BOOST_REQUIRE(db.GetHouse(1, r));
+    BOOST_CHECK_EQUAL(db.HouseCacheEntries(), 1U);
+
+    // A caller's copy is its own: changing it leaves the cached record alone.
+    r.vOutEscrowChange.clear();
+    r.status = HOUSE_STATUS_INSOLVENT;
+    CHouse r2;
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 25000U);
+    BOOST_CHECK(r2.status == h.status);
+
+    // The cost: a cached read of the 25,000-outpoint record is under security's 1 ms line (the copy, not a decode).
+    {
+        const int N = 200;
+        const int64_t t0 = GetTimeMicros();
+        for (int i = 0; i < N; i++) {
+            CHouse c;
+            BOOST_REQUIRE(db.GetHouse(1, c));
+        }
+        const int64_t nPer = (GetTimeMicros() - t0) / N;
+        BOOST_TEST_MESSAGE("R5-13 fix: a cached GetHouse of the 25,000-outpoint record takes " << nPer << " us");
+        BOOST_CHECK_MESSAGE(nPer <= 1000, "R5-13 fix: a cached GetHouse takes " + std::to_string(nPer) + " us");
+    }
+
+    // A block's effects (connect): the next read returns the new record.
+    h.vOutEscrowChange.push_back(COutPoint(uint256S("13e1"), 0));
+    h.status = HOUSE_STATUS_DEFERRED;
+    BOOST_REQUIRE(db.WriteBlockEffects({h}, &nLast, uint256S("13d2")));
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 25001U);
+    BOOST_CHECK(r2.status == HOUSE_STATUS_DEFERRED);
+
+    // An unstaged WriteHouse.
+    h.vOutEscrowChange.resize(24999);
+    BOOST_REQUIRE(db.WriteHouse(h));
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 24999U);
+
+    // A disconnect stage: inside it, reads see the staged record (the cache can't); aborted, the committed record is
+    // back; committed, the staged record stands. The cache is primed before each stage.
+    CHouse hs = h;
+    hs.vOutEscrowChange.resize(100);
+    hs.status = HOUSE_STATUS_OPEN;
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    db.BeginStage();
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 24999U);   // staged, nothing written yet: the database's record
+    BOOST_REQUIRE(db.WriteHouse(hs));
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 100U);
+    BOOST_CHECK(r2.status == HOUSE_STATUS_OPEN);
+    db.AbortStage();
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 24999U);
+    BOOST_CHECK(r2.status == HOUSE_STATUS_DEFERRED);
+    BOOST_REQUIRE(db.GetHouse(1, r2));   // primed again, from the database
+    db.BeginStage();
+    BOOST_REQUIRE(db.WriteHouse(hs));
+    BOOST_REQUIRE(db.CommitUndoStage(uint256S("13d3"), true));
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(r2.vOutEscrowChange.size(), 100U);
+    BOOST_CHECK(r2.status == HOUSE_STATUS_OPEN);
+
+    // A staged REGISTER undo (RemoveHouse inside the stage), committed: the record is gone, cached or not.
+    BOOST_REQUIRE(db.GetHouse(1, r2));
+    db.BeginStage();
+    BOOST_REQUIRE(db.RemoveHouse(1));
+    BOOST_CHECK(!db.GetHouse(1, r2));
+    BOOST_REQUIRE(db.CommitUndoStage(uint256S("13d4"), true));
+    BOOST_CHECK(!db.GetHouse(1, r2));
+    BOOST_CHECK_EQUAL(db.HouseCacheEntries(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(r5_13_house_cache_is_bounded_and_rereads_evicted_records)
+{
+    LOCK(cs_main);
+    HouseDB db(8 << 20, true, true);
+    // ~900 KB serialized each: 90 of them pass the 64 MB bound.
+    const uint32_t nHouses = 90;
+    for (uint32_t id = 1; id <= nHouses; id++) {
+        const uint32_t nLast = id;
+        BOOST_REQUIRE(db.WriteBlockEffects({R513House(id, 25000)}, &nLast, ArithToUint256(arith_uint256(0x13f000 + id))));
+    }
+    size_t nPeak = 0;
+    for (uint32_t id = 1; id <= nHouses; id++) {
+        CHouse r;
+        BOOST_REQUIRE(db.GetHouse(id, r));
+        BOOST_REQUIRE_EQUAL(r.vOutEscrowChange.size(), 25000U);
+        nPeak = std::max(nPeak, db.HouseCacheBytes());
+    }
+    BOOST_TEST_MESSAGE("R5-13 fix: cache peak " << nPeak << " bytes, " << db.HouseCacheEntries() << " entries of " << nHouses);
+    BOOST_CHECK(nPeak <= HouseDB::HOUSE_CACHE_MAX_BYTES);
+    BOOST_CHECK(db.HouseCacheEntries() < nHouses);   // the bound evicted some
+    // House 1 was the least recently used: evicted, it rereads whole and correct from the database.
+    CHouse r;
+    BOOST_REQUIRE(db.GetHouse(1, r));
+    BOOST_CHECK_EQUAL(r.vOutEscrowChange.size(), 25000U);
+    BOOST_CHECK(r.houseID == ArithToUint256(arith_uint256(0x513000 + 1)));
+    BOOST_CHECK(r.vOutEscrowChange[24999] == COutPoint(ArithToUint256(arith_uint256((1ULL << 32) + 25000)), 24999 % 4));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

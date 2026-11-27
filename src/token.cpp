@@ -58,10 +58,10 @@ CPubKey TokenYPoint(const uint256& y)
     return CPubKey(buf, buf + sizeof(buf));
 }
 
-uint256 TokenKeysetSigHash(const CTransaction& tx)
+uint256 TokenKeysetSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankToken/keyset");
+    return CreditTxSigHash(tx, "FreeBankToken/keyset", houseID);   // R5-15 (D-2026-11-27-2 (1)): binds the house's permanent id
 }
 
 uint256 TokenPostSigHash(const CTransaction& tx)

@@ -27,10 +27,18 @@ uint256 SettleHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 SettleExchangeSigHash(const CTransaction& tx)
+uint256 SettleHousesID(const std::vector<uint256>& vHouseCanonical)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankSettle/houses");
+    ss << vHouseCanonical;
+    return ss.GetHash();
+}
+
+uint256 SettleExchangeSigHash(const CTransaction& tx, const uint256& housesID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankSettle/exchange");
+    return CreditTxSigHash(tx, "FreeBankSettle/exchange", housesID);   // R5-15: both houses' permanent ids
 }
 
 bool SettleResidualInBand(uint64_t nUnitsANotes, uint64_t nUnitsBNotes,
@@ -111,10 +119,10 @@ static bool CheckSettleApproverShape(const std::vector<uint32_t>& vIndex,
     return true;
 }
 
-uint256 SettleNetSigHash(const CTransaction& tx)
+uint256 SettleNetSigHash(const CTransaction& tx, const uint256& housesID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankSettle/net");
+    return CreditTxSigHash(tx, "FreeBankSettle/net", housesID);   // R5-15: every house's permanent id
 }
 
 bool SettleNetPositions(const SettleNet& n, std::vector<int64_t>& vNet, std::vector<uint64_t>& vBurn)

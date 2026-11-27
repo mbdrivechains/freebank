@@ -357,6 +357,18 @@ static bool WalletSettleRate(const std::vector<uint32_t>& vHouseID, uint64_t& nR
     nRate = nLo + (nHi - nLo) / 2;
     return nRate != 0;
 }
+/** TG-4 (testing 11-27): an output the house owes a holder (a discharge's payout, its brassage spread) of at least the
+ *  dust threshold for its script. Consensus takes any payout >= what is due, and relay refuses a dust output, so a holder
+ *  who demanded a sub-dust amount (1 mg of notes) could otherwise never be paid by stock software and could then protest.
+ *  The house pays at most the dust threshold more. */
+static CAmount WalletPayAtLeastDust(CAmount amount, const CScript& script)
+{
+    // Security's condition 1 (11-27): the higher of this node's -dustrelayfee and the default, so a house node run with a
+    // lowered -dustrelayfee still builds what default peers relay.
+    const CFeeRate feeDust = std::max(::dustRelayFee, CFeeRate(DUST_RELAY_TX_FEE));
+    return std::max(amount, GetDustThreshold(CTxOut(amount, script), feeDust));
+}
+
 static CAmount WalletMgToSats(uint64_t nMg, uint64_t nPrice)
 {
     return (CAmount)std::min<unsigned __int128>(((unsigned __int128)nMg * nPrice + 999) / 1000, (unsigned __int128)MAX_MONEY);
@@ -3512,8 +3524,13 @@ bool CWallet::IssueBill(CTransactionRef& tx, std::string& strFail, const std::ve
     issue.nRefHouseID = nRefHouseID;
 
     const uint256 billID = BillIDFromBody(vchBody);
+    CHouse houseRef;   // R5-3: the signatures bind the reference house's permanent id
+    {
+        LOCK(cs_main);
+        if (!phousetree->GetHouse(nRefHouseID, houseRef)) { strFail = "Unknown reference house!"; return false; }
+    }
     const uint256 sighash = BillIssueSigHash(billID, nAmount, nAmountEscrow, nMaturityHeight, nGraceBlocks,
-            issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey, nRefHouseID);
+            issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey, nRefHouseID, houseRef.houseID);
 
     if (!keyDrawer.Sign(sighash, issue.vchDrawerSig) || !keyAcceptor.Sign(sighash, issue.vchAcceptorSig)) {
         strFail = "Failed to sign bill issue!";
@@ -3719,6 +3736,8 @@ bool CWallet::EndorseBill(std::string& strFail, uint256& txidOut, const uint32_t
     return true;
 }
 
+static bool WalletHouseByCanonical(const uint256& id, CHouse& houseOut);   // defined below (R5-2)
+
 bool CWallet::ReleaseBillTitle(std::string& strFail, uint256& txidOut, const uint32_t nBillID, const CAmount& nFee)
 {
     strFail = "Unknown error!";
@@ -3751,6 +3770,17 @@ bool CWallet::ReleaseBillTitle(std::string& strFail, uint256& txidOut, const uin
 
     BillTitleRelease rel;
     rel.nBillID = nBillID;
+    if (!bill.hclaimHouseID.IsNull()) {   // R5-2: name the op-8 house; refused while it is failed or closed
+        CHouse houseHC;
+        if (!WalletHouseByCanonical(bill.hclaimHouseID, houseHC)) { strFail = "The bill's op-8 house is unknown"; return false; }
+        const char chHC = HouseEffectiveStatus(houseHC, chainActive.Height() + 1);
+        if (HouseClosed(houseHC) || chHC == HOUSE_STATUS_DEFERRED || chHC == HOUSE_STATUS_INSOLVENT) {
+            strFail = strprintf("House %u, whose quorum defaulted this bill, has failed: its title stays where it is",
+                                houseHC.nHouseID);
+            return false;
+        }
+        rel.nHClaimHouseID = houseHC.nHouseID;
+    }
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_BILL_VERSION;
     mtx.nBillOp = BILL_OP_TITLE_RELEASE;
@@ -4118,7 +4148,7 @@ struct WalletNoteCoin {
 // inside one note op (the interest owed would be ambiguous), so the wallet must
 // never assemble such a spend.
 static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vector<uint256>& vRatePost, CAmount* pnSlotFees,
-                                                   bool fSlotOp);
+                                                   bool fSlotOp, int nProtective = -1, bool* pfProtectiveHolder = nullptr);
 
 /** fIncludePending (the holdings views only, never a builder): also list a pending DEMAND/PROTEST's outputs, as before
  *  TW-1, so the holder's notes don't vanish from view while the op waits for a block.
@@ -4286,10 +4316,11 @@ static void CollectWalletNoteCoins(CWallet* pwallet, uint32_t nHouseID,
     }
 }
 
-static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID, CAmount nFee = -1, bool fSlotOp = true);   // defined below (T-s6: settle-aware; rate ops take their own slot, D-2026-11-11-3; UR-ext-2: fee-aware)
+static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID, CAmount nFee = -1, bool fSlotOp = true,
+                                    bool fProtective = false);   // defined below (T-s6: settle-aware; rate ops take their own slot, D-2026-11-11-3; UR-ext-2: fee-aware)
 static std::string HouseSlotFeeHint();   // defined below (UR-ext-2): the fee the last fail-fast saw, for its message
 static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vector<uint256>& vRatePost, CAmount* pnSlotFees,
-                                                   bool fSlotOp);
+                                                   bool fSlotOp, int nProtective, bool* pfProtectiveHolder);
 
 /** UR-ext-7(c) (plain v1.2.2, security 11-10): while another op holds nHouseID's slot, an op on that house can only get
  *  in by displacing it (UR-ext-2), and a displacing tx may not spend unconfirmed coins (BIP125 rule 2). So drop the
@@ -4323,7 +4354,89 @@ static uint32_t WalletOpHouseID(const CMutableTransaction& mtx)
         nHouseID = ReadLE32(pv->data() + nOffset);
     return nHouseID;
 }
+/** R5-2: the house with permanent id `id` (the op-8 house a bill records), through the hash index - wallet only;
+ *  consensus reads it from the payload's dense id. cs_main held. */
+static bool WalletHouseByCanonical(const uint256& id, CHouse& houseOut)
+{
+    uint32_t nID = 0;
+    return phousetree->GetHouseIDByHash(id, nID) && phousetree->GetHouse(nID, houseOut);
+}
+
 static bool HouseFailFastEnabled();                       // defined below (A8: regtest-only escape)
+
+/** TG-2 (D-2026-11-27-1): whether a failed house's payouts can be built now, else why not. Consensus holds every payout
+ *  while a bill is still in the house's loan book, up to the backstop (HouseCollectionDone). Security's stock-software
+ *  condition (11-27): the payout RPCs clear a ready bill first - op 11 from this wallet, anyone may run it once the bill
+ *  is past maturity + grace - and wait for it to confirm before building the payout, since op 11 and a payout take the
+ *  same house slot. Past the backstop too, so a ready bill's bond still joins the pot before a payout snapshots it.
+ *  Otherwise the refusal names the bills and when op 11 opens for each. cs_main and cs_wallet held.
+ *  INTERFACE: the FreeBank app (session freebank, errors.ts) matches these substrings - keep them stable, or tell it
+ *  first: "was still in the failed house's loan book", "is waiting for a block: run the payout again", "The failed house
+ *  is still collecting its loan book", and (clearbills=false) "is ready to clear from the failed house's loan book;
+ *  clearbills=false, so nothing was sent". */
+static bool HousePayoutReady(CWallet* pwallet, const CHouse& house, int nNext, const CAmount& nFee, std::string& strFail,
+                             bool fClearBills)
+{
+    {
+        LOCK(mempool.cs);
+        for (const uint256& h : mempool.HouseStateConflictTxs(std::vector<uint32_t>{house.nHouseID}, 0)) {
+            const CTransactionRef ptx = mempool.get(h);
+            if (ptx && ptx->nVersion == TRANSACTION_BILL_VERSION &&
+                    (ptx->nBillOp == BILL_OP_HRETIRE_ESCROW || ptx->nBillOp == BILL_OP_HCLAIM_ESCROW)) {
+                strFail = strprintf("A bill leaving this house's loan book (%s) is waiting for a block: run the payout again "
+                                    "after it confirms, so it counts that money!", h.ToString());
+                return false;
+            }
+        }
+    }
+    std::vector<std::string> vBill;
+    size_t nMore = 0;
+    bool fReady = false;
+    CBill billReady;
+    for (const CBill& b : pbilltree->GetBills()) {
+        if (b.nOwnerHouseID != house.nHouseID || b.status != BILL_STATUS_ACTIVE)
+            continue;
+        const uint32_t nOpen = TermDeadlineHeight(b.nIssuedHeight, b.nMaturityHeight, (uint64_t)b.nGraceBlocks + 1, nNext);
+        if ((uint32_t)nNext >= nOpen && !fReady) {
+            fReady = true;
+            billReady = b;
+        }
+        if (vBill.size() >= 10) { nMore++; continue; }
+        vBill.push_back(strprintf("%u (%s)", b.nBillID, (uint32_t)nNext >= nOpen ? std::string("ready now")
+                                                                                  : strprintf("from block %u", nOpen)));
+    }
+    if (fReady && !fClearBills) {
+        // clearbills=false (security 11-27, freebank's phone cap): send nothing; the caller approves the op 11 itself.
+        strFail = strprintf("Bill %u is ready to clear from the failed house's loan book; clearbills=false, so nothing was "
+                            "sent. Clear it with claimbillescrow %u, then run the payout again after that confirms!",
+                            billReady.nBillID, billReady.nBillID);
+        return false;
+    }
+    if (fReady && pwallet) {
+        uint256 txidClear;
+        std::string strWhy;
+        if (pwallet->ClaimBillIntoHouseEscrow(strWhy, txidClear, billReady, house, nFee))
+            strFail = strprintf("Bill %u was still in the failed house's loan book: this wallet moved its bond into the "
+                                "house's escrow first (claimbillescrow, %s). Run the payout again after that confirms, so "
+                                "it counts the bond!", billReady.nBillID, txidClear.ToString());
+        else
+            strFail = strprintf("Bill %u is still in the failed house's loan book and ready to clear, but clearing it here "
+                                "failed (%s). Clear it with claimbillescrow %u, then run the payout again!",
+                                billReady.nBillID, strWhy, billReady.nBillID);
+        return false;
+    }
+    if (HouseCollectionDone(house, nNext))
+        return true;
+    std::string strBills;
+    for (size_t i = 0; i < vBill.size(); i++)
+        strBills += (i ? ", " : "") + vBill[i];
+    if (nMore)
+        strBills += strprintf(" and %u more", (unsigned)nMore);
+    strFail = "The failed house is still collecting its loan book: payouts open once every bill has left it (or at the "
+              "backstop, gethouse: collection_done). Anyone may clear a bill with claimbillescrow once it is ready" +
+              (strBills.empty() ? std::string("") : ": bills " + strBills) + "!";
+    return false;
+}
 
 /** The issuing caps the wallet's fail-fasts check (consensus's CapitalCapUnits / TillCapUnits in validation.cpp): the
  *  house's sECX escrow, or the till amountTillSats, in mg at its 30-day highest ask (Gold B). */
@@ -4516,7 +4629,7 @@ bool CWallet::MintNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID
     mint.nAsOfHeight = nAsOfHeight;
     mint.vReserveProofs = vReserveProofs;
     WriteC1Payload(mtx.vchNotePayload, mint);   // Stage 0 C1: the approvers sign the finished tx
-    if (!SignHouseApprovers(this, house, NoteMintSigHash(CTransaction(mtx)),
+    if (!SignHouseApprovers(this, house, NoteMintSigHash(CTransaction(mtx), house.houseID),
             mint.vApproverIndex, mint.vApproverSig, strFail))
         return false;
 
@@ -4806,7 +4919,7 @@ bool CWallet::LockNotes(std::string& strFail, uint256& txidOut, uint32_t nHouseI
 
     lock.vchHolderPubKey = chosen[0].vchHolderPubKey;
     WriteC1Payload(mtx.vchNotePayload, lock);   // Stage 0 C1: holder and approvers sign the finished tx
-    const uint256 sighash = NoteLockSigHash(CTransaction(mtx));
+    const uint256 sighash = NoteLockSigHash(CTransaction(mtx), house.houseID);
     if (!keyHolder.Sign(sighash, lock.vchHolderSig)) { strFail = "Failed to sign the lock as holder!"; return false; }
     if (!pmtxUnsent && !SignHouseApprovers(this, house, sighash, lock.vApproverIndex, lock.vApproverSig, strFail))
         return false;
@@ -4887,7 +5000,7 @@ bool CWallet::ApproveNoteLock(std::string& strFail, CMutableTransaction& mtx, No
     const CPubKey pubHolder(lock.vchHolderPubKey);
     if (!pubHolder.IsFullyValid()) { strFail = "The lock's holder key is not valid!"; return false; }
     WriteC1Payload(mtx.vchNotePayload, lock);   // Stage 0 C1 (the signature fields are stripped from the digest)
-    const uint256 sighash = NoteLockSigHash(CTransaction(mtx));
+    const uint256 sighash = NoteLockSigHash(CTransaction(mtx), house.houseID);
     if (!pubHolder.Verify(sighash, lock.vchHolderSig)) {
         strFail = "The holder's signature does not cover this lock (changed after signing?)!"; return false;
     }
@@ -4958,7 +5071,7 @@ bool CWallet::UnlockNotes(std::string& strFail, uint256& txidOut, uint32_t nHous
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     WriteC1Payload(mtx.vchNotePayload, unlock);   // Stage 0 C1
-    if (!SignHouseApprovers(this, house, NoteUnlockSigHash(CTransaction(mtx)),
+    if (!SignHouseApprovers(this, house, NoteUnlockSigHash(CTransaction(mtx), house.houseID),
             unlock.vApproverIndex, unlock.vApproverSig, strFail))
         return false;
     CDataStream ssPayload(SER_NETWORK, PROTOCOL_VERSION);
@@ -5142,7 +5255,7 @@ bool CWallet::RegisterTokenKeyset(std::string& strFail, uint256& txidOut, uint64
     mtx.nNoteOp = NOTE_OP_TOKEN_KEYSET;
     return SendFundedNoteOp(strFail, txidOut, mtx, 0, nFee, [&](CMutableTransaction& m, std::string& strErr) {
         WriteC1Payload(m.vchNotePayload, ks);   // Stage 0 C1: the approvers sign the finished tx
-        if (!SignHouseApprovers(this, house, TokenKeysetSigHash(CTransaction(m)),
+        if (!SignHouseApprovers(this, house, TokenKeysetSigHash(CTransaction(m), house.houseID),
                 ks.vApproverIndex, ks.vApproverSig, strErr))
             return false;
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
@@ -5247,22 +5360,34 @@ bool CWallet::RelayTokenClaims(std::string& strFail, uint256& txidOut, uint32_t 
     BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, cs_wallet);
     // Stage 0 rule A (security's ruling 2026-11-26): relays take at most 32 entries per claim, hashed within 2 x entries
-    // + 32 tries. Split at 32; check each part's tries first (an honest part needs 64 +/- 8 of its 96), rather than send
-    // a claim no relay takes.
+    // + 32 tries. Pack the parts by tries (local CI 11-27, s1x_27): a fixed split at 32 sometimes drew a part needing more
+    // than its 96 (an honest part needs 64 +/- 8) and refused the whole claim. Each entry joins the current part while the
+    // part stays within 32 entries and its budget, else starts the next; one secret alone has 34 tries (2^-34 to exceed).
     std::vector<std::vector<TokenClaimEntry>> vPart;
-    for (size_t i = 0; i < vEntry.size(); i += MAX_TOKEN_CLAIM_ENTRIES_RELAY)
-        vPart.emplace_back(vEntry.begin() + i, vEntry.begin() + std::min(vEntry.size(), i + MAX_TOKEN_CLAIM_ENTRIES_RELAY));
-    for (const std::vector<TokenClaimEntry>& part : vPart) {
-        uint32_t nLeft = TokenClaimRelayTryBudget(part.size());
-        for (const TokenClaimEntry& e : part) {
+    {
+        std::vector<TokenClaimEntry> vCur;
+        uint32_t nCurTries = 0;
+        for (const TokenClaimEntry& e : vEntry) {
+            const uint32_t nOne = TokenClaimRelayTryBudget(1);
+            uint32_t nLeft = nOne;
             CPubKey Y;
             if (!CashuHashToCurveBudget(e.vchSecret, Y, nLeft)) {
-                strFail = strprintf("These tokens' secrets need more than the %u hash-to-curve tries relays take for a claim "
-                                    "of %u; claim them in smaller groups.", TokenClaimRelayTryBudget(part.size()),
-                                    (unsigned)part.size());
+                strFail = strprintf("A token's secret needs more than the %u hash-to-curve tries relays take for one token; "
+                                    "no relay takes it.", nOne);
                 return false;
             }
+            const uint32_t nTries = nOne - nLeft;
+            if (!vCur.empty() && (vCur.size() >= MAX_TOKEN_CLAIM_ENTRIES_RELAY ||
+                                  nCurTries + nTries > TokenClaimRelayTryBudget(vCur.size() + 1))) {
+                vPart.push_back(vCur);
+                vCur.clear();
+                nCurTries = 0;
+            }
+            vCur.push_back(e);
+            nCurTries += nTries;
         }
+        if (!vCur.empty())
+            vPart.push_back(vCur);
     }
     for (size_t n = 0; n < vPart.size(); n++) {
         NoteTokenClaim claim;
@@ -5302,17 +5427,21 @@ bool CWallet::ClaimTokens(std::string& strFail, uint256& txidOut, uint32_t nHous
 }
 
 bool CWallet::CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, std::vector<uint256>& vY,
-                            const CAmount& nFee)
+                            const CAmount& nFee, bool fClearBills)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
-    if (HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseStateChangePending(this, nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint(); return false;
     }
     BlockUntilSyncedToCurrentChain();
     LOCK2(cs_main, cs_wallet);
     CHouse house;
     if (!phousetree->GetHouse(nHouseID, house)) { strFail = "Unknown house!"; return false; }
+    // TG-2 (security 11-27): a token COLLECT is a waterfall op and can take the snapshot (MaterializeInsolvency), so clear
+    // a ready bill first and wait for it, as the other payouts do (past the backstop too).
+    if (!HousePayoutReady(this, house, chainActive.Height() + 1, nFee, strFail, fClearBills))
+        return false;
     if (vY.empty()) {
         // Every uncollected claim, up to the per-tx limit.
         const size_t nMax = MAX_TOKEN_COLLECT_ENTRIES;
@@ -5594,7 +5723,7 @@ bool CWallet::ProtestNote(std::string& strFail, uint256& txidOut, uint32_t nHous
     // PROTEST takes the house slot - fail fast on a pending house-state op
     // (A8/C7c: ATMP would refuse anyway, but CommitTransaction does not
     // surface that, and the refused tx would pin its fee inputs).
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -5732,7 +5861,7 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     nRemainingOut = 0;
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
     // A discharge is a REDEEM - it takes the house slot (A8/C7c fail-fast).
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -5911,8 +6040,13 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     uint64_t nPrice = 0;   // at least the bid recorded at the demand (GOLD_B §3)
     if (!WalletHouseRate(house.nHouseID, false, nPrice, strFail, 30, 0, NoteDemandHeightOf(vBurn[0].tag)))
         return false;
-    CAmount amountPayout = WalletMgToSats((uint64_t)amountPayoutMg, nPrice);
-    const CAmount amountSpread = amountSpreadMg > 0 ? WalletMgToSats((uint64_t)amountSpreadMg, nPrice) : 0;
+    const CScript scriptDemandPayout(demChosen.vchPayoutScript.begin(), demChosen.vchPayoutScript.end());
+    // TG-4: never a dust output, or relay refuses the discharge (consensus takes >= due).
+    // At a non-Open house the spread rounds up (S1X-8), so a 1 mg demand can owe the holder 0 mg (security 11-27, TG-4).
+    CAmount amountPayout = WalletPayAtLeastDust(WalletMgToSats((uint64_t)std::max<CAmount>(amountPayoutMg, 0), nPrice),
+                                                scriptDemandPayout);
+    const CAmount amountSpread = amountSpreadMg > 0 ?
+        WalletPayAtLeastDust(WalletMgToSats((uint64_t)amountSpreadMg, nPrice), HouseEscrowScript(house.houseID)) : 0;
 
     // Gold B: R3-12's payment from the partners' gold capital is gone with the gold vaults.
     if (fFromCapital) { strFail = "There is no gold capital to pay from (Gold B): the house pays its queue in sECX"; return false; }
@@ -5920,7 +6054,6 @@ bool CWallet::DischargeDemands(std::string& strFail, uint256& txidOut, uint32_t&
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_NOTE_VERSION;
     mtx.nNoteOp = NOTE_OP_REDEEM;
-    const CScript scriptDemandPayout(demChosen.vchPayoutScript.begin(), demChosen.vchPayoutScript.end());
     mtx.vout.push_back(CTxOut(amountPayout, scriptDemandPayout));
     if (amountSpread > 0) {
         // The brassage spread sits at vout[1] (AddCoins re-tags it as escrow).
@@ -6202,7 +6335,8 @@ bool CWallet::RedeemNote(std::string& strFail, uint256& txidOut, uint32_t nHouse
     return true;
 }
 
-bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee)
+bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee,
+                        bool fClearBills)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
@@ -6210,7 +6344,7 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -6227,11 +6361,8 @@ bool CWallet::ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseI
     }
     // v0.2.28 (consensus mirrors: bad-note-claim-house-closed / -collecting)
     if (HouseClosed(house)) { strFail = "The house is closed: its claim window has ended and claims are refused!"; return false; }
-    if (!HouseCollectionDone(house, chainActive.Height() + 1)) {
-        strFail = "The house is still collecting its loan book - claims open when the book is empty or the collection "
-                  "window ends (gethouse: collection_done)!";
+    if (!HousePayoutReady(this, house, chainActive.Height() + 1, nFee, strFail, fClearBills))   // TG-2
         return false;
-    }
 
     // Exact-sum single-holder burn, like REDEEM (transfer to consolidate first)
     std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
@@ -6554,7 +6685,7 @@ bool CWallet::OriginateDeposit(std::string& strFail, uint256& txidOut, uint32_t 
     org.vRateBps.push_back(nRateBps);
     org.vMaturityHeight.push_back(nMaturityHeight);
     WriteC1Payload(mtx.vchDepositPayload, org);   // Stage 0 C1: the approvers sign the finished transaction
-    if (!SignHouseApprovers(this, house, DepositOriginateSigHash(CTransaction(mtx)),
+    if (!SignHouseApprovers(this, house, DepositOriginateSigHash(CTransaction(mtx), house.houseID),
             org.vApproverIndex, org.vApproverSig, strFail))
         return false;
     WriteC1Payload(mtx.vchDepositPayload, org);
@@ -6968,7 +7099,7 @@ bool CWallet::ProtestDeposit(std::string& strFail, uint256& txidOut, const uint2
             !DecodeDepositPayload(txDemand->vchDepositPayload, d)) { strFail = "Could not read the demand!"; return false; }
     CKey keyHolder;
     if (!GetKey(CPubKey(d.vchHolderPubKey).GetID(), keyHolder)) { strFail = "This wallet is not the receipt's holder!"; return false; }
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, coin.nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, coin.nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint(); return false;
     }
     CHouse house;
@@ -7068,7 +7199,7 @@ bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& 
         if (!DecodeDepositPayload(txC->vchDepositPayload, pr)) { strFail = "Undecodable protest!"; return false; }
         vchKey = pr.vchHolderPubKey; vchPayout = pr.vchPayoutScript; vchPreAuth = pr.vchPreAuthSig;
     } else { strFail = "That transaction is not a deposit demand or protest!"; return false; }
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, coin.nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, coin.nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint(); return false;
     }
     CHouse house;
@@ -7090,6 +7221,7 @@ bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& 
         return false;
     amountPaidOut = WalletMgToSats((uint64_t)coin.nDepositPrincipal +
                                    (uint64_t)DepositMaturityInterest(coin.nDepositPrincipal, nBlocks, coin.nDepositRateBps), nPrice);
+    amountPaidOut = WalletPayAtLeastDust(amountPaidOut, CScript(vchPayout.begin(), vchPayout.end()));   // TG-4
 
     DepositDischarge dc;
     dc.nHouseID = coin.nHouseID;
@@ -7109,7 +7241,8 @@ bool CWallet::DischargeDeposit(std::string& strFail, uint256& txidOut, CAmount& 
     return FundSignCommitDepositOp(strFail, txidOut, mtx, coin.out.nValue, amountPaidOut, nFee, false, CScript());
 }
 
-bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee)
+bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee,
+                           bool fClearBills)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
@@ -7117,7 +7250,7 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -7133,11 +7266,8 @@ bool CWallet::ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHou
     }
     // v0.2.28 (consensus mirrors: bad-deposit-claim-house-closed / -collecting)
     if (HouseClosed(house)) { strFail = "The house is closed: its claim window has ended and claims are refused!"; return false; }
-    if (!HouseCollectionDone(house, nNextHeight)) {
-        strFail = "The house is still collecting its loan book - claims open when the book is empty or the collection "
-                  "window ends (gethouse: collection_done)!";
+    if (!HousePayoutReady(this, house, nNextHeight, nFee, strFail, fClearBills))   // TG-2
         return false;
-    }
 
     WalletDepositCoin dc;
     if (!SelectDepositReceipt(this, nHouseID, nPrincipal, false, nNextHeight, dc, true /* v0.2.29: demanded too */)) {
@@ -7432,7 +7562,7 @@ static bool HouseFailFastEnabled()
 }
 
 static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vector<uint256>& vRatePost, CAmount* pnSlotFees,
-                                                   bool fSlotOp);
+                                                   bool fSlotOp, int nProtective, bool* pfProtectiveHolder);
 
 /** UR-ext-2 (plain v1.2.2): the node now settles a house-slot conflict by fee (ATMP's fnSlotYields), so a pending op is
  *  no longer a reason to refuse outright: an op whose fee beats the pooled ops holding the slot (their fees with
@@ -7452,13 +7582,20 @@ static std::string HouseSlotFeeHint()
 /** D-2026-11-11-3 (R121-R2): rate ops (POST, SETKEY) take their own slot, not the house slot, so a pooled one never
  *  counts here - the wallet's own POST included (an op may spend its change: they no longer conflict, TW-2).
  *  pwalletOwn is kept for the callers' shape. */
-static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID, CAmount nFee, bool fSlotOp)
+static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID, CAmount nFee, bool fSlotOp,
+                                    bool fProtective)
 {
     (void)pwalletOwn;
     std::vector<uint256> vRatePost;
     CAmount nSlotFees = 0;
     g_nSlotFeesSeen = 0;
-    if (HouseStateChangePendingExceptRatePosts(nHouseID, vRatePost, &nSlotFees, fSlotOp)) {
+    bool fProtectiveHolder = false;
+    // TG-3 (the node's rule, IsHouseSlotProtective): a protective op doesn't count non-protective holders (it displaces
+    // them whatever the fees), and a non-protective op can't displace a protective holder at any fee (no fee hint then).
+    if (HouseStateChangePendingExceptRatePosts(nHouseID, vRatePost, &nSlotFees, fSlotOp, fProtective ? 1 : 0,
+                                               &fProtectiveHolder)) {
+        if (!fProtective && fProtectiveHolder)
+            return true;
         g_nSlotFeesSeen = nSlotFees;
         // UR-ext-2: a fee that beats the slot's holders goes to the node, which decides.
         if (nFee >= 0 && nSlotFees > 0 && nFee > nSlotFees + ::incrementalRelayFee.GetFee(1000))
@@ -7472,9 +7609,9 @@ static bool HouseStateChangePending(const CWallet* pwalletOwn, uint32_t nHouseID
  *  deposit DEMAND, a pool CREATE) holds it too - ATMP refuses or fee-compares that pair (HouseStateKeysConflict). False
  *  for a reader (DEMAND, CREATE) and for ops that hold nothing (a TRANSFER): only pooled slot ops count, as before. */
 static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vector<uint256>& vRatePost, CAmount* pnSlotFees,
-                                                   bool fSlotOp)
+                                                   bool fSlotOp, int nProtective, bool* pfProtectiveHolder)
 {
-    LOCK(mempool.cs);
+    LOCK2(cs_main, mempool.cs);   // TG-3: IsHouseSlotProtective reads the tip and a RECLAIM's house
     bool fPending = false;
     HouseStateKeys keysMine;
     if (fSlotOp)
@@ -7498,6 +7635,14 @@ static bool HouseStateChangePendingExceptRatePosts(uint32_t nHouseID, std::vecto
         // pooled swap slipped past every fail-fast and a netting round reached the pool to be refused. UR3-8: and the
         // node's own conflict rule.
         if (nHouseID != 0 && HouseStateKeysConflict(keysMine, GetHouseStateKeys(mtx))) {
+            // TG-3: nProtective 1 (the wallet's op is protective) skips non-protective holders; 0 flags a protective one.
+            if (nProtective >= 0) {
+                const bool fTheirs = IsHouseSlotProtective(mtx, chainActive.Height() + 1);
+                if (nProtective == 1 && !fTheirs)
+                    continue;
+                if (fTheirs && pfProtectiveHolder)
+                    *pfProtectiveHolder = true;
+            }
             fPending = true;
             if (!pnSlotFees)
                 return true;
@@ -7616,7 +7761,7 @@ bool CWallet::CreatePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
         mtx.vin.push_back(CTxIn(coin.outpoint.hash, coin.outpoint.n, CScript()));
 
     WriteC1Payload(mtx.vchPoolPayload, create);   // Stage 0 C1: the creator and approvers sign the finished tx
-    const uint256 sighash = PoolCreateSigHash(CTransaction(mtx));
+    const uint256 sighash = PoolCreateSigHash(CTransaction(mtx), house.houseID);
     if (!keyCreator.Sign(sighash, create.vchCreatorSig)) { strFail = "Failed to sign as pool creator!"; return false; }
     if (!SignHouseApprovers(this, house, sighash, create.vApproverIndex, create.vApproverSig, strFail))
         return false;
@@ -7986,7 +8131,7 @@ bool CWallet::RetirePool(std::string& strFail, uint256& txidOut, uint32_t nPoolI
     // Insolvent (the liveness path - no M-of-N assembly required); otherwise the
     // charter M-of-N approves (valid at any status).
     WriteC1Payload(mtx.vchPoolPayload, ret);   // Stage 0 C1
-    const uint256 sighash = PoolRetireSigHash(CTransaction(mtx));
+    const uint256 sighash = PoolRetireSigHash(CTransaction(mtx), house.houseID);
     if (chEff == HOUSE_STATUS_INSOLVENT) {
         bool fSigned = false;
         for (size_t j = 0; j < house.vPartner.size(); j++) {
@@ -8519,7 +8664,7 @@ bool CWallet::SignSettle(std::string& strFail, std::string& strHexTxOut,
     // digest excludes sig fields, and so does the input sighash's payload
     // binding, creditbind.h).
     WriteC1Payload(mtx.vchSettlePayload, x);   // Stage 0 C1: the signers sign the finished tx (sig fields stripped)
-    const uint256 sighash = SettleExchangeSigHash(CTransaction(mtx));
+    const uint256 sighash = SettleExchangeSigHash(CTransaction(mtx), SettleHousesID({houseA.houseID, houseB.houseID}));   // R5-15
     {
         std::vector<uint32_t>& vIdx = fOwnIsA ? x.vApproverIndexA : x.vApproverIndexB;
         std::vector<std::vector<unsigned char>>& vSig = fOwnIsA ? x.vApproverSigA : x.vApproverSigB;
@@ -8673,7 +8818,9 @@ bool CWallet::CompleteSettle(std::string& strFail, uint256& txidOut, const std::
     // Counter-sign: our quorum + our presenter (we present the OTHER house's
     // issue, so our presenter slot is the ctpy-issued side's key).
     WriteC1Payload(mtx.vchSettlePayload, x);   // Stage 0 C1: the signers sign the finished tx (sig fields stripped)
-    const uint256 sighash = SettleExchangeSigHash(CTransaction(mtx));
+    const CHouse& houseSigA = fSignA ? houseOwn : houseCtpy;   // R5-15: the round's houses in payload order (A, B)
+    const CHouse& houseSigB = fSignA ? houseCtpy : houseOwn;
+    const uint256 sighash = SettleExchangeSigHash(CTransaction(mtx), SettleHousesID({houseSigA.houseID, houseSigB.houseID}));
     {
         std::vector<uint32_t>& vIdx = fSignA ? x.vApproverIndexA : x.vApproverIndexB;
         std::vector<std::vector<unsigned char>>& vSig = fSignA ? x.vApproverSigA : x.vApproverSigB;
@@ -9254,7 +9401,10 @@ bool CWallet::SignNetting(std::string& strFail, std::string& strRoundOut, uint25
     }
 
     WriteC1Payload(mtx.vchSettlePayload, n);   // Stage 0 C1: the finished tx (the signature lists are stripped)
-    const uint256 sighash = SettleNetSigHash(CTransaction(mtx));
+    std::vector<uint256> vNetCanonical;   // R5-15: every house's permanent id, in payload order
+    for (const uint32_t nID : n.vHouseID)
+        vNetCanonical.push_back(mapHouse[nID].houseID);
+    const uint256 sighash = SettleNetSigHash(CTransaction(mtx), SettleHousesID(vNetCanonical));
     n.vApproverIndex[nOwn].clear();
     n.vApproverSig[nOwn].clear();
     if (!SignSettleApprovers(this, mapHouse[nOwnHouseID], sighash, n.vApproverIndex[nOwn], n.vApproverSig[nOwn], strFail))
@@ -9727,7 +9877,7 @@ bool CWallet::SignDiscount(std::string& strFail, std::string& strHexTxOut,
     // -- our authority: the house quorum over the shared digest ----------------
     {
         WriteC1Payload(mtx.vchBillPayload, d);   // Stage 0 C1
-        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), bill.billID);
+        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), bill.billID, house.houseID);
         if (!SignHouseApprovers(this, house, sighash, d.vApproverIndex, d.vApproverSig, strFail))
             return false;
     }
@@ -9880,7 +10030,7 @@ bool CWallet::CompleteDiscount(std::string& strFail, uint256& txidOut, const std
     }
     {
         WriteC1Payload(mtx.vchBillPayload, d);   // Stage 0 C1
-        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), bill.billID);
+        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), bill.billID, house.houseID);
         if (!keyHolder.Sign(sighash, d.vchSellerSig)) {
             strFail = "Failed to sign the discount!"; return false;
         }
@@ -9999,14 +10149,30 @@ bool CWallet::RecourseBill(std::string& strFail, uint256& txidOut, const uint32_
 
     const CScript scriptHolder = BillScriptForPubKey(bill.vchHolderPubKey);
 
+    // R5-2 (D-2026-11-27-3): on a bill op 8 defaulted, name the op-8 house; while it is Deferred or Insolvent the cure
+    // goes to its escrow (consensus forces it), and once it is closed there is no recourse.
+    uint32_t nEscrowHouseID = 0;
+    CScript scriptPayTo = scriptHolder;
+    if (!bill.hclaimHouseID.IsNull() && bill.nHClaimRecourses == 0) {   // the first recourse after op 8 only
+        CHouse houseHC;
+        if (!WalletHouseByCanonical(bill.hclaimHouseID, houseHC)) { strFail = "The bill's op-8 house is unknown"; return false; }
+        if (HouseClosed(houseHC)) {
+            strFail = strprintf("House %u, whose quorum defaulted this bill, is closed: no recourse is taken", houseHC.nHouseID);
+            return false;
+        }
+        nEscrowHouseID = houseHC.nHouseID;
+        const char chHC = HouseEffectiveStatus(houseHC, chainActive.Height() + 1);
+        if (chHC == HOUSE_STATUS_DEFERRED || chHC == HOUSE_STATUS_INSOLVENT)
+            scriptPayTo = HouseEscrowScript(houseHC.houseID);
+    }
+
     CMutableTransaction mtx;
     mtx.nVersion = TRANSACTION_BILL_VERSION;
     mtx.nBillOp = BILL_OP_RECOURSE;
 
-    // vout[0] = the cure, paid straight to the holder's key. No title spend and
-    // no holder signature - that is what makes this work against an
-    // uncooperative holder.
-    mtx.vout.push_back(CTxOut(amountFloor, scriptHolder));
+    // vout[0] = the cure, paid straight to the holder's key (or, R5-2, the failed op-8 house's escrow). No title spend
+    // and no holder signature - that is what makes this work against an uncooperative holder.
+    mtx.vout.push_back(CTxOut(amountFloor, scriptPayTo));
 
     std::vector<COutput> vCoins;
     AvailableCoins(vCoins, true /* fOnlySafe */);
@@ -10042,6 +10208,7 @@ bool CWallet::RecourseBill(std::string& strFail, uint256& txidOut, const uint32_
     // The digest binds prevouts AND outputs, so both are final before we sign.
     BillRecourse r;
     r.nBillID = nBillID;
+    r.nEscrowHouseID = nEscrowHouseID;   // R5-2
     r.vchPayerPubKey = vchPayer;
     r.vchPrevHolderPubKey = bill.vchHolderPubKey;
     r.nRateNamed = nPrice;
@@ -10087,7 +10254,7 @@ bool CWallet::HouseHeldRetireBill(std::string& strFail, uint256& txidOut,
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
 
-    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for the owning house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -10214,7 +10381,7 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
 
-    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for the owning house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -10228,6 +10395,15 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
         return false;
     }
 
+    // R5-1 (D-2026-11-27-3): at an Insolvent house a bill is repaid in sECX only (consensus
+    // bad-bill-hretireescrow-notes-insolvent), never less than the bond.
+    const bool fOwnerInsolvent = fIntoEscrow &&
+                                 HouseEffectiveStatus(house, chainActive.Height() + 1) == HOUSE_STATUS_INSOLVENT;
+    if (fOwnerInsolvent && nNoteUnits > 0) {
+        strFail = "The owning house is insolvent: a bill owed to it is repaid in sECX only, not in its notes - run "
+                  "retirebill with 0 notes!";
+        return false;
+    }
     // The notes: plain (undemanded) coins of the owning house only - consensus refuses any other.
     const uint64_t nTarget = std::min<uint64_t>(nNoteUnits, (uint64_t)bill.amount);
     std::map<std::pair<CKeyID, uint32_t>, std::vector<WalletNoteCoin>> mapByHolder;
@@ -10277,6 +10453,8 @@ bool CWallet::HouseHeldRetireBillInNotes(std::string& strFail, uint256& txidOut,
     CAmount amountRest = 0;
     if (!WalletBillRepayment(bill, amountRestMg, nMarginBps, nPrice, amountRest, strFail))
         return false;
+    if (fOwnerInsolvent)
+        amountRest = std::max(amountRest, bill.amountEscrow);   // R5-1: never less than the bond
     if (fIntoEscrow && amountRest <= 0)
         amountRest = 1;   // op 10's vout[0] is always the escrow; raised to the dust line below
     if (amountRest > 0) {
@@ -10403,7 +10581,7 @@ bool CWallet::ClaimBillIntoHouseEscrow(std::string& strFail, uint256& txidOut, c
     // Deferred/Insolvent house's escrow. No quorum - the destination is fixed - and the fee comes from this wallet.
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
-    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -10481,7 +10659,7 @@ bool CWallet::HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut,
     AssertLockHeld(cs_main);
     AssertLockHeld(cs_wallet);
 
-    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee)) {
+    if (HouseStateChangePending(this, bill.nOwnerHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -10517,7 +10695,7 @@ bool CWallet::HouseHeldClaimBillEscrow(std::string& strFail, uint256& txidOut,
     // The QUORUM replaces op 4's single holder signature - the custody key alone
     // must never direct the escrow payout, nor take a bill out of the book.
     WriteC1Payload(mtx.vchBillPayload, h);   // Stage 0 C1
-    if (!SignHouseApprovers(this, house, BillClaimSigHash(CTransaction(mtx), bill.billID, true),
+    if (!SignHouseApprovers(this, house, BillClaimSigHash(CTransaction(mtx), bill.billID, true, house.houseID),
                             h.vApproverIndex, h.vApproverSig, strFail))
         return false;
 
@@ -11366,7 +11544,7 @@ bool CWallet::BuildDeferOrRenew(std::string& strFail, uint256& txidOut,
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee, true, !fRenew)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -11911,7 +12089,8 @@ bool CWallet::AttestHouse(std::string& strFail, uint256& txidOut, const uint32_t
     return true;
 }
 
-bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee)
+bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee,
+                            bool fClearBills)
 {
     strFail = "Unknown error!";
 
@@ -11923,7 +12102,15 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
     // slot, so building it against a pooled house-state op makes a tx ATMP
     // will refuse - and CommitTransaction does not surface that; the refused
     // phantom pins its inputs out of both wallet views until abandoned (C7c).
-    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee)) {
+    // TG-3: a RECLAIM at an insolvent house (the partners' residual settle) is protective.
+    bool fReclaimProtective = false;
+    {
+        LOCK(cs_main);
+        CHouse houseNow;
+        fReclaimProtective = phousetree->GetHouse(nHouseID, houseNow) &&
+                             HouseEffectiveStatus(houseNow, chainActive.Height() + 1) == HOUSE_STATUS_INSOLVENT;
+    }
+    if (HouseFailFastEnabled() && HouseStateChangePending(this, nHouseID, nFee, true, fReclaimProtective)) {
         strFail = "A house-state-changing op (or a pending settle) for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -11963,6 +12150,10 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
             strFail = "Partner already settled!";
             return false;
         }
+        // TG-2 (security 11-27, D/E (c)): the residual settle needs an empty book (consensus), so clear a ready bill
+        // first and wait for it, as the other payouts do.
+        if (!HousePayoutReady(this, house, chainActive.Height() + 1, nFee, strFail, fClearBills))
+            return false;
         if (house.nMintedUnits != 0) {
             strFail = "Notes still outstanding - holders claim first (holders senior)!";
             return false;
@@ -11980,6 +12171,10 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
         for (const HousePartner& p : house.vPartner)
             vSettleOutpoints.insert(vSettleOutpoints.end(), p.vOutPledge.begin(), p.vOutPledge.end());
         vSettleOutpoints.insert(vSettleOutpoints.end(), house.vOutEscrowChange.begin(), house.vOutEscrowChange.end());
+        // R5-30 (run 5, testing 11-27): the till locked at DEFER and op 10's repayments are part of the pot, and consensus
+        // requires the settle to spend them too (HouseEscrowOutpoints); without them it was refused
+        // bad-house-settle-incomplete after any DEFER.
+        vSettleOutpoints.insert(vSettleOutpoints.end(), house.vOutReserveLock.begin(), house.vOutReserveLock.end());
         for (const COutPoint& out : vSettleOutpoints) {
             Coin coin;
             if (viewSettle.GetCoin(out, coin) && !coin.IsSpent() && coin.fHouseEscrow) {
@@ -12043,7 +12238,10 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
             strFail = "Residual share computation failed (pot drained)!";
             return false;
         }
-        vShare.back().second += amountLive - amountShareSum;
+        // TG-2b (D-2026-11-27-2 (8)): the last partner takes the residual's rounding only; live escrow over the residual
+        // goes to the mutual fund output after the partners' (consensus bad-house-settle-fund), as at CLOSE.
+        vShare.back().second += amountResidual - amountShareSum;
+        const CAmount amountSettleFund = amountLive - amountResidual;
 
         CMutableTransaction mtx;
         mtx.nVersion = TRANSACTION_HOUSE_VERSION;
@@ -12052,6 +12250,8 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
             mtx.vin.push_back(CTxIn(out, CScript()));
         for (const auto& sh : vShare)
             mtx.vout.push_back(CTxOut(sh.second, NoteScriptForPubKey(house.vPartner[sh.first].vchPubKey)));
+        if (amountSettleFund > 0)
+            mtx.vout.push_back(CTxOut(amountSettleFund, MutualFundScript()));
 
         // Fee from plain coins; change appended after the forced outputs
         std::vector<COutput> vCoins;
@@ -12200,7 +12400,7 @@ bool CWallet::ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32
 
 
 bool CWallet::CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amountFundOut, const uint32_t nHouseID,
-                         const CAmount& nFee)
+                         const CAmount& nFee, bool fClearBills)
 {
     strFail = "Unknown error!";
     amountFundOut = 0;
@@ -12218,13 +12418,14 @@ bool CWallet::CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amount
         strFail = strprintf("The claim window is open until block %u - CLOSE is allowed from then on!", nCloses);
         return false;
     }
-    if (!HouseCollectionDone(house, nNext)) { strFail = "The house is still collecting its loan book!"; return false; }
+    if (!HousePayoutReady(this, house, nNext, nFee, strFail, fClearBills))   // TG-2
+        return false;
     if (house.nLoanBookFace != 0) {
         strFail = "Bills are still in the house's loan book - clear each with claimbillescrow (anyone may, after maturity + "
                   "grace), then close!";
         return false;
     }
-    if (HouseStateChangePending(this, nHouseID, nFee)) {
+    if (HouseStateChangePending(this, nHouseID, nFee, true, true)) {
         strFail = "A house-state-changing op for this house is already in the mempool - retry next block!" + HouseSlotFeeHint();
         return false;
     }
@@ -14396,7 +14597,7 @@ bool CWallet::SwapExpire(std::string& strFail, uint256& txidOut, const uint256& 
 }
 
 bool CWallet::SwapClaimFromEscrow(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee,
-                                  CAmount& amountPaidOut)
+                                  CAmount& amountPaidOut, bool fClearBills)
 {
     strFail = "Unknown error!";
     if (!HasWallets()) { strFail = "No active wallet!"; return false; }
@@ -14408,7 +14609,8 @@ bool CWallet::SwapClaimFromEscrow(std::string& strFail, uint256& txidOut, const 
     if (!phousetree->GetHouse(r.nHouseID, house)) { strFail = "Unknown house"; return false; }
     const int nNext = chainActive.Height() + 1;
     if (HouseEffectiveStatus(house, nNext) != HOUSE_STATUS_INSOLVENT) { strFail = "The house has not failed"; return false; }
-    if (!HouseCollectionDone(house, nNext)) { strFail = "The failed house is still collecting its bills - claims open after"; return false; }
+    if (!HousePayoutReady(this, house, nNext, nFee, strFail, fClearBills))   // TG-2
+        return false;
     uint64_t nUnits = 0;
     if (r.Open())
         nUnits = r.nUnits;

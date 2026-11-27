@@ -172,7 +172,9 @@ uint256 SettleHashPrevouts(const CTransaction& tx);
  * field of the payload in declaration order (sig/index fields excluded),
  * hashPrevouts, hashOutputs. Atomic mutual consent - neither side can alter
  * any term after the other signs. */
-uint256 SettleExchangeSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+/** R5-15 (D-2026-11-27-2 (1)): one id for a round's houses - their permanent ids, in payload order - bound by its digest. */
+uint256 SettleHousesID(const std::vector<uint256>& vHouseCanonical);
+uint256 SettleExchangeSigHash(const CTransaction& tx, const uint256& housesID);   // Stage 0 C1: CreditTxSigHash; R5-15
 
 /** Payload-pure residual band check (consensus s4 check 6; NO DB read - par
  * is 1:1 by canon). For dU = nUnitsANotes - nUnitsBNotes:
@@ -253,7 +255,7 @@ struct SettleNet {
 
 /** The digest every NET signature covers: domain tag, every value field in declaration order (signatures and
  * approver indices excluded), hashPrevouts, hashOutputs. */
-uint256 SettleNetSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 SettleNetSigHash(const CTransaction& tx, const uint256& housesID);   // Stage 0 C1: CreditTxSigHash; R5-15
 
 /** Each house's net position and burn (units of its notes presented), parallel to vHouseID. False if a bundle names
  * a house outside the round, or a house's presented or presented-of total leaves SETTLE_MAX_UNITS. */

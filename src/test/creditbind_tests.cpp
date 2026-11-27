@@ -159,13 +159,15 @@ BOOST_AUTO_TEST_CASE(binding_form_per_op)
         p.vchSellerSig.clear();
         ClearApprovers(p);
     }, "BILL DISCOUNT");
-    CheckOp<BillRecourse>(B, BILL_OP_RECOURSE, 18, [](BillRecourse& p) { p.vchPayerSig.clear(); }, "BILL RECOURSE");
+    CheckOp<BillRecourse>(B, BILL_OP_RECOURSE, 22,   // R5-2: nEscrowHouseID (4 bytes, bound)
+            [](BillRecourse& p) { p.vchPayerSig.clear(); }, "BILL RECOURSE");
     CheckOp<BillHRetire>(B, BILL_OP_HRETIRE, 54, [](BillHRetire& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE");
     CheckOp<BillHClaim>(B, BILL_OP_HCLAIM, 52, [](BillHClaim& p) { ClearApprovers(p); }, "BILL HCLAIM");
     CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_NOTES, 70, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_NOTES");
     CheckOp<BillHRetireNotes>(B, BILL_OP_HRETIRE_ESCROW, 70, [](BillHRetireNotes& p) { p.vchAcceptorSig.clear(); }, "BILL HRETIRE_ESCROW");
     CheckOp<BillHClaimEscrow>(B, BILL_OP_HCLAIM_ESCROW, 44, [](BillHClaimEscrow&) {}, "BILL HCLAIM_ESCROW");
-    CheckOp<BillTitleRelease>(B, BILL_OP_TITLE_RELEASE, 4, [](BillTitleRelease&) {}, "BILL TITLE_RELEASE");   // S1X-29
+    CheckOp<BillTitleRelease>(B, BILL_OP_TITLE_RELEASE, 8,   // R5-2: nHClaimHouseID (4 bytes, bound)
+            [](BillTitleRelease&) {}, "BILL TITLE_RELEASE");   // S1X-29
 
     CheckOp<HouseRegister>(H, HOUSE_OP_REGISTER, 32, [](HouseRegister& p) { p.vPartnerSig.clear(); }, "HOUSE REGISTER");
     CheckOp<HouseTopup>(H, HOUSE_OP_TOPUP, 10, [](HouseTopup& p) { p.vchSig.clear(); }, "HOUSE TOPUP");
@@ -470,9 +472,9 @@ BOOST_AUTO_TEST_CASE(binding_height_per_network)
     BOOST_CHECK(easynet->GetConsensus().CreditBindingActive(0));
     // ...and credits treasury changes only from its deposit start (L1 2,058 for the v1.2.2 restart; 1,676 at v1.2.0,
     // 1,100 at v1.1.0); every other network from the start. Building the params also checks easynet's genesis hash.
-    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 3975);   // v1.2.7 restart
-    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0xe457ddc1b3fe7954f1ce26f7797469854c722b4d3574ea8d37017feab2801c7a"));
-    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0d);   // a fresh chain's magic (v1.2.7, D-2026-11-23-1)
+    BOOST_CHECK_EQUAL(easynet->GetConsensus().nDepositStartL1Height, 4166);   // v1.2.8 restart
+    BOOST_CHECK(easynet->GetConsensus().hashGenesisBlock == uint256S("0x9558468672f8a2806212edc1de78597c1689a16d1ec3b06ee9b3fc7b8eda008b"));
+    BOOST_CHECK_EQUAL(easynet->MessageStart()[3], 0x0e);   // a fresh chain's magic (v1.2.8, D-2026-11-23-1)
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::MAIN)->GetConsensus().nDepositStartL1Height, 0);
     BOOST_CHECK_EQUAL(CreateChainParams(CBaseChainParams::REGTEST)->GetConsensus().nDepositStartL1Height, 0);
 }

@@ -41,6 +41,12 @@ bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& s
     if (!DecodeHousePayload(tx.vchHousePayload, rate) || rate.nKind != HOUSE_RATE_POST)
         return true;
     CUnitsView units(punitsdb.get());   // scratch: written to, then dropped
+    uint64_t nSeq = 0;
+    units.Get(HouseRatePostSeqKey(rate.nHouseID), nSeq);
+    if (rate.nPrevSeq != nSeq) {   // R5-6: a newer POST or a SETKEY connected
+        strReject = "bad-house-rate-stale";
+        return false;
+    }
     std::vector<unsigned char> vchKey;
     if (!units.Get(RateKeyKey(rate.nHouseID), vchKey)) {
         strReject = "bad-house-rate-nokey";
@@ -57,6 +63,37 @@ bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& s
     }
     return ApplyHouseRatePost(units, rate.nHouseID, rate.nBid, rate.nAsk, (uint32_t)nHeight, clock.nMonoTime,
                               Params().GetConsensus().GramAt(nHeight), strReject, clock.nActiveTime);
+}
+
+bool HouseRateOpCountStale(const CTransaction& tx, std::string& strReject)
+{
+    // R5-6 (security 11-27): a pooled SETKEY or charter op a newer one has made stale holds its slot until dropped.
+    if (tx.nVersion != TRANSACTION_HOUSE_VERSION)
+        return false;
+    CUnitsView units(punitsdb.get());
+    if (tx.nHouseOp == HOUSE_OP_RATE) {
+        HouseRate rate;
+        if (!DecodeHousePayload(tx.vchHousePayload, rate) || rate.nKind != HOUSE_RATE_SETKEY)
+            return false;
+        uint64_t n = 0;
+        units.Get(HouseRateKeySeqKey(rate.nHouseID), n);
+        if (rate.nPrevSeq == n)
+            return false;
+        strReject = "bad-house-rate-stale";
+        return true;
+    }
+    if (tx.nHouseOp == HOUSE_OP_CHARTER) {
+        HouseCharter ch;
+        if (!DecodeHousePayload(tx.vchHousePayload, ch))
+            return false;
+        uint64_t n = 0;
+        units.Get(HouseCharterSeqKey(ch.nHouseID), n);
+        if (ch.nPrevSeq == n)
+            return false;
+        strReject = "bad-house-charter-stale";
+        return true;
+    }
+    return false;
 }
 
 bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnitsView& units, int nHeight,
@@ -100,8 +137,16 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
         HouseRate rate;
         if (!DecodeHousePayload(tx.vchHousePayload, rate))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-rate-payload");
+        // R5-6 (D-2026-11-27-2 (2)): a SETKEY names the key count, a POST the post count (houserate.h); stale if newer.
+        uint64_t nKeySeq = 0, nPostSeq = 0;
+        units.Get(HouseRateKeySeqKey(rate.nHouseID), nKeySeq);
+        units.Get(HouseRatePostSeqKey(rate.nHouseID), nPostSeq);
+        if (rate.nPrevSeq != (rate.nKind == HOUSE_RATE_SETKEY ? nKeySeq : nPostSeq))
+            return state.DoS(0, false, REJECT_INVALID, "bad-house-rate-stale");
         if (rate.nKind == HOUSE_RATE_SETKEY) {
             units.Put(RateKeyKey(rate.nHouseID), rate.vchRatePubKey);
+            units.Put(HouseRateKeySeqKey(rate.nHouseID), nKeySeq + 1);
+            units.Put(HouseRatePostSeqKey(rate.nHouseID), nPostSeq + 1);   // a pending POST under the old key goes stale
             // SA-H2 (switch-on): the partners' new key may restore the house's recent high once (houserate.h)
             CChainClock clock;
             if (GetChainClock(units, clock))
@@ -119,6 +164,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
             if (!ApplyHouseRatePost(units, rate.nHouseID, rate.nBid, rate.nAsk, (uint32_t)nHeight, clock.nMonoTime,
                                     Params().GetConsensus().GramAt(nHeight), strReject, clock.nActiveTime))
                 return state.DoS(strReject == "bad-house-rate-spread" ? 100 : 0, false, REJECT_INVALID, strReject);
+            units.Put(HouseRatePostSeqKey(rate.nHouseID), nPostSeq + 1);
         }
     }
 
@@ -214,6 +260,10 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
         HouseCharter ch;
         if (!DecodeHousePayload(tx.vchHousePayload, ch))
             return state.DoS(100, false, REJECT_INVALID, "bad-house-charter-payload");
+        uint64_t nCharterSeq = 0;   // R5-6: the charter-op count it follows
+        units.Get(HouseCharterSeqKey(ch.nHouseID), nCharterSeq);
+        if (ch.nPrevSeq != nCharterSeq)
+            return state.DoS(0, false, REJECT_INVALID, "bad-house-charter-stale");
         CChainClock clock;
         if (!GetChainClock(units, clock))
             return state.DoS(0, false, REJECT_INVALID, "bad-house-charter-noclock");
@@ -221,6 +271,7 @@ bool ConnectIssuedTx(const CTransaction& tx, const CCoinsViewCache& view, CUnits
         if (!ApplyHouseCharter(units, ch, (uint32_t)nHeight, clock.nMonoTime, Params().GetConsensus().GramAt(nHeight),
                                strReject))
             return state.DoS(0, false, REJECT_INVALID, strReject);
+        units.Put(HouseCharterSeqKey(ch.nHouseID), nCharterSeq + 1);
     }
 
     if (tx.nVersion != TRANSACTION_TOKEN_VERSION) {

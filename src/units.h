@@ -99,6 +99,9 @@ static const unsigned char UNITS_RATE_DAY = 'd';         // + house + day -> CRa
 static const unsigned char UNITS_RATE_KEY = 'K';         // + house -> the rate key's public key (set by the partners)
 static const unsigned char UNITS_CHARTER = 'C';          // + house -> CHouseCharter (the gold tokens it pays in kind)
 static const unsigned char UNITS_SWAP = 'S';             // + hash lock -> CSwapRecord (every swap ever: H is used once)
+static const unsigned char UNITS_RATE_KEY_SEQ = 'Q';      // + house -> uint64 SETKEYs connected (R5-6; a SETKEY binds it)
+static const unsigned char UNITS_RATE_POST_SEQ = 'Y';     // + house -> uint64 POSTs + SETKEYs connected (R5-6; a POST binds it)
+static const unsigned char UNITS_CHARTER_SEQ = 'X';       // + house -> uint64 charter ops connected (R5-6)
 static const unsigned char UNITS_SWAP_PENDING = 'W';     // + house -> uint64 mg of its swaps not yet done or paid
 
 inline UnitsKey IssuedTokenKey(const uint256& tokenID) { return UnitsKey(UNITS_ISSUED_TOKEN).Hash(tokenID); }

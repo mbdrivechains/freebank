@@ -100,10 +100,10 @@ uint256 NoteDemandId(const CTransaction& tx, const std::vector<uint64_t>& vUnits
     return ss.GetHash();
 }
 
-uint256 NoteMintSigHash(const CTransaction& tx)
+uint256 NoteMintSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankNote/mint");
+    return CreditTxSigHash(tx, "FreeBankNote/mint", houseID);   // R5-15 (D-2026-11-27-2 (1)): binds the house's permanent id
 }
 
 uint256 NoteTransferSigHash(const CTransaction& tx)
@@ -170,16 +170,16 @@ uint256 NoteProtestSigHash(const CTransaction& tx)
     return CreditTxSigHash(tx, "FreeBankNote/protest");
 }
 
-uint256 NoteLockSigHash(const CTransaction& tx)
+uint256 NoteLockSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankNote/lock");
+    return CreditTxSigHash(tx, "FreeBankNote/lock", houseID);   // R5-15 (D-2026-11-27-2 (1)): binds the house's permanent id
 }
 
-uint256 NoteUnlockSigHash(const CTransaction& tx)
+uint256 NoteUnlockSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankNote/unlock");
+    return CreditTxSigHash(tx, "FreeBankNote/unlock", houseID);   // R5-15 (D-2026-11-27-2 (1)): binds the house's permanent id
 }
 
 uint32_t DeferInterestBpsAt(const std::vector<Consensus::DeferInterestStep>& vSchedule, uint32_t nHeight)
@@ -851,14 +851,19 @@ bool CheckNoteTransactionShape(const CTransaction& tx, CValidationState& state)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payout");
             // Review round 1 (G8e): a payout script the collect couldn't pay gold to (unspendable, or another family's
             // tagged script) would block every collect of the house for good.
+            // R5-7 (D-2026-11-27-2 (6), S1X-15's whitelist on every payout a counterparty names): a script every stock
+            // node relays (IsHousePayableScript), for the payout and any relayer, or the house's COLLECT can't be sent.
             {
                 const CScript scriptPay(e.vchPayoutScript.begin(), e.vchPayoutScript.end());
-                if (IsGoldUnpayableScript(scriptPay))
+                if (!IsHousePayableScript(scriptPay))
                     return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-payout");
             }
             if (e.nFeeBps > TOKEN_FEE_BPS_MAX || (e.nFeeBps == 0) != e.vchRelayerScript.empty() ||
                     e.vchRelayerScript.size() > MAX_TOKEN_RELAYER_SCRIPT)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-fee");
+            if (!e.vchRelayerScript.empty() &&
+                    !IsHousePayableScript(CScript(e.vchRelayerScript.begin(), e.vchRelayerScript.end())))
+                return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-relayer-script");
             if (e.vchSig.empty() || e.vchSig.size() > 80)
                 return state.DoS(100, false, REJECT_INVALID, "bad-token-claim-sig");
         }

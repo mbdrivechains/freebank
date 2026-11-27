@@ -716,6 +716,7 @@ BOOST_AUTO_TEST_CASE(house_state_keys_ur3_8)
         {TRANSACTION_BILL_VERSION, BILL_OP_DISCOUNT}, {TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE},
         {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM}, {TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_NOTES},
         {TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_ESCROW}, {TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW},
+        {TRANSACTION_BILL_VERSION, BILL_OP_RECOURSE},   // R5-2: when it names the op-8 house (bytes 4..8)
         {TRANSACTION_NOTE_VERSION, NOTE_OP_MINT}, {TRANSACTION_NOTE_VERSION, NOTE_OP_REDEEM},
         {TRANSACTION_NOTE_VERSION, NOTE_OP_CLAIM}, {TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST},
         {TRANSACTION_NOTE_VERSION, NOTE_OP_LOCK}, {TRANSACTION_NOTE_VERSION, NOTE_OP_UNLOCK},
@@ -764,7 +765,9 @@ BOOST_AUTO_TEST_CASE(house_state_keys_ur3_8)
 
     auto K = [](const CTransaction& tx) { return GetHouseStateKeys(tx); };
     const CTransaction demand = HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, H);
-    // The pairs the old DEMAND loop let through (it saw pooled house ops only): every slot op on the house
+    // TG-3 (security 11-27): a status reader conflicts with nothing. Stage 0 B1 made readers order-free at consensus
+    // (HouseAtBlockStart), so a DEMAND and any slot op on its house share a block; the reader arm, kept, let an
+    // outbidding house op keep a holder's DEMAND out or evict it. (UR3-8 had made these pairs conflicts.)
     for (const CTransaction& s : {HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST, H),
                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PROTEST, H),
                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_PROTEST, H),
@@ -773,13 +776,13 @@ BOOST_AUTO_TEST_CASE(house_state_keys_ur3_8)
                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_DISCOUNT, H),
                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_ATTEST, H),
                                   HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE, H2, H)}) {
-        BOOST_CHECK(HouseStateKeysConflict(K(demand), K(s)));
-        BOOST_CHECK(HouseStateKeysConflict(K(s), K(demand)));
+        BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(s)));
+        BOOST_CHECK(!HouseStateKeysConflict(K(s), K(demand)));
     }
-    // ...and the reverse ones the slot loops let through: a slot op against a pooled deposit DEMAND or pool CREATE
+    // ...either way round: a slot op against a pooled deposit DEMAND or pool CREATE
     const CTransaction protest = HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST, H);
-    BOOST_CHECK(HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND, H))));
-    BOOST_CHECK(HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_POOL_VERSION, POOL_OP_CREATE, H))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND, H))));
+    BOOST_CHECK(!HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_POOL_VERSION, POOL_OP_CREATE, H))));
     // Readers never conflict with readers; another house never conflicts; ops with no key never conflict
     BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, H))));
     BOOST_CHECK(!HouseStateKeysConflict(K(demand), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND, H))));
@@ -792,6 +795,65 @@ BOOST_AUTO_TEST_CASE(house_state_keys_ur3_8)
     BOOST_CHECK(HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE, H))));
     BOOST_CHECK(HouseStateKeysConflict(K(HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_NET, 9, H)), K(protest)));
     BOOST_CHECK(!HouseStateKeysConflict(K(protest), K(HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE, H2))));
+}
+
+// TG-3 (security's ruling 11-27): the protective house-slot ops, one list for the ATMP guards and the wallet.
+BOOST_AUTO_TEST_CASE(house_slot_protective_tg3)
+{
+    const uint32_t H = 5;
+    const int nH = 1000;
+    for (const CTransaction& tx : {HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_PROTEST, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_CLAIM, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PAY, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_PROTEST, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP_CLAIM, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_TOKEN_COLLECT, H),
+                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_PROTEST, H),
+                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DISCHARGE, H),
+                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_CLAIM, H),
+                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE, H),
+                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM, H),
+                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_NOTES, H),
+                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_HRETIRE_ESCROW, H),
+                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_HCLAIM_ESCROW, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_DEFER, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_CLOSE, H)})
+        BOOST_CHECK_MESSAGE(IsHouseSlotProtective(tx, nH), strprintf("v%d op protective", tx.nVersion));
+    for (const CTransaction& tx : {HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_TOPUP, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_ATTEST, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_CHARTER, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_MEMBER_ADD, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_EXIT, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_WINDDOWN, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_RELEASE, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_ESCROW_MERGE, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_RENEW, H),
+                                   HouseOpTx(TRANSACTION_HOUSE_VERSION, HOUSE_OP_RECLAIM, H),   // no such house: not insolvent
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_MINT, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_REDEEM, H),     // no payload: not a discharge
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_LOCK, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_SWAP, H),
+                                   HouseOpTx(TRANSACTION_NOTE_VERSION, NOTE_OP_DEMAND, H),
+                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_ORIGINATE, H),
+                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_WITHDRAW, H),
+                                   HouseOpTx(TRANSACTION_DEPOSIT_VERSION, DEPOSIT_OP_DEMAND, H),
+                                   HouseOpTx(TRANSACTION_BILL_VERSION, BILL_OP_DISCOUNT, H),
+                                   HouseOpTx(TRANSACTION_POOL_VERSION, POOL_OP_RETIRE, H),
+                                   HouseOpTx(TRANSACTION_SETTLE_VERSION, SETTLE_OP_EXCHANGE, H, 6)})
+        BOOST_CHECK_MESSAGE(!IsHouseSlotProtective(tx, nH), strprintf("v%d op non-protective", tx.nVersion));
+    // A note REDEEM is protective only as the pre-authorised DISCHARGE.
+    for (const uint8_t fPre : {(uint8_t)0, (uint8_t)1}) {
+        NoteRedeem r;
+        r.nHouseID = H;
+        r.fPreAuthDischarge = fPre;
+        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+        ss << r;
+        CMutableTransaction m;
+        m.nVersion = TRANSACTION_NOTE_VERSION;
+        m.nNoteOp = NOTE_OP_REDEEM;
+        m.vchNotePayload.assign(ss.begin(), ss.end());
+        BOOST_CHECK_EQUAL(IsHouseSlotProtective(CTransaction(m), nH), fPre == 1);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -1310,11 +1310,10 @@ std::vector<uint256> CTxMemPool::HouseStateConflictTxs(const std::vector<uint32_
         if (it != m.end())
             setTx.insert(it->second.begin(), it->second.end());
     };
-    for (const uint32_t n : vSlot) {
+    // TG-3 (security 11-27): readers conflict with nothing (HouseStateKeysConflict), so only the slot holders.
+    (void)nReader;
+    for (const uint32_t n : vSlot)
         fnTake(mapHouseSlotTxs, n);     // both take house n's slot
-        fnTake(mapHouseReaderTxs, n);   // the pooled tx reads house n's status
-    }
-    fnTake(mapHouseSlotTxs, nReader);   // the incomer reads the status of a house a pooled tx takes the slot of
     return std::vector<uint256>(setTx.begin(), setTx.end());
 }
 

@@ -534,7 +534,7 @@ BOOST_AUTO_TEST_CASE(pool_sighash_domains)
     create.nPoolID = 1;
     create.nFeeBps = 30;
     // Stage 0 C1: each digest takes the whole tx (payload, inputs, outputs); same payload fields, distinct domains
-    const uint256 h1 = PoolCreateSigHash(C1PoolTx(POOL_OP_CREATE, create, hp, ho));
+    const uint256 h1 = PoolCreateSigHash(C1PoolTx(POOL_OP_CREATE, create, hp, ho), uint256S("f00d"));
     const uint256 h2 = PoolAddLiqSigHash(C1PoolTx(POOL_OP_ADD_LIQ, add, hp, ho));
     const uint256 h3 = PoolRemoveLiqSigHash(C1PoolTx(POOL_OP_REMOVE_LIQ, rem, hp, ho));
     const uint256 h4 = PoolSwapSigHash(C1PoolTx(POOL_OP_SWAP, swap, hp, ho));
@@ -553,19 +553,19 @@ BOOST_AUTO_TEST_CASE(pool_sighash_domains)
     // RETIRE is a fifth distinct domain, and binds every payload field.
     PoolRetire ret;
     ret.nPoolID = 1;
-    const uint256 h5 = PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, hp, ho));
+    const uint256 h5 = PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, hp, ho), uint256S("f00d"));
     BOOST_CHECK(h5 != h1 && h5 != h2 && h5 != h3 && h5 != h4);
     PoolRetire retMut = ret;
     retMut.nPriorNoteReserve = 1;
-    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho)) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho), uint256S("f00d")) != h5);
     retMut = ret;
     retMut.nTriggerPartnerIndex = 1;
-    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho)) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho), uint256S("f00d")) != h5);
     retMut = ret;
     retMut.nCreateHeight = 1;
-    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho)) != h5);
-    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, uint256S("0x03"), ho)) != h5);
-    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, hp, uint256S("0x03"))) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, retMut, hp, ho), uint256S("f00d")) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, uint256S("0x03"), ho), uint256S("f00d")) != h5);
+    BOOST_CHECK(PoolRetireSigHash(C1PoolTx(POOL_OP_RETIRE, ret, hp, uint256S("0x03")), uint256S("f00d")) != h5);
 }
 
 BOOST_AUTO_TEST_CASE(pool_shape_create)
@@ -1482,7 +1482,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_create)
     mtx.vout.emplace_back(POOL_DUST_VALUE, PoolScriptForPubKey(create.vchCreatorPubKey));
 
     // Sign over the REAL prevouts/outputs (payload is outside both hashes).
-    const uint256 sighash = PoolCreateSigHash(C1With(mtx, &CMutableTransaction::vchPoolPayload, create));
+    const uint256 sighash = PoolCreateSigHash(C1With(mtx, &CMutableTransaction::vchPoolPayload, create), uint256S("f00d"));
     create.vchCreatorSig = SignHash(creatorKey, sighash);
     create.vApproverIndex = {0};
     create.vApproverSig = {SignHash(partnerKey, sighash)};
@@ -1775,7 +1775,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
     tmpl.nCreateHeight = 500;
 
     const CMutableTransaction mtxTmpl = buildRetire(tmpl);
-    const uint256 sighash = PoolRetireSigHash(C1With(mtxTmpl, &CMutableTransaction::vchPoolPayload, tmpl));
+    const uint256 sighash = PoolRetireSigHash(C1With(mtxTmpl, &CMutableTransaction::vchPoolPayload, tmpl), uint256S("f00d"));
 
     // --- M-of-N happy path (valid at effective Open) ---
     PoolRetire mn = tmpl;
@@ -1839,7 +1839,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
         CMutableTransaction bad = buildRetire(mn);
         bad.vout[0] = CTxOut(5000, PoolScriptForPubKey(PoolFreshPubKey()));
         PoolRetire r = mn;
-        r.vApproverSig = {SignHash(partnerKey, PoolRetireSigHash(C1With(bad, &CMutableTransaction::vchPoolPayload, r)))};
+        r.vApproverSig = {SignHash(partnerKey, PoolRetireSigHash(C1With(bad, &CMutableTransaction::vchPoolPayload, r), uint256S("f00d")))};
         bad.vchPoolPayload = EncodePoolPayload(r);
         BOOST_CHECK_EQUAL(PoolCtxRetire(bad, 1100, fnGetPool, fnGetHouse, houseOut, fRetired), "bad-pool-retire-payout");
     }
@@ -1847,7 +1847,7 @@ BOOST_AUTO_TEST_CASE(pool_contextual_retire)
     // --- Single-partner path: rejected at effective Open, accepted at Insolvent ---
     PoolRetire sp = tmpl;
     sp.nTriggerPartnerIndex = 0;
-    sp.vchTriggerSig = SignHash(partnerKey, PoolRetireSigHash(C1With(mtxTmpl, &CMutableTransaction::vchPoolPayload, sp)));
+    sp.vchTriggerSig = SignHash(partnerKey, PoolRetireSigHash(C1With(mtxTmpl, &CMutableTransaction::vchPoolPayload, sp), uint256S("f00d")));
     const CMutableTransaction spTx = buildRetire(sp);
     BOOST_CHECK_EQUAL(PoolCtxRetire(spTx, 1100, fnGetPool, fnGetHouse, houseOut, fRetired),
                       "bad-pool-retire-trigger-not-insolvent");

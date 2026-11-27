@@ -144,11 +144,15 @@ struct Params {
     uint32_t nTokenClaimWindow;
     /** v0.2.28 (gateway/docs/freebank/FAILED_HOUSE_DESIGN.md, signed off 2026-10-16), all in blocks:
      *  nSuspensionCap - a suspension ends in insolvency this long after DEFER (12 months);
-     *  nCollectWindow - payouts at an insolvent house wait until its loan book is empty or this long after E (6
-     *                   months), and DISCOUNT refuses a bill maturing further ahead than this;
+     *  nCollectWindow - DISCOUNT refuses a bill maturing (plus grace) further ahead than this (6 months), so a failed
+     *                   house's book can run off within it;
+     *  nCollectBackstop - TG-2 (D-2026-11-27-1): payouts at an insolvent house wait until its loan book is empty, or at
+     *                   most nCollectWindow + this long after E (3 months), so a book that can't empty never strands
+     *                   the claims;
      *  nInsolventClaimWindow - claims close this long after E (2 years); then anyone may CLOSE the house. */
     uint32_t nSuspensionCap;
     uint32_t nCollectWindow;
+    uint32_t nCollectBackstop;
     uint32_t nInsolventClaimWindow;
     /** Withdrawal poison-row guard (v0.2.13, operator sign-off 2026-09-24:
      *  0 on main and regtest).

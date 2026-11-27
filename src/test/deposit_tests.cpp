@@ -134,7 +134,7 @@ BOOST_AUTO_TEST_CASE(deposit_sighash_domain_separation)
     t.vout.push_back(CTxOut(DEPOSIT_DUST_VALUE, CScript() << OP_TRUE));
     const CTransaction tx(t);
     std::vector<uint256> v;
-    v.push_back(DepositOriginateSigHash(tx));
+    v.push_back(DepositOriginateSigHash(tx, uint256S("f00d")));
     v.push_back(DepositTransferSigHash(tx));
     v.push_back(DepositWithdrawSigHash(tx));
     v.push_back(DepositClaimSigHash(tx));
@@ -145,7 +145,7 @@ BOOST_AUTO_TEST_CASE(deposit_sighash_domain_separation)
     // Sensitive to the inputs and outputs (and, through the binding form, every payload field)
     CMutableTransaction t2 = t;
     t2.vin[0].prevout = COutPoint(uint256S("33"), 0);
-    BOOST_CHECK(DepositOriginateSigHash(CTransaction(t2)) != DepositOriginateSigHash(tx));
+    BOOST_CHECK(DepositOriginateSigHash(CTransaction(t2), uint256S("f00d")) != DepositOriginateSigHash(tx, uint256S("f00d")));
     t2 = t;
     t2.vout[0].nValue++;
     BOOST_CHECK(DepositTransferSigHash(CTransaction(t2)) != DepositTransferSigHash(tx));
@@ -411,12 +411,53 @@ BOOST_AUTO_TEST_CASE(deposit_originate_gate)
         // capital cap = 3 * 100 COIN = 30,000,000,000 units. Fill most of it.
         house.nMintedUnits = 29000000000ULL;
         house.nDepositUnits = 900000000ULL;
+        // R5-8: the approvers are checked before the cap, so the batch carries a real approver signature.
+        CKey keyPartner;
+        keyPartner.MakeNewKey(true);
+        const CPubKey pubPartner = keyPartner.GetPubKey();
+        house.vPartner[0].vchPubKey = std::vector<unsigned char>(pubPartner.begin(), pubPartner.end());
         auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 3) { out = house; return true; } return false; };
         CMutableTransaction mtx = MakeOriginateTx(3, {200000000});   // would exceed
+        {
+            DepositOriginate org;
+            BOOST_REQUIRE(DecodeDepositPayload(mtx.vchDepositPayload, org));
+            org.vApproverSig.clear();
+            CDataStream s0(SER_NETWORK, PROTOCOL_VERSION);
+            s0 << org;
+            mtx.vchDepositPayload.assign(s0.begin(), s0.end());   // Stage 0 C1: sign the finished tx
+            std::vector<unsigned char> vchSig;
+            BOOST_REQUIRE(keyPartner.Sign(DepositOriginateSigHash(CTransaction(mtx), house.houseID), vchSig));
+            org.vApproverSig.push_back(vchSig);
+            CDataStream s1(SER_NETWORK, PROTOCOL_VERSION);
+            s1 << org;
+            mtx.vchDepositPayload.assign(s1.begin(), s1.end());
+        }
         CValidationState state; CHouse houseOut; bool fChanged = false;
         BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnNoCoin, houseOut, fChanged));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-deposit-originate-over-cap");
     }
+}
+
+// testing 2026-11-27, R5-8 (s1 Claude max run 5 #8; security 11-27: Medium, family A). Rule A: the fee floor, then
+// signatures, then reads that grow with the payload or the house. ORIGINATE runs HouseCapitalForChecks (partners x
+// tranches, a clock read per matched tranche: ~8K uncached reads at a 64-partner house) before VerifyHouseApprovers, so
+// an ORIGINATE with junk approver signatures makes every node do the capital work for free (refused at DoS 0 in the
+// mempool). An ORIGINATE that is both over the cap and badly signed must be refused for its signatures. FAILS while
+// the cap is checked first ("bad-deposit-originate-over-cap"). deposit_originate_gate's over-cap case carries the
+// same junk signatures and asserts over-cap; it changes with the fix.
+BOOST_AUTO_TEST_CASE(r5_8_originate_checks_approvers_before_capital)
+{
+    auto fnNoCoin = [](const COutPoint&, Coin&) { return false; };
+    CHouse house = MakeOpenDepositHouse(3);
+    house.nMintedUnits = 29000000000ULL;   // near the capital cap (3 * 100 COIN)
+    house.nDepositUnits = 900000000ULL;
+    auto fnGetHouse = [&](uint32_t id, CHouse& out) { if (id == 3) { out = house; return true; } return false; };
+    CMutableTransaction mtx = MakeOriginateTx(3, {200000000});   // over the cap, junk approver signature
+    CValidationState state; CHouse houseOut; bool fChanged = false;
+    BOOST_CHECK(!CheckDepositOperation(CTransaction(mtx), state, 1000, fnGetHouse, fnNoCoin, houseOut, fChanged));
+    BOOST_CHECK_MESSAGE(state.GetRejectReason().find("bad-deposit-originate-approver") == 0,
+        "R5-8: an over-cap ORIGINATE with a junk approver signature was refused for '" + state.GetRejectReason() +
+        "', so the capital check (the costly read) ran before the signatures (rule A)");
 }
 
 BOOST_AUTO_TEST_CASE(deposit_transfer_gate)

@@ -670,6 +670,7 @@ static bool WalletPostHouseRate(CWallet* pwallet, std::string& strFail, uint256&
     rate.nKind = HOUSE_RATE_POST;
     rate.nBid = nBid;
     rate.nAsk = nAsk;
+    rate.nPrevSeq = HouseRatePostSeqForChecks(nHouseID);   // R5-6: a POST names the post count
     return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction&, CMutableTransaction& m) {
         m.vchHousePayload = EncodeIssued(rate);   // Stage 0 C1: the finished transaction
         if (!key.Sign(HouseRateSigHash(CTransaction(m)), rate.vchRateSig))
@@ -704,6 +705,7 @@ static bool WalletSetHouseRateKey(CWallet* pwallet, std::string& strFail, uint25
     rate.houseID = house.houseID;   // S1X-26
     rate.nKind = HOUSE_RATE_SETKEY;
     rate.vchRatePubKey = std::vector<unsigned char>(pubKey.begin(), pubKey.end());
+    rate.nPrevSeq = HouseRateKeySeqForChecks(nHouseID);   // R5-6: a SETKEY names the key count
     return CommitHouseOp(pwallet, strFail, txidOut, HOUSE_OP_RATE, nFee, [&](const CTransaction&, CMutableTransaction& m) {
         m.vchHousePayload = EncodeIssued(rate);   // Stage 0 C1
         const uint256 h = HouseRateSigHash(CTransaction(m));
@@ -724,6 +726,7 @@ static bool WalletHouseCharter(CWallet* pwallet, std::string& strFail, uint256& 
     CHouse house;
     if (!phousetree->GetHouse(op.nHouseID, house)) { strFail = "Unknown house"; return false; }
     op.houseID = house.houseID;   // S1X-26
+    op.nPrevSeq = HouseCharterSeqForChecks(op.nHouseID);   // R5-6
     if (op.nKind == HOUSE_CHARTER_REMOVE || op.nKind == HOUSE_CHARTER_RELATED) {
         // UR1-1 (switch-on): name the token at the index, so the signed op can't land on another one if an ADD
         // renumbers the list first (consensus refuses the mismatch).
@@ -1510,20 +1513,22 @@ UniValue swapclaim(const JSONRPCRequest& request)
     CWallet* const pwallet = WalletOrThrow(request);
     if (!pwallet)
         return NullUniValue;
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
-            "swapclaim \"hash_lock\" ( fee )\n"
+            "swapclaim \"hash_lock\" ( fee clearbills )\n"
+            "clearbills: (boolean, optional) default true: at a failed house, first clear one ready bill from its loan book (op 11, claimbillescrow, this wallet pays the fee) and ask to run again; false sends nothing and names the bill\n"
             "\nAt a failed house (after its bills are collected), claim a pending swap, or a shortfall the house paid within\n"
             "90 days before it failed, at the noteholders' rank: its exact pro-rata share of the escrow pot goes to the\n"
             "swap's payout address. Anyone may; this wallet pays the fee.\n"
             "\nResult: {\"txid\", \"paid_sats\"}\n");
     const uint256 hashLock = ParseHashLock(request.params[0]);
     const CAmount nFee = ParseFee(request, 1);
+    const bool fClearBills = request.params.size() <= 2 || request.params[2].isNull() ? true : request.params[2].get_bool();   // TG-2
     EnsureWalletIsUnlocked(pwallet);
     uint256 txid;
     std::string strFail;
     CAmount amountPaid = 0;
-    if (!pwallet->SwapClaimFromEscrow(strFail, txid, hashLock, nFee, amountPaid))
+    if (!pwallet->SwapClaimFromEscrow(strFail, txid, hashLock, nFee, amountPaid, fClearBills))
         throw JSONRPCError(RPC_WALLET_ERROR, strFail);
     UniValue o = TxidResult(txid);
     o.pushKV("paid_sats", amountPaid);
@@ -1764,7 +1769,7 @@ const CRPCCommand issuedCommands[] = {
     { "notes",            "swappay",                &swappay,                {"hash_lock", "fee"} },
     { "notes",            "swapprotest",            &swapprotest,            {"hash_lock", "fee"} },
     { "notes",            "swapexpire",             &swapexpire,             {"hash_lock", "fee"} },
-    { "notes",            "swapclaim",              &swapclaim,              {"hash_lock", "fee"} },
+    { "notes",            "swapclaim",              &swapclaim,              {"hash_lock", "fee", "clearbills"} },
 };
 
 // v1.1.1: the read-only ones never touch a wallet, so they are registered with the node's commands, also under

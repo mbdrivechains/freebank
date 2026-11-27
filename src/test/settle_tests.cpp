@@ -64,7 +64,7 @@ static uint256 C1SettleXSigHash(const SettleExchange& x, const uint256& hp, cons
     m.nSettleOp = SETTLE_OP_EXCHANGE;
     m.vin.push_back(CTxIn(COutPoint(hp, 0)));
     m.vout.push_back(CTxOut(1000, CScript() << std::vector<unsigned char>(ho.begin(), ho.end())));
-    return SettleExchangeSigHash(C1With(m, &CMutableTransaction::vchSettlePayload, x));
+    return SettleExchangeSigHash(C1With(m, &CMutableTransaction::vchSettlePayload, x), SettleHousesID({uint256(), uint256()}));
 }
 
 BOOST_FIXTURE_TEST_SUITE(settle_tests, BasicTestingSetup)
@@ -684,7 +684,7 @@ static CMutableTransaction BuildSignedSettle(SettleExchange& x, const CHouse& hA
     // Digest covers value fields + prevouts + outputs (sig fields excluded),
     // so it is computable before the signatures exist.
     const CTransaction ctx(mtx);
-    const uint256 sighash = SettleExchangeSigHash(C1With(ctx, &CMutableTransaction::vchSettlePayload, x));
+    const uint256 sighash = SettleExchangeSigHash(C1With(ctx, &CMutableTransaction::vchSettlePayload, x), SettleHousesID({uint256(), uint256()}));
     for (size_t i = 0; i < apprA.size(); i++) {
         x.vApproverIndexA.push_back((uint32_t)i);
         x.vApproverSigA.push_back(SignHash(apprA[i], sighash));
@@ -697,6 +697,29 @@ static CMutableTransaction BuildSignedSettle(SettleExchange& x, const CHouse& hA
     x.vchPresentSigOfBNotes = SignHash(presB, sighash);
     mtx.vchSettlePayload = Encode(x);
     return mtx;
+}
+
+/** R5-8: the four signatures are checked first now, so a vector that changes the tx after signing re-signs it to reach
+ *  the later check it is about. */
+static void ResignSettle(CMutableTransaction& mtx, SettleExchange& x, const std::vector<CKey>& apprA,
+                         const std::vector<CKey>& apprB, const CKey& presA, const CKey& presB)
+{
+    x.vApproverIndexA.clear(); x.vApproverSigA.clear();
+    x.vApproverIndexB.clear(); x.vApproverSigB.clear();
+    x.vchPresentSigOfANotes.clear(); x.vchPresentSigOfBNotes.clear();
+    const uint256 sighash = SettleExchangeSigHash(C1With(CTransaction(mtx), &CMutableTransaction::vchSettlePayload, x),
+                                                  SettleHousesID({uint256(), uint256()}));
+    for (size_t i = 0; i < apprA.size(); i++) {
+        x.vApproverIndexA.push_back((uint32_t)i);
+        x.vApproverSigA.push_back(SignHash(apprA[i], sighash));
+    }
+    for (size_t i = 0; i < apprB.size(); i++) {
+        x.vApproverIndexB.push_back((uint32_t)i);
+        x.vApproverSigB.push_back(SignHash(apprB[i], sighash));
+    }
+    x.vchPresentSigOfANotes = SignHash(presA, sighash);
+    x.vchPresentSigOfBNotes = SignHash(presB, sighash);
+    mtx.vchSettlePayload = Encode(x);
 }
 
 static std::string SettleOpReject(const CMutableTransaction& mtx,
@@ -797,6 +820,7 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
     {
         CMutableTransaction mtx = BuildSignedSettle(x, hA, hB, apprA, apprB, presA, presB, 1);
         mtx.vout[0].scriptPubKey = NoteScriptForPubKey(PK(redA));   // creditor is B
+        ResignSettle(mtx, x, apprA, apprB, presA, presB);   // R5-8: signatures first, so sign what's sent
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-residual-dest");
     }
     // Expired authorization.
@@ -834,6 +858,7 @@ BOOST_AUTO_TEST_CASE(settle_contextual_vectors)
         x.amountResidual = 15001;
         mtx.vchSettlePayload = Encode(x);
         mtx.vout[0].nValue = 15001;
+        ResignSettle(mtx, x, apprA, apprB, presA, presB);   // R5-8: signatures first, so sign what's sent
         BOOST_CHECK_EQUAL(SettleOpReject(mtx, houses, H), "bad-settle-band");
     }
 }

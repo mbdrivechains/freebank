@@ -411,11 +411,11 @@ bool PoolSwapOut(uint64_t nAmountIn, uint64_t nReserveIn, uint64_t nReserveOut,
  * (R-i6: bind prevouts wherever a payload signature is an authorization). */
 uint256 PoolHashPrevouts(const CTransaction& tx);
 
-uint256 PoolCreateSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 PoolCreateSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1: CreditTxSigHash; R5-15
 uint256 PoolAddLiqSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 uint256 PoolRemoveLiqSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 uint256 PoolSwapSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
-uint256 PoolRetireSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 PoolRetireSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1: CreditTxSigHash; R5-15
 
 template <typename T>
 bool DecodePoolPayload(const std::vector<unsigned char>& vch, T& payload);

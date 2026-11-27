@@ -308,7 +308,7 @@ uint256 TokenYID(const CPubKey& Y);
 /** The point back from its stored form. */
 CPubKey TokenYPoint(const uint256& y);
 
-uint256 TokenKeysetSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
+uint256 TokenKeysetSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1: CreditTxSigHash; R5-15
 uint256 TokenPostSigHash(const CTransaction& tx);   // Stage 0 C1: CreditTxSigHash
 /** What a holder signs with P = B_ - Y: the house, the token, and its payout terms. Not bound to the tx, so any
  *  relayer can carry it; a token can be claimed once, so it can't be replayed. */

@@ -362,6 +362,11 @@ bool IsHouseRatePostTx(const CTransaction& mtx);
 /** Every house slot a transaction takes (none for a rate op: those have their own slot, D-2026-11-11-3). The one list
  *  the mempool guards, the template and the wallet's fail-fasts all read (TW-5). */
 bool GetHouseSlotSet(const CTransaction& mtx, std::vector<uint32_t>& vHouse);
+/** TG-3 (security's ruling 11-27, rule G's house-slot arm): is mtx a PROTECTIVE house-slot op? In the house slot a
+ *  protective op takes priority over a non-protective holder whatever the fees, and a non-protective incomer never
+ *  displaces a pooled protective op; like against like stays on UR-ext-2's fee priority. nHeight: the spend height (a
+ *  RECLAIM is protective only at an insolvent house). The ATMP guards and the wallet's fail-fasts read this one list. */
+bool IsHouseSlotProtective(const CTransaction& mtx, int nHeight);
 /** UR3-8: the house whose STAGED effective status an op reads without taking its slot (note DEMAND, deposit DEMAND, pool
  *  CREATE). False for every other tx. */
 bool GetHouseStatusReaderID(const CTransaction& mtx, uint32_t& nHouse);
@@ -754,7 +759,7 @@ static const int MAIN_BLOCK_CACHE_PIN_MIN_VERSION = 22500;
 //! requires less (v1.2.3 and older, and builds before S5X-2) keeps its
 //! withdrawal-bundle and deposit entries but loses its verified-BMM ones, so
 //! those blocks are checked again.
-static const int BMM_CACHE_S5X2_MIN_VERSION = 1020700;
+static const int BMM_CACHE_S5X2_MIN_VERSION = 1020800;
 
 void DumpMainBlockCache();
 

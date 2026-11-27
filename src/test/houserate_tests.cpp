@@ -587,6 +587,15 @@ struct H2Chain {
     uint32_t nSeq;
     H2Chain() : db(1 << 20, true, true), coins(&coinsBase), nSeq(0) {}
 
+    // R5-6: a SETKEY names the key count, a POST the post count, read at the tip as the wallet does.
+    uint64_t RateSeq(bool fKey)
+    {
+        CUnitsView v(&db);
+        uint64_t n = 0;
+        v.Get(fKey ? HouseRateKeySeqKey(H2_HOUSE) : HouseRatePostSeqKey(H2_HOUSE), n);
+        return n;
+    }
+
     CMutableTransaction SetKey(const CKey& key)
     {
         HouseRate r;
@@ -594,6 +603,7 @@ struct H2Chain {
         r.nKind = HOUSE_RATE_SETKEY;
         const CPubKey pub = key.GetPubKey();
         r.vchRatePubKey.assign(pub.begin(), pub.end());
+        r.nPrevSeq = RateSeq(true);
         return H2RateTx(r, nSeq++);
     }
     CMutableTransaction Post(const CKey& key, uint64_t nBid)
@@ -602,6 +612,7 @@ struct H2Chain {
         r.nHouseID = H2_HOUSE;
         r.nKind = HOUSE_RATE_POST;
         r.nBid = r.nAsk = nBid;
+        r.nPrevSeq = RateSeq(false);
         CMutableTransaction mtx = H2RateTx(r, nSeq++);
         BOOST_REQUIRE(key.Sign(HouseRateSigHash(CTransaction(mtx)), r.vchRateSig));
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);

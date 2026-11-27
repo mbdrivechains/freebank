@@ -237,7 +237,7 @@ CMutableTransaction BuildIssue(World& w, WBill& keysOut)
     is.nRefHouseID = 1;   // Gold B: the reference house
     const uint256 sighash = BillIssueSigHash(billID, is.amount, amountEscrow,
             is.nMaturityHeight, is.nGraceBlocks,
-            is.vchDrawerPubKey, is.vchAcceptorPubKey, is.vchHolderPubKey, is.nRefHouseID);
+            is.vchDrawerPubKey, is.vchAcceptorPubKey, is.vchHolderPubKey, is.nRefHouseID, uint256S("f00d0001"));
     BOOST_REQUIRE(keysOut.drawer.Sign(sighash, is.vchDrawerSig));
     BOOST_REQUIRE(keysOut.acceptor.Sign(sighash, is.vchAcceptorSig));
 
@@ -318,7 +318,7 @@ CMutableTransaction BuildDiscount(World& w, const WBill& wb, const WHouse& wh)
 
     CDataStream ss0(SER_NETWORK, PROTOCOL_VERSION); ss0 << d;
     SetBillPayload(mtx, ss0);
-    const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), wb.bill.billID);
+    const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), wb.bill.billID, wh.house.houseID);
     BOOST_REQUIRE(wb.holder.Sign(sighash, d.vchSellerSig));
     d.vApproverIndex.push_back(0);
     std::vector<unsigned char> vchApprover;

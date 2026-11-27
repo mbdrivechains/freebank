@@ -2208,6 +2208,11 @@ static UniValue HouseToJSON(const CHouse& house)
             if (nE != 0) {
                 obj.pushKV("insolvent_since", (uint64_t)nE);
                 obj.pushKV("collection_done", HouseCollectionDone(house, nTipHeight + 1));
+                // TG-2 (D-2026-11-27-1): payouts wait for an empty loan book, at most to the backstop.
+                const Consensus::Params& cp = Params().GetConsensus();
+                obj.pushKV("collection_window_ends", (uint64_t)ClockDeadlineHeight(nE, cp.nCollectWindow, nTipHeight + 1));
+                obj.pushKV("collection_backstop", (uint64_t)ClockDeadlineHeight(nE, (uint64_t)cp.nCollectWindow +
+                                                                                 cp.nCollectBackstop, nTipHeight + 1));
                 obj.pushKV("claim_window_closes", (uint64_t)HouseClaimWindowCloses(house, nTipHeight + 1));
             }
             obj.pushKV("closed", HouseClosed(house));

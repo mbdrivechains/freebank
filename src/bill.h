@@ -132,7 +132,7 @@ static const uint64_t LOAN_BOOK_MAX_FACE = (uint64_t)MAX_MONEY;
 // STRICT byte compare (which is what catches u128 accumulator drift). Only a
 // house-held bill takes the versioned layout.
 static const uint32_t BILL_SER_SENTINEL = 0xFFFFFFFFU;
-static const uint8_t BILL_SER_VERSION = 4;   // 3 = Gold B: nRefHouseID; 4 = S1X-25: nEscrowHouseID
+static const uint8_t BILL_SER_VERSION = 5;   // 3 = Gold B: nRefHouseID; 4 = S1X-25: nEscrowHouseID; 5 = R5-2: hclaimHouseID
 
 /** One link of the endorsement chain (ARCH §4): signed over
  * (bill_id, to_pk, at_height) with a domain tag. */
@@ -187,10 +187,17 @@ struct CBill {
     // custody key, and a liable party's payment must never reach the operator's key (FAILED_HOUSE_DESIGN A). What that
     // gives up: an endorser's liability on such a bill can be settled only off chain.
     uint32_t nEscrowHouseID;
+    // R5-2 (D-2026-11-27-3): the permanent id of the house whose quorum defaulted this bill by op 8 (HCLAIM), which left
+    // its custody key as the holder. While that house is Deferred or Insolvent a RECOURSE pays its escrow, and once it
+    // is closed RECOURSE and TITLE_RELEASE are refused. Zero otherwise.
+    uint256 hclaimHouseID;
+    // R5-2 (security 11-27): recourses taken on it since op 8. The escrow form applies only before the first (while the
+    // op-8 custody key still holds it); after that the payer is the holder, and later recourses pay them.
+    uint32_t nHClaimRecourses;
 
     CBill() : nBillID(0), amount(0), amountEscrow(0), nIssuedHeight(0),
               nMaturityHeight(0), nGraceBlocks(0), status(BILL_STATUS_ACTIVE),
-              nOwnerHouseID(0), nRefHouseID(0), nEscrowHouseID(0) {}
+              nOwnerHouseID(0), nRefHouseID(0), nEscrowHouseID(0), nHClaimRecourses(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -215,7 +222,8 @@ struct CBill {
         } else {
             // Emit the legacy layout iff the record carries no post-legacy
             // state, so the on-disk bytes of an untouched bill never change.
-            if (nOwnerHouseID != 0 || nRefHouseID != 0 || nEscrowHouseID != 0) {
+            if (nOwnerHouseID != 0 || nRefHouseID != 0 || nEscrowHouseID != 0 || !hclaimHouseID.IsNull() ||
+                    nHClaimRecourses != 0) {
                 uint32_t nSentinel = BILL_SER_SENTINEL;
                 nSerVersion = BILL_SER_VERSION;
                 READWRITE(nSentinel);
@@ -252,6 +260,13 @@ struct CBill {
             READWRITE(nEscrowHouseID);
         } else if (ser_action.ForRead()) {
             nEscrowHouseID = 0;
+        }
+        if (nSerVersion >= 5) {
+            READWRITE(hclaimHouseID);
+            READWRITE(nHClaimRecourses);
+        } else if (ser_action.ForRead()) {
+            hclaimHouseID.SetNull();
+            nHClaimRecourses = 0;
         }
     }
 };
@@ -424,6 +439,10 @@ struct BillDiscount {
  * historical cascade order: drawee, then escrow, then the endorser chain. */
 struct BillRecourse {
     uint32_t nBillID;                                     // LEADING
+    // R5-2 (D-2026-11-27-3): the dense id of the op-8 house, named by the FIRST recourse on a bill op 8 defaulted (its
+    // escrow form is forced while that house is Deferred or Insolvent); 0 on any other recourse. Bytes 4..8, so GetHouseSlotIDs reads it like the
+    // other house-held ops' (the escrow form takes that house's slot). Signed (Stage 0 C1).
+    uint32_t nEscrowHouseID = 0;
     std::vector<unsigned char> vchPayerPubKey;            // in the liable set, != holder
     std::vector<unsigned char> vchPrevHolderPubKey;       // prior; == bill.vchHolderPubKey
     std::vector<unsigned char> vchPayerSig;               // over BillRecourseSigHash
@@ -439,6 +458,7 @@ struct BillRecourse {
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nBillID);
+        READWRITE(nEscrowHouseID);
         READWRITE(vchPayerPubKey);
         READWRITE(vchPrevHolderPubKey);
         READWRITE(vchPayerSig);
@@ -533,14 +553,18 @@ struct BillHRetireNotes {
 /** TITLE_RELEASE (op 12, S1X-29): the bill whose title the transaction spends. */
 struct BillTitleRelease {
     uint32_t nBillID;
+    // R5-2 (security's condition 4): on a bill op 8 defaulted, the op-8 house's dense id (its status is read; refused
+    // while that house is Deferred, Insolvent or closed); 0 otherwise.
+    uint32_t nHClaimHouseID;
 
-    BillTitleRelease() : nBillID(0) {}
+    BillTitleRelease() : nBillID(0), nHClaimHouseID(0) {}
 
     ADD_SERIALIZE_METHODS
 
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(nBillID);
+        READWRITE(nHClaimHouseID);
     }
 };
 
@@ -650,7 +674,7 @@ uint256 BillIDFromBody(const std::vector<unsigned char>& vchBody);
 // cover v11 trailer fields, so every payload field a party relies on MUST be
 // bound by one of these payload-level signatures.
 //
-uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID);
+uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID, const uint256& refHouseCanonical);
 /** S1X-34 (testing: Medium; security 11-26; Michael 2026-11-26 "Yes, build all 6"): the link also binds its endorser and
  *  its index in the chain (the bill's vEndorsement.size() when it is appended). RECOURSE appends no link, so with
  *  (bill, to, height) alone the endorsee of a link whose endorser later paid recourse could replay that link within
@@ -668,7 +692,9 @@ uint256 BillHashOutputs(const CTransaction& tx);
  *  transaction even when no input carries a signature (an escrow-only CLAIM, HCLAIM, HRETIRE or HRETIRE_ESCROW). */
 uint256 BillTxBindingHash(const CTransaction& tx);
 uint256 BillRetireSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld);   // Stage 0 C1
-uint256 BillClaimSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld);    // Stage 0 C1
+/** R5-15: op 8 (fHouseHeld) binds the holding house's permanent id with the bill's; op 4 names none. */
+uint256 BillClaimSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld,
+                         const uint256& houseID = uint256());    // Stage 0 C1
 
 /** SHA256d over every input outpoint of tx - bound into the B1 digests (the R-i6
  * rule: bind prevouts wherever a payload signature authorizes a spend). */
@@ -681,7 +707,7 @@ uint256 BillHashPrevouts(const CTransaction& tx);
 // per op carries every authority: for DISCOUNT the seller AND the house quorum
 // sign the same bytes, so neither side can alter any term after the other signs.
 //
-uint256 BillDiscountSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
+uint256 BillDiscountSigHash(const CTransaction& tx, const uint256& billID, const uint256& houseID);   // Stage 0 C1; R5-15
 uint256 BillRecourseSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
 uint256 BillHRetireNotesSigHash(const CTransaction& tx, const uint256& billID);   // Stage 0 C1
 /** Op 10's digest: op 9's fields under its own tag, so neither op's signature verifies as the other's. */

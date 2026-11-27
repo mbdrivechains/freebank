@@ -511,7 +511,7 @@ static uint64_t TillCapUnits(const CHouse& house, int nHeight, CAmount amountTil
 enum class HouseRateKind { BID, ASK30, ASK90 };
 static bool BoundHouseRate(uint32_t nHouseID, uint64_t nRateNamed, int nHeight, HouseRateKind kind,
                            CValidationState& state, const std::string& strPrefix, uint64_t& nSatsPerGram,
-                           int nAnchorHeight = 0)
+                           int nAnchorHeight = 0, bool fBidFloor = false)
 {
     // nAnchorHeight: the house has failed at that height (E) - its windows end there (an insolvent house can't post, so
     // a window running on would only lose its highs; review 2026-11-07).
@@ -531,6 +531,10 @@ static bool BoundHouseRate(uint32_t nHouseID, uint64_t nRateNamed, int nHeight, 
         nSatsPerGram = nRateNamed;
         return true;
     }
+    // R5-23 (D-2026-11-27-2 (7)): a holder's op names a floor on the bid, never an exact value the house can move each
+    // block: valid while the bid in effect is at least the named one (the op uses the bid in effect, e.g. a SWAP's nBid0).
+    if (fBidFloor && kind == HouseRateKind::BID && nRateNamed <= nSatsPerGram)
+        return true;
     if (nRateNamed != nSatsPerGram)
         return state.DoS(0, false, REJECT_INVALID, strPrefix + "-rate");
     return true;
@@ -1162,8 +1166,11 @@ static bool GetHouseSlotIDs(const CTransaction& mtx, uint32_t& nA, uint32_t& nB)
     if (mtx.nVersion == TRANSACTION_BILL_VERSION &&
             (mtx.nBillOp == BILL_OP_DISCOUNT || mtx.nBillOp == BILL_OP_HRETIRE ||
              mtx.nBillOp == BILL_OP_HCLAIM || mtx.nBillOp == BILL_OP_HRETIRE_NOTES ||
-             mtx.nBillOp == BILL_OP_HRETIRE_ESCROW || mtx.nBillOp == BILL_OP_HCLAIM_ESCROW) &&
+             mtx.nBillOp == BILL_OP_HRETIRE_ESCROW || mtx.nBillOp == BILL_OP_HCLAIM_ESCROW ||
+             mtx.nBillOp == BILL_OP_RECOURSE) &&
             mtx.vchBillPayload.size() >= 8) {
+        // R5-2: a RECOURSE on a bill op 8 defaulted names the op-8 house at bytes 4..8 (its escrow form changes that
+        // house; the plain form is held to the slot too, which only makes the pool stricter); any other RECOURSE has 0.
         nA = ReadLE32(mtx.vchBillPayload.data() + 4);
         return nA != 0;
     }
@@ -1215,8 +1222,55 @@ bool GetHouseSlotSet(const CTransaction& mtx, std::vector<uint32_t>& vHouse)
     return true;
 }
 
+/** TG-3 (security's ruling 11-27): the protective house-slot ops - those a holder, a counterparty or a failed house's
+ * waterfall needs, which no non-protective holder of the slot may keep out by outbidding them (an auction a hostile
+ * partner wins by outpaying a wallet's fee bump is a keep-out, and under TG-2 it would stall the waterfall):
+ *  - note PROTEST, CLAIM and the pre-authorised DISCHARGE (a REDEEM with fPreAuthDischarge);
+ *  - SWAP_PAY, SWAP_PROTEST and SWAP_CLAIM; the token COLLECT;
+ *  - deposit PROTEST, DISCHARGE and CLAIM;
+ *  - bill ops 7 to 11 (they take the owner house's slot);
+ *  - DEFER, CLOSE, and RECLAIM at an insolvent house (the partners' residual settle).
+ * Every other house-slot op (TOPUP, ATTEST, CHARTER, the member ops, EXIT, WINDDOWN, RELEASE, MERGE, a RECLAIM at a house
+ * that isn't insolvent, a MINT, a DISCOUNT, a settle round, ...) and every status reader is non-protective. Payload read
+ * for a note REDEEM only (its flag), house status for a RECLAIM only. */
+bool IsHouseSlotProtective(const CTransaction& mtx, int nHeight)
+{
+    if (mtx.nVersion == TRANSACTION_NOTE_VERSION) {
+        if (mtx.nNoteOp == NOTE_OP_PROTEST || mtx.nNoteOp == NOTE_OP_CLAIM || mtx.nNoteOp == NOTE_OP_SWAP_PAY ||
+                mtx.nNoteOp == NOTE_OP_SWAP_PROTEST || mtx.nNoteOp == NOTE_OP_SWAP_CLAIM ||
+                mtx.nNoteOp == NOTE_OP_TOKEN_COLLECT)
+            return true;
+        if (mtx.nNoteOp == NOTE_OP_REDEEM) {
+            NoteRedeem r;
+            return DecodeNotePayload(mtx.vchNotePayload, r) && r.fPreAuthDischarge == 1;
+        }
+        return false;
+    }
+    if (mtx.nVersion == TRANSACTION_DEPOSIT_VERSION)
+        return mtx.nDepositOp == DEPOSIT_OP_PROTEST || mtx.nDepositOp == DEPOSIT_OP_DISCHARGE ||
+               mtx.nDepositOp == DEPOSIT_OP_CLAIM;
+    if (mtx.nVersion == TRANSACTION_BILL_VERSION) {
+        // R5-2 (security's condition 3): a RECOURSE naming the op-8 house pays its escrow (or the holder at a live house).
+        if (mtx.nBillOp == BILL_OP_RECOURSE)
+            return mtx.vchBillPayload.size() >= 8 && ReadLE32(mtx.vchBillPayload.data() + 4) != 0;
+        return mtx.nBillOp >= BILL_OP_HRETIRE && mtx.nBillOp <= BILL_OP_HCLAIM_ESCROW;
+    }
+    if (mtx.nVersion == TRANSACTION_HOUSE_VERSION) {
+        if (mtx.nHouseOp == HOUSE_OP_DEFER || mtx.nHouseOp == HOUSE_OP_CLOSE)
+            return true;
+        if (mtx.nHouseOp == HOUSE_OP_RECLAIM && mtx.vchHousePayload.size() >= 4 && phousetree) {
+            CHouse house;
+            return phousetree->GetHouse(ReadLE32(mtx.vchHousePayload.data()), house) &&
+                   HouseEffectiveStatus(house, nHeight) == HOUSE_STATUS_INSOLVENT;
+        }
+    }
+    return false;
+}
+
 /** UR3-8 (ultra s3 #8, agreed with testing 11-10): the house an op takes NO slot on but whose effective status decides
- * it, read from the STAGED record at connect: a note DEMAND (its mode is keyed on Deferred / Open-Stressed / Insolvent),
+ * it. Since Stage 0 B1 it reads the house as of the block's start (HouseAtBlockStart), so its place in a block no longer
+ * matters, and since TG-3 it conflicts with no pooled op (HouseStateKeysConflict); the text below is the UR3-8 history.
+ * Before B1 it read the STAGED record at connect: a note DEMAND (its mode is keyed on Deferred / Open-Stressed / Insolvent),
  * a deposit DEMAND (v0.2.29, the same) and a pool CREATE (needs effective Open). Any slot op on that house can move the
  * status (an ATTEST lifts a clause, a PROTEST with no cure left makes it Insolvent, a DISCHARGE ends a deferral), and
  * ordered first in a template it fails the reader inside TestBlockValidity. Rate and member ops and the token ops other
@@ -1250,7 +1304,13 @@ bool HouseStateKeysConflict(const HouseStateKeys& a, const HouseStateKeys& b)
     for (const uint32_t n : a.vSlot)
         if (fnHas(b.vSlot, n))
             return true;   // both take one house's slot: one house change per block
-    return fnHas(a.vSlot, b.nStatusReader) || fnHas(b.vSlot, a.nStatusReader);   // two readers never conflict
+    // TG-3 (security 11-27): a status reader (note/deposit DEMAND, pool CREATE) conflicts with nothing. Stage 0 B1 made
+    // readers order-free at consensus (they read the house as of the block's start, HouseAtBlockStart), so a reader and
+    // a slot op share a block in either order; keeping the reader arm let an outbidding house op keep a holder's DEMAND
+    // (which starts the protest clock) out, or evict it. A pooled DEMAND a confirmed status change makes invalid is
+    // dropped at the next tip (EvictStaleHouseNoteOps). Readers are kept out of the protective list: cheap DEMANDs
+    // parked against an ATTEST would be J2 reversed.
+    return false;
 }
 
 static thread_local bool g_fFbSigCacheScope = false;
@@ -1397,15 +1457,20 @@ static void EvictStaleRatePosts()
         LOCK(mempool.cs);
         const int nNextHeight = chainActive.Height() + 1;
         for (CTxMemPool::txiter mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); mi++) {
+            std::string strReject;
+            // R5-6 (security 11-27): a SETKEY or charter op a newer one made stale, too.
+            if (HouseRateOpCountStale(mi->GetTx(), strReject)) {
+                vEvict.emplace_back(mi->GetSharedTx(), strReject);
+                continue;
+            }
             if (!IsHouseRatePostTx(mi->GetTx()))
                 continue;
-            std::string strReject;
             if (!HouseRatePostStillValid(mi->GetTx(), nNextHeight, strReject))
                 vEvict.emplace_back(mi->GetSharedTx(), strReject);
         }
     }
     for (const auto& e : vEvict) {
-        LogPrintf("%s: evicting stale rate POST %s (%s)\n", __func__, e.first->GetHash().ToString(), e.second);
+        LogPrintf("%s: evicting stale rate op %s (%s)\n", __func__, e.first->GetHash().ToString(), e.second);
         mempool.removeRecursive(*e.first, MemPoolRemovalReason::EXPIRY);   // EXPIRY: the wallet must see it (H1 note)
     }
 }
@@ -2650,7 +2715,10 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
             // Stage 0 rule A: by index (HouseStateConflictTxs), not a walk of the pool.
             for (const uint256& hashConflict : pool.HouseStateConflictTxs(keysOurs.vSlot, keysOurs.nStatusReader)) {
                 CTxMemPool::txiter mi = pool.mapTx.find(hashConflict);
-                if (mi != pool.mapTx.end() && !fnSlotYields(mi, "settle-house-op-in-mempool"))
+                if (mi == pool.mapTx.end())
+                    continue;
+                // TG-3: a settle round is non-protective, so it never displaces a pooled protective op, whatever it pays.
+                if (IsHouseSlotProtective(mi->GetTx(), GetSpendHeight(view)) || !fnSlotYields(mi, "settle-house-op-in-mempool"))
                     return state.DoS(0, false, REJECT_DUPLICATE, "settle-house-op-in-mempool");
             }
         }
@@ -2962,6 +3030,12 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         {
             const HouseStateKeys keysIn = GetHouseStateKeys(tx);
             if (tx.nVersion != TRANSACTION_SETTLE_VERSION && keysIn.Any()) {
+                // TG-3 (security's ruling 11-27, rule G's house-slot arm): a protective incomer takes priority over a
+                // non-protective holder whatever the fees (a free yield, evicted after the add and the trim like the
+                // other Stage 0 G yields, so a refused incomer evicts nothing; the fee floor still applies), and a
+                // non-protective incomer never displaces a pooled protective op. Like against like: UR-ext-2's fees.
+                const int nSlotHeight = GetSpendHeight(view);
+                const bool fInProtective = !keysIn.vSlot.empty() && IsHouseSlotProtective(tx, nSlotHeight);
                 // Stage 0 rule A (no pool walks): the conflicting pooled txs by index; the check below is the same.
                 for (const uint256& hashConflict : pool.HouseStateConflictTxs(keysIn.vSlot, keysIn.nStatusReader)) {
                     CTxMemPool::txiter mi = pool.mapTx.find(hashConflict);
@@ -2969,6 +3043,18 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
                         continue;
                     const CTransaction& mtx = mi->GetTx();
                     if (HouseStateKeysConflict(keysIn, GetHouseStateKeys(mtx))) {
+                        const bool fTheirsProtective = IsHouseSlotProtective(mtx, nSlotHeight);
+                        if (fInProtective && !fTheirsProtective) {
+                            // Never an op the incomer spends (evicting its unconfirmed parent aborts the node).
+                            if (SpendsPooledOrDescendant(setInPrevouts, pool, mi))
+                                return state.DoS(0, false, REJECT_DUPLICATE, "house-slot-op-in-mempool");
+                            setGuardYield.insert(mtx.GetHash());
+                            continue;
+                        }
+                        if (!fInProtective && fTheirsProtective)
+                            return state.DoS(0, false, REJECT_DUPLICATE, "house-slot-op-in-mempool", false,
+                                             "a pooled protective op (a holder's or the waterfall's) holds this house's "
+                                             "slot; no fee displaces it: retry after the next block");
                         // Never an op the incomer spends (fnSlotYields checks SpendsPooledOrDescendant: evicting the
                         // incomer's unconfirmed parent aborts the node in CheckInputsFromMempoolAndCache).
                         if (fnSlotYields(mi, mtx.nVersion == TRANSACTION_SETTLE_VERSION ?
@@ -4152,8 +4238,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // bond (the bond is the holder's default-recovery collateral).
         // Gold B (GOLD_B.md §3): the reference house whose ask governs sECX repayment while the bill is privately held. It
         // must exist and have posted a rate, so "the drawee can always discharge" holds from issue.
+        CHouse houseRef;
         {
-            CHouse houseRef;
             uint64_t nRefBid = 0, nRefAsk = 0;
             if (issue.nRefHouseID == 0 || !fnGetHouse(issue.nRefHouseID, houseRef))
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-ref-house");
@@ -4162,7 +4248,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         }
         const uint256 sighash = BillIssueSigHash(billID, issue.amount,
                 tx.vout[1].nValue, issue.nMaturityHeight, issue.nGraceBlocks,
-                issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey, issue.nRefHouseID);
+                issue.vchDrawerPubKey, issue.vchAcceptorPubKey, issue.vchHolderPubKey, issue.nRefHouseID,
+                houseRef.houseID);   // R5-3: the reference house's permanent id
         if (!FbVerifyStrict(CPubKey(issue.vchDrawerPubKey), sighash, issue.vchDrawerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-issue-drawer-sig");
         if (!FbVerifyStrict(CPubKey(issue.vchAcceptorPubKey), sighash, issue.vchAcceptorSig))
@@ -4401,7 +4488,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         // -- 26: authorization - two authorities, ONE shared digest ----------
         // Seller and house quorum sign the same bytes, so neither side can
         // alter any term after the other has signed.
-        const uint256 sighashDiscount = BillDiscountSigHash(tx, bill.billID);   // Stage 0 C1
+        const uint256 sighashDiscount = BillDiscountSigHash(tx, bill.billID, house.houseID);   // Stage 0 C1; R5-15
         if (!BillVerifyStrict(bill.vchHolderPubKey, sighashDiscount, d.vchSellerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-discount-seller-sig");
         if (!VerifyHouseApprovers(house, d.vApproverIndex, d.vApproverSig, sighashDiscount,
@@ -4529,10 +4616,18 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             // D-2026-11-20-1 (S1X-1): at the reference house's 30-day highest ask with the bond's share as a floor, as
             // ops 3, 7 and 9. GOLD_B §6's owner ASK90 is gone: the owner's ask no longer counts, so a failing owner
             // dragging it down changes nothing, and a failed reference house is anchored at its failure.
+            // R5-1 (D-2026-11-27-3): at an Insolvent house the house's notes are worth less than par, so burning them at
+            // par would repay the bill at a discount out of the other holders' pot. There op 10 takes no notes, and pays
+            // the whole face in sECX at the bound price, never less than the bond. A Deferred house keeps par reflux.
+            const bool fInsolvent = chEff == HOUSE_STATUS_INSOLVENT;
+            if (fInsolvent && hr.nUnitsBurned != 0)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-hretireescrow-notes-insolvent");   // flips with no tx
             const uint64_t nRestMg = (uint64_t)(hr.amountFace - (CAmount)hr.nUnitsBurned);
             if (!BillRepaymentOwed(bill, nRestMg, hr.nRateNamed, nHeight, fnGetHouse, state, "bad-bill-hretireescrow",
                                    amountOwed))
                 return false;
+            if (fInsolvent)
+                amountOwed = std::max(amountOwed, bill.amountEscrow);
         } else {
             // Anyone, but only once the drawee has defaulted (op 8's maturity gate); the whole bond goes in.
             if ((uint32_t)nHeight < TermDeadlineHeight(bill.nIssuedHeight, bill.nMaturityHeight, (uint64_t)bill.nGraceBlocks + 1, nHeight))
@@ -4591,6 +4686,19 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-bill-titlerelease-active");
         if (bill.nEscrowHouseID != 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-escrowed");
+        // R5-2 (security's condition 4): after op 8 the title sits with the op-8 house's custody key; while that house
+        // is Deferred, Insolvent or closed its 10,000 sats must not reach the operator. Its status as of the block's
+        // start (rule B1), so the order of the block doesn't matter.
+        if (bill.hclaimHouseID.IsNull() != (r.nHClaimHouseID == 0))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-house");
+        if (r.nHClaimHouseID != 0) {
+            CHouse houseHC;
+            if (!HouseAtBlockStart(r.nHClaimHouseID, houseHC, fnGetHouse) || houseHC.houseID != bill.hclaimHouseID)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-titlerelease-house");
+            const char chHC = HouseEffectiveStatus(houseHC, nHeight);
+            if (HouseClosed(houseHC) || chHC == HOUSE_STATUS_DEFERRED || chHC == HOUSE_STATUS_INSOLVENT)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-titlerelease-house-failed");   // flips with no tx
+        }
         billOut = bill;
         return true;
     }
@@ -4753,7 +4861,7 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
             // The QUORUM replaces the single holder signature of op 4: the
             // custody key alone must never direct the escrow payout.
             if (!VerifyHouseApprovers(house, hc.vApproverIndex, hc.vApproverSig,
-                    BillClaimSigHash(tx, bill.billID, true),   // Stage 0 C1
+                    BillClaimSigHash(tx, bill.billID, true, house.houseID),   // Stage 0 C1; R5-15
                     house.nThresholdM, state, "bad-bill-hclaim-approvers"))
                 return false;
         }
@@ -4778,6 +4886,8 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
         billOut = bill;
         billOut.status = fRetire ? BILL_STATUS_RETIRED : BILL_STATUS_DEFAULTED;
         billOut.nOwnerHouseID = 0;
+        if (!fRetire)
+            billOut.hclaimHouseID = house.houseID;   // R5-2: whose custody key now holds it (the disconnect clears it)
 
         houseOut = house;
         fHouseChanged = true;
@@ -4866,8 +4976,40 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                 return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-no-deficiency");
             amountFloor = amountFaceSats - bill.amountEscrow;
         }
-        if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountFloor)
+        // R5-2 (D-2026-11-27-3; security's conditions 11-27): on a bill op 8 defaulted, the op-8 house's custody key is the
+        // holder. The payload names that house (nEscrowHouseID, its dense id, checked against the bill's permanent id);
+        // its status decides the form. Deferred or Insolvent: the escrow form is forced - vout[0] is the house's escrow,
+        // at least the floor, and the coin joins vOutReserveLock (the op takes the house's slot), so the money reaches
+        // its holders. Closed: refused. Otherwise the plain form, paying the holder. A bill op 8 didn't default names 0.
+        CHouse houseHC;
+        bool fEscrowForm = false;
+        // Only the first recourse after op 8 (the custody key still holds the bill) names the house (security 11-27):
+        // after it the payer is the holder, and later recourses pay them.
+        const bool fNamesHouse = !bill.hclaimHouseID.IsNull() && bill.nHClaimRecourses == 0;
+        if (fNamesHouse != (r.nEscrowHouseID != 0))
+            return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-escrow-house");
+        if (r.nEscrowHouseID != 0) {
+            // As of the block's start (rule B1): the escrow form takes the house's slot, so no other op changed it
+            // earlier in the block, and the plain form only reads it.
+            if (!HouseAtBlockStart(r.nEscrowHouseID, houseHC, fnGetHouse) || houseHC.houseID != bill.hclaimHouseID)
+                return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-escrow-house");
+            if (HouseClosed(houseHC))
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-recourse-house-closed");
+            const char chHC = HouseEffectiveStatus(houseHC, nHeight);
+            fEscrowForm = chHC == HOUSE_STATUS_DEFERRED || chHC == HOUSE_STATUS_INSOLVENT;
+        }
+        if (fEscrowForm) {
+            if (tx.vout.empty() || tx.vout[0].scriptPubKey != HouseEscrowScript(houseHC.houseID) ||
+                    tx.vout[0].nValue < amountFloor)
+                return state.DoS(10, false, REJECT_INVALID, "bad-bill-recourse-escrow-payment");   // flips with no tx
+        } else if (BillValuePaidTo(tx, bill.vchHolderPubKey) < amountFloor) {
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-payment");
+        }
+        for (size_t o = fEscrowForm ? 1 : 0; o < tx.vout.size(); o++) {   // only the escrow form's vout[0] is escrow-shaped
+            if (IsHouseEscrowScript(tx.vout[o].scriptPubKey))   // vout[0] at a house that recovered: flips with no tx
+                return state.DoS(o == 0 && r.nEscrowHouseID != 0 ? 10 : 100, false, REJECT_INVALID,
+                                 "bad-bill-recourse-stray-escrow");
+        }
 
         // -- 34: authorization ----------------------------------------------
         // The payer alone. Holder consent is structurally unnecessary: they are
@@ -4877,11 +5019,19 @@ bool CheckBillOperation(const CTransaction& tx, CValidationState& state, int nHe
                 r.vchPayerSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-bill-recourse-payer-sig");
 
-        // Effects: subrogation, and nothing else. No status change, no owner
-        // change (it is already 0), NO house record touched and no house slot
-        // taken - which is why fHouseChanged stays false here.
+        // Effects: subrogation. No status change, no owner change (it is already 0). The plain form touches no house
+        // record and takes no house slot; the escrow form (R5-2) adds its coin to the op-8 house's locked till, where
+        // the pot reaches it, as ops 10/11 do.
         billOut = bill;
         billOut.vchHolderPubKey = r.vchPayerPubKey;
+        if (!bill.hclaimHouseID.IsNull())
+            billOut.nHClaimRecourses++;   // R5-2: the disconnect lowers it
+        if (fEscrowForm) {
+            houseHC.vOutReserveLock.push_back(COutPoint(tx.GetHash(), 0));
+            std::sort(houseHC.vOutReserveLock.begin(), houseHC.vOutReserveLock.end());
+            houseOut = houseHC;
+            fHouseChanged = true;
+        }
         return true;
     }
 
@@ -5455,20 +5605,32 @@ bool CheckHouseOperation(const CTransaction& tx, CValidationState& state, int nH
             // live >= residual >= sum-of-floor-shares, so the sweep is >= 0
             if (amountLive < amountShareSum)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-underfunded");
-            vShare.back().second += amountLive - amountShareSum;
+            // TG-2b (D-2026-11-27-2 (8)): the last partner sweeps the residual's rounding only. Live escrow over the
+            // residual (e.g. a bond collected after the snapshot) goes to the mutual fund output, as at CLOSE, so the two
+            // endings agree.
+            const CAmount amountToPartners = std::min(amountResidual, amountLive);
+            vShare.back().second += amountToPartners - amountShareSum;
+            const CAmount amountFund = amountLive - amountToPartners;
 
-            // Forced payout layout: vout[k] pays partner vShare[k] exactly
-            if (tx.vout.size() < vShare.size())
+            // Forced payout layout: vout[k] pays partner vShare[k] exactly, then the fund output carries any excess
+            const size_t nPinned = vShare.size() + (amountFund > 0 ? 1 : 0);
+            if (tx.vout.size() < nPinned)
                 return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-vout");
             for (size_t k = 0; k < vShare.size(); k++) {
                 const CScript expected = NoteScriptForPubKey(house.vPartner[vShare[k].first].vchPubKey);
                 if (tx.vout[k].scriptPubKey != expected || tx.vout[k].nValue != vShare[k].second)
                     return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-payout");
             }
+            if (amountFund > 0) {
+                const CTxOut& outFund = tx.vout[vShare.size()];
+                if (!IsMutualFundScript(outFund.scriptPubKey) || outFund.nValue != amountFund)
+                    return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-fund");
+            }
             // The settle terminates the pot - no output may re-create an
-            // escrow-shaped coin (it would enter the UTXO set untagged).
-            for (const CTxOut& out : tx.vout) {
-                if (IsHouseEscrowScript(out.scriptPubKey))
+            // escrow-shaped coin (it would enter the UTXO set untagged), and no second fund output.
+            for (size_t o = 0; o < tx.vout.size(); o++) {
+                if (IsHouseEscrowScript(tx.vout[o].scriptPubKey) ||
+                        (o >= nPinned && IsMutualFundScript(tx.vout[o].scriptPubKey)))
                     return state.DoS(100, false, REJECT_INVALID, "bad-house-settle-stray-escrow");
             }
 
@@ -6015,7 +6177,8 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
             if (SwapRecordForChecks(sw.hashLock, existing))
                 return state.DoS(100, false, REJECT_INVALID, "bad-note-swap-hash-used");
             uint64_t nBid = 0;
-            if (!BoundHouseRate(sw.nHouseID, sw.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap", nBid))
+            if (!BoundHouseRate(sw.nHouseID, sw.nRateNamed, nHeight, HouseRateKind::BID, state, "bad-note-swap", nBid, 0,
+                                true))   // R5-23: the named bid is the holder's floor
                 return false;
             const CScript scriptPayout(sw.vchPayoutScript.begin(), sw.vchPayoutScript.end());
             if (scriptPayout == HouseEscrowScript(house.houseID) || !IsHousePayableScript(scriptPayout))   // S1X-15
@@ -6239,7 +6402,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         // without new consent. Stage 0 rule A: before the member reads, the
         // capital read (tranches, rate days) and the reserve proofs.
         if (!VerifyHouseApprovers(house, mint.vApproverIndex, mint.vApproverSig,
-                NoteMintSigHash(tx),
+                NoteMintSigHash(tx, house.houseID),
                 house.nThresholdM, state, "bad-note-mint-approver"))
             return false;
         // v0.2.19 members-only: new notes go to members (spec 4.1)
@@ -6958,7 +7121,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (status != HOUSE_STATUS_OPEN && status != HOUSE_STATUS_STRESSED)
             return state.DoS(10, false, REJECT_INVALID, "bad-note-lock-house-status");
         // Both the holder and the house approve the exact lock (Q1).
-        const uint256 sighash = NoteLockSigHash(tx);
+        const uint256 sighash = NoteLockSigHash(tx, house.houseID);
         if (!FbVerifyStrict(CPubKey(lock.vchHolderPubKey), sighash, lock.vchHolderSig))
             return state.DoS(100, false, REJECT_INVALID, "bad-note-lock-sig");
         if (!VerifyHouseApprovers(house, lock.vApproverIndex, lock.vApproverSig, sighash, house.nThresholdM, state,
@@ -6997,7 +7160,7 @@ bool CheckNoteOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (!CheckMembersOnlyOutputs(tx, state, nHeight, house, MembersOnlyMove::ISSUE, nullptr))
             return false;
         if (!VerifyHouseApprovers(house, unlock.vApproverIndex, unlock.vApproverSig,
-                NoteUnlockSigHash(tx),
+                NoteUnlockSigHash(tx, house.houseID),
                 house.nThresholdM, state, "bad-note-unlock-approver"))
             return false;
         house.nTokenUnits -= total;
@@ -7075,7 +7238,7 @@ bool CheckTokenOperation(const CTransaction& tx, CValidationState& state, int nH
         // Keys are unique within a keyset (the shape check), not across houses (Michael 2026-10-08, review M1): mint
         // keys are public, so a chain-wide rule would let another house squat a mint's keys. A house that copies
         // another's keys only pays its own backing out to the other's token holders.
-        if (!VerifyHouseApprovers(house, ks.vApproverIndex, ks.vApproverSig, TokenKeysetSigHash(tx),
+        if (!VerifyHouseApprovers(house, ks.vApproverIndex, ks.vApproverSig, TokenKeysetSigHash(tx, house.houseID),
                 house.nThresholdM, state, "bad-token-keyset-approver"))
             return false;
         // Stage 0 rule A: each key a real point (the shape check reads bytes only), after the approvers' signatures.
@@ -7402,6 +7565,15 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
             wtDelta += (unsigned __int128)org.vPrincipal[i] * (unsigned __int128)m;
         }
 
+        // R5-8 (rule A: approvers before any capital or state read that grows with the house): first.
+        // House M-of-N authorizes the exact batch (house_id + terms + inputs +
+        // outputs). Binding DepositHashPrevouts makes a confirmed origination's
+        // approver sigs non-replayable with fresh funding (the notes-MINT lesson).
+        if (!VerifyHouseApprovers(house, org.vApproverIndex, org.vApproverSig,
+                DepositOriginateSigHash(tx, house.houseID),   // Stage 0 C1; R5-15
+                house.nThresholdM, state, "bad-deposit-originate-approver"))
+            return false;
+
         // CM-2 CAPITAL cap, SHARED with notes: N + D + total <= lambda * E. Reads
         // LIVE nMintedUnits (notes and deposits share the one leverage ceiling).
         // Deposits are OUTSIDE rho - NO reserve proof, NO rho gate: a term-locked,
@@ -7413,14 +7585,6 @@ bool CheckDepositOperation(const CTransaction& tx, CValidationState& state, int 
                 house.nMintedUnits > (uint64_t)MAX_MONEY - (house.nDepositUnits + total) ||
                 house.nMintedUnits + house.nDepositUnits + total > CapitalCapUnits(house, nHeight))
             return state.DoS(100, false, REJECT_INVALID, "bad-deposit-originate-over-cap");
-
-        // House M-of-N authorizes the exact batch (house_id + terms + inputs +
-        // outputs). Binding DepositHashPrevouts makes a confirmed origination's
-        // approver sigs non-replayable with fresh funding (the notes-MINT lesson).
-        if (!VerifyHouseApprovers(house, org.vApproverIndex, org.vApproverSig,
-                DepositOriginateSigHash(tx),   // Stage 0 C1
-                house.nThresholdM, state, "bad-deposit-originate-approver"))
-            return false;
 
         house.nDepositUnits += total;
         house.SetDepositWtMaturity(house.DepositWtMaturity() + wtDelta);
@@ -7887,7 +8051,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_OPEN)
             return state.DoS(100, false, REJECT_INVALID, "bad-pool-create-house-not-open");
 
-        const uint256 sighash = PoolCreateSigHash(tx);
+        const uint256 sighash = PoolCreateSigHash(tx, house.houseID);   // R5-15
         if (!VerifyHouseApprovers(house, create.vApproverIndex, create.vApproverSig,
                 sighash, house.nThresholdM, state, "bad-pool-create-approver"))
             return false;
@@ -7952,7 +8116,7 @@ bool CheckPoolOperation(const CTransaction& tx, CValidationState& state, int nHe
         // (any non-settled partner may trigger) - so insolvency liveness never
         // depends on assembling M-of-N. The M-of-N path is accepted at ANY
         // effective status (operator decision 5).
-        const uint256 sighash = PoolRetireSigHash(tx);
+        const uint256 sighash = PoolRetireSigHash(tx, house.houseID);   // R5-15
         if (!ret.vchTriggerSig.empty()) {
             if (HouseEffectiveStatus(house, nHeight) != HOUSE_STATUS_INSOLVENT)
                 return state.DoS(100, false, REJECT_INVALID, "bad-pool-retire-trigger-not-insolvent");
@@ -8124,6 +8288,22 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     CHouse houseA, houseB;
     if (!fnGetHouse(x.nHouseA, houseA) || !fnGetHouse(x.nHouseB, houseB))
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-unknown-house");
+    // R5-8 (rule A: approvers before any capital or state read; GoldParEligible reads the capital): (13) four
+    // signatures over ONE shared digest - atomic mutual consent:
+    // both houses' M-of-N approver quorums (corporate consent) and both
+    // presentment-key holders (coin authority; their P2PKH scriptSigs bind the
+    // spend, this sig binds the op semantics - the standard double-binding).
+    const uint256 sighash = SettleExchangeSigHash(tx, SettleHousesID({houseA.houseID, houseB.houseID}));   // Stage 0 C1; R5-15
+    if (!VerifyHouseApprovers(houseA, x.vApproverIndexA, x.vApproverSigA,
+            sighash, houseA.nThresholdM, state, "bad-settle-approver"))
+        return false;
+    if (!VerifyHouseApprovers(houseB, x.vApproverIndexB, x.vApproverSigB,
+            sighash, houseB.nThresholdM, state, "bad-settle-approver"))
+        return false;
+    if (!FbVerifyStrict(CPubKey(x.vchPresentKeyOfANotes), sighash, x.vchPresentSigOfANotes) ||
+            !FbVerifyStrict(CPubKey(x.vchPresentKeyOfBNotes), sighash, x.vchPresentSigOfBNotes))
+        return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
+
     if (!GoldParEligible(houseA, nHeight) || !GoldParEligible(houseB, nHeight))
         return state.DoS(100, false, REJECT_INVALID, "bad-settle-house-ineligible");
     // Gold B (GOLD_B.md §3): a residual (mode 1) is sECX between the lower bid and the higher ask of the two houses. A
@@ -8182,20 +8362,7 @@ bool CheckSettleOperation(const CTransaction& tx, CValidationState& state, int n
     if (x.nExpiryHeight != 0 && (nHeight < 0 || (uint32_t)nHeight > x.nExpiryHeight))
         return state.DoS(fMempool ? 0 : 100, false, REJECT_INVALID, "bad-settle-expired");   // v0.2.24: timing, 0 in the mempool
 
-    // (13) Four signatures over ONE shared digest - atomic mutual consent:
-    // both houses' M-of-N approver quorums (corporate consent) and both
-    // presentment-key holders (coin authority; their P2PKH scriptSigs bind the
-    // spend, this sig binds the op semantics - the standard double-binding).
-    const uint256 sighash = SettleExchangeSigHash(tx);   // Stage 0 C1
-    if (!VerifyHouseApprovers(houseA, x.vApproverIndexA, x.vApproverSigA,
-            sighash, houseA.nThresholdM, state, "bad-settle-approver"))
-        return false;
-    if (!VerifyHouseApprovers(houseB, x.vApproverIndexB, x.vApproverSigB,
-            sighash, houseB.nThresholdM, state, "bad-settle-approver"))
-        return false;
-    if (!FbVerifyStrict(CPubKey(x.vchPresentKeyOfANotes), sighash, x.vchPresentSigOfANotes) ||
-            !FbVerifyStrict(CPubKey(x.vchPresentKeyOfBNotes), sighash, x.vchPresentSigOfBNotes))
-        return state.DoS(100, false, REJECT_INVALID, "bad-settle-presenter-sig-invalid");
+    // (13) The four signatures: checked first, right after the two records (R5-8 below).
 
     // Mutations for the caller to stage: REDEEM semantics, twice, atomically -
     // the counters only ever move against real burned coins (input layer).
@@ -8242,7 +8409,10 @@ bool CheckSettleNetOperation(const CTransaction& tx, CValidationState& state, in
     }
     // One digest: every house's M-of-N quorum, and every presenting house's key.
     {
-        const uint256 sighash = SettleNetSigHash(tx);
+        std::vector<uint256> vCanonical;
+        for (const CHouse& h : vHouse)
+            vCanonical.push_back(h.houseID);
+        const uint256 sighash = SettleNetSigHash(tx, SettleHousesID(vCanonical));   // R5-15
         for (size_t i = 0; i < n.vHouseID.size(); i++) {
             if (!VerifyHouseApprovers(vHouse[i], n.vApproverIndex[i], n.vApproverSig[i],
                     sighash, vHouse[i].nThresholdM, state, "bad-settle-approver"))
@@ -8854,6 +9024,8 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 // recourses on one bill in one block therefore unwind correctly
                 // in reverse: each carries its OWN prior.
                 bill.vchHolderPubKey = r.vchPrevHolderPubKey;
+                if (!bill.hclaimHouseID.IsNull() && bill.nHClaimRecourses > 0)
+                    bill.nHClaimRecourses--;   // R5-2: connect raised it
                 mapBillUndo[bill.nBillID] = bill;
             }
             else if (tx.nBillOp == BILL_OP_HRETIRE || tx.nBillOp == BILL_OP_HCLAIM ||
@@ -8920,6 +9092,10 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 // S1X-25: only ops 10/11 set it, on a house-held bill (owner != 0), and nothing else writes it while a
                 // house holds the bill, so the pre-op value is 0.
                 bill.nEscrowHouseID = 0;
+                // R5-2: only op 8 sets it, on a house-held bill (a bill leaves a book once), so the pre-op value is null;
+                // no recourse can precede op 8 (a house-held bill refuses it), so the count was 0.
+                bill.hclaimHouseID.SetNull();
+                bill.nHClaimRecourses = 0;
                 mapBillUndo[bill.nBillID] = bill;
             }
         }
@@ -9040,6 +9216,28 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
             if (!phousetree->WriteHouse(house)) {
                 error("DisconnectBlock(): Failed to write bill-op house undo!");
                 return DISCONNECT_FAILED;
+            }
+        }
+        // R5-2: a RECOURSE's escrow form appended (txid, 0) to the op-8 house's vOutReserveLock: removed BY VALUE, as for
+        // ops 10/11 (a no-op for the plain form, which names the house but appended nothing). Idempotent.
+        if (fHouseUndo && tx.nVersion == TRANSACTION_BILL_VERSION && tx.nBillOp == BILL_OP_RECOURSE &&
+                tx.vchBillPayload.size() >= 8 && ReadLE32(tx.vchBillPayload.data() + 4) != 0) {
+            CHouse house;
+            if (!phousetree->GetHouse(ReadLE32(tx.vchBillPayload.data() + 4), house)) {
+                error("DisconnectBlock(): Failed to undo recourse escrow effects!");
+                return DISCONNECT_FAILED;
+            }
+            const COutPoint outLock(tx.GetHash(), 0);
+            std::vector<COutPoint> vKeep;
+            for (const COutPoint& out : house.vOutReserveLock)
+                if (!(out == outLock))
+                    vKeep.push_back(out);
+            if (vKeep.size() != house.vOutReserveLock.size()) {
+                house.vOutReserveLock = vKeep;
+                if (!phousetree->WriteHouse(house)) {
+                    error("DisconnectBlock(): Failed to write recourse escrow undo!");
+                    return DISCONNECT_FAILED;
+                }
             }
         }
 
@@ -9524,7 +9722,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nProtestOpen = pr.nPrevProtestOpen;
                 house.nProtestHeight = pr.nPrevProtestHeight;
                 house.nProtestDemandHeight = pr.nPrevProtestDemandHeight;
-                if (house.nNoCureHeight == (uint32_t)pindex->nHeight)
+                if (house.nNoCureHeight == (uint32_t)pindex->nHeight + 1)
                     house.nNoCureHeight = 0;   // only this op (it holds the house's slot) can have set it here
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write deposit protest undo!");
@@ -10031,7 +10229,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 house.nProtestOpen = pro.nPrevProtestOpen;
                 house.nProtestHeight = pro.nPrevProtestHeight;
                 house.nProtestDemandHeight = pro.nPrevProtestDemandHeight;
-                if (house.nNoCureHeight == (uint32_t)pindex->nHeight)
+                if (house.nNoCureHeight == (uint32_t)pindex->nHeight + 1)
                     house.nNoCureHeight = 0;   // only this op (it holds the house's slot) can have set it here
                 if (!phousetree->WriteHouse(house)) {
                     error("DisconnectBlock(): Failed to write note protest undo!");
@@ -10101,7 +10299,7 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                     house.nProtestOpen = pro.nPrevProtestOpen;
                     house.nProtestHeight = pro.nPrevProtestHeight;
                     house.nProtestDemandHeight = pro.nPrevProtestDemandHeight;
-                    if (house.nNoCureHeight == (uint32_t)pindex->nHeight)
+                    if (house.nNoCureHeight == (uint32_t)pindex->nHeight + 1)
                         house.nNoCureHeight = 0;   // only this op (it holds the house's slot) can have set it here
                     fWrite = true;
                 }
@@ -11651,8 +11849,8 @@ bool CChainState::ConnectBlock(const CBlock& block, CValidationState& state, CBl
 
             // Ops 5/7/8 take the owning house's one-op-per-house-per-block slot,
             // under the SAME collision rule as a governance op or a note MINT.
-            // RECOURSE takes no slot: it mutates no house record, so mempool
-            // slot accounting and consensus agree exactly.
+            // RECOURSE's escrow form (R5-2) changes the op-8 house, so it is counted here like ops 10/11; the plain form
+            // changes none (the pool holds it to the slot anyway: stricter, never looser).
             if (fHouseChangedBill) {
                 for (const CHouse& h : vHouseNew)
                     if (h.nHouseID == houseResultBill.nHouseID)

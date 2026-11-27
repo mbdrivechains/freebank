@@ -206,9 +206,10 @@ inline uint256 DemandDigestAny(uint256 (*f)(uint32_t, const std::vector<uint64_t
 {
     return f(nHouse, vUnits, BillHashOutputs(CTransaction(mtx)));
 }
-inline uint256 ClaimDigestAny(uint256 (*f)(const CTransaction&, const uint256&, bool), const uint256& billID, const CMutableTransaction& mtx)
+inline uint256 ClaimDigestAny(uint256 (*f)(const CTransaction&, const uint256&, bool, const uint256&), const uint256& billID,
+                              const CMutableTransaction& mtx)
 {
-    return f(CTransaction(mtx), billID, false);
+    return f(CTransaction(mtx), billID, false, uint256());   // op 4 names no house (R5-15 binds op 8's)
 }
 inline uint256 ClaimDigestAny(uint256 (*f)(const uint256&, const uint256&, const uint256&, bool), const uint256& billID,
                               const CMutableTransaction& mtx)

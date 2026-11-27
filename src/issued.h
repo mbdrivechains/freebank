@@ -408,6 +408,8 @@ struct CHouse;
  *  clock), on a scratch view over the units DB, and no coins: safe before a reorg's re-adds. False with strReject when
  *  it no longer would. A non-POST tx is never stale here. */
 bool HouseRatePostStillValid(const CTransaction& tx, int nHeight, std::string& strReject);
+/** R5-6: is tx a SETKEY or charter op whose op count a newer one has passed (stale at the tip)? */
+bool HouseRateOpCountStale(const CTransaction& tx, std::string& strReject);
 
 /** fMempool (ATMP): every refusal scores DoS 0 (MempoolRefusalScoresZero, UF4-1): its verdicts read units state a
  *  block can change (a pool created, a pooled MINT's supply: S2X-3, S2X-5). The block path keeps DoS 100. */

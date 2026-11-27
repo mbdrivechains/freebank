@@ -1187,7 +1187,7 @@ public:
     bool RelayTokenClaims(std::string& strFail, uint256& txidOut, uint32_t nHouseID,
                           const std::vector<TokenClaimEntry>& vEntry, const CAmount& nFee, std::vector<uint256>* pvTxid = nullptr);
     bool CollectTokens(std::string& strFail, uint256& txidOut, uint32_t nHouseID, std::vector<uint256>& vY,
-                       const CAmount& nFee);
+                       const CAmount& nFee, bool fClearBills = true);
     /** Fund and send a v13 note op whose outputs (and any extra inputs, unsigned: escrow) are already set: add this
      *  wallet's coins for the outputs not covered and the fee, plain change last, then fnPayload fills the payload
      *  (the inputs are fixed by then, so it can sign over them). */
@@ -1221,7 +1221,7 @@ public:
     /** The waterfall (GOLD_B §6): claim a failed house's pending swap or live shortfall - its exact entitlement from the
      *  escrow pot to the swap's payout script. Anyone may; this wallet pays the fee. */
     bool SwapClaimFromEscrow(std::string& strFail, uint256& txidOut, const uint256& hashLock, const CAmount& nFee,
-                             CAmount& amountPaidOut);
+                             CAmount& amountPaidOut, bool fClearBills = true);
     /** DEMAND, one op two modes keyed on house status (B3):
      * - Deferred: the 3.5 option-clause demand (plain; interest from demand).
      * - Open/Stressed: the B3 formal demand - coins move onto the consensus-
@@ -1241,7 +1241,8 @@ public:
                           bool fFromCapital = false);
     /** Insolvency waterfall (3.4): burn nUnits and take the pro-rata
      * entitlement from the house's escrow pot. */
-    bool ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee);
+    bool ClaimNote(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nUnits, const CAmount& nFee,
+                   bool fClearBills = true);
 
     /** A wallet's note position in one house (drives listmynotes / the GUI hold view). */
     struct WalletNoteHolding {
@@ -1286,7 +1287,8 @@ public:
                           const CAmount& nFee);
     /** At insolvency, burn a receipt (house, nPrincipal) for the subordinated
      * pro-rata from the escrow pot (junior to notes). */
-    bool ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee);
+    bool ClaimDeposit(std::string& strFail, uint256& txidOut, uint32_t nHouseID, uint64_t nPrincipal, const CAmount& nFee,
+                      bool fClearBills = true);
 
     // AMM pools (Phase 3.7). One pool per house (nPoolID == nHouseID); every
     // op binds the pool's live priors, so a builder racing another pool op
@@ -1351,12 +1353,13 @@ public:
     bool AdmitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nPledge, const CAmount& nFee);
     bool ExitPartner(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);
     bool WinddownHouse(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const CAmount& nFee);
-    bool ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee);
+    bool ReclaimPledge(std::string& strFail, uint256& txidOut, const uint32_t nHouseID, const uint32_t nPartnerIndex, const CAmount& nFee,
+                       bool fClearBills = true);
     /** v0.2.28 CLOSE: anyone closes a failed house once its claim window has closed (FAILED_HOUSE_DESIGN.md E). Spends
      *  every live escrow coin; pays the partners' residual shares and the rest to the mutual fund; the fee and change
      *  come from this wallet's plain coins. */
     bool CloseHouse(std::string& strFail, uint256& txidOut, CAmount& amountFundOut, const uint32_t nHouseID,
-                    const CAmount& nFee);
+                    const CAmount& nFee, bool fClearBills = true);
     /** Publish a reserve attestation (Phase 3.4): proves the wallet's plain
      * confirmed coins as the house's liquid till (up to MAX_ATTEST_PROOFS,
      * largest first; fee funded from coins OUTSIDE the proof set). */

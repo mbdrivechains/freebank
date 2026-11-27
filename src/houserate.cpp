@@ -437,6 +437,27 @@ bool HouseRateKeyForChecks(uint32_t nHouseID, std::vector<unsigned char>& vchPub
     return WithChecksView([&](const CUnitsView& units) { return units.Get(RateKeyKey(nHouseID), vchPubKey); });
 }
 
+uint64_t HouseRateKeySeqForChecks(uint32_t nHouseID)
+{
+    uint64_t n = 0;
+    WithChecksView([&](const CUnitsView& units) { units.Get(HouseRateKeySeqKey(nHouseID), n); return true; });
+    return n;
+}
+
+uint64_t HouseRatePostSeqForChecks(uint32_t nHouseID)
+{
+    uint64_t n = 0;
+    WithChecksView([&](const CUnitsView& units) { units.Get(HouseRatePostSeqKey(nHouseID), n); return true; });
+    return n;
+}
+
+uint64_t HouseCharterSeqForChecks(uint32_t nHouseID)
+{
+    uint64_t n = 0;
+    WithChecksView([&](const CUnitsView& units) { units.Get(HouseCharterSeqKey(nHouseID), n); return true; });
+    return n;
+}
+
 bool HouseRateMaxAtForChecks(uint32_t nHouseID, int nAnchorHeight, uint32_t nDays, uint64_t& nMaxBid, uint64_t& nMaxAsk)
 {
     if (g_nHouseRateTestOverride) {

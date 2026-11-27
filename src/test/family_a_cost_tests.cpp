@@ -447,7 +447,7 @@ BOOST_AUTO_TEST_CASE(family_a_cost_token_claim_insolvent_house)
     BOOST_CHECK_MESSAGE(r.strReason == "bad-token-claim-sig", "family A: the 96-try claim was refused at " + r.strReason +
                         ", not at the holder signature after the reads (so the probe no longer measures that path)");
     // Security 11-26: a token holder's signature has no standing; bad-token-claim-sig, -dleq and -proof are pure in the
-    // tx and the keyset its id names, so they score DoSStateIndependent(100) (FAILS until that lands).
+    // tx and the keyset its id names, so they score DoSStateIndependent(100) (freebankd 4358e5d, v1.2.7).
     ExpectDoS100(r);
     const FaResult rProof = Time("note TOKEN_CLAIM at an insolvent house, 32 random secrets, the first C not a point", [&](int i) {
         CMutableTransaction mtx = fnClaim(0)(i);

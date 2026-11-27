@@ -11,7 +11,9 @@
 #include <chain.h>
 #include <sidechain.h>
 
+#include <list>
 #include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -334,6 +336,23 @@ public:
     bool GetHouseIDByClassID(const std::string& strClassID, uint32_t& nID);
 
     bool RemoveHouse(const uint32_t nID);
+
+    /** R5-13 (run 5; security Medium): GetHouse keeps decoded records, so admission and block reads of a large house
+     *  (25,000 listed outpoints cost ~2.4 ms to decode) decode once per database state. Every write of a house record
+     *  and every stage commit clears it; it is bypassed while a disconnect stage is open. Bounded (LRU) by
+     *  HOUSE_CACHE_MAX_BYTES of serialized size. */
+    static const size_t HOUSE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+    size_t HouseCacheBytes() const;
+    size_t HouseCacheEntries() const;
+    void ClearHouseCache();
+
+private:
+    mutable std::mutex m_cacheMutex;
+    mutable std::list<uint32_t> m_lru;   // most recently used first
+    struct CacheEntry { CHouse house; size_t nBytes; std::list<uint32_t>::iterator itLru; };
+    mutable std::map<uint32_t, CacheEntry> m_cache;
+    mutable size_t m_nCacheBytes = 0;
+    mutable uint64_t m_nCacheGen = 0;   // bumped by every clear: a read that began before one doesn't insert
 };
 
 /** Access to the pool database (blocks/Pools/). nPoolID == nHouseID (one pool

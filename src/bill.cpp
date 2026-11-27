@@ -27,7 +27,7 @@ uint256 BillIDFromBody(const std::vector<unsigned char>& vchBody)
     return hash;
 }
 
-uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID)
+uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAmount& amountEscrow, uint32_t nMaturityHeight, uint32_t nGraceBlocks, const std::vector<unsigned char>& vchDrawerPubKey, const std::vector<unsigned char>& vchAcceptorPubKey, const std::vector<unsigned char>& vchHolderPubKey, uint32_t nRefHouseID, const uint256& refHouseCanonical)
 {
     CHashWriter ss(SER_GETHASH, 0);
     ss << std::string("FreeBankBill/issue");
@@ -41,6 +41,8 @@ uint256 BillIssueSigHash(const uint256& billID, const CAmount& amount, const CAm
     ss << vchAcceptorPubKey;
     ss << vchHolderPubKey;
     ss << nRefHouseID;   // Gold B: the reference house is part of the acceptance
+    // R5-3 (D-2026-11-27-2 (1)): and its permanent id, so a reorg that renumbers houses can't repoint the bill's price.
+    ss << refHouseCanonical;
     return ss.GetHash();
 }
 
@@ -88,10 +90,19 @@ uint256 BillRetireSigHash(const CTransaction& tx, const uint256& billID, bool fH
     return CreditTxSigHash(tx, fHouseHeld ? "FreeBankBill/hretire" : "FreeBankBill/retire", billID);
 }
 
-uint256 BillClaimSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld)
+/** R5-15 (D-2026-11-27-2 (1)): one id binding a bill and the house acting on it by their permanent ids. */
+static uint256 BillHouseBindID(const uint256& billID, const uint256& houseID)
 {
-    // Stage 0 rule C1: op 8 vs op 4 by domain.
-    return CreditTxSigHash(tx, fHouseHeld ? "FreeBankBill/hclaim" : "FreeBankBill/claim", billID);
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << std::string("FreeBankBill/house") << billID << houseID;
+    return ss.GetHash();
+}
+
+uint256 BillClaimSigHash(const CTransaction& tx, const uint256& billID, bool fHouseHeld, const uint256& houseID)
+{
+    // Stage 0 rule C1: op 8 vs op 4 by domain. R5-15: op 8's approvers also bind the holding house's permanent id.
+    return CreditTxSigHash(tx, fHouseHeld ? "FreeBankBill/hclaim" : "FreeBankBill/claim",
+                           fHouseHeld ? BillHouseBindID(billID, houseID) : billID);
 }
 
 uint256 BillHashPrevouts(const CTransaction& tx)
@@ -102,12 +113,12 @@ uint256 BillHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 BillDiscountSigHash(const CTransaction& tx, const uint256& billID)
+uint256 BillDiscountSigHash(const CTransaction& tx, const uint256& billID, const uint256& houseID)
 {
     // Stage 0 rule C1: the seller and the house's approvers sign the whole transaction. The reserve proofs carry their
     // own per-coin challenge signatures, and the endorsement link carries its standing BillEndorseSigHash; the binding
     // form strips their signature fields and the link's height (bound by the link's own signature), nothing else.
-    return CreditTxSigHash(tx, "FreeBankBill/discount", billID);
+    return CreditTxSigHash(tx, "FreeBankBill/discount", BillHouseBindID(billID, houseID));   // R5-15: the house too
 }
 
 uint256 BillRecourseSigHash(const CTransaction& tx, const uint256& billID)
@@ -225,8 +236,18 @@ void ApplyBillCoinTags(const CTransaction& tx, uint32_t n, Coin& coin, BillTagCa
         }
         return;
     }
-    // RECOURSE / HRETIRE / HCLAIM create no tagged output: recourse pays the
-    // holder in plain value, and the two terminal events pay out of the escrow.
+    // R5-2: a RECOURSE's escrow form pays the op-8 house's escrow at vout[0] (consensus pins script and value; the plain
+    // form may hold no escrow-shaped output at all), tagged from the payload alone like ops 10/11: bytes 4..8 = the
+    // house id, and the script is the house-escrow shape.
+    if (tx.nBillOp == BILL_OP_RECOURSE) {
+        if (n == 0 && tx.vchBillPayload.size() >= 8 && !tx.vout.empty() && IsHouseEscrowScript(tx.vout[0].scriptPubKey)) {
+            const uint32_t nHouseID = ReadLE32(tx.vchBillPayload.data() + 4);
+            if (nHouseID != 0)
+                coin.SetHouseEscrow(nHouseID);
+        }
+        return;
+    }
+    // HRETIRE / HCLAIM create no tagged output: the two terminal events pay out of the escrow.
 }
 
 static bool IsValidBillPubKey(const std::vector<unsigned char>& vch)

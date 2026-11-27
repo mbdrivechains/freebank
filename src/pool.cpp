@@ -51,10 +51,10 @@ uint256 PoolHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 PoolCreateSigHash(const CTransaction& tx)
+uint256 PoolCreateSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankPool/create");
+    return CreditTxSigHash(tx, "FreeBankPool/create", houseID);   // R5-15
 }
 
 uint256 PoolAddLiqSigHash(const CTransaction& tx)
@@ -75,10 +75,10 @@ uint256 PoolSwapSigHash(const CTransaction& tx)
     return CreditTxSigHash(tx, "FreeBankPool/swap");
 }
 
-uint256 PoolRetireSigHash(const CTransaction& tx)
+uint256 PoolRetireSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankPool/retire");
+    return CreditTxSigHash(tx, "FreeBankPool/retire", houseID);   // R5-15
 }
 
 template <typename T>

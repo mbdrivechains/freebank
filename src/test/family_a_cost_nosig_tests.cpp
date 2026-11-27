@@ -299,15 +299,15 @@ BOOST_AUTO_TEST_CASE(family_a_cost_nosig_bill_claim_escrow_only)
 // ---------------------------------------------------------------------------
 // note REDEEM, pre-auth DISCHARGE, inputs only the demand's custody coins (NoteDemandCustodyScript: anyone-can-spend by
 // script, pinned to the holder's keyid by tx_verify), their dust paying the fee. The pre-auth signature is the holder's
-// standing authorisation, public in the DEMAND payload, so anyone can send this. Before the refusal
-// (bad-note-redeem-interest-short, validation.cpp ~6492): the house read and status, an O(vin) TipCoin loop with the
-// custody demand id (~6362), the pre-auth verify (cached after the first run: the digest never changes), the bound
-// rate, the brassage, an O(vin) demand-tag loop (~6444), NoteDemandInterest, fnPaidMg over the outputs. Probed at one
-// coin and at ~2,400 coins (one demand of 2,400 coins: the holder's own notes). Measured 11-26 on DEV (load ~6): 7.9 ms,
-// 1.5 ms over a plain tx spending 2,400 unowned coins (6.4 ms) and 6.1 ms over a plain tx of the same size; refused at
-// DoS 0, so it repeats for free with a new nLockTime. FAILS the 1 ms line until the per-input work is cut: the custody
-// keyid hashed once per input (tx_verify.cpp ~735, NoteCustodyKeyIs) and CheckNoteOperation's O(vin) loops before the
-// floor check (validation.cpp ~6362, ~6444).
+// standing authorisation, public in the DEMAND payload, so anyone can send this. It is refused at
+// bad-note-redeem-interest-short, DoS 0 (rightly: the floor moves each block), so it repeats for free with a new
+// nLockTime; what it costs before that refusal is the point. Probed at 2 coins and at ~2,400 coins (one demand of 2,400
+// coins: the holder's own notes).
+// S1X-57 (testing 11-26; security asked for the OPEN row): before freebankd's 655a01f this cost 7.9 ms, 1.5-1.9 ms over
+// a plain tx spending 2,400 coins (DEV, load ~6), from per-input work: the custody keyid hashed per input in tx_verify
+// before the floor, and two O(vin) coin-read loops in CheckNoteOperation REDEEM. 655a01f (v1.2.7) hashes the keyid once
+// per tx and makes one input pass; freebankd measured it 0.66 ms under the same-inputs plain. The 1 ms line is checked
+// only with FAMILY_A_COST_ENFORCE=1 (a quiet machine).
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(family_a_cost_nosig_preauth_discharge_custody_only)
 {

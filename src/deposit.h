@@ -300,7 +300,7 @@ CScript DepositScriptForPubKey(const std::vector<unsigned char>& vchPubKey);
  * origination. */
 uint256 DepositHashPrevouts(const CTransaction& tx);
 
-uint256 DepositOriginateSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 DepositOriginateSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1; R5-15
 uint256 DepositTransferSigHash(const CTransaction& tx);    // Stage 0 C1
 uint256 DepositWithdrawSigHash(const CTransaction& tx);    // Stage 0 C1
 uint256 DepositClaimSigHash(const CTransaction& tx);       // Stage 0 C1

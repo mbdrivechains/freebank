@@ -451,7 +451,14 @@ bool HouseCollectionDone(const CHouse& house, int nHeight)
         return false;
     if (house.nLoanBookFace == 0)
         return true;
-    return nHeight >= 0 && (uint32_t)nHeight >= ClockDeadlineHeight(nE, Params().GetConsensus().nCollectWindow, nHeight);
+    // TG-2 (D-2026-11-27-1, security Medium): a bill still in the book holds every payout, past the collection window
+    // too, so its bond (op 11, open to anyone after maturity + grace, which the discount tenor cap keeps within
+    // nCollectWindow) joins the pot before the first waterfall op snapshots it: nothing is collected after the snapshot
+    // (FAILED_HOUSE_DESIGN B(i)). The backstop, nCollectBackstop past the window, keeps a book that can't empty from
+    // stranding the claims.
+    const Consensus::Params& c = Params().GetConsensus();
+    return nHeight >= 0 &&
+           (uint32_t)nHeight >= ClockDeadlineHeight(nE, (uint64_t)c.nCollectWindow + c.nCollectBackstop, nHeight);
 }
 
 uint32_t HouseClaimWindowCloses(const CHouse& house, int nHeight)
@@ -501,8 +508,10 @@ void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight)
     // per-block record). A fresh protest needs the house at Open or Stressed with nProtestOpen 0, so the previous
     // episode has always ended by then. 0 = no earlier episode: no spacing check (security's condition 4).
     const uint32_t nRef = house.nEpisodeEndHeight;
+    // R5-4 (D-2026-11-27-2 (3), Stage 0 rule B): a status change dated to its own block takes effect from the next block
+    // for every reader, so a same-block reader (a TOKEN_POST at the block's start state) and the protest agree.
     if (nRef != 0 && nHeight >= nRef && ClockSince(nRef, (int)nHeight) < (int64_t)HOUSE_CURE_SPACING_BLOCKS)
-        house.nNoCureHeight = nHeight;
+        house.nNoCureHeight = nHeight + 1;
 }
 
 uint64_t HouseCapitalCapUnits(const CHouse& house)

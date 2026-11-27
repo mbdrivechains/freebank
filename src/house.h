@@ -496,7 +496,8 @@ struct CHouse {
     // D-2026-11-07-3); the field stays in the record layout.
     uint32_t nEquityNegativeHeight;
     // v14 (Gold B, D-2026-11-07-2/-3): the height a fresh protest episode found no cure available - it started within
-    // HOUSE_CURE_SPACING_BLOCKS of the last episode's start - so the house is insolvent from it (0 = none).
+    // HOUSE_CURE_SPACING_BLOCKS of the last episode's end - plus one: the house is insolvent from the block after that
+    // protest (R5-4; 0 = none).
     uint32_t nNoCureHeight;
     // v14 (Gold B ramp, GOLD_B.md §5): the escrow tranches (bounded by MAX_HOUSE_PLEDGE_OUTPOINTS per partner).
     std::vector<CEscrowTranche> vEscrowTranche;
@@ -1063,8 +1064,12 @@ struct HouseRate {
     // signed op on the other house; CheckHouseOperation refuses one whose houseID isn't that house's. Last in the
     // payload, so the leading bytes the pool reads (IsHouseRatePostTx, HouseRateOpOf) don't move.
     uint256 houseID;
+    // R5-6 (D-2026-11-27-2 (2)): the count this op follows, signed - a SETKEY the key count (HouseRateKeySeqKey), a POST
+    // the post count (HouseRatePostSeqKey) - so one displaced from the pool by a newer one is stale once that connects
+    // (an A->B->A key rotation included), and the rate key's POSTs can't make the partners' SETKEY stale.
+    uint64_t nPrevSeq;
 
-    HouseRate() : nHouseID(0), nKind(HOUSE_RATE_POST), nBid(0), nAsk(0) {}
+    HouseRate() : nHouseID(0), nKind(HOUSE_RATE_POST), nBid(0), nAsk(0), nPrevSeq(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -1079,6 +1084,7 @@ struct HouseRate {
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
         READWRITE(houseID);
+        READWRITE(nPrevSeq);
     }
 };
 
@@ -1098,9 +1104,10 @@ struct HouseCharter {
     std::vector<uint32_t> vApproverIndex;
     std::vector<std::vector<unsigned char>> vApproverSig;
     uint256 houseID;   // S1X-26: the house's declared id, signed with the rest (HouseRate's note)
+    uint64_t nPrevSeq;   // R5-6: the house's charter-op count this op follows (HouseCharterSeqKey), signed
 
     HouseCharter() : nHouseID(0), nKind(HOUSE_CHARTER_ADD), nChainID(0), nDecimals(0), nGramsNum(0), nGramsDen(0),
-                     nRelated(0), nIndex(0) {}
+                     nRelated(0), nIndex(0), nPrevSeq(0) {}
 
     ADD_SERIALIZE_METHODS
 
@@ -1118,6 +1125,7 @@ struct HouseCharter {
         READWRITE(vApproverIndex);
         READWRITE(vApproverSig);
         READWRITE(houseID);
+        READWRITE(nPrevSeq);
     }
 };
 
@@ -1422,7 +1430,8 @@ uint32_t HouseInsolventSince(const CHouse& house, int nHeight);
 
 /** Gold B (D-2026-11-07-2/-3): a protest op starting a FRESH episode (nProtestOpen was 0) calls this before it writes
  * the protest heights. Within HOUSE_CURE_SPACING_BLOCKS of the last episode's END (nEpisodeEndHeight, UR-ext-12
- * precision 2; 0 = none) there is no cure: nNoCureHeight = nHeight, insolvent from this block. Otherwise the episode is
+ * precision 2; 0 = none) there is no cure: nNoCureHeight = nHeight + 1, insolvent from the NEXT block (R5-4, rule B: a
+ * status change dated to its own block takes effect from the next for every reader). Otherwise the episode is
  * the house's cure (Stressed for HOUSE_STRESSED_WINDOW). */
 void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight);
 /** The cure window from stress origin nStress: a re-armed protest's time left (CHouse::nCureLeft), else
@@ -1430,7 +1439,8 @@ void HouseProtestEpisodeStart(CHouse& house, uint32_t nHeight);
 uint64_t HouseCureWindow(const CHouse& house, uint32_t nStress);
 
 /** v0.2.28 (FAILED_HOUSE_DESIGN.md B, "collect, then pay"): at an insolvent house, payouts (note/deposit CLAIM, token
- * COLLECT, the partners' settle, CLOSE) wait until the loan book is empty or nCollectWindow blocks past E. Monotonic:
+ * COLLECT, the partners' settle, CLOSE) wait until the loan book is empty, or (TG-2, D-2026-11-27-1) at most
+ * nCollectWindow + nCollectBackstop blocks past E. Monotonic:
  * the book only falls once the house has left Open, and the height only rises. False if not insolvent at nHeight. */
 bool HouseCollectionDone(const CHouse& house, int nHeight);
 

@@ -806,9 +806,9 @@ public:
         return v;
     }
 
-    /** Stage 0 rule A: the pooled txs that can't share a block with an incomer taking the house slots vSlot or reading
-     *  house nReader's status (HouseStateKeysConflict, by index): every pooled op taking one of those slots or reading the
-     *  status of a house in vSlot. Two readers never conflict. Sorted, no duplicates. */
+    /** Stage 0 rule A: the pooled txs that can't share a block with an incomer taking the house slots vSlot
+     *  (HouseStateKeysConflict, by index): every pooled op taking one of those slots. Since TG-3 a status reader (nReader,
+     *  kept for the callers' shape) conflicts with nothing. Sorted, no duplicates. */
     std::vector<uint256> HouseStateConflictTxs(const std::vector<uint32_t>& vSlot, uint32_t nReader) const;
     /** Stage 0 rule A: the pooled member ops of house nHouse, rate ops of house nHouse, ops on pool nPool. */
     std::vector<uint256> MemberOpTxs(uint32_t nHouse) const;

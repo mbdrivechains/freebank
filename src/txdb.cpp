@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <txdb.h>
+#include <clientversion.h>   // R5-13: the house cache sizes records
 
 #include <bill.h>
 #include <house.h>
@@ -936,22 +937,29 @@ HouseDB::HouseDB(size_t nCacheSize, bool fMemory, bool fWipe)
 
 bool HouseDB::WriteHouse(const CHouse& house)
 {
+    ClearHouseCache();   // R5-13
     if (Staged()) {   // UR-ext-10: inside a disconnect's stage, committed later with the marker
         SWrite(std::make_pair(DB_HOUSE, house.nHouseID), house);
         SWrite(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
         SWrite(std::make_pair(DB_HOUSE_CLASS, house.strClassID), house.nHouseID);
+        ClearHouseCache();   // R5-13: after the write too (security 11-27)
         return true;
     }
     CDBBatch batch(*this);
     batch.Write(std::make_pair(DB_HOUSE, house.nHouseID), house);
     batch.Write(std::make_pair(DB_HOUSE_HASH, house.houseID), house.nHouseID);
     batch.Write(std::make_pair(DB_HOUSE_CLASS, house.strClassID), house.nHouseID);
-    return WriteBatch(batch, true);
+    const bool fOk = WriteBatch(batch, true);
+    ClearHouseCache();
+    return fOk;
 }
 
 bool HouseDB::CommitUndoStage(const uint256& hashBestBlock, bool fMarker)
 {
-    return fMarker ? CommitStage(DB_SIDE_BEST_BLOCK, hashBestBlock) : CommitStageNoMarker();
+    ClearHouseCache();   // R5-13
+    const bool fOk = fMarker ? CommitStage(DB_SIDE_BEST_BLOCK, hashBestBlock) : CommitStageNoMarker();
+    ClearHouseCache();
+    return fOk;
 }
 
 bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_t* pnLastID, const uint256& hashBestBlock,
@@ -959,6 +967,7 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
                                 const TokenEffects* pTokens,
                                 const std::vector<std::pair<uint32_t, uint32_t>>* pEpisodeEndUndo)
 {
+    ClearHouseCache();   // R5-13
     CDBBatch batch(*this);
     if (pEpisodeEndUndo)
         batch.Write(std::make_pair(DB_EPISODE_END_UNDO, hashBestBlock), *pEpisodeEndUndo);
@@ -995,7 +1004,9 @@ bool HouseDB::WriteBlockEffects(const std::vector<CHouse>& vHouse, const uint32_
             batch.Write(std::make_pair(DB_TOKEN_CLAIM, kv.first), kv.second);
     }
     batch.Write(DB_SIDE_BEST_BLOCK, hashBestBlock);
-    return WriteBatch(batch, true);
+    const bool fOk = WriteBatch(batch, true);
+    ClearHouseCache();   // R5-13: after the write too (security 11-27)
+    return fOk;
 }
 
 bool HouseDB::GetTokenKeyset(uint32_t nHouseID, uint64_t nKeysetID, CTokenKeyset& rec)
@@ -1192,7 +1203,63 @@ void HouseDB::AssertStageLock() const
 
 bool HouseDB::GetHouse(const uint32_t nID, CHouse& house)
 {
-    return SRead(std::make_pair(DB_HOUSE, nID), house);
+    // R5-13: decoded records, outside a disconnect stage (whose staged writes the cache can't see).
+    if (!Staged()) {
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        const auto it = m_cache.find(nID);
+        if (it != m_cache.end()) {
+            m_lru.splice(m_lru.begin(), m_lru, it->second.itLru);
+            house = it->second.house;
+            return true;
+        }
+    }
+    uint64_t nGen = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        nGen = m_nCacheGen;
+    }
+    if (!SRead(std::make_pair(DB_HOUSE, nID), house))
+        return false;
+    if (!Staged()) {
+        const size_t nBytes = ::GetSerializeSize(house, SER_DISK, CLIENT_VERSION);
+        if (nBytes <= HOUSE_CACHE_MAX_BYTES / 4) {
+            std::lock_guard<std::mutex> lock(m_cacheMutex);
+            // Security 11-27 (hardening): a clear (a write) between our read and here means the record may be stale.
+            if (nGen == m_nCacheGen && !m_cache.count(nID)) {
+                while (!m_lru.empty() && m_nCacheBytes + nBytes > HOUSE_CACHE_MAX_BYTES) {
+                    const auto itOld = m_cache.find(m_lru.back());
+                    m_nCacheBytes -= itOld->second.nBytes;
+                    m_cache.erase(itOld);
+                    m_lru.pop_back();
+                }
+                m_lru.push_front(nID);
+                m_cache.emplace(nID, CacheEntry{house, nBytes, m_lru.begin()});
+                m_nCacheBytes += nBytes;
+            }
+        }
+    }
+    return true;
+}
+
+void HouseDB::ClearHouseCache()
+{
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+    m_nCacheGen++;
+    m_cache.clear();
+    m_lru.clear();
+    m_nCacheBytes = 0;
+}
+
+size_t HouseDB::HouseCacheBytes() const
+{
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+    return m_nCacheBytes;
+}
+
+size_t HouseDB::HouseCacheEntries() const
+{
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+    return m_cache.size();
 }
 
 bool HouseDB::GetHouseIDByHash(const uint256& houseID, uint32_t& nID)
@@ -1220,18 +1287,22 @@ bool HouseDB::RemoveHouse(const uint32_t nID)
     CHouse house;
     if (!GetHouse(nID, house))
         return false;
+    ClearHouseCache();   // R5-13
 
     if (Staged()) {
         SErase(std::make_pair(DB_HOUSE, nID));
         SErase(std::make_pair(DB_HOUSE_HASH, house.houseID));
         SErase(std::make_pair(DB_HOUSE_CLASS, house.strClassID));
+        ClearHouseCache();
         return true;
     }
     CDBBatch batch(*this);
     batch.Erase(std::make_pair(DB_HOUSE, nID));
     batch.Erase(std::make_pair(DB_HOUSE_HASH, house.houseID));
     batch.Erase(std::make_pair(DB_HOUSE_CLASS, house.strClassID));
-    return WriteBatch(batch, true);
+    const bool fOk = WriteBatch(batch, true);
+    ClearHouseCache();
+    return fOk;
 }
 
 BillDB::BillDB(size_t nCacheSize, bool fMemory, bool fWipe)

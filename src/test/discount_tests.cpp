@@ -21,7 +21,10 @@
 #include <utilstrencodings.h>
 #include <version.h>
 
+#include <algorithm>
 #include <functional>
+#include <memory>
+#include <string>
 
 #include <boost/test/unit_test.hpp>
 
@@ -221,7 +224,7 @@ static CMutableTransaction MakeDiscount(const Scene& s, BillDiscount& dOut,
 
     // One shared digest carries both authorities.
     SetPayload(mtx, d);
-    const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), s.bill.billID);
+    const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), s.bill.billID, s.house.houseID);
     BOOST_REQUIRE(s.seller.Sign(sighash, d.vchSellerSig));
     d.vApproverIndex.push_back(0);
     std::vector<unsigned char> vchApprover;
@@ -453,7 +456,7 @@ BOOST_AUTO_TEST_CASE(discount_signature_binding)
         BillDiscount d;
         CMutableTransaction mtx = MakeDiscount(s, d);
         std::vector<unsigned char> sig;
-        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), s.bill.billID);
+        const uint256 sighash = BillDiscountSigHash(CTransaction(mtx), s.bill.billID, s.house.houseID);
         BOOST_REQUIRE(s.stranger.Sign(sighash, sig));
         d.vApproverSig[0] = sig;
         SetPayload(mtx, d);
@@ -1107,13 +1110,19 @@ static CMutableTransaction MakeHRetireEscrow(const Scene& s, uint64_t nUnits,
 
 BOOST_AUTO_TEST_CASE(hretire_escrow_pays_the_failed_house_escrow)
 {
-    // Deferred and Insolvent: valid, with or without notes; the money joins the locked till.
+    // Deferred: valid, with or without notes. Insolvent: in sECX only (R5-1, D-2026-11-27-3: the house's notes are worth
+    // less than par there). The money joins the locked till.
     for (int i = 0; i < 4; i++) {
         Scene s = MakeKindScene();
         if (i < 2) MakeDeferred(s); else s.house.status = HOUSE_STATUS_INSOLVENT;
         const uint64_t nUnits = (i % 2 == 0) ? 0 : (uint64_t)PRICE;
         const CMutableTransaction mtx = MakeHRetireEscrow(s, nUnits);
         CValidationState state; CBill b; CHouse h; bool f = false;
+        if (i == 3) {
+            BOOST_CHECK(!RunOp(s, mtx, state, b, h, f));
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-bill-hretireescrow-notes-insolvent");
+            continue;
+        }
         BOOST_CHECK(RunOp(s, mtx, state, b, h, f));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "");
         BOOST_CHECK_EQUAL(b.status, BILL_STATUS_RETIRED);
@@ -1255,6 +1264,55 @@ BOOST_AUTO_TEST_CASE(discount_tenor_capped_at_the_collection_window)
     }
 }
 
+// TG-2 (D-2026-11-27-1; security's liveness condition 11-27): payouts now wait for an empty book, so a book must always be
+// able to empty before the backstop. DISCOUNT is the only way into a book, and its tenor cap keeps maturity + grace within
+// nCollectWindow of the discount (discount_tenor_capped_at_the_collection_window), so op 11 (anyone, after maturity +
+// grace) opens by E + nCollectWindow + 1 for every bill, even when the house fails in the discount's block. Op 11 takes
+// the house slot, one per block, so a book of N bills at the cap clears by E + nCollectWindow + N: this clears a book of
+// many, one per block from the first block op 11 opens, and payouts open only once the last has gone, before the backstop.
+BOOST_AUTO_TEST_CASE(tg2_book_at_the_tenor_cap_clears_before_the_backstop)
+{
+    const Consensus::Params& c = Params().GetConsensus();
+    const uint32_t nWindow = c.nCollectWindow;
+    BOOST_REQUIRE(c.nCollectBackstop >= 2);
+    const uint32_t nMaturityCap = (uint32_t)H + nWindow - GRACE;   // the latest maturity DISCOUNT takes at H
+    const uint32_t nE = (uint32_t)H;                               // the house fails in the discount's block
+    const int nBills = (int)std::min<uint32_t>(c.nCollectBackstop - 1, 40);
+    Scene s = MakeHeldScene();
+    s.bill.nMaturityHeight = nMaturityCap;
+    s.house.status = HOUSE_STATUS_INSOLVENT;
+    s.house.nInsolventHeight = nE;
+    s.house.nLoanBookFace = (uint64_t)FACE * (uint64_t)nBills;
+    s.house.SetLoanWtMaturity((unsigned __int128)(uint64_t)FACE * (unsigned __int128)nMaturityCap * (unsigned __int128)nBills);
+    BOOST_CHECK(!HouseCollectionDone(s.house, (int)(nE + nWindow)));   // the window's end paid here before TG-2
+    for (int i = 0; i < nBills; i++) {
+        const int nHeight = (int)(nE + nWindow + 1) + i;   // one op 11 per block: the house slot
+        BOOST_CHECK(!HouseCollectionDone(s.house, nHeight));
+        const CMutableTransaction mtx = MakeHClaimEscrow(s, [&](BillHClaimEscrow& hc, CMutableTransaction&) {
+            hc.nBillMaturityHeight = nMaturityCap; });
+        CValidationState state; CBill b; CHouse h; bool f = false;
+        BOOST_REQUIRE_MESSAGE(RunOp(s, mtx, state, b, h, f, 100000, nHeight), "op 11, bill " + std::to_string(i) + ": " +
+                              state.GetRejectReason());
+        s.house = h;   // the next bill's priors
+    }
+    BOOST_CHECK_EQUAL(s.house.nLoanBookFace, 0U);
+    const uint32_t nLast = nE + nWindow + (uint32_t)nBills;
+    BOOST_CHECK(nLast < nE + nWindow + c.nCollectBackstop);   // cleared before the backstop
+    BOOST_CHECK(HouseCollectionDone(s.house, (int)nLast + 1));
+}
+
+// TG-2: on every network the backstop is positive and falls inside the claim window (the chainparams asserts too).
+BOOST_AUTO_TEST_CASE(tg2_backstop_inside_the_claim_window_on_every_network)
+{
+    for (const std::string& strNet : {CBaseChainParams::MAIN, CBaseChainParams::BETA, CBaseChainParams::EASYNET,
+                                      CBaseChainParams::REGTEST}) {
+        const std::unique_ptr<CChainParams> p = CreateChainParams(strNet);
+        const Consensus::Params& c = p->GetConsensus();
+        BOOST_CHECK_MESSAGE(c.nCollectBackstop > 0, strNet);
+        BOOST_CHECK_MESSAGE((uint64_t)c.nCollectWindow + c.nCollectBackstop < c.nInsolventClaimWindow, strNet);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
 {
     Scene s = MakeHeldScene();
@@ -1282,7 +1340,7 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
         h.vApproverIndex.push_back(0);
         { CDataStream s0(SER_NETWORK, PROTOCOL_VERSION); s0 << h; mtx.vchBillPayload.assign(s0.begin(), s0.end()); }   // Stage 0 C1
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(s.partner.Sign(BillClaimSigHash(CTransaction(mtx), s.bill.billID, true), sig));
+        BOOST_REQUIRE(s.partner.Sign(BillClaimSigHash(CTransaction(mtx), s.bill.billID, true, s.house.houseID), sig));
         h.vApproverSig.push_back(sig);
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << h;
@@ -1298,6 +1356,7 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
         BOOST_CHECK_EQUAL(b.status, BILL_STATUS_DEFAULTED);
         BOOST_CHECK_EQUAL(b.nOwnerHouseID, 0);
         BOOST_CHECK_EQUAL(h.nLoanBookFace, 0);
+        BOOST_CHECK(b.hclaimHouseID == s.house.houseID);   // R5-2: op 8 records the holding house
     }
     // Not before maturity + grace.
     {
@@ -1313,7 +1372,7 @@ BOOST_AUTO_TEST_CASE(hclaim_quorum_replaces_the_holder_signature)
         BillHClaim h;
         BOOST_REQUIRE(DecodeBillPayload(mtx.vchBillPayload, h));
         std::vector<unsigned char> sig;
-        BOOST_REQUIRE(s.custody.Sign(BillClaimSigHash(CTransaction(mtx), s.bill.billID, true), sig));   // S1X-17
+        BOOST_REQUIRE(s.custody.Sign(BillClaimSigHash(CTransaction(mtx), s.bill.billID, true, s.house.houseID), sig));   // S1X-17
         h.vApproverSig[0] = sig;
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << h;
@@ -2216,37 +2275,37 @@ BOOST_AUTO_TEST_CASE(discount_digest_is_the_ceremony_contract)
     const CMutableTransaction mtx = MakeDiscount(s, d);
     const uint256 hashPrev = BillHashPrevouts(CTransaction(mtx));
     const uint256 hashOut = BillHashOutputs(CTransaction(mtx));
-    const uint256 base = BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, hashOut), s.bill.billID);
+    const uint256 base = BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, hashOut), s.bill.billID, s.house.houseID);
 
     // --- EXCLUDED: everything a later round writes ------------------------
     {   // the seller's own signature (written in round 3, after the house signed)
         BillDiscount x = d;
         x.vchSellerSig.assign(70, 0x11);
-        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID, s.house.houseID) == base);
     }
     {   // the house quorum's slots (written in round 2, before the seller signs)
         BillDiscount x = d;
         x.vApproverIndex.clear();
         x.vApproverSig.clear();
-        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID, s.house.houseID) == base);
     }
     {   // the WHOLE endorsement link - height and signature both, since round 3
         // sets nAtHeight as late as it can to keep the slack window fresh
         BillDiscount x = d;
         x.endorsement.nAtHeight = d.endorsement.nAtHeight + 33;
         x.endorsement.vchSig.assign(71, 0x22);
-        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID, s.house.houseID) == base);
     }
     {   // the reserve proofs' own per-coin challenge signatures (Stage 0 C1: the proofs themselves - which coins, which
         // keys - are bound now; the wallet sets them before the house's approvers sign and never after)
         BillDiscount x = d;
         for (AttestProof& p : x.vReserveProofs)
             p.vchSig.assign(70, 0x44);
-        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) == base);
+        BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID, s.house.houseID) == base);
         BillDiscount y = d;
         y.vReserveProofs.clear();
         if (!d.vReserveProofs.empty())
-            BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, y, hashPrev, hashOut), s.bill.billID) != base);
+            BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, y, hashPrev, hashOut), s.bill.billID, s.house.houseID) != base);
     }
 
     // --- INCLUDED: every term either side relies on -----------------------
@@ -2269,13 +2328,13 @@ BOOST_AUTO_TEST_CASE(discount_digest_is_the_ceremony_contract)
     for (size_t i = 0; i < vMutate.size(); i++) {
         BillDiscount x = d;
         vMutate[i](x);
-        BOOST_CHECK_MESSAGE(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID) != base,
+        BOOST_CHECK_MESSAGE(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, x, hashPrev, hashOut), s.bill.billID, s.house.houseID) != base,
                             "digest ignored value field #" << i << " - it could be altered after signing");
     }
     // ...and the canonical bill identity, the input set and the output set.
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, hashOut), uint256S("b112")) != base);
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, uint256S("aaaa"), hashOut), s.bill.billID) != base);
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, uint256S("bbbb")), s.bill.billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, hashOut), uint256S("b112"), s.house.houseID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, uint256S("aaaa"), hashOut), s.bill.billID, s.house.houseID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hashPrev, uint256S("bbbb")), s.bill.billID, s.house.houseID) != base);
 }
 
 /** The same contract for RECOURSE. One party, but still assemble-then-sign:
@@ -2467,7 +2526,7 @@ BOOST_AUTO_TEST_CASE(ur_ext_11_mint_ceiling_counts_pending_swaps)
             ss0 << mint;
             mtx.vchNotePayload.assign(ss0.begin(), ss0.end());
             std::vector<unsigned char> vchSig;
-            BOOST_REQUIRE(keyApprover.Sign(NoteMintSigHash(CTransaction(mtx)), vchSig));
+            BOOST_REQUIRE(keyApprover.Sign(NoteMintSigHash(CTransaction(mtx), uint256S("f00d")), vchSig));
             mint.vApproverIndex.push_back(0);
             mint.vApproverSig.push_back(vchSig);
         }

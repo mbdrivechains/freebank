@@ -532,7 +532,7 @@ uint256 NoteHashPrevouts(const CTransaction& tx);
 uint256 NoteDemandId(const CTransaction& tx, const std::vector<uint64_t>& vUnits,
                      const std::vector<unsigned char>& vchPayoutScript);
 
-uint256 NoteMintSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 NoteMintSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1; R5-15 the permanent id
 uint256 NoteTransferSigHash(const CTransaction& tx);   // Stage 0 C1
 uint256 NoteRedeemSigHash(const CTransaction& tx);     // Stage 0 C1
 uint256 NoteClaimSigHash(const CTransaction& tx);      // Stage 0 C1
@@ -672,8 +672,8 @@ uint256 NoteProtestSigHash(const CTransaction& tx);  // Stage 0 C1 (closes the S
 /** v0.2.20 token records. Both bind hashPrevouts (tx-unique: approvals can't be
  * replayed onto a second, differently-funded tx - the MINT rule) and the outputs.
  * The holder and the house's approvers sign the SAME lock digest. */
-uint256 NoteLockSigHash(const CTransaction& tx);   // Stage 0 C1
-uint256 NoteUnlockSigHash(const CTransaction& tx);   // Stage 0 C1
+uint256 NoteLockSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1; R5-15
+uint256 NoteUnlockSigHash(const CTransaction& tx, const uint256& houseID);   // Stage 0 C1; R5-15
 
 /** The scheduled suspension-interest rate (bps/yr) at block nHeight: the last
  * step with nHeight <= the block (v0.2.18). 0 for an empty schedule. */

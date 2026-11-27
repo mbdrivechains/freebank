@@ -141,9 +141,11 @@ public:
         consensus.nDeferSilenceWindow = 4032;  // ~4 weeks after 2 missed cadences
         consensus.nTokenClaimWindow = 4032;    // the token claim window: ~4 weeks from insolvency
         consensus.nSuspensionCap = 52560;          // v0.2.28: 12 months suspended, then insolvent
-        consensus.nCollectWindow = 26280;          // v0.2.28: collect for 6 months (or until the book is empty), then pay
+        consensus.nCollectWindow = 26280;          // v0.2.28: the discount tenor cap (maturity + grace), 6 months
+        consensus.nCollectBackstop = 13140;        // TG-2 (D-2026-11-27-1): payouts wait for an empty book, at most 3 months more
         consensus.nInsolventClaimWindow = 105120;  // v0.2.28: claims close 2 years after insolvency; CLOSE then
-        assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow);
+        assert(consensus.nCollectBackstop > 0);
+        assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow + consensus.nCollectBackstop);
         // Withdrawal poison-row guard from genesis (operator sign-off 2026-09-24, H = 0).
         // Until v0.2.19 these params served BOTH the eCash beta and eCash mainnet, so one H
         // covered both; mainnet (CMainParams below) inherits it.
@@ -349,23 +351,23 @@ public:
         pchMessageStart[0] = 0xfb;
         pchMessageStart[1] = 0x4b;
         pchMessageStart[2] = 0xea;
-        pchMessageStart[3] = 0x0d;   // v1.2.7 (D-2026-11-23-1): a fresh chain for Stage 0 (0c: v1.2.6)
+        pchMessageStart[3] = 0x0e;   // v1.2.8 (D-2026-11-23-1): a fresh chain for the review fixes (0d: v1.2.7)
         nDefaultPort = 28455;
 
-        genesis = CreateGenesisBlock("FreeBank easynet genesis 10: v1.2.7 Stage 0 rules, easynet slot 130, 2026-11-26",
+        genesis = CreateGenesisBlock("FreeBank easynet genesis 11: v1.2.8 review fixes, easynet slot 130, 2026-11-27",
                                      CScript() << OP_RETURN,
-                                     1795672800, 1, 0);   // 2026-11-26 06:00Z: before every L1 block it will use
+                                     1795759200, 1, 0);   // 2026-11-27 06:00Z: before every L1 block it will use
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0xe457ddc1b3fe7954f1ce26f7797469854c722b4d3574ea8d37017feab2801c7a"));
+        assert(consensus.hashGenesisBlock == uint256S("0x9558468672f8a2806212edc1de78597c1689a16d1ec3b06ee9b3fc7b8eda008b"));
         // The fresh chain binds credit signatures from genesis.
         consensus.nCreditBindingHeight = 0;
-        // ...and credits only treasury changes from L1 block 3,975 (v1.2.7 restart; the L1 tip + 1 when this was cut): the
-        // 373.29792050 ECX in the treasury at L1 3,974 (CTIP c5bc1ad6..:0, sequence 14; the last slot-130 event the
-        // deposit at 3,946; no bundle pending or in vote; easynet's miner2, 2026-11-26 07:08Z) stays the old chains'.
-        // Each later deposit credits what it added (DEPOSITS_664_SPEC). (v1.2.6's chain: 3,896; v1.2.5, never released:
-        // 3,795; v1.2.4's chain: 3,573; the s1/s2 chain: 2,935; S5X-2 + RQ-1's: 2,730; v1.2.2's: 2,058; v1.2.0's: 1,676;
-        // v1.1.0's: 1,100.)
-        consensus.nDepositStartL1Height = 3975;
+        // ...and credits only treasury changes from L1 block 4,166 (v1.2.8 restart; the L1 tip + 1 when this was cut): the
+        // 423.29792050 ECX in the treasury at L1 4,165 (CTIP 6103d505..:0, sequence 15; the last slot-130 event the
+        // deposit at 4,110; no bundle pending or in vote; easynet's miner2, 2026-11-27 11:02Z) stays the old chains'.
+        // Each later deposit credits what it added (DEPOSITS_664_SPEC). (v1.2.7's chain: 3,975; v1.2.6's: 3,896; v1.2.5,
+        // never released: 3,795; v1.2.4's chain: 3,573; the s1/s2 chain: 2,935; S5X-2 + RQ-1's: 2,730; v1.2.2's: 2,058;
+        // v1.2.0's: 1,676; v1.1.0's: 1,100.)
+        consensus.nDepositStartL1Height = 4166;
         consensus.defaultAssumeValid = consensus.hashGenesisBlock;
         // No forks (D-2026-11-05-3): easynet switches the later rules on days after the release that carries them, so
         // they can be seen working before mainnet's date. EASYNET_LATER_RULES_TIME: set at that release.
@@ -431,8 +433,10 @@ public:
         consensus.nTokenClaimWindow = 20;      // gate-testable claim window (main: 4032)
         consensus.nSuspensionCap = 400;        // gate-testable (main: 52560); above the silence clock (2x144+1+40)
         consensus.nCollectWindow = 600;        // gate-testable (main: 26280); above the discount gates' 400-500-block bills
+        consensus.nCollectBackstop = 50;       // gate-testable (main: 13140); inside the claim window, as on main
         consensus.nInsolventClaimWindow = 700; // gate-testable (main: 105120); after the collect window, as on main
-        assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow);
+        assert(consensus.nCollectBackstop > 0);
+        assert(consensus.nInsolventClaimWindow > consensus.nCollectWindow + consensus.nCollectBackstop);
         consensus.nWithdrawalGuardHeight = 0;     // poison-row guard active from genesis on regtest
         consensus.nCreditBindingHeight = 0;       // credit binding from genesis on regtest
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;

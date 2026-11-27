@@ -4676,9 +4676,10 @@ UniValue collecttokens(const JSONRPCRequest& request)
     CWallet * const pwallet = GetWalletForJSONRPCRequest(request);
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)
         throw std::runtime_error(
-            "collecttokens \"id\" ( [\"Y\",...] fee )\n"
+            "collecttokens \"id\" ( [\"Y\",...] fee clearbills )\n"
+            "clearbills: (boolean, optional) default true: at a failed house, first clear one ready bill from its loan book (op 11, claimbillescrow, this wallet pays the fee) and ask to run again; false sends nothing and names the bill\n"
             "\nAfter a failed house's claim window (v0.2.21): pay claims from the escrow - each its amount x\n"
             "min(1, backing / claimed) at a note's share of the pot, less its relayer fee. Anyone can send it; this\n"
             "wallet pays the fee. Default: up to 100 uncollected claims. With no claims made, it writes the backing off.\n"
@@ -4693,10 +4694,11 @@ UniValue collecttokens(const JSONRPCRequest& request)
         for (const UniValue& y : request.params[1].get_array().getValues())
             vY.push_back(ParseTokenY(y));
     const CAmount nFee = ParseTokenFee(request, 2);
+    const bool fClearBills = request.params.size() <= 3 || request.params[3].isNull() ? true : request.params[3].get_bool();   // TG-2
     EnsureWalletIsUnlocked(pwallet);
     uint256 txid;
     std::string strFail;
-    if (!pwallet->CollectTokens(strFail, txid, nHouseID, vY, nFee))
+    if (!pwallet->CollectTokens(strFail, txid, nHouseID, vY, nFee, fClearBills))
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("txid", txid.ToString());
@@ -5092,13 +5094,14 @@ UniValue claimnote(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "claimnote\n"
             "\nArguments:\n"
             "1. \"id\"     (numeric, required) the house ID number\n"
             "2. \"units\"  (numeric, required) note units to claim (a holder's coins must sum exactly to this)\n"
             "3. \"fee\"    (numeric or string, optional) default 0.001\n"
+            "4. clearbills ((boolean, optional) default true: at a failed house, first clear one ready bill from its loan book (op 11, claimbillescrow, this wallet pays the fee) and ask to run again; false sends nothing and names the bill)\n"
             "\nInsolvency waterfall: burn notes of an INSOLVENT house and take\n"
             "the pro-rata entitlement from its escrow pot: each mg valued at the house's highest\n"
             "bid of the 90 days before it failed, scaled down pro rata if the pot is short.\n"
@@ -5113,6 +5116,7 @@ UniValue claimnote(const JSONRPCRequest& request)
     const uint64_t nUnits = request.params[1].get_int64();
     CAmount nFee = 100000;
     if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+    const bool fClearBills = request.params.size() <= 3 || request.params[3].isNull() ? true : request.params[3].get_bool();   // TG-2
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -5120,7 +5124,7 @@ UniValue claimnote(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->ClaimNote(strFail, txid, nHouseID, nUnits, nFee)) {
+    if (!pwallet->ClaimNote(strFail, txid, nHouseID, nUnits, nFee, fClearBills)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -5648,13 +5652,14 @@ UniValue claimdeposit(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(pwallet, request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "claimdeposit\n"
             "\nArguments:\n"
             "1. \"id\"        (numeric, required) the house ID number\n"
             "2. \"principal\" (numeric, required) principal of the receipt to claim\n"
             "3. \"fee\"       (numeric or string, optional) default 0.001\n"
+            "4. clearbills ((boolean, optional) default true: at a failed house, first clear one ready bill from its loan book (op 11, claimbillescrow, this wallet pays the fee) and ask to run again; false sends nothing and names the bill)\n"
             "\nInsolvency waterfall: burn a receipt of an INSOLVENT house and take the\n"
             "SUBORDINATED pro-rata from the escrow pot (junior to notes; capped at principal).\n"
             + HelpRequiringPassphrase(pwallet) +
@@ -5668,6 +5673,7 @@ UniValue claimdeposit(const JSONRPCRequest& request)
     const uint64_t nPrincipal = request.params[1].get_int64();
     CAmount nFee = 100000;
     if (request.params.size() >= 3) nFee = AmountFromValue(request.params[2]);
+    const bool fClearBills = request.params.size() <= 3 || request.params[3].isNull() ? true : request.params[3].get_bool();   // TG-2
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -5675,7 +5681,7 @@ UniValue claimdeposit(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->ClaimDeposit(strFail, txid, nHouseID, nPrincipal, nFee)) {
+    if (!pwallet->ClaimDeposit(strFail, txid, nHouseID, nPrincipal, nFee, fClearBills)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -7000,13 +7006,14 @@ UniValue reclaimpledge(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
         throw std::runtime_error(
             "reclaimpledge\n"
             "\nArguments:\n"
             "1. \"id\"      (numeric, required) the house ID number\n"
             "2. \"partner\" (numeric, required) partner index reclaiming\n"
             "3. \"fee\"     (numeric or string, optional) default 0.001\n"
+            "4. clearbills ((boolean, optional) default true: at a failed house, first clear one ready bill from its loan book (op 11, claimbillescrow, this wallet pays the fee) and ask to run again; false sends nothing and names the bill; the residual settle at an insolvent house only)\n"
             "\nReclaim a tail-expired pledge (or a solo pledge after wind-down).\n"
             + HelpRequiringPassphrase(pwallet) +
             "\nExamples:\n"
@@ -7022,6 +7029,7 @@ UniValue reclaimpledge(const JSONRPCRequest& request)
     CAmount nFee = 100000;
     if (request.params.size() >= 3)
         nFee = AmountFromValue(request.params[2]);
+    const bool fClearBills = request.params.size() <= 3 || request.params[3].isNull() ? true : request.params[3].get_bool();   // TG-2
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -7030,7 +7038,7 @@ UniValue reclaimpledge(const JSONRPCRequest& request)
 
     uint256 txid;
     std::string strFail = "";
-    if (!pwallet->ReclaimPledge(strFail, txid, nHouseID, nPartnerIndex, nFee)) {
+    if (!pwallet->ReclaimPledge(strFail, txid, nHouseID, nPartnerIndex, nFee, fClearBills)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -7047,12 +7055,13 @@ UniValue closehouse(const JSONRPCRequest& request)
         return NullUniValue;
     }
 
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
             "closehouse\n"
             "\nArguments:\n"
             "1. \"id\"   (numeric, required) the house ID number\n"
             "2. \"fee\"  (numeric or string, optional) default 0.001, paid from this wallet\n"
+            "3. clearbills ((boolean, optional) default true: at a failed house, first clear one ready bill from its loan book (op 11, claimbillescrow, this wallet pays the fee) and ask to run again; false sends nothing and names the bill)\n"
             "\nClose a failed house once its claim window has closed (v0.2.28): two years after it became insolvent\n"
             "(gethouse: insolvent_since, claim_window_closes). Anyone may close it. The partners get exactly their\n"
             "residual (if the escrow covered notes and deposits at par); everything else in its escrow goes to the\n"
@@ -7070,6 +7079,7 @@ UniValue closehouse(const JSONRPCRequest& request)
     CAmount nFee = 100000;
     if (request.params.size() >= 2 && !request.params[1].isNull())
         nFee = AmountFromValue(request.params[1]);
+    const bool fClearBills = request.params.size() <= 2 || request.params[2].isNull() ? true : request.params[2].get_bool();   // TG-2
 
     EnsureWalletIsUnlocked(pwallet);
     pwallet->BlockUntilSyncedToCurrentChain();
@@ -7077,7 +7087,7 @@ UniValue closehouse(const JSONRPCRequest& request)
     uint256 txid;
     CAmount amountFund = 0;
     std::string strFail = "";
-    if (!pwallet->CloseHouse(strFail, txid, amountFund, nHouseID, nFee)) {
+    if (!pwallet->CloseHouse(strFail, txid, amountFund, nHouseID, nFee, fClearBills)) {
         LogPrintf("%s: %s\n", __func__, strFail);
         throw JSONRPCError(RPC_MISC_ERROR, strFail);
     }
@@ -8293,12 +8303,12 @@ static const CRPCCommand commands[] =
     { "notes",              "registertokenkeyset",              &registertokenkeyset,           {"id", "keys", "postingpubkey", "fee"} },
     { "notes",              "posttokens",                       &posttokens,                    {"id", "keysetid", "issued", "spent", "fee"} },
     { "notes",              "claimtokens",                      &claimtokens,                   {"id", "proofs", "payoutaddress", "feebps", "relayeraddress", "fee"} },
-    { "notes",              "collecttokens",                    &collecttokens,                 {"id", "ys", "fee"} },
+    { "notes",              "collecttokens",                    &collecttokens,                 {"id", "ys", "fee", "clearbills"} },
     { "notes",              "signtokenclaims",                  &signtokenclaims,               {"id", "proofs", "payoutaddress", "feebps", "relayeraddress"} },
     { "notes",              "relaytokenclaims",                 &relaytokenclaims,              {"id", "entries", "fee"} },
     { "notes",              "listnotecoins",                    &listnotecoins,                 {"id"} },
     { "notes",              "redeemnote",                       &redeemnote,                    {"id", "units", "fee"} },
-    { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee"} },
+    { "notes",              "claimnote",                        &claimnote,                     {"id", "units", "fee", "clearbills"} },
     { "notes",              "demandnote",                       &demandnote,                    {"id", "units", "fee", "payout", "plain"} },
     { "notes",              "upgradedemand",                    &upgradedemand,                 {"id", "units", "fee", "payout"} },
     { "notes",              "protestnote",                      &protestnote,                   {"id", "fee"} },
@@ -8311,7 +8321,7 @@ static const CRPCCommand commands[] =
     { "deposits",           "protestdeposit",                   &protestdeposit,                {"txid", "fee"} },
     { "deposits",           "dischargedeposit",                 &dischargedeposit,              {"txid", "fee"} },
     { "deposits",           "listdepositdemands",               &listdepositdemands,            {"id"} },
-    { "deposits",           "claimdeposit",                     &claimdeposit,                  {"id", "principal", "fee"} },
+    { "deposits",           "claimdeposit",                     &claimdeposit,                  {"id", "principal", "fee", "clearbills"} },
 
     { "pools",              "createpool",                       &createpool,                    {"id", "noteunits", "btxsats", "feebps", "fee"} },
     { "pools",              "addpoolliquidity",                 &addpoolliquidity,              {"id", "noteunits", "btxsats", "fee"} },
@@ -8342,8 +8352,8 @@ static const CRPCCommand commands[] =
     { "houses",             "renewdeferral",                    &renewdeferral,                 {"id", "fee"} },
     { "houses",             "releasereserves",                  &releasereserves,               {"id", "fee"} },
     { "houses",             "mergehouseescrow",                 &mergehouseescrow,              {"id", "list", "fee"} },
-    { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee"} },
-    { "houses",             "closehouse",                       &closehouse,                    {"id", "fee"} },
+    { "houses",             "reclaimpledge",                    &reclaimpledge,                 {"id", "partner", "fee", "clearbills"} },
+    { "houses",             "closehouse",                       &closehouse,                    {"id", "fee", "clearbills"} },
 
 };
 

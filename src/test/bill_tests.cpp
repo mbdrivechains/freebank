@@ -83,7 +83,7 @@ static CMutableTransaction MakeIssueTx(BillIssue& issueOut, CKey& keyDrawer, CKe
     const uint256 billID = BillIDFromBody(issue.vchEncryptedBody);
     const uint256 sighash = BillIssueSigHash(billID, issue.amount, TEST_BILL_ESCROW,
             issue.nMaturityHeight, issue.nGraceBlocks, issue.vchDrawerPubKey,
-            issue.vchAcceptorPubKey, issue.vchHolderPubKey, issue.nRefHouseID);
+            issue.vchAcceptorPubKey, issue.vchHolderPubKey, issue.nRefHouseID, uint256());
     BOOST_REQUIRE(keyDrawer.Sign(sighash, issue.vchDrawerSig));
     BOOST_REQUIRE(keyAcceptor.Sign(sighash, issue.vchAcceptorSig));
 
@@ -230,20 +230,20 @@ BOOST_AUTO_TEST_CASE(bill_issue_sig_binding)
     const CAmount escrow = 75 * COIN / 10;
 
     const uint256 sighash = BillIssueSigHash(billID, amount, escrow, 500,
-            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1);
+            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1, uint256());
     std::vector<unsigned char> vchSig;
     BOOST_REQUIRE(keyDrawer.Sign(sighash, vchSig));
     BOOST_CHECK(pub.Verify(sighash, vchSig));
 
     // Front-run with a token escrow bond -> different sighash -> sig invalid
     const uint256 sighashCheapBond = BillIssueSigHash(billID, amount, 1, 500,
-            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1);
+            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1, uint256());
     BOOST_CHECK(sighash != sighashCheapBond);
     BOOST_CHECK(!pub.Verify(sighashCheapBond, vchSig));
 
     // Tampered face amount -> sig invalid
     BOOST_CHECK(!pub.Verify(BillIssueSigHash(billID, amount + 1, escrow, 500,
-            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1), vchSig));
+            DEFAULT_BILL_GRACE_BLOCKS, vchPub, vchPub, vchPub, 1, uint256()), vchSig));
 }
 
 BOOST_AUTO_TEST_CASE(bill_issue_shape_rejections)
@@ -461,7 +461,7 @@ BOOST_AUTO_TEST_CASE(bill_ser_escrow_house_roundtrip)
     uint32_t nFirst = 0;
     memcpy(&nFirst, vch.data(), 4);
     BOOST_CHECK_EQUAL(nFirst, BILL_SER_SENTINEL);
-    BOOST_CHECK_EQUAL(vch[4], 4);
+    BOOST_CHECK_EQUAL(vch[4], BILL_SER_VERSION);   // R5-2: version 5 (hclaimHouseID)
     CBill back;
     CDataStream ssIn(vch, SER_NETWORK, PROTOCOL_VERSION);
     ssIn >> back;
@@ -643,41 +643,41 @@ BOOST_AUTO_TEST_CASE(bill_b1_digests_bind_every_value_field)
     const uint256 billID = uint256S("0a0b");
     const uint256 hp = uint256S("1111");
     const uint256 ho = uint256S("2222");
-    const uint256 base = BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), billID);
+    const uint256 base = BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), billID, uint256());
 
     // Same inputs -> same digest.
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), billID) == base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), billID, uint256()) == base);
 
     // Every value field is bound.
     BillDiscount m = d; m.amountPrice += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.amountFace += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nBillMaturityHeight += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nHouseID += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.vUnits[0] += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.vchCustodyPubKey[0] = 0x03;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nExpiryHeight += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nAsOfHeight += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nPrevMintedUnits += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nPrevLoanBookFace += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nPrevLoanWtMatHi += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
     m = d; m.nPrevLoanWtMatLo += 1;
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) != base);
 
     // The tx context is bound.
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), uint256S("0a0c")) != base);
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, uint256S("1112"), ho), billID) != base);
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, uint256S("2223")), billID) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, ho), uint256S("0a0c"), uint256()) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, uint256S("1112"), ho), billID, uint256()) != base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, d, hp, uint256S("2223")), billID, uint256()) != base);
 
     // Signature and approver-index fields are EXCLUDED, so the seller's payload
     // signature survives the house adding its quorum (and vice versa).
@@ -685,7 +685,7 @@ BOOST_AUTO_TEST_CASE(bill_b1_digests_bind_every_value_field)
     m.vchSellerSig = std::vector<unsigned char>(70, 0x30);
     m.vApproverIndex.push_back(0);
     m.vApproverSig.push_back(std::vector<unsigned char>(70, 0x30));
-    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID) == base);
+    BOOST_CHECK(BillDiscountSigHash(C1BillTx(BILL_OP_DISCOUNT, m, hp, ho), billID, uint256()) == base);
 
     // Domain separation: the two B1 digests never collide.
     BillRecourse r;

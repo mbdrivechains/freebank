@@ -351,7 +351,12 @@ BOOST_AUTO_TEST_CASE(token_claim_rules)
 
     // The copier: same token, another payout, signed by someone who is not the holder (no r).
     TokenClaimEntry stolen = Entry(5, id, t1, pay);
-    stolen.vchPayoutScript = std::vector<unsigned char>{OP_TRUE};
+    {
+        CKey thief;   // R5-7: a payable script (P2PKH), so the refusal is the signature's, not the shape's
+        thief.MakeNewKey(true);
+        const CScript scriptThief = GetScriptForDestination(thief.GetPubKey().GetID());
+        stolen.vchPayoutScript = std::vector<unsigned char>(scriptThief.begin(), scriptThief.end());
+    }
     BOOST_CHECK_EQUAL(Run(Claim({stolen}), nH, f.Get(), rec), "bad-token-claim-sig");
     CKey other;
     other.MakeNewKey(true);
@@ -426,7 +431,7 @@ BOOST_AUTO_TEST_CASE(token_post_and_keyset_rules)
     CMutableTransaction mtx = NoteOpTx(NOTE_OP_TOKEN_KEYSET);
     ks.vApproverIndex = {0};
     ks.vApproverSig = {std::vector<unsigned char>()};
-    BOOST_REQUIRE(f.keyPartner.Sign(TokenKeysetSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, ks)), ks.vApproverSig[0]));
+    BOOST_REQUIRE(f.keyPartner.Sign(TokenKeysetSigHash(C1With(mtx, &CMutableTransaction::vchNotePayload, ks), uint256S("f00d")), ks.vApproverSig[0]));
     SetPayload(mtx, ks);
     Records rec;
     TokenEffects eff;
@@ -633,7 +638,7 @@ BOOST_AUTO_TEST_CASE(s4x_1_a_blocks_token_claims_stay_under_the_flush_headroom)
     ks.nHeight = 150;
     ks.vKey = vKey;
     rec.keyset[{f.house.nHouseID, id}] = ks;
-    const CScript pay = CScript() << OP_TRUE;
+    const CScript pay = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 7) << OP_EQUALVERIFY << OP_CHECKSIG;   // R5-7: payable
     NoteTokenClaim claim;
     claim.nHouseID = f.house.nHouseID;
     for (size_t i = 0; i < MAX_TOKEN_CLAIM_ENTRIES; i++) {
@@ -1011,7 +1016,7 @@ BOOST_FIXTURE_TEST_CASE(s1x_27_token_claim_probe_cost_does_not_grow_with_the_poo
 // each repeat with a fresh payout script (new holder sighashes, re-signed by the holder) pays the 32 signatures again.
 // Security ruled 11-26 (appended to its family-rules note): a token holder's signature has no standing, and
 // bad-token-claim-sig, -dleq and -proof score DoSStateIndependent(100) - each is pure in the tx and the keyset its id
-// names - so a probe costs its sender the connection. Checked here: the refusal scores 100 (FAILS until that lands).
+// names - so a probe costs its sender the connection. Checked here: the refusal scores 100 (freebankd 4358e5d, v1.2.7).
 // The cost is reported. The control: the same claim with the right proof is accepted.
 // ===========================================================================
 BOOST_FIXTURE_TEST_CASE(family_a_cost_token_claim_holder_last_dleq_wrong, TokenPoolSetup)

@@ -36,10 +36,10 @@ uint256 DepositHashPrevouts(const CTransaction& tx)
     return ss.GetHash();
 }
 
-uint256 DepositOriginateSigHash(const CTransaction& tx)
+uint256 DepositOriginateSigHash(const CTransaction& tx, const uint256& houseID)
 {
     // Stage 0 rule C1: the whole transaction except the signatures (issued.h CreditTxSigHash).
-    return CreditTxSigHash(tx, "FreeBankDeposit/originate");
+    return CreditTxSigHash(tx, "FreeBankDeposit/originate", houseID);   // R5-15
 }
 
 uint256 DepositTransferSigHash(const CTransaction& tx)
